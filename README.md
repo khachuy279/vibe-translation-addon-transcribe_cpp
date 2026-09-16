@@ -337,17 +337,17 @@ thư viện native đang nạp **không có** `ggml-cuda.dll` (thiếu `bin/`) �
 
 ```mermaid
 flowchart TD
-    EXT[Extension MV3<br/>AudioWorklet 48k→16k PCM16] -->|WSS binary frame| WS[FastAPI /ws<br/>protocol v3]
-    WS --> BUF[CircularAudioBuffer 60s]
-    WS --> VAD[VAD: FireRed / Silero / FSMN<br/>CPU, pre-warm]
-    VAD -->|speech start/end| SEG[Segmenter + CommitManager 4 bậc]
-    BUF --> NORM[Speech Normalizer<br/>RMS auto-gain + limiter]
-    NORM --> ASR[transcribe.cpp<br/>Vulkan (mặc định) / CUDA (tuỳ chọn)]
+    EXT["Extension MV3<br/>AudioWorklet 48k→16k PCM16"] -->|WSS binary frame| WS["FastAPI /ws<br/>protocol v3"]
+    WS --> BUF["CircularAudioBuffer 60s"]
+    WS --> VAD["VAD: FireRed / Silero / FSMN<br/>CPU, pre-warm"]
+    VAD -->|speech start/end| SEG["Segmenter + CommitManager 4 bậc"]
+    BUF --> NORM["Speech Normalizer<br/>RMS auto-gain + limiter"]
+    NORM --> ASR["transcribe.cpp<br/>Vulkan (mặc định) / CUDA (tuỳ chọn)"]
     ASR -->|preview tokens| WS
-    ASR -->|committed text| DEDUP[3-layer Dedup]
-    DEDUP --> TRANS[llama.cpp GGUF<br/>Hunyuan-MT2]
+    ASR -->|committed text| DEDUP["3-layer Dedup"]
+    DEDUP --> TRANS["llama.cpp GGUF<br/>Hunyuan-MT2"]
     TRANS -->|streaming translation| WS
-    TRANS --> TTS[OmniVoice TTS<br/>CUDA]
+    TRANS --> TTS["OmniVoice TTS<br/>CUDA"]
     TTS -->|binary WAV frame| WS
     WS -->|utterance_update + translation + audio| EXT
 ```
