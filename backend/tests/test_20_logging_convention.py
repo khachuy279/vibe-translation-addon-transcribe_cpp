@@ -33,10 +33,32 @@ def _backend_files():
     return sorted(p for p in BACKEND.rglob("*.py") if "tests" not in p.parts)
 
 
+def _module_string_constants(tree: ast.Module) -> dict:
+    """Tên -> giá trị của các hằng chuỗi cấp module (vd `_TAG = "TRANSLATE"`).
+
+    VÌ SAO CẦN: `hotswap.py` đặt `_TAG = "TRANSLATE"` rồi dùng
+    `extra={"module_tag": _TAG}`. Bản trước của test chỉ nhận `ast.Constant` nên coi
+    hằng này là "thiếu module_tag" và báo 3 lời gọi sai — trong khi runtime hoàn toàn
+    đúng. Resolve hằng chuỗi ở đây giữ nguyên độ chặt của quy ước (tag vẫn phải có và
+    vẫn phải nằm trong danh sách chuẩn) mà không bắt lỗi sai.
+    """
+    consts: dict = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                consts[target.id] = node.value.value
+    return consts
+
+
 def _logger_calls():
-    """Sinh ra (file, dòng, node_call) cho mọi lời gọi `logger.<level>(...)`."""
+    """Sinh ra (file, dòng, node_call, hằng_chuỗi_cấp_module) cho mọi `logger.<level>(...)`."""
     for path in _backend_files():
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        consts = _module_string_constants(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -47,7 +69,7 @@ def _logger_calls():
                 and isinstance(fn.value, ast.Name)
                 and fn.value.id == "logger"
             ):
-                yield path, node.lineno, node
+                yield path, node.lineno, node, consts
 
 
 MARKER = "\x01"  # đại diện cho biểu thức trong f-string khi ghép phần chữ
@@ -73,37 +95,42 @@ def _literal_text(call: ast.Call) -> str:
     return re.sub(r"\[[^\[\]]*" + MARKER + r"[^\[\]]*\]", "", text)
 
 
-def _module_tag(call: ast.Call):
+def _module_tag(call: ast.Call, consts=None):
+    """Giá trị `module_tag`. Chấp nhận literal HOẶC hằng chuỗi cấp module."""
+    consts = consts or {}
     for kw in call.keywords:
         if kw.arg == "extra" and isinstance(kw.value, ast.Dict):
             for k, v in zip(kw.value.keys, kw.value.values):
                 if isinstance(k, ast.Constant) and k.value == "module_tag":
-                    return v.value if isinstance(v, ast.Constant) else None
+                    if isinstance(v, ast.Constant):
+                        return v.value
+                    if isinstance(v, ast.Name):
+                        return consts.get(v.id)
     return None
 
 
 def test_every_logger_call_has_module_tag():
     missing = [
         f"{p.relative_to(ROOT)}:{line}"
-        for p, line, call in _logger_calls()
-        if _module_tag(call) is None
+        for p, line, call, consts in _logger_calls()
+        if _module_tag(call, consts) is None
     ]
     assert not missing, f"{len(missing)} lời gọi logger thiếu module_tag: {missing[:10]}"
 
 
 def test_module_tags_are_canonical():
     bad = {
-        _module_tag(call)
-        for _p, _line, call in _logger_calls()
-        if _module_tag(call) is not None and _module_tag(call) not in KNOWN_TAGS
+        _module_tag(call, consts)
+        for _p, _line, call, consts in _logger_calls()
+        if _module_tag(call, consts) is not None and _module_tag(call, consts) not in KNOWN_TAGS
     }
     assert not bad, f"module_tag ngoài danh sách chuẩn: {sorted(bad)}"
 
 
 def test_message_does_not_repeat_its_own_tag():
     offenders = []
-    for path, line, call in _logger_calls():
-        tag = _module_tag(call)
+    for path, line, call, consts in _logger_calls():
+        tag = _module_tag(call, consts)
         if tag and f"[{tag}]" in _literal_text(call):
             offenders.append(f"{path.relative_to(ROOT)}:{line} (tag {tag})")
     assert not offenders, f"thông điệp lặp lại tag: {offenders[:10]}"
@@ -111,7 +138,7 @@ def test_message_does_not_repeat_its_own_tag():
 
 def test_only_allowed_bracket_tokens_in_messages():
     offenders = []
-    for path, line, call in _logger_calls():
+    for path, line, call, _consts in _logger_calls():
         for token in BRACKET_RE.findall(_literal_text(call)):
             if not any(token.strip().startswith(a) for a in ALLOWED_BRACKETS):
                 offenders.append(f"{path.relative_to(ROOT)}:{line} [{token.strip()}]")
@@ -124,7 +151,7 @@ def test_only_allowed_bracket_tokens_in_messages():
 def test_no_emoji_in_log_messages():
     offenders = [
         f"{p.relative_to(ROOT)}:{line}"
-        for p, line, call in _logger_calls()
+        for p, line, call, _consts in _logger_calls()
         if EMOJI_RE.search(_literal_text(call))
     ]
     assert not offenders, f"còn emoji trong log: {offenders[:10]}"

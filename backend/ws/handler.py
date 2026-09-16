@@ -71,15 +71,180 @@ def shutdown_vad_executor(wait: bool = False) -> None:
         pass
 
 
+# FIX-09: nhịp tối thiểu giữa hai lần ghi gauge độ sâu hàng đợi (khi queue đứng yên > 0).
+_QUEUE_GAUGE_MIN_INTERVAL_S = 0.1
+
+
 def _record_queue_gauges(session: SessionState) -> None:
-    """P0.1: ghi độ sâu queue để bottleneck trở thành quan sát được (F-22)."""
+    """P0.1: ghi độ sâu queue để bottleneck trở thành quan sát được (F-22).
+
+    FIX-09: KHÔNG ghi ở MỌI item nữa. `MetricsCollector` dùng MUTEX TOÀN CỤC cho mọi
+    metric, mà hàm này được gọi theo từng item ở vòng stream ASR và trong cả 2 worker ⇒
+    mỗi item là 2 lần tranh mutex trong hot path realtime.
+
+    Nay chỉ ghi khi thông tin THỰC SỰ MỚI:
+      - độ sâu ĐỔI (tăng hoặc giảm) — đây là tín hiệu backlog chính, hoặc
+      - độ sâu tạo high-watermark mới, hoặc
+      - queue đứng yên ở mức > 0 và đã quá `_QUEUE_GAUGE_MIN_INTERVAL_S` (nhịp tim, để
+        gauge không "cũ" khi hàng đợi kẹt lâu).
+    """
     try:
-        if session.translation_queue is not None:
-            metrics_collector.record_gauge("queue", "translation_depth", session.translation_queue.qsize())
-        if session.tts_queue is not None:
-            metrics_collector.record_gauge("queue", "tts_depth", session.tts_queue.qsize())
+        state = getattr(session, "_queue_gauge_state", None)
+        if state is None:
+            state = {}
+            session._queue_gauge_state = state  # type: ignore[attr-defined]
+
+        now = time.perf_counter()
+        for q_name, metric in (
+            ("translation_queue", "translation_depth"),
+            ("tts_queue", "tts_depth"),
+        ):
+            q = getattr(session, q_name, None)
+            if q is None:
+                continue
+
+            depth = q.qsize()
+            last_depth, last_ts, high_water = state.get(q_name, (-1, 0.0, -1))
+            is_new_high = depth > high_water
+            changed = depth != last_depth
+            heartbeat = depth > 0 and (now - last_ts) >= _QUEUE_GAUGE_MIN_INTERVAL_S
+
+            if changed or is_new_high or heartbeat:
+                metrics_collector.record_gauge("queue", metric, depth)
+                state[q_name] = (depth, now, depth if is_new_high else high_water)
     except Exception:
         pass
+
+
+def _discard_queued(session: SessionState, counter_suffix: str = "cleared") -> int:
+    """Bỏ HẾT item còn trong hàng đợi dịch/TTS và cân lại `_unfinished_tasks`.
+
+    F-44b: PHẢI gọi `task_done()` cho mỗi mục bị bỏ. Không gọi thì bộ đếm
+    `_unfinished_tasks` của asyncio.Queue không bao giờ về 0 ⇒ mọi `queue.join()` sau đó
+    treo vĩnh viễn (một dạng "server treo" rất khó thấy).
+
+    Dùng chung cho 2 đường: tua video (`_reset_session_stream`) và dọn phiên (FIX-13).
+    Trả về tổng số item đã bỏ.
+    """
+    total = 0
+    for q_name in ("translation_queue", "tts_queue"):
+        q = getattr(session, q_name, None)
+        if q is None:
+            continue
+        dropped = 0
+        while True:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            except Exception:  # noqa: BLE001
+                break
+            dropped += 1
+            try:
+                q.task_done()
+            except Exception:  # noqa: BLE001
+                pass
+        if dropped:
+            metrics_collector.increment_counter(f"queue.{q_name}_{counter_suffix}")
+        total += dropped
+    return total
+
+
+def _join_texts(a: str, b: str) -> str:
+    """Nối hai câu thành một, tránh khoảng trắng thừa."""
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    return f"{a} {b}"
+
+
+def _coalesce_enqueue(
+    queue: "asyncio.Queue",
+    item: Dict[str, Any],
+    *,
+    label: str,
+    merged_counter: str,
+    dropped_counter: str,
+) -> str:
+    """Đẩy `item` vào hàng đợi; nếu ĐẦY thì GỘP vào câu cũ nhất thay vì VỨT.
+
+    VÌ SAO (FIX-02/FIX-03 — lỗi mất chất lượng đã xác nhận):
+    `translation_queue` và `tts_queue` CHỈ chứa câu FINAL (`is_final`). Bản cũ dùng
+    `put_nowait` + `except QueueFull: drop`, nghĩa là khi hàng đợi đầy thì câu đã chốt
+    **vĩnh viễn không có bản dịch / không có lồng tiếng** (phụ đề gốc vẫn hiện, kèm dấu
+    "..." treo). Đây là mất mát về đúng đắn, không phải tối ưu.
+
+    Cách xử lý (cùng triết lý với `_pending_commits` của ASR: gộp, không vứt):
+    - GỘP `text` của câu mới vào câu **MỚI NHẤT đang chờ** — tức hai câu LIỀN KỀ về thời
+      gian, nên câu gộp vẫn là một đơn vị ngữ nghĩa hợp lý (gộp với câu CŨ NHẤT sẽ tạo ra
+      "câu đầu + câu vừa nói" trong khi các câu giữa vẫn nằm trong hàng đợi ⇒ vô nghĩa);
+    - giữ nguyên số phần tử và thứ tự hàng đợi ⇒ trần RAM và FIFO không đổi;
+    - ghi lại `merged_utterance_ids` để tầng gửi kết quả còn báo được bản dịch cho những
+      câu đã bị gộp (tránh phụ đề treo ở "...").
+
+    Trả về: "queued" | "merged" | "dropped".
+    """
+    try:
+        queue.put_nowait(item)
+        return "queued"
+    except asyncio.QueueFull:
+        pass
+
+    # Đã đầy ⇒ phải gộp. `asyncio.Queue` không có API sửa phần tử, nên rút hết ra rồi đẩy
+    # lại. Chi phí O(n) với n <= trần hàng đợi, và chỉ chạy khi đã quá tải.
+    # AN TOÀN: đang ở event loop đơn luồng nên không coroutine nào chen giữa được.
+    drained: list = []
+    while True:
+        try:
+            drained.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    if not drained:
+        # Hàng đợi đầy nhưng không lấy ra được (đua hiếm gặp) — đành chịu.
+        metrics_collector.increment_counter(dropped_counter)
+        logger.warning(f"Hàng đợi {label} đầy và không gộp được — bỏ câu này.", extra={"module_tag": "WS"})
+        return "dropped"
+
+    # `get_nowait()` KHÔNG giảm `_unfinished_tasks`, còn `put_nowait()` thì TĂNG. Cân lại
+    # bằng `task_done()` cho đúng số phần tử đã rút, nếu không `queue.join()` trong
+    # `drain_queues()` sẽ treo vĩnh viễn.
+    for _ in drained:
+        try:
+            queue.task_done()
+        except ValueError:  # pragma: no cover - chỉ xảy ra nếu ai đó đã task_done thừa
+            break
+
+    newest = drained[-1]
+    merged = dict(newest)
+    merged["text"] = _join_texts(newest.get("text", ""), item.get("text", ""))
+    # `_queued_at` giữ của câu mới nhất đang chờ: metric queue_wait phản ánh đúng thời điểm
+    # nội dung được đưa vào.
+    merged["utterance_id"] = item.get("utterance_id") or newest.get("utterance_id", "")
+    covered = list(newest.get("merged_utterance_ids") or [newest.get("utterance_id", "")])
+    covered.append(item.get("utterance_id", ""))
+    merged["merged_utterance_ids"] = [u for u in covered if u]
+    merged["_merged_from"] = int(newest.get("_merged_from", 1) or 1) + 1
+    drained[-1] = merged
+
+    for element in drained:
+        try:
+            queue.put_nowait(element)
+        except asyncio.QueueFull:  # pragma: no cover - vừa rút ra nên không thể xảy ra
+            metrics_collector.increment_counter(dropped_counter)
+            logger.warning(f"Hàng đợi {label} đầy trở lại sau khi gộp — bỏ câu này.", extra={"module_tag": "WS"})
+            return "dropped"
+
+    metrics_collector.increment_counter(merged_counter)
+    logger.warning(
+        f"Hàng đợi {label} đầy — đã GỘP {merged['_merged_from']} câu thay vì vứt bỏ. "
+        f"Không mất chữ; bản dịch/lồng tiếng sẽ phủ cả {len(merged['merged_utterance_ids'])} câu.",
+        extra={"module_tag": "WS"},
+    )
+    return "merged"
 
 
 async def handle_ws(ws: WebSocket) -> None:
@@ -164,16 +329,18 @@ async def handle_ws(ws: WebSocket) -> None:
 
         unregister_session(session)
 
+        # FIX-13: THỨ TỰ DỌN PHIÊN.
+        # 1) Dừng nhận việc mới: huỷ + chờ worker kết thúc.
         for t in workers:
             t.remove_done_callback(_on_worker_done)
             t.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
 
-        # Dọn dẹp hàng đợi nhanh (< 200ms)
-        try:
-            await session.drain_queues(timeout=0.15)
-        except Exception:
-            pass
+        # 2) Bỏ hết item còn lại VÀ cân lại `_unfinished_tasks`.
+        #    Bản cũ gọi `drain_queues()` SAU khi đã huỷ worker: không còn consumer nào gọi
+        #    `task_done()`, nên `join()` chỉ thoát nhờ timeout 0.15 s — vừa vô nghĩa vừa
+        #    làm chậm cleanup. Realtime thì nên VỨT NHANH, không phải flush.
+        _discard_queued(session, "cleared_on_cleanup")
 
         await session.cleanup()
         await safe_ws.close()
@@ -252,6 +419,17 @@ def _process_binary_chunk(session: SessionState, data: bytes) -> None:
 
 async def _handle_binary_message(session: SessionState, data: bytes) -> None:
     """Xử lý khung nhị phân âm thanh trên luồng worker VAD chuyên dụng."""
+    # FIX-14: `config.ws.max_payload_bytes` trước đây là config CHẾT (không nơi nào đọc).
+    # Frame audio thật chỉ ~2 KB, nên một khung vượt trần là bất thường (client lỗi/hỏng
+    # giao thức). Chặn ở đây để (a) config có tác dụng thật, (b) không đẩy rác vào VAD/ASR.
+    limit = int(getattr(config.ws, "max_payload_bytes", 0) or 0)
+    if limit > 0 and len(data) > limit:
+        metrics_collector.increment_counter("ws.payload_rejected")
+        logger.warning(
+            f"Bỏ khung nhị phân {len(data)} byte vượt trần max_payload_bytes={limit}.",
+            extra={"module_tag": "WS"},
+        )
+        return
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(_VAD_EXECUTOR, _process_binary_chunk, session, data)
 
@@ -313,17 +491,19 @@ async def _stream_asr_tokens(session: SessionState) -> None:
                 # 3. Đưa vào hàng đợi dịch thuật
                 if is_final and text and session.translation_queue:
                     target_l = session.config.get("target_lang") or config.translation.target_lang
-                    try:
-                        session.translation_queue.put_nowait({
+                    _coalesce_enqueue(
+                        session.translation_queue,
+                        {
                             "utterance_id": utt_id,
                             "text": text,
                             "source_lang": msg.get("language", session.config.get("source_lang", "auto")),
                             "target_lang": target_l,
                             "_queued_at": time.perf_counter(),
-                        })
-                    except asyncio.QueueFull:
-                        logger.warning(f"Session {session.session_id}: Hàng đợi Translation đầy, bỏ qua", extra={"module_tag": "WS"})
-                        metrics_collector.increment_counter("queue.translation_dropped")
+                        },
+                        label="Translation",
+                        merged_counter="queue.translation_merged",
+                        dropped_counter="queue.translation_dropped",
+                    )
 
 
     except asyncio.CancelledError:
@@ -364,28 +544,7 @@ async def _reset_session_stream(session: SessionState, reason: str = "seek") -> 
                            extra={"module_tag": "WS"})
 
     # Hàng đợi dịch/TTS còn câu của đoạn CŨ ⇒ bỏ hết (kết quả sẽ lệch với vị trí mới).
-    # F-44b: PHẢI gọi `task_done()` cho mỗi mục bị bỏ. Không gọi thì bộ đếm
-    # `_unfinished_tasks` của asyncio.Queue không bao giờ về 0 ⇒ mọi `queue.join()` sau đó
-    # treo (đây là một dạng "server treo" rất khó thấy).
-    for q_name in ("translation_queue", "tts_queue"):
-        q = getattr(session, q_name, None)
-        if q is None:
-            continue
-        dropped = 0
-        while True:
-            try:
-                q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            except Exception:  # noqa: BLE001
-                break
-            dropped += 1
-            try:
-                q.task_done()
-            except Exception:  # noqa: BLE001
-                pass
-        if dropped:
-            metrics_collector.increment_counter(f"queue.{q_name}_cleared_on_seek")
+    _discard_queued(session, "cleared_on_seek")
 
     metrics_collector.increment_counter("ws.stream_reset")
     logger.info(
@@ -508,6 +667,22 @@ async def _process_translation_item(
     if not sent1 or not sent2:
         return
 
+    # FIX-02: nếu item này là kết quả của việc GỘP nhiều câu final (hàng đợi đầy), phát
+    # bản dịch cho MỌI câu được phủ. Nếu không, các câu bị gộp sẽ treo vĩnh viễn ở dấu "..."
+    # vì chúng đã được gửi đi với placeholder `translated="..."`.
+    for covered_id in item.get("merged_utterance_ids") or []:
+        if not covered_id or covered_id == utt_id:
+            continue
+        await session.send_json(
+            make_translation_msg(
+                utt_id=covered_id,
+                translated=translated,
+                elapsed_ms=elapsed_ms,
+                target_lang=tgt_lang,
+                compact=compact,
+            )
+        )
+
     # Đo đạc End-to-End Latency từ lúc ASR commit đến khi Client nhận phụ đề
     e2e_sub_ms = (time.perf_counter() - queued_at) * 1000.0
     metrics_collector.record_metric("pipeline", "e2e_asr_to_sub_ms", e2e_sub_ms)
@@ -516,18 +691,19 @@ async def _process_translation_item(
     # 3. Đưa vào hàng đợi TTS nếu người dùng bật chế độ lồng tiếng
     if session.config.get("tts_enabled"):
         if session.tts_queue and translated:
-            try:
-                session.tts_queue.put_nowait({
+            _coalesce_enqueue(
+                session.tts_queue,
+                {
                     "utterance_id": utt_id,
                     "text": translated,
                     "voice": session.config.get("tts_voice"),
                     "speed": float(session.config.get("tts_speed", 1.0)),
                     "_queued_at": time.perf_counter(),
-                })
-                logger.info(f"Đã đưa vào hàng đợi lồng tiếng: '{translated}'", extra={"module_tag": "WS"})
-            except asyncio.QueueFull:
-                logger.warning(f"Session {session.session_id}: Hàng đợi TTS đầy, bỏ qua câu này", extra={"module_tag": "WS"})
-                metrics_collector.increment_counter("queue.tts_dropped")
+                },
+                label="TTS",
+                merged_counter="queue.tts_merged",
+                dropped_counter="queue.tts_dropped",
+            )
 
 
 async def _translation_worker(session: SessionState) -> None:

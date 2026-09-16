@@ -174,6 +174,9 @@ class MetricsCollector:
             "asr.e2e_commit_ms",
             "asr.preview_audio_sec",
             "asr.commit_audio_sec",
+            # FIX-10: đo mức lãng phí compute của preview (xem engine._finalize_recompute_metrics).
+            "asr.audio_seconds_unique_preview",
+            "asr.preview_recompute_ratio",
             "asr.idle_wait_ms",
             "vad.chunk_ms",
             "vad.frame_ms",

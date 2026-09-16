@@ -47,11 +47,38 @@
   let isCapturing = false;
   let settings = { targetLang: "vi", subPosY: 10, subWidth: 80 };
   let cachedVideo = null;
+  // FIX-01: handle của "liveness probe" backpressure. Khi socket nghẽn tới mức HARD,
+  // content script tắt capture nên không còn frame nào để service worker tự kiểm tra lại;
+  // timer này hỏi định kỳ cho tới khi nó báo "ok".
+  let backpressureProbeTimer = null;
+  const BACKPRESSURE_PROBE_MS = 250;
   // P3.5e: cache cả KẾT QUẢ ÂM của findVideo(). Trước đây nếu không tìm thấy video thì
   // `cachedVideo = null` và mọi sự kiện sau lại quét toàn DOM (`querySelectorAll("*")`)
   // — trên trang nhiều frame / DOM lớn đây là mục CPU chiếm ưu thế.
   let videoScanMissUntil = 0;
   const VIDEO_SCAN_MISS_TTL_MS = 2000;
+
+  /**
+   * FIX-01: bắt đầu hỏi service worker xem socket đã rút hết hàng đợi chưa.
+   * Chỉ chạy khi capture ĐANG bị tạm dừng (không còn frame nào để nó tự biết).
+   */
+  function startBackpressureProbe() {
+    if (backpressureProbeTimer !== null) return;
+    backpressureProbeTimer = setInterval(() => {
+      if (!wsClient) {
+        stopBackpressureProbe();
+        return;
+      }
+      // Service worker sẽ trả "ok" (qua sự kiện backpressure) khi bufferedAmount < SOFT.
+      wsClient.flushPending();
+    }, BACKPRESSURE_PROBE_MS);
+  }
+
+  function stopBackpressureProbe() {
+    if (backpressureProbeTimer === null) return;
+    try { clearInterval(backpressureProbeTimer); } catch (e) {}
+    backpressureProbeTimer = null;
+  }
 
   function getVideo(forceRefresh = false) {
     if (!forceRefresh && cachedVideo && cachedVideo.isConnected && !cachedVideo.ended) {
@@ -316,13 +343,23 @@
       wsClient.on("backpressure", (bp) => {
         if (bp.state === "paused") {
           if (audioCapture && audioCapture.isCapturing) {
-            console.warn("[BS] Backend chậm: tạm dừng gửi audio để tránh trôi độ trễ.");
+            console.warn(
+              "[BS] Backend chậm: tạm dừng gửi audio để tránh trôi độ trễ.",
+              `(pause #${bp.pauseCount || 0}, đã mất ${bp.droppedFrames || 0} frame)`
+            );
             audioCapture.isCapturing = false;
           }
+          // FIX-01: capture đã dừng nên KHÔNG còn SEND_BINARY nào để service worker biết
+          // lúc nào hàng đợi rút hết. Bắn probe định kỳ để nó nhả trạng thái tạm dừng.
+          startBackpressureProbe();
         } else if (bp.state === "ok") {
+          stopBackpressureProbe();
           if (audioCapture && !audioCapture.isCapturing) {
             audioCapture.isCapturing = true;
-            console.log("[BS] Backend đã bắt kịp: tiếp tục gửi audio.");
+            console.log(
+              "[BS] Backend đã bắt kịp: tiếp tục gửi audio.",
+              `(paused ${Math.round((bp.pausedMs || 0))}ms, resume #${bp.resumeCount || 0})`
+            );
           }
         }
       });
@@ -377,6 +414,7 @@
 
   async function cleanup() {
     isCapturing = false;
+    stopBackpressureProbe();   // FIX-01: không để timer probe sống sót qua Stop
     if (captureAbortController) {
       try { captureAbortController.abort(); } catch (e) {}
       captureAbortController = null;

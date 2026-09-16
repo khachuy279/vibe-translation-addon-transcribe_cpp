@@ -38,10 +38,34 @@ def reset_hotswap_state():
 
 @pytest.fixture
 def tmp_models(monkeypatch, tmp_path):
-    """Trỏ `MODELS_DIR` của cả hai registry vào thư mục tạm (không đụng file thật)."""
+    """Cô lập hoàn toàn vị trí model dịch (không đụng file GGUF thật).
+
+    VÌ SAO PHẢI VÁ CẢ HAI ĐẦU (bug của chính bộ test, đã gây 2 test đỏ vô nghĩa):
+    `resolve_gguf_path()` đọc `registry.MODELS_DIR`, nhưng `ensure_model_file()` lại nhận
+    `local_dir` mặc định đã bind sẵn từ `config.MODELS_DIR` **tại thời điểm import**.
+    Trước đây fixture chỉ vá `trans_registry.MODELS_DIR`, nên:
+      - `resolve_gguf_path()` ⇒ trỏ thư mục tạm (file *thiếu*);
+      - `ensure_model_file()` ⇒ đọc `backend/models` THẬT (file *có sẵn*).
+    Kết quả: test tưởng đang kiểm tra "file thiếu" nhưng thực tế **nạp model 1.8B thật lên
+    GPU**, và `/api/config` trả 202 thay vì 409. Vì vậy fixture này vá thêm
+    `model_download.ensure_model_file` (và bản đã import vào `translation.engine`) để mọi
+    đường tải/nạp đều nhìn vào `tmp_path`.
+    """
+    from backend.translation import engine as trans_engine
     from backend.translation import registry as trans_registry
+    from backend.utils import model_download
 
     monkeypatch.setattr(trans_registry, "MODELS_DIR", tmp_path)
+
+    # `local_dir` là keyword-only ⇒ chỉ cần tiêm mặc định mới khi caller không truyền.
+    real_ensure = model_download.ensure_model_file
+
+    def _ensure(repo_id, filename, **kwargs):
+        kwargs.setdefault("local_dir", tmp_path)
+        return real_ensure(repo_id, filename, **kwargs)
+
+    monkeypatch.setattr(model_download, "ensure_model_file", _ensure)
+    monkeypatch.setattr(trans_engine, "ensure_model_file", _ensure)
     return tmp_path
 
 
@@ -261,10 +285,16 @@ def test_hot_path_degrades_to_passthrough_when_model_unavailable(monkeypatch, tm
     translator = GGUFTranslator.get_instance()
     monkeypatch.setattr(translator, "canonical_key", "tencent-1.8b")
 
-    def _boom(allow_download=False):
+    def _boom(self, allow_download=False):
         raise FileNotFoundError("thiếu file")
 
-    monkeypatch.setattr(translator, "load_model", _boom)
+    # PHẢI vá ở CLASS, không vá ở instance: `load_model` là method của class nên
+    # `monkeypatch.setattr(translator, "load_model", ...)` sẽ tạo một ATTRIBUTE INSTANCE;
+    # khi teardown, monkeypatch "khôi phục" bằng cách setattr lại giá trị cũ lên chính
+    # instance đó ⇒ attribute instance TỒN TẠI VĨNH VIỄN và che method của class cho mọi
+    # test sau dùng cùng singleton. Đây chính là thứ làm `test_25` đỏ khi chạy full suite
+    # nhưng xanh khi chạy riêng.
+    monkeypatch.setattr(GGUFTranslator, "load_model", _boom)
     out = translator._translate_sync("Xin chào", source_lang="en", target_lang="vi")
     assert out["translated_text"] == "Xin chào"
     assert out["elapsed_ms"] == 0.0
@@ -334,16 +364,39 @@ def test_rest_missing_file_with_auto_download_returns_202_and_keeps_model(
 
 
 def test_rest_busy_with_another_model_returns_409(reset_hotswap_state, monkeypatch, tmp_models):
-    """Đang tải model khác ⇒ 409 thay vì hai lượt tải/nạp chồng nhau."""
-    from backend.translation import hotswap
+    """Đang tải model khác ⇒ 409 thay vì hai lượt tải/nạp chồng nhau.
+
+    LƯU Ý: KHÔNG monkeypatch `hotswap.is_busy`. `main.py` kiểm tra theo khoá
+    (`is_busy() and not is_busy(canonical_key)`), nên một stub `lambda key=None: True`
+    sẽ vô hiệu hoá vế thứ hai và biến test thành "mong đợi 409 nhưng nhận 202".
+    Chỉ cần đặt trạng thái thật là đủ để tái hiện tình huống.
+    """
+    hotswap = reset_hotswap_state
 
     monkeypatch.setattr(hotswap, "needs_download", lambda key: True)
-    monkeypatch.setattr(hotswap, "is_busy", lambda key=None: True)
     hotswap._set_state(state="downloading", model="xiaomi")
+
+    assert hotswap.is_busy() is True
+    assert hotswap.is_busy("tencent-1.8b") is False, "đang tải model KHÁC"
 
     with pytest.raises(HTTPException) as excinfo:
         _post_config(translation_model="tencent-1.8b")
     assert excinfo.value.status_code == 409
+
+
+def test_rest_busy_with_same_model_does_not_409(reset_hotswap_state, monkeypatch, tmp_models):
+    """Bấm lại ĐÚNG model đang tải ⇒ không 409 (tránh chặn nhầm thao tác lặp của user)."""
+    hotswap = reset_hotswap_state
+
+    monkeypatch.setattr(hotswap, "needs_download", lambda key: True)
+    hotswap._set_state(state="downloading", model="tencent-1.8b")
+
+    assert hotswap.is_busy() is True
+    assert hotswap.is_busy("tencent-1.8b") is True, "cùng model ⇒ nhánh 409 phải bị bỏ qua"
+
+    # `reserve()` thấy đã có lượt chạy cho đúng model này ⇒ không xếp thêm task nền (202).
+    resp = _post_config(translation_model="tencent-1.8b")
+    assert getattr(resp, "status_code", None) == 202
 
 
 def test_config_response_exposes_download_status(tmp_models):

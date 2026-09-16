@@ -9,6 +9,7 @@ Hỗ trợ:
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import logging
 import os
 import threading
@@ -116,6 +117,24 @@ class GGUFTranslator(BaseTranslator):
         )
         return llm, get_prompt_strategy(info.get("prompt_style", "tencent"))
 
+    @staticmethod
+    def _close_llm_quietly(llm: Optional[Any]) -> None:
+        """Đóng model NGAY, KHÔNG chờ `_infer_lock`.
+
+        Chỉ dùng cho model CHƯA từng được cài vào `_shared_llm` (ví dụ bản build dư bị bỏ
+        đi khi một luồng khác đã nạp xong trước). Chờ `_infer_lock` ở đây là vô nghĩa và có
+        thể treo hàng chục giây nếu đang có một lượt sinh token chạy.
+        """
+        if llm is None:
+            return
+        try:
+            if hasattr(llm, "close"):
+                llm.close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Đóng model dịch gặp lỗi (bỏ qua): {e}", extra={"module_tag": "TRANSLATE"})
+        del llm
+        gc.collect()
+
     @classmethod
     def _release_llm(cls, llm: Optional[Any]) -> None:
         """Giải phóng một model dịch (chờ lượt suy luận đang chạy trên nó kết thúc trước)."""
@@ -123,14 +142,7 @@ class GGUFTranslator(BaseTranslator):
             return
         with cls._infer_lock:
             pass  # hàng rào: không đóng model khi còn thread đang sinh token trên nó
-        try:
-            if hasattr(llm, "close"):
-                llm.close()
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Đóng model dịch gặp lỗi (bỏ qua): {e}", extra={"module_tag": "TRANSLATE"})
-        del llm
-        import gc
-        gc.collect()
+        cls._close_llm_quietly(llm)
         logger.info("Đã giải phóng mô hình dịch khỏi GPU VRAM.", extra={"module_tag": "TRANSLATE"})
 
     def _log_load_failure(self, exc: Exception) -> None:
@@ -146,22 +158,43 @@ class GGUFTranslator(BaseTranslator):
     def load_model(self, allow_download: bool = False) -> None:
         """Nạp model GGUF lên GPU nếu chưa nạp (đường khởi động / prewarm).
 
+        FIX-04: `_build_llm()` (đọc GGUF + mmap tensors + cấp VRAM) chạy **NGOÀI**
+        `_shared_lock`. Bản cũ giữ lock suốt quá trình build — đo được hàng giây tới hàng
+        chục giây cho model 7B — nên mọi đường chỉ cần ĐỌC trạng thái
+        (`get_instance()`, `_translate_sync()` đọc `_shared_llm`, `unload_model()`) đều bị
+        chặn theo, làm popup/REST treo.
+
         Vẫn theo nguyên tắc F-50: nạp model mới TRƯỚC, chỉ giải phóng model cũ sau khi
         model mới đã sẵn sàng.
         """
-        with self.__class__._shared_lock:
+        cls = self.__class__
+        with cls._shared_lock:
             if (
-                self.__class__._shared_llm is not None
-                and self.__class__._shared_model_key == self.canonical_key
+                cls._shared_llm is not None
+                and cls._shared_model_key == self.canonical_key
             ):
                 return
 
-            llm, prompt_strategy = self._build_llm(self.canonical_key, self.cfg, allow_download)
-            old_llm = self.__class__._shared_llm
-            self.__class__._shared_llm = llm
-            self.__class__._shared_model_key = self.canonical_key
-            self.prompt_strategy = prompt_strategy
+        # Nạp NGOÀI lock (chậm). Model cũ vẫn phục vụ bình thường trong lúc này.
+        llm, prompt_strategy = self._build_llm(self.canonical_key, self.cfg, allow_download)
+
+        with cls._shared_lock:
+            if cls._shared_llm is not None and cls._shared_model_key == self.canonical_key:
+                # Luồng khác đã nạp ĐÚNG model này trong lúc ta build ⇒ bỏ bản dư để không
+                # rò VRAM. (Chỉ có thể xảy ra khi `load_model` được gọi song song.)
+                duplicate = True
+                old_llm = None
+            else:
+                duplicate = False
+                old_llm = cls._shared_llm
+                cls._shared_llm = llm
+                cls._shared_model_key = self.canonical_key
+                self.prompt_strategy = prompt_strategy
+
         self._load_failure_logged = False
+        if duplicate:
+            self._close_llm_quietly(llm)
+            return
         self.__class__._release_llm(old_llm)
 
     def reconfigure(self, new_cfg: TranslationConfig, allow_download: bool = True) -> None:

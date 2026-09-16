@@ -30,6 +30,7 @@
   },
   "background": {
     "scripts": [
+      "lib/backpressure-gate.js",
       "lib/frame-builder.js",
       "background/service-worker.js"
     ]

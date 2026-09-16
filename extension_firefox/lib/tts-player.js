@@ -132,7 +132,12 @@
       }
 
       ctx.decodeAudioData(
-        arrayBuffer.slice(0),
+        // FIX-11: KHÔNG `slice(0)` thêm lần nữa. Caller (`content-script.js`) đã tạo một
+        // ArrayBuffer MỚI bằng `buf.slice(7 + jsonLen)` chỉ để đưa vào đây, nên bản sao
+        // thứ hai là thừa (thêm một full copy WAV cho mỗi câu). `decodeAudioData` sẽ
+        // DETACH buffer truyền vào — chấp nhận được vì buffer này không ai dùng lại
+        // (`playedIds` chặn phát trùng theo `utterance_id`).
+        arrayBuffer,
         (audioBuffer) => {
           this.queue.push({
             id: id,

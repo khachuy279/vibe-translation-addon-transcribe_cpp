@@ -227,7 +227,12 @@ class TranscribeEngine(BaseASREngine):
             int(poll_interval_ms) if poll_interval_ms is not None else int(config.asr.poll_interval_ms)
         )
 
-        self.audio_buffer = CircularAudioBuffer(sample_rate=16000, capacity_sec=60.0)
+        # FIX-07: đọc từ config — trước đây hard-code `capacity_sec=60.0` nên
+        # `AudioBufferConfig.capacity_sec` hoàn toàn không có tác dụng.
+        self.audio_buffer = CircularAudioBuffer(
+            sample_rate=int(getattr(config.audio_buffer, "sample_rate", 16000) or 16000),
+            capacity_sec=float(getattr(config.audio_buffer, "capacity_sec", 60.0) or 60.0),
+        )
         self.normalizer = SpeechNormalizer.from_config(config.asr)
         self.commit_manager = CommitManager(sentence_cfg=config.sentence)
 
@@ -264,6 +269,13 @@ class TranscribeEngine(BaseASREngine):
         # P2.4b: nhịp preview hiệu dụng (tự giãn ra khi backend chậm, tự thu lại khi nhanh).
         self._eff_poll_interval: float = self.poll_interval_ms / 1000.0
         self._preview_durations: deque = deque(maxlen=8)
+        # FIX-10: đo mức LÃNG PHÍ compute của preview (tích luỹ theo từng câu).
+        #   processed = tổng số giây audio đã đưa qua model cho các lượt preview
+        #   unique    = số giây audio THẬT của câu (đỉnh của "đã nói được bao nhiêu")
+        # ratio = processed / unique. ratio = 8 nghĩa là mỗi giây audio bị encode/decode 8 lần.
+        # Đây là số liệu QUYẾT ĐỊNH để biết có đáng tối ưu preview hay không (đo trước, sửa sau).
+        self._preview_sec_processed: float = 0.0
+        self._preview_sec_unique_peak: float = 0.0
         # Số inference đang chạy trong executor. Dùng để biết pipeline còn việc hay không
         # (`_pending_commits` rỗng KHÔNG có nghĩa là đã xử lý xong — commit bị pop ra
         # ngay khi bắt đầu inference).
@@ -499,12 +511,15 @@ class TranscribeEngine(BaseASREngine):
             if len(audio_data) == 0:
                 return
             audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
-            audio_float32 = (audio_int16.astype(np.float32) / 32768.0)
+            # FIX-06b: chia TẠI CHỖ (1 mảng tạm thay vì 2), kết quả float32 như cũ.
+            audio_float32 = audio_int16.astype(np.float32)
+            audio_float32 /= 32768.0
         elif isinstance(audio_data, np.ndarray):
             if len(audio_data) == 0:
                 return
             if audio_data.dtype == np.int16:
-                audio_float32 = (audio_data.astype(np.float32) / 32768.0)
+                audio_float32 = audio_data.astype(np.float32)
+                audio_float32 /= 32768.0
             else:
                 audio_float32 = audio_data.astype(np.float32)
         else:
@@ -537,6 +552,9 @@ class TranscribeEngine(BaseASREngine):
             # K2: mốc để đo "thời gian tới preview ĐẦU TIÊN" của câu này.
             self._speech_started_at = time.perf_counter()
             self._first_preview_reported = False
+            # FIX-10: reset bộ đếm lãng phí compute cho câu mới.
+            self._preview_sec_processed = 0.0
+            self._preview_sec_unique_peak = 0.0
         self.commit_manager.reset_stability()
         # K2: ĐÁNH THỨC generator ngay. Trước đây nhánh idle ngủ tới `poll_interval_ms`
         # (mặc định 300 ms) nên preview đầu tiên của câu bị trễ thêm tới ~300 ms chỉ vì
@@ -876,6 +894,49 @@ class TranscribeEngine(BaseASREngine):
         finally:
             self._end_infer()
 
+    def _publish_recompute_ratio(self) -> None:
+        """FIX-10: công bố gauge lãng phí compute của preview (giá trị SỐNG, cập nhật mỗi vòng).
+
+        `ratio` là số lần trung bình mỗi giây audio bị đưa qua model trong câu hiện tại.
+        Đây là chỉ số DUY NHẤT trả lời được câu hỏi "có đáng tối ưu preview không" trước khi
+        bỏ công sức (và rủi ro hồi quy WER) vào incremental/adaptive preview.
+        """
+        unique = self._preview_sec_unique_peak
+        if unique <= 0:
+            return
+        metrics_collector.record_gauge(
+            "asr", "audio_seconds_processed_preview", self._preview_sec_processed
+        )
+        metrics_collector.record_gauge("asr", "audio_seconds_unique_preview", unique)
+        metrics_collector.record_gauge(
+            "asr", "preview_recompute_ratio", self._preview_sec_processed / unique
+        )
+
+    def _finalize_recompute_metrics(self) -> None:
+        """FIX-10: chốt số liệu lãng phí preview cho câu VỪA chốt rồi reset bộ đếm.
+
+        Ghi qua `record_metric` để `/api/metrics` trả được p50/p95 — nhờ vậy benchmark
+        (`test_08_streaming_latency.py`, `test_09_wer_ab.py`) đọc được phân bố chứ không chỉ
+        giá trị cuối cùng.
+        """
+        processed = self._preview_sec_processed
+        unique = self._preview_sec_unique_peak
+        if processed > 0:
+            metrics_collector.record_metric("asr", "audio_seconds_processed_preview", processed)
+        if unique > 0:
+            metrics_collector.record_metric("asr", "audio_seconds_unique_preview", unique)
+        if processed > 0 and unique > 0:
+            ratio = processed / unique
+            metrics_collector.record_metric("asr", "preview_recompute_ratio", ratio)
+            metrics_collector.record_gauge("asr", "preview_recompute_ratio", ratio)
+            logger.debug(
+                f"Preview lãng phí: xử lý {processed:.2f}s audio cho câu {unique:.2f}s "
+                    f"(ratio {ratio:.2f}x).",
+                extra={"module_tag": "ASR"},
+            )
+        self._preview_sec_processed = 0.0
+        self._preview_sec_unique_peak = 0.0
+
     def _preload_model(self, force_warm: bool = False) -> None:
         """Nạp + pre-warm model trước khi dùng (idempotent).
 
@@ -929,8 +990,7 @@ class TranscribeEngine(BaseASREngine):
             metrics_collector.record_metric("asr", "warmup_long_ms", long_ms)
             logger.info(
                 f"Nạp trước + pre-warm model '{self.model_key}' xong "
-                    f"(warmup {short_sec:.1f}s={short_ms:.0f}ms + {long_sec:.1f}s={long_ms:.0f}ms). "
-                        f"Đã phủ trước độ dài câu tối đa => preview/commit đầu tiên không bị đơ.",
+                    f"(warmup {short_sec:.1f}s={short_ms:.0f}ms + {long_sec:.1f}s={long_ms:.0f}ms). ",
                 extra={"module_tag": "ASR"},
             )
         except Exception as exc:  # noqa: BLE001
@@ -1089,6 +1149,8 @@ class TranscribeEngine(BaseASREngine):
         self._last_committed_sample = end_s
         self.commit_manager.record_commit(final_text)
         metrics_collector.increment_counter(f"asr.commit_reason.{reason}")
+        # FIX-10: chốt số liệu lãng phí preview của câu này (đo trước khi tối ưu).
+        self._finalize_recompute_metrics()
 
         if final_text:
             logger.info(
@@ -1231,6 +1293,12 @@ class TranscribeEngine(BaseASREngine):
                             infer_ms = 0.0
                         metrics_collector.record_metric("asr", "preview_ms", infer_ms)
                         metrics_collector.record_metric("asr", "preview_audio_sec", len(audio_slice) / 16000.0)
+                        # FIX-10: tích luỹ lượng audio ĐÃ đưa qua model so với lượng audio THẬT.
+                        self._preview_sec_processed += len(audio_slice) / 16000.0
+                        self._preview_sec_unique_peak = max(
+                            self._preview_sec_unique_peak, (current_total - seg_start) / 16000.0
+                        )
+                        self._publish_recompute_ratio()
                         self._preview_durations.append(infer_ms)
 
                         if preview_text and self._speech_active:
@@ -1399,8 +1467,14 @@ class TranscribeEngine(BaseASREngine):
         Huỷ task chỉ huỷ future của asyncio; thread C++ vẫn chạy hết và vẫn giữ
         `_infer_lock`, khiến session mới phải chờ. Gọi `Session.cancel()` để native
         side dừng sớm.
+
+        FIX-12: đọc `_shared_session` **trong** `_shared_lock` rồi mới gọi `.cancel()` trên
+        tham chiếu cục bộ. Trước đây đọc trực tiếp không lock, nên có thể đua với
+        hot-swap/unload (`prepare_model()`/`unload_shared_model()` đóng native handle) ⇒
+        gọi `cancel()` lên handle đã giải phóng. KHÔNG giữ lock trong lời gọi native.
         """
-        session = self.__class__._shared_session
+        with self.__class__._shared_lock:
+            session = self.__class__._shared_session
         if session is None:
             return
         try:

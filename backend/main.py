@@ -100,7 +100,7 @@ def _warn_if_cuda_provider_missing() -> None:
             # INFO (không còn WARNING): đây là trạng thái BÌNH THƯỜNG của bản dựng này,
             # không phải sự cố cần người dùng khắc phục.
             logger.info(
-                "[STARTUP] ASR dùng backend Vulkan (bản dựng transcribe-cpp hiện chỉ có ""— chưa có CUDA cho Windows). Translation/TTS vẫn dùng CUDA. ""Đây là cấu hình được hỗ trợ, không cần cài thêm gì.",
+                "[STARTUP] ASR dùng backend Vulkan (bản dựng transcribe-cpp hiện chỉ có ""— chưa có CUDA cho Windows). Translation/TTS vẫn dùng CUDA.",
                 extra={"module_tag": "ASR"},
             )
     except Exception as exc:  # noqa: BLE001

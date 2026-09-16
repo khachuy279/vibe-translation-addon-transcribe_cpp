@@ -21,6 +21,10 @@ class WSClient {
     // P3.2: trạng thái backpressure do service worker báo về.
     this.backpressureState = "ok";
     this.droppedAudioFrames = 0;
+    // FIX-01: số liệu chẩn đoán nghẽn (do service worker đếm).
+    this.backpressurePauseCount = 0;
+    this.backpressureResumeCount = 0;
+    this.backpressurePausedMs = 0;
     // P3.1: backend có gửi audio TTS dạng binary frame không (do backend quyết định
     // theo protocol version mà client khai báo).
     this.supportsBinaryTts = false;
@@ -78,10 +82,17 @@ class WSClient {
             // P3.2: service worker báo socket đang tắc.
             this.backpressureState = msg.state;
             this.droppedAudioFrames = msg.droppedFrames || 0;
+            this.backpressurePauseCount = msg.pauseCount || 0;
+            this.backpressureResumeCount = msg.resumeCount || 0;
+            this.backpressurePausedMs = msg.pausedMs || 0;
             this._emit("backpressure", {
               state: msg.state,
               bufferedAmount: msg.bufferedAmount,
               droppedFrames: this.droppedAudioFrames,
+              // FIX-01: số liệu để biết nghẽn thật hay chỉ spike ngắn.
+              pauseCount: this.backpressurePauseCount,
+              resumeCount: this.backpressureResumeCount,
+              pausedMs: this.backpressurePausedMs,
             });
           } else if (msg.type === "disconnected") {
             this.isConnected = false;
@@ -306,6 +317,27 @@ class WSClient {
     new Uint8Array(buffer, 4, headerBytes.length).set(headerBytes);
     new Uint8Array(buffer, 4 + headerBytes.length).set(pcmBytes);
     return buffer;
+  }
+
+  /**
+   * FIX-01: "liveness probe" cho đường backpressure của bridge.
+   *
+   * Khi capture đang bị tạm dừng vì socket nghẽn, KHÔNG còn `SEND_BINARY` nào được gửi
+   * nữa, nên service worker không có cơ hội tự kiểm tra lại. Content script gọi hàm này
+   * định kỳ để hỏi "đã rút hết hàng đợi chưa?" — service worker sẽ nhả trạng thái tạm dừng
+   * và báo "ok" khi `bufferedAmount` đã xuống dưới ngưỡng SOFT.
+   *
+   * Chỉ có ý nghĩa ở chế độ bridge (đường trực tiếp không giám sát `bufferedAmount`).
+   * Trả về true nếu thực sự đã gửi được probe.
+   */
+  flushPending() {
+    if (!this.port) return false;
+    try {
+      this.port.postMessage({ action: "FLUSH_PENDING" });
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   sendJSON(data) {

@@ -190,8 +190,15 @@ class SessionState:
         """
         self.asr_engine = asr_engine or TranscribeEngine(session_id=self.session_id)
 
-        self.translation_queue = asyncio.Queue(maxsize=4)
-        self.tts_queue = asyncio.Queue(maxsize=4)
+        # FIX-02/FIX-03: trần hàng đợi đọc từ config (trước đây hardcode 4). Hàng đợi này
+        # CHỈ chứa câu final, nên khi đầy thì bản dịch/lồng tiếng của câu đó bị mất hẳn.
+        # Trần vẫn bị chặn trên (RAM bound) nhưng rộng hơn để overflow gần như không xảy ra.
+        self.translation_queue = asyncio.Queue(
+            maxsize=max(1, int(getattr(config.ws, "translation_queue_maxsize", 32) or 32))
+        )
+        self.tts_queue = asyncio.Queue(
+            maxsize=max(1, int(getattr(config.ws, "tts_queue_maxsize", 32) or 32))
+        )
 
         self.vad_processor = VADProcessor(
             sample_rate=config.vad.sample_rate,

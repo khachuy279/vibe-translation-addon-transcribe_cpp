@@ -14,6 +14,7 @@ Test ở đây chốt:
 
 import logging
 import os
+import re
 import time
 
 import pytest
@@ -82,13 +83,22 @@ def _reset_dedup():
 
 
 def test_partial_write_is_not_retried():
-    """F-41: write() lỗi GIỮA CHỪNG ⇒ không ghi lại phần còn thiếu (không sinh dòng thứ hai)."""
+    """F-41: write() lỗi GIỮA CHỪNG ⇒ không ghi lại phần còn thiếu (không sinh dòng thứ hai).
+
+    LƯU Ý: trước đây test này hardcode `"2026-09-15"`, nên nó chỉ xanh đúng MỘT ngày và
+    đỏ từ hôm sau — dù handler hoàn toàn đúng. Nay lấy ngày từ cùng nguồn đồng hồ với
+    `%(asctime)s` của logging (`time.strftime`), và vẫn chốt đúng định dạng ngày.
+    """
     stream = _FlakyStream(fail_after=10)
     handler = _make_handler(stream)
     handler.emit(_record())
 
-    assert stream.chunks == ["2026-09-15"], (
+    expected_date = time.strftime("%Y-%m-%d")  # cùng nguồn với %(asctime)s
+    assert stream.chunks == [expected_date], (
         f"handler đã ghi lại sau lỗi giữa chừng: {stream.chunks}"
+    )
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", stream.chunks[0]), (
+        f"phần đầu dòng log phải là ngày ISO, nhận được: {stream.chunks[0]!r}"
     )
 
 

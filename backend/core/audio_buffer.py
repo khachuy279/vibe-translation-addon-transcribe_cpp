@@ -91,8 +91,10 @@ class CircularAudioBuffer:
         if dtype == "float32":
             data = np.frombuffer(pcm_bytes, dtype=np.float32)
         elif dtype == "int16":
-            raw_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
-            data = raw_int16.astype(np.float32) / 32768.0
+            # FIX-06b: `astype` rồi chia tạo 2 mảng tạm; chia TẠI CHỖ chỉ tạo 1.
+            # Kết quả số học giống hệt (cùng phép chia IEEE trên float32).
+            data = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+            data /= 32768.0
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
             
@@ -172,8 +174,22 @@ class CircularAudioBuffer:
         return data, actual_start, actual_end
 
     def clear(self) -> None:
-        """Xóa sạch bộ đệm và reset tất cả con trỏ (phục vụ Fast Cleanup < 200ms)."""
+        """Xoá bỏ dữ liệu cũ và reset con trỏ (Fast Cleanup < 200ms).
+
+        FIX-06: KHÔNG zero-fill toàn bộ buffer nữa. Buffer mặc định 60 s float32
+        = 960.000 mẫu × 4 byte ≈ **3,84 MB**; mỗi lần tua video / reset phiên lại ghi
+        3,84 MB số 0 vào RAM mà không mang lại lợi ích đúng đắn nào.
+
+        An toàn vì MỌI đường đọc đều bị chặn bởi con trỏ `_total_written`:
+        - `get_slice()` trả mảng rỗng ngay khi `current_total == 0` và luôn kẹp
+          `effective_start >= max(0, current_total - capacity_samples)`;
+        - `write()` ghi đè từ `_total_written % capacity_samples`.
+        Nên không có mẫu "rác" nào ngoài vùng hợp lệ được trả ra. (Xem
+        `test_01_core_audio.py` cho test toàn vẹn bit-exact.)
+
+        Nếu sau này cần xoá dữ liệu vì lý do bảo mật thì phải zero-fill TƯỜNG MINH ở
+        đường đó, đừng bật lại ở đây.
+        """
         with self._lock:
-            self._buffer.fill(0)
             self._total_written = 0
             self._dropped_samples_count = 0

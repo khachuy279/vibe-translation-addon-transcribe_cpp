@@ -42,6 +42,13 @@ class WSConfig(BaseModel):
     # (`utterance_id`+`utteranceId`, `original`+`ui_text`+`text`, …).
     # Client cũ khai báo v1/v2 vẫn nhận payload đầy đủ nên không bị ảnh hưởng.
     protocol_version: int = 3
+    # FIX-02/FIX-03: trần hàng đợi dịch/TTS. Trước đây là 4 và khi đầy thì **VỨT** câu
+    # cuối cùng (queue chỉ chứa câu final) ⇒ phụ đề gốc hiện mà bản dịch/lồng tiếng mất hẳn.
+    # Mỗi item chỉ là một câu chữ (vài trăm byte) nên trần lớn hơn gần như không tốn RAM,
+    # trong khi overflow trở nên cực hiếm. Khi vẫn overflow thì `_coalesce_enqueue()` GỘP
+    # thay vì vứt (xem backend/ws/handler.py).
+    translation_queue_maxsize: int = 32
+    tts_queue_maxsize: int = 32
 
 class FireRedVADConfig(BaseModel):
     """Cấu hình chuyên biệt cho FireRed-VAD (Xiaohongshu DFSMN)."""
