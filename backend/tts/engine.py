@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import contextlib
 import gc
 import os
 import threading
@@ -25,6 +26,7 @@ from backend.config import config, MODELS_DIR
 from backend.tts.base import BaseTTSEngine
 from backend.tts.audio_processor import AudioProcessor
 from backend.tts.voice_manager import VoiceManager
+from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TTS
 from backend.utils.logger import get_logger
 
 logger = get_logger("tts.omnivoice")
@@ -65,6 +67,11 @@ class OmniVoiceTTS(BaseTTSEngine):
         self._voice_prompt_cache_max: int = 8
         self._init_lock = threading.RLock()
         self._infer_lock = threading.RLock()
+        # A2-2 (Hy3): CUDA stream RIÊNG cho TTS thay vì đồng bộ toàn device.
+        # `torch.cuda.synchronize()` cũ đồng bộ MỌI stream CUDA đang chờ => chặn cả
+        # inference dịch (CUDA) đang xếp hàng, gây priority inversion và latency spike.
+        # Dùng stream riêng + `stream.synchronize()` chỉ chờ công việc của TTS này.
+        self._cuda_stream: Any = None
 
     def _resolve_model_path(self) -> str:
         """Xác định đường dẫn mô hình (ưu tiên cache cục bộ, fallback HF repo id)."""
@@ -91,15 +98,32 @@ class OmniVoiceTTS(BaseTTSEngine):
         p = self._resolve_model_path()
         return bool(p and (os.path.exists(p) or "splendor1811" in p))
 
+    def _invoke_generate(self, gen_kwargs: dict) -> Any:
+        """Gọi `model.generate` — trên CUDA stream riêng của TTS nếu đã có.
+
+        A2-2 (Hy3): dùng `with torch.cuda.stream(...)` (API ổn định ở mọi bản PyTorch)
+        thay vì dạng decorator `stream(fn)` để tránh phụ thuộc vào `StreamContext.__call__`.
+        """
+        if self._cuda_stream is not None:
+            with torch.cuda.stream(self._cuda_stream):
+                return self.model.generate(**gen_kwargs)
+        return self.model.generate(**gen_kwargs)
+
     def _run_generate(self, gen_kwargs: dict) -> Any:
-        """Thực thi model.generate trong inference_mode và xử lý cuDNN an toàn."""
+        """Thực thi model.generate trong inference_mode và xử lý cuDNN an toàn.
+
+        A2-2 (Hy3): chạy trên CUDA stream RIÊNG của TTS (`self._cuda_stream`) thay vì
+        stream mặc định, để sau này chỉ cần `stream.synchronize()` (chờ riêng TTS) thay
+        vì `torch.cuda.synchronize()` (chờ TOÀN device, làm tắc nghẽn inference dịch CUDA
+        khác đang chạy => priority inversion / latency spike).
+        """
         with torch.inference_mode():
             if self._cudnn_disabled:
                 with torch.backends.cudnn.flags(enabled=False):
-                    return self.model.generate(**gen_kwargs)
+                    return self._invoke_generate(gen_kwargs)
 
             try:
-                return self.model.generate(**gen_kwargs)
+                return self._invoke_generate(gen_kwargs)
             except RuntimeError as e:
                 if "CUDNN" in str(e):
                     logger.warning(
@@ -108,7 +132,7 @@ class OmniVoiceTTS(BaseTTSEngine):
                     )
                     self._cudnn_disabled = True
                     with torch.backends.cudnn.flags(enabled=False):
-                        return self.model.generate(**gen_kwargs)
+                        return self._invoke_generate(gen_kwargs)
                 raise
 
     def _get_voice_clone_prompt(self, ref_audio_path: str, ref_text: str) -> Optional[Any]:
@@ -187,17 +211,20 @@ class OmniVoiceTTS(BaseTTSEngine):
                             "ref_text": ref_text,
                             "num_step": 4,
                         }
+                    if torch.cuda.is_available() and "cuda" in str(self.device):
+                        # A2-2 (Hy3): tạo CUDA stream RIÊNG cho TTS một lần duy nhất.
+                        # Đồng bộ MỘT LẦN ở đây (đường nạp model, không phải hot path) để
+                        # mọi công việc nạp trọng số trên stream mặc định đã hoàn tất trước
+                        # khi TTS bắt đầu đọc trọng số trên stream mới. Nếu bỏ bước này, lần
+                        # sinh đầu tiên có thể đọc trọng số chưa ghi xong (race cross-stream).
+                        torch.cuda.synchronize()
+                        self._cuda_stream = torch.cuda.Stream()
                     with self._infer_lock:
                         _ = self._run_generate(warmup_kwargs)
-                        if torch.cuda.is_available() and "cuda" in str(self.device):
-                            torch.cuda.synchronize()
+                        if self._cuda_stream is not None:
+                            self._cuda_stream.synchronize()
             except Exception as e:
                 logger.debug(f"Warmup notice: {e}", extra={"module_tag": "TTS"})
-
-            # Thu hồi bộ nhớ đệm sau nạp và warmup
-            gc.collect()
-            if torch.cuda.is_available() and "cuda" in str(self.device):
-                torch.cuda.empty_cache()
 
             self._is_loaded = True
             elapsed = time.perf_counter() - t0
@@ -208,6 +235,36 @@ class OmniVoiceTTS(BaseTTSEngine):
         if not self._is_loaded:
             await asyncio.to_thread(self.load_model)
         return self._is_loaded
+
+    def unload_model(self) -> None:
+        """Giải phóng hoàn toàn mô hình khỏi RAM và VRAM GPU.
+
+        A2-3 (Hy3): khi `tts_enabled` chuyển sang False, caller (main.py / handler.py)
+        NÊN gọi hàm này để trả VRAM vài GB (OmniVoice float16) thay vì giữ vô ích.
+        """
+        with self._init_lock:
+            with self._infer_lock:
+                self._is_loaded = False
+                if self.model is not None:
+                    try:
+                        del self.model
+                    except Exception:
+                        pass
+                self.model = None
+                self._voice_prompt_cache.clear()
+                self._cuda_stream = None
+                # B9-4 (Hy3): CHỈ giữ `gc.collect()` ở đường unload. Module PyTorch tạo
+                # vòng tham chiếu (module ↔ parameter ↔ hook) nên nếu không ép GC thì
+                # `empty_cache()` bên dưới không đòi lại được VRAM — tức là làm hỏng chính
+                # mục tiêu của A2-3. Đây là đường RẤT hiếm (tắt TTS / đổi model) nên chi phí
+                # GC không nằm trên hot path; `gc.collect()` ở warmup (hot path khởi động)
+                # đã được bỏ.
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    with contextlib.suppress(Exception):
+                        torch.cuda.ipc_collect()
+        logger.info("Đã giải phóng OmniVoice model và dọn sạch VRAM.", extra={"module_tag": "TTS"})
 
     def _synthesize_audio(self, text: str, voice_id: Optional[str], speed: float) -> Tuple[Optional[np.ndarray], float]:
         """Sinh audio float32 (bỏ qua bước mã hóa). Trả (audio, duration_sec)."""
@@ -245,7 +302,13 @@ class OmniVoiceTTS(BaseTTSEngine):
         t_start = time.perf_counter()
         with self._infer_lock:
             audio_output = self._run_generate(gen_kwargs)
-            if torch.cuda.is_available() and "cuda" in str(self.device):
+            # A2-2 (Hy3): chỉ chờ stream RIÊNG của TTS, KHÔNG `torch.cuda.synchronize()`
+            # (cái cũ đồng bộ TOÀN device => chặn inference dịch CUDA khác đang chạy =>
+            # priority inversion / latency spike). Nếu chưa có stream riêng (CPU/trường
+            # hợp lỗi) thì fall back về synchronize toàn device để vẫn đúng kết quả.
+            if self._cuda_stream is not None:
+                self._cuda_stream.synchronize()
+            elif torch.cuda.is_available() and "cuda" in str(self.device):
                 torch.cuda.synchronize()
 
         infer_time = time.perf_counter() - t_start
@@ -308,7 +371,11 @@ class OmniVoiceTTS(BaseTTSEngine):
         voice_id: Optional[str] = None,
         speed: float = 1.0,
     ) -> Tuple[Optional[bytes], float]:
-        """Bản async của `synthesize_wav_bytes` (không block event loop)."""
+        """Bản async của `synthesize_wav_bytes` (không block event loop).
+
+        A2-1: nhường GPU nếu commit ASR đang chạy (no-op khi scheduler tắt).
+        """
+        await gpu_arbiter.admit(PRIORITY_TTS)
         return await asyncio.to_thread(self.synthesize_wav_bytes, text, voice_id, speed)
 
     async def synthesize_clone(
@@ -317,26 +384,9 @@ class OmniVoiceTTS(BaseTTSEngine):
         voice_id: Optional[str] = None,
         speed: float = 1.0,
     ) -> Tuple[Optional[str], float]:
-        """Tổng hợp giọng nói bất đồng bộ không làm block asyncio event loop."""
-        return await asyncio.to_thread(self.synthesize_sync, text, voice_id, speed)
+        """Tổng hợp giọng nói bất đồng bộ không làm block asyncio event loop.
 
-    def unload_model(self) -> None:
-        """Giải phóng hoàn toàn mô hình khỏi RAM và VRAM GPU."""
-        with self._init_lock:
-            with self._infer_lock:
-                self._is_loaded = False
-                if self.model is not None:
-                    try:
-                        del self.model
-                    except Exception:
-                        pass
-                self.model = None
-                self._voice_prompt_cache.clear()
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    try:
-                        torch.cuda.ipc_collect()
-                    except Exception:
-                        pass
-        logger.info("Đã giải phóng OmniVoice model và dọn sạch VRAM.", extra={"module_tag": "TTS"})
+        A2-1: nhường GPU nếu commit ASR đang chạy (no-op khi scheduler tắt).
+        """
+        await gpu_arbiter.admit(PRIORITY_TTS)
+        return await asyncio.to_thread(self.synthesize_sync, text, voice_id, speed)

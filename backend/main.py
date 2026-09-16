@@ -65,58 +65,97 @@ logger = get_logger("main")
 _background_tasks: set = set()
 
 
-def _warn_if_cuda_provider_missing() -> None:
-    """P1.1 — KẾT LUẬN: KHÔNG dùng được CUDA cho ASR trên Windows; cảnh báo nay chỉ để ghi nhận.
+def _log_asr_backend_at_startup() -> None:
+    """Ghi log MỘT DÒNG nêu rõ ASR sẽ chạy backend nào, từ nguồn native nào.
 
-    Bằng chứng (kiểm tra trên chính máy này):
-    - `transcribe_cpp_native/_native/contract.json` → `"backends": ["vulkan", "cpu"]`,
-      `"lane": "cpu-vulkan"`; thư mục `_native` có `ggml-vulkan.dll` + các `ggml-cpu-*.dll`
-      nhưng **KHÔNG có `ggml-cuda.dll`**.
-    - Metadata wheel `transcribe-cpp-native 0.2.3`: *"Planned wheels will bundle CPU plus
-      platform accelerators"* ⇒ bản CUDA CHƯA phát hành.
-    - Trên PyPI, `transcribe-cpp-native-cu12` chỉ có **duy nhất phiên bản 0.0.0** (đặt tên
-      trước, không có nội dung) ⇒ lời khuyên cũ "cài gói CUDA kia" là SAI và đã bị gỡ hoàn toàn
-      khỏi mã (có test tầng A canh việc này).
+    Lịch sử: trước đây hàm này tên `_warn_if_cuda_provider_missing()` và khẳng định
+    *"KHÔNG dùng được CUDA cho ASR trên Windows"*. Kết luận đó **đã hết đúng**: dự án tự
+    dựng được bundle CUDA trong `bin/` (xem `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2),
+    và PyPI `transcribe-cpp-native-cu12` vẫn chỉ là name-reservation.
 
-    Vì vậy ASR chạy **Vulkan** (đã có tăng tốc GPU: +1,4 GB VRAM, ~90 % util khi suy luận) —
-    đây là đường được hỗ trợ. Hàm này chỉ ghi log ngắn gọn, KHÔNG hướng dẫn cài gì thêm.
+    Hàm này KHÔNG quyết định backend — `backend/asr/native.py::resolve_backend()` làm việc đó
+    (có fallback + log). Ở đây chỉ tóm tắt trạng thái để người vận hành thấy ngay lúc khởi động.
     """
     try:
-        import transcribe_cpp
-        try:
-            if bool(transcribe_cpp.backend_available("cuda")):
-                return
-        except Exception:
-            pass
+        from backend.asr import native as asr_native
 
-        torch_cuda = False
-        try:
-            import torch
-            torch_cuda = bool(torch.cuda.is_available())
-        except Exception:
-            torch_cuda = False
+        info = asr_native.runtime_info()
+        requested = (config.asr.backend or "auto").strip().lower()
+        avail = info.get("available_backends") or []
+        effective = asr_native.resolve_backend(config.asr.backend)
 
-        if torch_cuda:
-            # INFO (không còn WARNING): đây là trạng thái BÌNH THƯỜNG của bản dựng này,
-            # không phải sự cố cần người dùng khắc phục.
+        bundle = info.get("native_bundle_dir")
+        source_desc = f"bundle bin/ ({info.get('native_bundle_source')})" if bundle else "wheel đã cài"
+        line = (
+            f"[STARTUP] ASR backend: yêu cầu='{requested}' → thực tế='{effective}' | "
+            f"native: {source_desc} | có sẵn: {', '.join(avail) or 'không rõ'} | "
+            f"device: {info.get('devices')}"
+        )
+        if effective != requested and requested not in ("auto",):
+            logger.warning(line, extra={"module_tag": "ASR"})
+        else:
+            logger.info(line, extra={"module_tag": "ASR"})
+
+        if "cuda" not in avail:
             logger.info(
-                "[STARTUP] ASR dùng backend Vulkan (bản dựng transcribe-cpp hiện chỉ có ""— chưa có CUDA cho Windows). Translation/TTS vẫn dùng CUDA.",
+                "[STARTUP] ASR: không có backend CUDA trong thư viện native đang nạp. "
+                "Đặt bundle có `ggml-cuda.dll` vào bin/ để bật CUDA, hoặc đặt "
+                "asr.backend='vulkan' để chỉ định rõ.",
                 extra={"module_tag": "ASR"},
             )
     except Exception as exc:  # noqa: BLE001
-        logger.debug(f"Bỏ qua kiểm tra CUDA provider: {exc}", extra={"module_tag": "MAIN"})
+        logger.debug(f"Bỏ qua ghi log backend ASR lúc khởi động: {exc}", extra={"module_tag": "MAIN"})
 
 
 def _asr_runtime_info() -> Dict[str, Any]:
-    """Thông tin backend ASR thực tế đang dùng (để /health xác nhận bằng mắt)."""
-    info: Dict[str, Any] = {"model": None, "backend": None, "provider": None, "cuda_backend_available": None}
+    """Thông tin backend ASR thực tế đang dùng (để /health xác nhận bằng mắt).
+
+    Lưu ý: `provider` là tên provider PyPI (entry point). Khi chạy bằng bundle cục bộ
+    trong `bin/` (qua `TRANSCRIBE_LIBRARY`), binding đi theo đường "dev-tree" nên
+    `native_provider()` trả `None` — đó KHÔNG phải lỗi. Dùng `native_source`/
+    `native_bundle_dir` để biết thư viện native đang nạp thực sự đến từ đâu.
+    """
+    info: Dict[str, Any] = {
+        "model": None,
+        "backend": None,
+        "backend_requested": (config.asr.backend or "auto"),
+        "provider": None,
+        "native_source": None,
+        "native_bundle_dir": None,
+        "library_path": None,
+        "available_backends": [],
+        "cuda_backend_available": None,
+    }
     try:
         import transcribe_cpp
         info["provider"] = transcribe_cpp.native_provider()
         try:
+            info["library_path"] = transcribe_cpp.library_path()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             info["cuda_backend_available"] = bool(transcribe_cpp.backend_available("cuda"))
         except Exception:
             info["cuda_backend_available"] = False
+    except Exception:
+        pass
+    try:
+        from backend.asr import native as asr_native
+
+        rt = asr_native.runtime_info()
+        info["native_source"] = rt.get("native_bundle_source")
+        info["native_bundle_dir"] = rt.get("native_bundle_dir")
+        info["available_backends"] = rt.get("available_backends") or []
+        info["devices"] = rt.get("devices")
+        if not info["provider"]:
+            # Đang chạy bundle cục bộ — nêu rõ để không ai tưởng là thiếu provider.
+            info["provider"] = "local-bin" if rt.get("native_bundle_dir") else None
+    except Exception:
+        pass
+    try:
+        from backend.core.gpu_scheduler import arbiter_status
+
+        info["gpu_arbiter"] = arbiter_status()
     except Exception:
         pass
     try:
@@ -250,7 +289,7 @@ async def lifespan(app: FastAPI):
     """Khởi tạo và pre-warm trước (Pre-warm) song song toàn bộ các mô hình khi máy chủ khởi động."""
     logger.info("[STARTUP] Đang nạp và pre-warm song song ASR, Translation & VAD...", extra={"module_tag": "MAIN"})
 
-    _warn_if_cuda_provider_missing()
+    _log_asr_backend_at_startup()
 
     results = await asyncio.gather(
         asyncio.to_thread(_prewarm_asr),
@@ -567,6 +606,15 @@ async def update_backend_config(req: SwitchModelRequest):
         config.tts.enabled = req.tts_enabled
         if req.tts_enabled:
             track_background_task(get_tts_engine().prewarm(), name="tts_prewarm_post_config")
+        else:
+            # A2-3 (Hy3): tắt TTS => trả VRAM vài GB thay vì giữ model vô ích.
+            # Model sẽ được nạp lại (prewarm) khi người dùng bật lại.
+            # Chạy trong thread riêng: `unload_model()` có `gc.collect()` + `empty_cache()`,
+            # chặn event loop ở đây sẽ tự tạo ra một latency spike.
+            try:
+                await asyncio.to_thread(get_tts_engine().unload_model)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"TTS unload khi tắt thất bại (bỏ qua): {exc}", extra={"module_tag": "MAIN"})
     if req.tts_voice is not None:
         config.tts.default_voice = req.tts_voice
     if req.tts_speed is not None:

@@ -57,6 +57,16 @@
   // — trên trang nhiều frame / DOM lớn đây là mục CPU chiếm ưu thế.
   let videoScanMissUntil = 0;
   const VIDEO_SCAN_MISS_TTL_MS = 2000;
+  // B10-1 (Hy3): hai chốt chặn cho lần quét Shadow DOM đắt tiền.
+  //  - MAX_SHADOW_SCAN_NODES: trần số phần tử duyệt trong MỘT lần quét. `querySelectorAll("*")`
+  //    trên trang lớn (YouTube/Bilibili) cấp phát NodeList hàng trăm nghìn node và chặn
+  //    main thread; TreeWalker + trần node giữ chi phí có chặn trên.
+  //  - VIDEO_SCAN_MIN_INTERVAL_MS: khoảng nghỉ tối thiểu giữa hai lần quét. Trước đây TTL 2 s
+  //    chỉ áp dụng cho đường `getVideo()`; các chỗ gọi thẳng `findVideo()` (popup, status,
+  //    attach) vẫn quét lại toàn DOM mỗi lần.
+  const MAX_SHADOW_SCAN_NODES = 20000;
+  const VIDEO_SCAN_MIN_INTERVAL_MS = 250;
+  let lastVideoScanAt = 0;
 
   /**
    * FIX-01: bắt đầu hỏi service worker xem socket đã rút hết hàng đợi chưa.
@@ -474,38 +484,54 @@
 
     const allVideos = [];
 
-    // 1. Scan direct DOM
+    // 1. Light DOM: `document.querySelectorAll("video")` do engine native thực hiện nên rất
+    //    nhanh kể cả trên DOM lớn.
     try {
       document.querySelectorAll("video").forEach(v => allVideos.push(v));
     } catch (e) {}
 
-    // 2. Scan Shadow DOMs recursively (linear element traversal)
-    function collectVideosAndShadowRoots(root) {
-      if (!root) return;
-      try {
-        if (root.querySelectorAll) {
+    // B10-1 (Hy3): chỉ đi tiếp vào Shadow DOM / iframe khi light DOM CHƯA có video dùng được
+    // VÀ đã qua khoảng nghỉ tối thiểu. Nhờ vậy đường nóng (video ở light DOM — gần như mọi
+    // trang) không bao giờ phải duyệt cây.
+    const lightUsable =
+      allVideos.some(v => !v.paused && !v.ended) || allVideos.some(v => v.readyState > 0);
+    const now = Date.now();
+    if (!lightUsable && now - lastVideoScanAt >= VIDEO_SCAN_MIN_INTERVAL_MS) {
+      lastVideoScanAt = now;
+      let budget = MAX_SHADOW_SCAN_NODES;
+
+      // 2. Scan Shadow DOMs (TreeWalker: KHÔNG cấp phát NodeList cho cả cây).
+      function collectVideosAndShadowRoots(root) {
+        if (!root || budget <= 0) return;
+        try {
+          if (!root.querySelectorAll) return;
           root.querySelectorAll("video").forEach(v => allVideos.push(v));
-          root.querySelectorAll("*").forEach(el => {
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+          let el = walker.nextNode();
+          while (el && budget > 0) {
+            budget--;
             if (el.shadowRoot) {
               collectVideosAndShadowRoots(el.shadowRoot);
             }
-          });
-        }
-      } catch (e) {}
-    }
-    collectVideosAndShadowRoots(document.body || document.documentElement);
-
-    // 3. Scan accessible same-origin/child iframes
-    try {
-      document.querySelectorAll("iframe").forEach(iframe => {
-        try {
-          const doc = iframe.contentDocument || iframe.contentWindow?.document;
-          if (doc) {
-            collectVideosAndShadowRoots(doc.body || doc.documentElement);
+            el = walker.nextNode();
           }
         } catch (e) {}
-      });
-    } catch (e) {}
+      }
+      collectVideosAndShadowRoots(document.body || document.documentElement);
+
+      // 3. Scan accessible same-origin/child iframes
+      try {
+        document.querySelectorAll("iframe").forEach(iframe => {
+          if (budget <= 0) return;
+          try {
+            const doc = iframe.contentDocument || iframe.contentWindow?.document;
+            if (doc) {
+              collectVideosAndShadowRoots(doc.body || doc.documentElement);
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
 
     if (!allVideos.length) return null;
 

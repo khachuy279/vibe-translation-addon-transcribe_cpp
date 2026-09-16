@@ -1,0 +1,75 @@
+# ============================================================================
+# Vibe Translation Addon — Backend runtime dependencies
+#
+# Cài đặt:
+#     pip install -r backend/requirements.txt
+#
+# File này cài được MỘT LẦN cho toàn bộ backend (ASR + VAD + dịch + TTS + WebSocket).
+# Hai gói dưới đây KHÔNG có trên PyPI ở bản CUDA nên phải trỏ đúng index — hai dòng
+# --extra-index-url ngay dưới lo việc đó:
+#   * torch / torchaudio : PyPI chỉ có bản CPU. Index chính thức của PyTorch có bản CUDA.
+#   * llama-cpp-python   : PyPI chỉ có sdist (phải tự build, cần nvcc). Index của tác giả
+#                          abetlen có wheel Windows dựng sẵn với CUDA.
+#
+# PHIÊN BẢN ĐÃ ĐO THỰC TẾ trên máy tham chiếu (RTX 5060 Ti, Windows 11, Python 3.13):
+#     fastapi 0.141.1 · uvicorn 0.52.0 · pydantic 2.13.4 · numpy 2.4.4 · scipy 1.18.0
+#     torch 2.12.0+cu130 · llama-cpp-python 0.3.22 · transcribe-cpp-native 0.2.3
+#     omnivoice 0.2.1 · fireredvad 0.0.2 · silero-vad 6.2.1 · funasr 1.4.15
+#     huggingface-hub 1.31.0 · soundfile 0.14.0 · cryptography 42.0.5 · psutil 7.2.2
+#
+# Ghi chú về CUDA: torch ở đây dùng CUDA 13.0 (cu130) để khớp driver mới. Nếu driver của
+# bạn chỉ hỗ trợ CUDA 12.x, đổi cả hai dòng index/phiên bản bên dưới sang cu124 (xem README
+# mục "Cài đặt chi tiết"). Đừng trộn: torch cu124 + llama-cpp cu130 sẽ nạp 2 bộ DLL CUDA
+# khác nhau trong cùng tiến trình.
+# ============================================================================
+
+--extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+
+# ---------------------------------------------------------------- Web framework
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+websockets>=12.0
+pydantic>=2.7,<3.0
+
+# ------------------------------------------------------------------- Số & dữ liệu
+# numpy/scipy: DSP cho audio (resample, RMS, time-stretch, đọc/ghi wav)
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12.1
+PyYAML>=6.0
+
+# ------------------------------------------------------------------ Tiện ích hệ thống
+psutil>=5.9                 # đo RSS cho watchdog chống phình bộ nhớ native
+cryptography>=42.0          # sinh chứng chỉ WSS tự ký (backend/cert.pem)
+orjson>=3.9                 # TUỲ CHỌN — thiếu thì backend tự fallback sang json chuẩn
+
+# ------------------------------------------------------------------ ASR (transcribe.cpp)
+# Provider native chính thức: chỉ có backend VULKAN + CPU.
+#   - Vulkan: transcribe.cpp hỗ trợ CHÍNH THỨC => chắc chắn chạy được. ĐÂY LÀ MẶC ĐỊNH.
+#   - CPU: chạy được nhưng RTF ~1,6 (chậm hơn thời gian thực) nên backend từ chối chọn.
+#   - CUDA: KHÔNG có trên PyPI (`transcribe-cpp-native-cu12` chỉ là name-reservation,
+#     wheel 1380 byte). Muốn có phải tự build — xem README mục "Bật ASR CUDA (tuỳ chọn)".
+# Bản `transcribe-cpp-native` là provider native mà `transcribe-cpp` (binding) tìm qua
+# entry point `transcribe_cpp.native`.
+transcribe-cpp-native>=0.2.3
+
+# ------------------------------------------------------------------ Dịch (llama.cpp GGUF)
+# Bản CUDA dựng sẵn cho Windows; index ở đầu file lo việc chọn đúng wheel.
+# Bản 0.3.22 là bản đã đo; các bản 0.3.25–0.3.35 cũng có wheel cu124/cu130.
+llama-cpp-python>=0.3.22,<0.4
+
+# ------------------------------------------------------------------- TTS (OmniVoice)
+# kéo theo torch/torchaudio (>=2.4) + transformers + librosa + pydub
+torch>=2.4
+torchaudio>=2.4
+omnivoice>=0.2.1
+
+# ------------------------------------------------------------------------- VAD engine
+fireredvad>=0.0.2           # mặc định (FireRed Stream-VAD)
+silero-vad>=5.1             # tuỳ chọn
+funasr>=1.1                 # tuỳ chọn (FSMN-VAD) — khá nặng, kéo modelscope/omegaconf
+
+# ------------------------------------------------------------------ Tải model / giọng
+huggingface_hub>=0.23
+datasets>=2.18              # TUỲ CHỌN — chỉ cần cho backend/voices/wav_downloader.py

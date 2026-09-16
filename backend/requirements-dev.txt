@@ -1,0 +1,14 @@
+# ============================================================================
+# Vibe Translation Addon — Backend DEV/TEST dependencies
+#
+# Cài đặt:
+#     pip install -r backend/requirements-dev.txt
+#
+# Bộ test tầng A (mặc định) KHÔNG nạp model thật, chạy ~10-15 s:
+#     python -m pytest
+# ============================================================================
+
+-r requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=0.23

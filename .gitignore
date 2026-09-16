@@ -20,8 +20,7 @@ models/
 *.blob
 
 # 2b. Native Binaries & Large CUDA DLLs
-backend/bin/
-*.dll
+# *.dll
 *.exe
 *.so
 *.dylib
@@ -70,3 +69,17 @@ Thumbs.db
 # 8. Temporary Performance Reports & Logs
 perf_report.json
 perf_report_summary.txt
+
+# 9. G2/G3 — bản dựng CUDA ASR & toolchain cục bộ (không commit)
+# bin/                  : bundle native lúc chạy (transcribe.dll + ggml*.dll, gồm
+#                         ggml-cuda.dll). Ứng dụng nạp từ đây qua TRANSCRIBE_LIBRARY
+#                         (backend/asr/native.py). Nội dung đều là *.dll nên đã bị mục 2b
+#                         chặn; khai báo thêm cho tường minh.
+# external/cuda-toolkit : CUDA toolkit dựng từ wheel pip (nvcc/cublas/headers) ~1,4 GB
+# external/build-cuda   : cây build CMake của transcribe.cpp với backend CUDA
+# external/build-tmp    : log/script/JSON tạm của quá trình đo G2/G3
+# (external/ đã bị chặn ở mục 1; các mục con dưới đây chỉ để tài liệu hoá.)
+# bin/
+external/cuda-toolkit/
+external/build-cuda/
+external/build-tmp/

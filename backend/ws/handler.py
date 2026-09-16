@@ -63,6 +63,34 @@ def count_active_sessions() -> int:
         return len(_ACTIVE_SESSIONS)
 
 
+async def _maybe_unload_tts_when_idle(session: "SessionState") -> None:
+    """A2-3 (Hy3): giải phóng model OmniVoice khi không còn phiên nào cần TTS.
+
+    Model TTS là singleton chiếm vài GB VRAM (float16). Trước đây tắt TTS chỉ đổi cờ cấu
+    hình nên VRAM vẫn bị giữ. Ở đây chỉ gọi `unload_model()` khi **mọi** phiên đang mở đều
+    đã tắt TTS — nếu còn phiên khác dùng TTS thì bỏ qua để phiên đó không phải nạp lại model
+    giữa chừng. Bật lại TTS sẽ `prewarm()` nạp lại như cũ nên không mất chức năng.
+
+    `unload_model()` có `gc.collect()` + `empty_cache()` nên chạy trong thread riêng để
+    KHÔNG chặn event loop (nếu chặn, chính nó lại gây ra một latency spike — đúng thứ A2-3
+    muốn tránh).
+    """
+    try:
+        for other in get_active_sessions():
+            if other is not session and other.config.get("tts_enabled"):
+                return
+        engine = get_tts_engine()
+        if getattr(engine, "_is_loaded", False) or getattr(engine, "model", None) is not None:
+            await asyncio.to_thread(engine.unload_model)
+            logger.info(
+                "Đã giải phóng TTS (không còn phiên nào bật TTS) để trả VRAM.",
+                extra={"module_tag": "WS"},
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Giải phóng VRAM là tối ưu, không được làm hỏng luồng cấu hình.
+        logger.debug(f"Bỏ qua giải phóng TTS: {exc}", extra={"module_tag": "WS"})
+
+
 def shutdown_vad_executor(wait: bool = False) -> None:
     """Giải phóng executor chuyên dụng cho VAD khi máy chủ tắt."""
     try:
@@ -386,6 +414,10 @@ async def _handle_text_message(session: SessionState, text: str) -> None:
                     if not t.cancelled() and t.exception()
                     else None
                 )
+            else:
+                # A2-3 (Hy3): popup tắt TTS ⇒ trả VRAM của OmniVoice (vài GB float16) thay vì
+                # giữ vô ích. Chỉ giải phóng khi KHÔNG còn phiên nào khác đang cần TTS.
+                await _maybe_unload_tts_when_idle(session)
 
         elif action == "reset_stream":
             # F-44: client báo vừa TUA video (hoặc nhảy vị trí) ⇒ xoá audio/trạng thái cũ để

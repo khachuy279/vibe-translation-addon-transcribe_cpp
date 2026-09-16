@@ -213,9 +213,14 @@ def test_extension_manifest_is_production_one():
     assert int(manifest["version"].split(".")[0]) >= 0
 
 
-# --------------------------------------------------- P1.1: CUDA cho ASR là bất khả thi
-def test_cuda_warning_no_longer_suggests_bogus_package(caplog):
-    """Lời khuyên cũ `pip install transcribe-cpp-native-cu12` phải bị gỡ khỏi log."""
+# ------------------------------- P1.1: không hướng dẫn cài gói CUDA không tồn tại
+def test_backend_log_never_suggests_bogus_package(caplog):
+    """Log backend ASR KHÔNG được hướng dẫn `pip install transcribe-cpp-native-cu12`.
+
+    Gói đó trên PyPI chỉ có `0.0.0` — name reservation, wheel 1380 byte không có native
+    code. CUDA cho ASR nay có được là nhờ **tự dựng** bundle trong `bin/` (xem
+    `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2), không phải nhờ cài gói kia.
+    """
     import logging
 
     import backend.main as main_mod
@@ -227,6 +232,7 @@ def test_cuda_warning_no_longer_suggests_bogus_package(caplog):
     assert "pip uninstall transcribe-cpp-native" not in src
 
     with caplog.at_level(logging.INFO):
-        main_mod._warn_if_cuda_provider_missing()
+        main_mod._log_asr_backend_at_startup()
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "transcribe-cpp-native-cu12" not in joined
+    assert "pip install" not in joined

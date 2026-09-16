@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![Extension](https://img.shields.io/badge/Extension-Manifest%20V3-FF7139.svg)](https://developer.mozilla.org/docs/Mozilla/Add-ons/WebExtensions)
-[![ASR](https://img.shields.io/badge/ASR-transcribe.cpp%20(Vulkan%2FCPU)-76B900.svg)](external/transcribe.cpp)
+[![ASR](https://img.shields.io/badge/ASR-transcribe.cpp%20(Vulkan%20%7C%20CUDA%20tuỳ%20chọn)-76B900.svg)](external/transcribe.cpp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#-giấy-phép)
 
 Hệ thống **chạy hoàn toàn ngoại tuyến** (100 % local inference) biến mọi video trên trình duyệt
@@ -31,6 +31,9 @@ Repository: [github.com/khachuy279/vibe-translation-addon-transcribe_cpp](https:
 - [Tính năng chính](#-tính-năng-chính)
 - [Yêu cầu hệ thống](#-yêu-cầu-hệ-thống)
 - [Cài đặt](#-cài-đặt)
+  - [Cách nhanh (khuyến nghị)](#cách-nhanh-khuyến-nghị)
+  - [Cài đặt chi tiết (từng bước)](#cài-đặt-chi-tiết-từng-bước)
+  - [Bật ASR CUDA (tuỳ chọn)](#bật-asr-cuda-tuỳ-chọn)
 - [Chuẩn bị mô hình](#-chuẩn-bị-mô-hình)
 - [Khởi chạy backend](#-khởi-chạy-backend)
 - [Cài extension & sử dụng](#-cài-extension--sử-dụng)
@@ -68,19 +71,36 @@ Repository: [github.com/khachuy279/vibe-translation-addon-transcribe_cpp](https:
 | OS | Windows 10/11 64-bit (đã đo trên Windows; mã Python không phụ thuộc Windows trừ loader CUDA/DLL) |
 | Python | 3.10 – 3.13 (máy tham chiếu dùng **3.13**) |
 | GPU | NVIDIA RTX ≥ 8 GB VRAM; thoải mái nhất 12–16 GB (RTX 4060 Ti / 5060 Ti / 4070 / 4080 / 5080) |
-| Driver | NVIDIA ≥ 535 (CUDA 12.x) cho **dịch (llama.cpp) + TTS (PyTorch)** |
+| Driver | ≥ **580** nếu dùng `torch` cu130 (mặc định trong `backend/requirements.txt`); ≥ 550 nếu hạ xuống cu124 |
 | Trình duyệt | Firefox (khuyến nghị, `about:debugging`), Chrome/Edge (load unpacked) |
-| RAM | ≥ 8 GB trống (native ASR/Vulkan có thể phình tạm thời; xem [Khắc phục sự cố](#-khắc-phục-sự-cố)) |
+| RAM | ≥ 8 GB trống (native ASR có thể phình tạm thời; xem [Khắc phục sự cố](#-khắc-phục-sự-cố)) |
+| Đĩa | ~12 GB cho `backend/models/` (ASR + dịch + VAD) + ~3 GB cho môi trường Python |
 
-> **ASR dùng Vulkan, không phải CUDA.** Bản `transcribe-cpp-native` trên PyPI chỉ có backend
-> **Vulkan + CPU**; `transcribe-cpp-native-cu12` hiện là *name reservation* (bản `0.0.0`, wheel ~1,4 KB)
-> — cài vào **không có** CUDA. Muốn CUDA phải tự build từ
-> `external/transcribe.cpp/bindings/python-native-cu12/`. Kiểm tra thực tế: `GET /health` →
-> `asr_runtime.backend`.
+### ASR chạy backend nào?
+
+| Backend | Nguồn | Trạng thái |
+| :--- | :--- | :--- |
+| **Vulkan** *(mặc định)* | Wheel `transcribe-cpp-native` trên PyPI | ✅ **Được transcribe.cpp hỗ trợ CHÍNH THỨC** ⇒ chắc chắn chạy được |
+| **CUDA** *(tuỳ chọn)* | `bin/` — do dự án **tự build** | ⚙️ Nhanh hơn ~1,53× nhưng **không đảm bảo chạy trên mọi máy** |
+| CPU | Wheel `transcribe-cpp-native` | ❌ Chạy được nhưng **RTF ~1,6** (chậm hơn thời gian thực) ⇒ backend từ chối chọn |
+
+> [!IMPORTANT]
+> **Vì sao mặc định là Vulkan, không phải CUDA.** `transcribe.cpp` hỗ trợ Vulkan chính thức nên
+> wheel trên PyPI là đường **chắc chắn chạy**. Bản CUDA **không có trên PyPI**
+> (`transcribe-cpp-native-cu12` chỉ là *name reservation* — wheel `0.0.0` ~1,4 KB, không có native
+> code), nên muốn có phải tự build; bản tự build **chưa được kiểm chứng trên mọi cấu hình máy**.
+> Vì vậy Vulkan là mặc định và CUDA là **tuỳ chọn có thể bật** — xem
+> [Bật ASR CUDA (tuỳ chọn)](#bật-asr-cuda-tuỳ-chọn).
+>
+> Backend hỗ trợ **fallback**: nếu backend được yêu cầu không khả dụng, nó tự chuyển về Vulkan và
+> ghi log **WARNING** nêu rõ lý do. Kiểm tra thực tế: `GET /health → asr_runtime`, hoặc log lúc
+> khởi động `[STARTUP] ASR backend: yêu cầu='...' → thực tế='...'`.
 
 ---
 
 ## ⚙️ Cài đặt
+
+### Cách nhanh (khuyến nghị)
 
 ```powershell
 git clone https://github.com/khachuy279/vibe-translation-addon-transcribe_cpp.git
@@ -89,25 +109,127 @@ cd vibe-translation-addon-transcribe_cpp
 python -m venv .venv
 .venv\Scripts\activate
 
-# 1) PyTorch CUDA 12.4 (cho TTS OmniVoice; VAD chạy torch trên CPU)
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
-
-# 2) Runtime backend
-pip install fastapi "uvicorn[standard]" websockets pydantic pyyaml numpy soundfile scipy cryptography psutil orjson
-
-# 3) ASR native (CPU + Vulkan — ĐANG dùng; KHÔNG có provider CUDA trên PyPI)
-pip install transcribe-cpp-native
-
-# 4) Dịch GGUF trên GPU
-pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-
-# 5) VAD + TTS + tiện ích tải model/voice
-pip install huggingface_hub fireredvad silero-vad funasr omnivoice
-# (tuỳ chọn) chỉ cần khi tải file giọng mẫu từ HuggingFace Dataset:
-pip install datasets
+# Cài TẤT CẢ thư viện runtime (đã gồm torch CUDA + llama.cpp CUDA)
+pip install -r backend\requirements.txt
 ```
 
-> `orjson` là tuỳ chọn — nếu thiếu, backend tự fallback sang `json` chuẩn (`backend/ws/connection.py`).
+`backend/requirements.txt` đã khai báo sẵn `--extra-index-url` cho hai gói **không có bản CUDA trên
+PyPI**, nên một lệnh là đủ:
+
+| Gói | Vì sao cần index riêng |
+| :--- | :--- |
+| `torch` / `torchaudio` | PyPI chỉ có bản **CPU**; index chính thức của PyTorch có bản CUDA |
+| `llama-cpp-python` | PyPI chỉ có **sdist** (phải tự build, cần `nvcc`); index của tác giả `abetlen` có wheel Windows dựng sẵn với CUDA |
+
+> [!NOTE]
+> **Chưa có file `requirements.txt` ở thư mục gốc** — file nằm trong `backend/` vì đây là phụ thuộc
+> của backend. Môi trường dev/test dùng `pip install -r backend/requirements-dev.txt` (thêm
+> `pytest`, `pytest-asyncio`).
+
+### Cài đặt chi tiết (từng bước)
+
+<details>
+<summary><b>Bước 1 — Python 3.10–3.13 và venv</b></summary>
+
+```powershell
+python --version          # cần 3.10 - 3.13
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+```
+</details>
+
+<details>
+<summary><b>Bước 2 — PyTorch có CUDA (cho TTS + VAD)</b></summary>
+
+```powershell
+# Mặc định trong requirements.txt là CUDA 13.0 (cu130).
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+
+# Nếu driver của bạn CHỈ hỗ trợ CUDA 12.x, dùng cu124 thay thế:
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
+
+`backend/utils/cuda.py` tự đăng ký `torch/lib` vào đường tìm DLL, nên `cudart64_*.dll`,
+`cublas64_*.dll` của torch được dùng chung cho cả ASR CUDA (nếu bật) và llama.cpp.
+
+**Kiểm tra:**
+```powershell
+python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+# kỳ vọng: 2.12.0+cu130 13.0 True
+```
+</details>
+
+<details>
+<summary><b>Bước 3 — llama.cpp cho dịch GGUF (bắt buộc có CUDA)</b></summary>
+
+```powershell
+pip install "llama-cpp-python>=0.3.22,<0.4" `
+  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+```
+
+**Kiểm tra GPU offload đã bật chưa** (phải in `True`):
+```powershell
+python -c "import sys;sys.path.insert(0,'.');from backend.utils.cuda import setup_cuda_dll_paths;setup_cuda_dll_paths();from llama_cpp import llama_cpp as L;print('GPU offload:',L.llama_supports_gpu_offload())"
+```
+
+> ⚠️ Nếu in `False` (hoặc lỗi *Failed to load shared library ... llama.dll*), bạn đang có bản **CPU**.
+> Bản CPU vẫn dịch được nhưng rất chậm. Cách xử lý: cài lại bằng index ở trên, hoặc build từ source:
+> ```powershell
+> $env:CMAKE_ARGS="-DGGML_CUDA=on"; $env:FORCE_CMAKE="1"
+> pip install llama-cpp-python --no-binary llama-cpp-python   # cần CUDA Toolkit + MSVC
+> ```
+</details>
+
+<details>
+<summary><b>Bước 4 — ASR native (Vulkan — bắt buộc)</b></summary>
+
+```powershell
+pip install transcribe-cpp-native
+```
+Đây là provider **được hỗ trợ chính thức** (Vulkan + CPU) và là mặc định của backend.
+</details>
+
+<details>
+<summary><b>Bước 5 — VAD + TTS + tiện ích</b></summary>
+
+```powershell
+pip install fireredvad silero-vad funasr omnivoice huggingface_hub
+# tuỳ chọn — chỉ cần khi tải file giọng mẫu từ HuggingFace Dataset:
+pip install datasets
+```
+</details>
+
+<details>
+<summary><b>Bước 6 — Kiểm tra toàn bộ môi trường</b></summary>
+
+```powershell
+python -c "import sys;sys.path.insert(0,'.');from backend.asr import native;from backend.utils.logger import get_logger;print('backends:', sorted(native._available_kinds()));print('devices :', native.backend_devices())"
+```
+Kỳ vọng tối thiểu (chỉ wheel Vulkan): `backends: ['vulkan']`, `devices: vulkan=Vulkan0, cpu=CPU`.
+</details>
+
+### Bật ASR CUDA (tuỳ chọn)
+
+Chỉ làm khi bạn **muốn** và **chấp nhận** rằng bản CUDA là do dự án tự build (không phải đường
+được transcribe.cpp phát hành). Đo được: **nhanh hơn Vulkan ~1,53×**, độ chính xác tương đương,
+tốn thêm ~243 MB VRAM.
+
+1. **Lấy bundle.** Đặt sẵn `bin/transcribe.dll` + `bin/ggml-*.dll` (gồm `ggml-cuda.dll`).
+   Cách dựng lại: xem `external/build-tmp/build_cuda.bat` và
+   `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2 (dựng CUDA toolkit **không cần quyền admin**).
+2. **Chọn backend.** Sửa `backend/config.py` rồi **khởi động lại** backend:
+   ```python
+   asr.backend = "cuda"     # "auto" | "cuda" | "vulkan"
+   ```
+   > Backend ASR được chốt **lúc nạp model** (thư viện native `dlopen` một lần cho cả tiến trình),
+   > nên **không đổi được qua `POST /api/config`** — hiện chưa có field đó. `GET /api/config` chỉ
+   > *hiển thị* giá trị đang dùng ở `native_backend`.
+3. **Kiểm tra.** Log khởi động phải ghi `Backend: CUDA0 ... native: bin/`. Nếu CUDA không khả dụng,
+   backend **tự fallback về Vulkan** và ghi WARNING nêu rõ lý do — không cần làm gì thêm.
+
+> `asr.backend = "auto"` ưu tiên **Vulkan** (đường chắc chắn chạy), rồi mới tới CUDA nếu Vulkan
+> không có. Muốn dùng CUDA thì chỉ định rõ `"cuda"`.
 
 ---
 
@@ -171,13 +293,19 @@ Lần đầu khởi động sẽ **pre-warm** ASR + dịch + VAD (dịch 7B mấ
 inference — giữ nguyên vì nếu không warm thì câu dịch **đầu tiên** bị đơ ~38 s):
 
 ```text
-[STARTUP] Đang nạp và pre-warm ASR, VAD & Translation Models...
-[ASR] Nạp thành công ASR Model 'qwen3-asr-1.7b' trên GPU (Backend: Vulkan0)
+[STARTUP] Đang nạp và pre-warm song song ASR, Translation & VAD...
+[ASR] ASR native: dùng bundle cục bộ '...\bin\transcribe.dll' (nguồn: default).   # chỉ khi có bin/
+[ASR] [STARTUP] ASR backend: yêu cầu='auto' → thực tế='vulkan' | native: bundle bin/ | có sẵn: cuda, vulkan | device: cuda=CUDA0, vulkan=Vulkan0, cpu=CPU
+[ASR] Nạp thành công ASR Model 'qwen3-asr-1.7b'(Arch: qwen3_asr, Backend: Vulkan0, yêu cầu: 'auto', Streaming: False, max_audio=..., native: bin/)
 [TRANSLATE] Nạp thành công mô hình dịch 'tencent' trên GPU (n_ctx=512, n_batch=256, n_threads=4)
 [VAD] Đã nạp model FireRed Stream-VAD từ: backend/models/firered_stream/Stream-VAD
 [MAIN] Chế độ WSS (SSL) kích hoạt với cert: backend/cert.pem
 INFO:  Uvicorn running on https://0.0.0.0:8765 (Press CTRL+C to quit)
 ```
+
+**Đọc log backend ASR:** dòng `[STARTUP] ASR backend:` là nơi khẳng định backend thực tế. Nếu bạn
+yêu cầu `cuda` mà thấy `→ thực tế='vulkan'` kèm `[WARNING] ... KHÔNG khả dụng ⇒ FALLBACK`, nghĩa là
+thư viện native đang nạp **không có** `ggml-cuda.dll` (thiếu `bin/`) — Vulkan vẫn chạy bình thường.
 
 - Chứng chỉ WSS **tự ký** được sinh tự động vào `backend/cert.pem` + `backend/key.pem`.
 - Mở `https://localhost:8765` một lần và chọn **Nâng cao → Tiếp tục** để trình duyệt chấp nhận
@@ -214,7 +342,7 @@ flowchart TD
     WS --> VAD[VAD: FireRed / Silero / FSMN<br/>CPU, pre-warm]
     VAD -->|speech start/end| SEG[Segmenter + CommitManager 4 bậc]
     BUF --> NORM[Speech Normalizer<br/>RMS auto-gain + limiter]
-    NORM --> ASR[transcribe.cpp<br/>Vulkan/CPU]
+    NORM --> ASR[transcribe.cpp<br/>Vulkan (mặc định) / CUDA (tuỳ chọn)]
     ASR -->|preview tokens| WS
     ASR -->|committed text| DEDUP[3-layer Dedup]
     DEDUP --> TRANS[llama.cpp GGUF<br/>Hunyuan-MT2]
@@ -231,7 +359,7 @@ flowchart TD
 | Audio ingress | Ring buffer 60 s, single-writer + mutex multi-reader | ghi `< 0,05 ms` |
 | VAD | FireRed-VAD / Silero / FSMN, CPU, cả 3 pre-warm | `~3,2 ms` / chunk 25 ms (~13 % 1 nhân) |
 | Chuẩn hoá | RMS auto-gain + soft-knee + peak limiter | `< 0,2 ms` / chunk |
-| ASR | `transcribe.cpp` (Vulkan), preview cửa sổ ≤ 6 s | commit p50 **~107 ms** (câu 4,5 s, RTF ≈ 0,024) |
+| ASR | `transcribe.cpp` (Vulkan mặc định; CUDA tuỳ chọn nhanh hơn 1,53×), preview cửa sổ ≤ 6 s | commit p50 **~107 ms** (câu 4,5 s, RTF ≈ 0,024) |
 | Cắt câu | CommitManager 4 bậc + dedup 3 lớp | cả 3 loại lý do cắt đều xuất hiện trong log |
 | Dịch | llama.cpp GPU, streaming token | **~67 token/s**, token đầu **26 ms** |
 | TTS | OmniVoice PyTorch 24 kHz, cache prompt giọng | `~420 ms` / câu 3 s (RTF 0,077) |
@@ -298,6 +426,10 @@ Toàn bộ cấu hình tập trung ở `backend/config.py` (Pydantic v2). Các c
 | Cờ | Mặc định | Ý nghĩa |
 | :--- | :--- | :--- |
 | `ws.port` / `ws.protocol_version` | `8765` / `3` | Cổng WSS và phiên bản giao thức |
+| **`asr.backend`** | `"auto"` | `auto` (Vulkan trước, rồi CUDA) · `cuda` · `vulkan`. **Không có `cpu`** — CPU chạy ở RTF ~1,6 nên vô dụng cho phụ đề |
+| **`asr.backend_fallback`** | `True` | Tự fallback + ghi WARNING khi backend yêu cầu không khả dụng |
+| **`asr.use_local_native`** | `True` | Ưu tiên bundle trong `bin/` hơn provider đã cài |
+| **`asr.native_dir`** | `""` | Thư mục bundle; trống = `<project_root>/bin` |
 | `vad.vad_engine` / `vad.threshold` | `firered-vad` / `0,45` | Engine VAD và ngưỡng phát hiện nói |
 | `vad.silence_duration_ms` / `hangover_ms` | `600` / `400` | Im lặng để ngắt câu / giữ trạng thái nói |
 | `asr.min_transcribe_sec` | `0,35` | Audio tối thiểu để có preview đầu tiên |
@@ -308,12 +440,17 @@ Toàn bộ cấu hình tập trung ở `backend/config.py` (Pydantic v2). Các c
 | `sentence.min_words_to_commit` | `2` | Lọc tiếng ậm ừ / mảnh vụn |
 | `translation.base` / `auto_download` | `tencent` / `True` | Model dịch đang dùng / tự tải khi thiếu file |
 | `tts.enabled` / `default_voice` | `True` / `speaker_01_0039.wav` | Lồng tiếng và giọng mặc định |
+| **`gpu.scheduler_enabled`** | `False` | `GpuArbiter` — điều phối tranh chấp GPU giữa ASR/dịch/TTS. Đo được: commit p50 **−49 %**, p95 **−39 %** dưới tải bão hoà, đổi lại −24 % thông lượng dịch (chỉ thấy khi bão hoà). Xem §4.3b báo cáo audit |
+| `gpu.commit_reserve_ms` / `admit_max_wait_ms` | `1500` / `1200` | Cửa sổ dành riêng GPU cho commit / trần chờ của job ưu tiên thấp |
 
 ---
 
 ## 🧪 Kiểm thử
 
 ```powershell
+# Cài phụ thuộc dev (gồm cả runtime)
+pip install -r backend\requirements-dev.txt
+
 # Tầng A — mặc định, KHÔNG nạp model thật, ~10-15 s
 python -m pytest
 
@@ -325,9 +462,20 @@ python -m pytest -m full
 ```
 
 Cấu hình marker nằm ở `pytest.ini` (`addopts = -m "not slow and not full"`). Bộ test tầng A hiện có
-**hơn 230 hàm test** trong `backend/tests/test_01…test_22`, phủ: ring buffer & chuẩn hoá, commit
+**277 hàm test** trong `backend/tests/test_01…test_29`, phủ: ring buffer & chuẩn hoá, commit
 manager, hiệu lực cấu hình popup, khoá/metric, giao thức compact, chống trùng dòng log, quy ước
-logging, seek/reset, và tải model dịch + swap nguyên tử.
+logging, seek/reset, tải model dịch + swap nguyên tử, **chọn/fallback backend native
+(`test_29_gpu_arbiter.py` + nhánh `native`)** và **`GpuArbiter`**.
+
+**Harness WER đầy đủ** (đo độ chính xác thật của pipeline streaming trên `wav_test/`):
+
+```powershell
+python backend\tests\test_09_wer_ab.py --model qwen3-asr-0.6b --speed 6 --max-sec 0 --repeats 3
+```
+
+> Harness này chạy **pipeline VAD + ASR thật** và chấm bằng chính bộ scorer của dự án (CJK → CER,
+> Latin → WER). Nó tự tính **sàn nhiễu** giữa các lần lặp; chênh lệch A/B **nhỏ hơn sàn nhiễu thì
+> KHÔNG được kết luận**. Đây là công cụ để so Vulkan vs CUDA hoặc bật/tắt `gpu.scheduler_enabled`.
 
 Có cả harness JS chạy bằng Node (không cần trình duyệt): `backend/tests/js/worklet_harness.js`
 (AudioWorklet, 11 điểm), `backend/tests/js/subtitle_policy_test.js` (chính sách hiện bản dịch) và
@@ -353,7 +501,7 @@ trực tiếp được với số trên **pipeline streaming** — hãy dùng `/
 | K5 | Không mất câu; mọi drop/merge có counter | `commit_carried_over`, `pending_commits`, `commit_slice_clamped`, `commit_dropped_stale`… | ✅ |
 | K6 | WER không xấu đi | `reuse_preview_for_commit` bật ⇒ xấu hơn (+9,5 / +14,8 điểm ở 2 file đo ổn định) ⇒ giữ TẮT | ✅ |
 | K7 | VRAM đỉnh < 14 GB | **9,5 GB** (ASR + dịch 7B + TTS) | ✅ |
-| K8 | ASR dùng CUDA | Vulkan (`cuda_backend_available = False`) | ❌ bất khả thi với wheel hiện có |
+| K8 | ASR dùng CUDA | **Đã làm được** bằng bundle tự build trong `bin/` — nhanh hơn Vulkan **1,53×**, WER tương đương (chênh 0,82 điểm % < sàn nhiễu 2,28–4,12), +243 MB VRAM. **Mặc định vẫn là Vulkan** vì đó là đường transcribe.cpp hỗ trợ chính thức | ⚙️ tuỳ chọn |
 | K9 | Mọi control trong popup có tác dụng | 11/11 nhóm control có test | ✅ |
 | K10 | 0 crash khi đổi model lúc đang stream | soak **200 vòng** | ✅ |
 | K11 | Độ trễ capture phía client < 70 ms | **64 ms** (worklet gom 1024 mẫu @16 kHz) | ✅ (chờ xác nhận trên Firefox thật) |
@@ -378,7 +526,10 @@ transcript tham chiếu):
 | Triệu chứng | Nguyên nhân & cách xử lý |
 | :--- | :--- |
 | Popup báo **Server Offline** dù backend đang chạy | Chưa chấp nhận chứng chỉ tự ký: mở `https://localhost:8765` → *Nâng cao → Tiếp tục*, rồi mở lại popup |
-| `pip install transcribe-cpp-native-cu12` rồi vẫn không có CUDA | Gói này chỉ là *name reservation*. ASR chạy **Vulkan** — đây là đường được hỗ trợ. Kiểm tra `GET /health → asr_runtime.backend` |
+| `pip install transcribe-cpp-native-cu12` rồi vẫn không có CUDA | Gói này chỉ là *name reservation* (wheel `0.0.0` ~1,4 KB, không có native code). CUDA cho ASR **không phát hành qua PyPI** — phải tự build bundle vào `bin/` (xem [Bật ASR CUDA](#bật-asr-cuda-tuỳ-chọn)). Không có `bin/` thì ASR chạy **Vulkan**, đúng như thiết kế |
+| Log ghi `ASR backend: 'cuda' KHÔNG khả dụng ⇒ FALLBACK sang 'vulkan'` | Thư viện native đang nạp không có `ggml-cuda.dll`. Đây là **hành vi đúng** (fallback + log rõ). Kiểm tra `GET /health → asr_runtime.available_backends` |
+| Dịch rất chậm, `llama_supports_gpu_offload()` trả `False` | Bạn đang cài bản llama.cpp **CPU**. Cài lại bằng index CUDA (xem [Bước 3](#-cài-đặt)) |
+| Lỗi `Failed to load shared library ... llama.dll` khi import `llama_cpp` trực tiếp | Bình thường: DLL CUDA chỉ nằm trong `torch/lib`. Backend tự gọi `setup_cuda_dll_paths()` trước khi import. Nếu tự viết script, hãy import `backend.asr` (hoặc gọi `setup_cuda_dll_paths()`) **trước** `llama_cpp` |
 | Đổi model dịch báo *Chưa có file GGUF cục bộ* | File chưa tải và `auto_download` đang tắt. Bật lại (mặc định bật) để backend tự tải, hoặc copy `.gguf` vào `backend/models/` |
 | Đang tải model dịch, API trả **409** | Một lượt tải/nạp khác đang chạy. Xem `GET /api/config → translation.download`, đợi xong rồi thử lại |
 | Backend đứng im, **Ctrl+C không tắt được** | Xem log có `[STALL WATCHDOG]` (dump stack mọi thread). Gửi kèm dump khi báo lỗi; đây là dạng treo event loop mà watchdog được thiết kế để bắt |
@@ -393,7 +544,10 @@ transcript tham chiếu):
 
 1. **1 phiên / 1 video** — xem khối cảnh báo ở đầu tài liệu. Không có model pool.
 2. **ASR không tự tải model** — phải copy `.gguf` vào `backend/models/` (khác với model dịch và VAD).
-3. **ASR dùng Vulkan, không có CUDA** trên bản wheel hiện hành.
+3. **ASR mặc định dùng Vulkan.** Bản CUDA **không có trên PyPI** (phải tự build vào `bin/`) và
+   **chưa được kiểm chứng trên mọi cấu hình máy**, nên Vulkan — đường được transcribe.cpp hỗ trợ
+   chính thức — vẫn là mặc định. Bật CUDA là tuỳ chọn: xem
+   [Bật ASR CUDA (tuỳ chọn)](#bật-asr-cuda-tuỳ-chọn).
 4. **Cửa sổ preview có đuôi độ trễ lẻ**: p50 ≈ 87 ms nhưng thỉnh thoảng spike ~2,5 s do tầng native
    dựng lại scheduler/compute context mỗi `run()`. Nhịp preview **bỏ nhịp** (không trôi) và commit
    được ưu tiên nên phụ đề chốt không bị chặn.
@@ -411,19 +565,30 @@ transcript tham chiếu):
 vibe-translation-addon-transcribe_cpp/
 ├── backend/
 │   ├── main.py                   # FastAPI app: lifespan pre-warm, REST API, WSS endpoint
-│   ├── config.py                 # Cấu hình tập trung (Pydantic v2)
+│   ├── config.py                 # Cấu hình tập trung (Pydantic v2) — gồm asr.backend, gpu.*
+│   ├── requirements.txt          # Phụ thuộc runtime (torch cu130 + llama.cpp CUDA qua extra-index)
+│   ├── requirements-dev.txt      # + pytest / pytest-asyncio
 │   ├── models.yaml               # Catalog model ASR (GGUF)
 │   ├── translation_models.yaml   # Catalog model dịch (GGUF + repo HuggingFace)
 │   ├── asr/                      # transcribe.cpp engine, registry, adapter, text cleaner
-│   ├── core/                     # Ring buffer, SpeechNormalizer, CommitManager, dedup, metrics, heartbeat
+│   │   └── native.py             #   nạp bundle bin/ + chọn backend có fallback (Vulkan/CUDA)
+│   ├── core/                     # Ring buffer, SpeechNormalizer, CommitManager, dedup, metrics
+│   │   └── gpu_scheduler.py      #   GpuArbiter (A2-1) — điều phối tranh chấp GPU, mặc định TẮT
 │   ├── vad/                      # VADProcessor + engine FireRed / Silero / FSMN
 │   ├── translation/              # GGUFTranslator, hotswap (đổi model nguyên tử), registry, prompts
 │   ├── tts/                      # OmniVoice TTS, audio processor, VoiceManager
 │   ├── ws/                       # handler, session, connection, serializers (payload v3)
-│   ├── utils/                    # logger (quy ước tag), CUDA DLL, SSL tự ký, mem_guard, stall_watchdog, model_download
+│   ├── utils/                    # logger (quy ước tag), CUDA DLL, SSL tự ký, mem_guard, stall_watchdog
 │   ├── voices/                   # Giọng mẫu (.wav/.txt), voices.json, wav_downloader.py
 │   ├── models/                   # Model cục bộ (.gguf, .jit, firered_stream/, fsmn_vad/) — gitignore
-│   └── tests/                    # test_01…test_22 + harness JS (Node)
+│   └── tests/                    # test_01…test_29 + harness JS (Node) + harness WER
+├── bin/                          # Bundle native ASR lúc chạy — gitignore, TÙY CHỌN
+│                                 #   transcribe.dll + ggml(-base|-cpu|-cuda|-vulkan).dll
+│                                 #   Có bin/ ⇒ nạp từ đây; không có ⇒ dùng wheel đã cài (Vulkan)
+├── external/                     # gitignore: transcribe.cpp, omnivoice.cpp, FireRedVAD
+│   ├── transcribe.cpp/           #   Mã nguồn ASR (Vulkan chính thức; CUDA tự build)
+│   ├── cuda-toolkit/             #   CUDA toolkit dựng từ wheel pip (chỉ khi tự build CUDA)
+│   └── build-tmp/                #   Script build + log/JSON kết quả đo (build_cuda.bat, …)
 ├── extension_firefox/            # Extension MV3: content script, overlay, popup, worklet
 ├── wav_test/                     # 8 file audio (thoại EN/ZH/JA/RU + đa ngữ) kèm transcript tham chiếu
 ├── report/                       # Báo cáo theo phase (01…07) + report/audit/ (audit hiệu năng)
@@ -444,6 +609,9 @@ Dự án phát hành theo **MIT License** — dùng, sửa, chia sẻ tự do ch
 **Tài liệu liên quan**
 
 - `report/audit/00_BAO_CAO_AUDIT_HIEU_NANG.md` — audit hiệu năng đầy đủ (F-01…F-51).
+- `report/audit/BAO_CAO_AUDIT_HIEU_NANG_Hy3.md` — audit hiệu năng chuyên sâu (A2-1, A2-2, B3-1, …).
+- `report/audit/KE_HOACH_FIX_LOI_Hy3.md` — **kế hoạch fix lỗi + kết quả**: Gate G1–G3 (build ASR
+  CUDA), hạ tầng Nhánh A (`bin/`, chọn backend + fallback), và `GpuArbiter` (A2-1) kèm số đo A/B.
 - `report/audit/03_KE_HOACH_TRIEN_KHAI.md` — kế hoạch triển khai & KPI.
 - `report/audit/05_measurements_and_status.md` — trạng thái, số đo, nghiệm thu K1–K12.
 

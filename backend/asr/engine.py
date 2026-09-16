@@ -33,6 +33,10 @@ from collections import deque
 from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
 import numpy as np
 
+# `backend/asr/__init__.py` đã gọi `backend.asr.native.bootstrap()` TRƯỚC khi module này
+# được nạp (mọi đường vào đều đi qua package `backend.asr`). Lúc này `TRANSCRIBE_LIBRARY`
+# đã trỏ đúng bundle trong `bin/` (nếu có) và các thư mục DLL phụ thuộc đã được đăng ký,
+# nên `import transcribe_cpp` bên dưới dlopen đúng thư viện mong muốn.
 try:
     import transcribe_cpp
 except ImportError:
@@ -48,12 +52,19 @@ from backend.asr.base import BaseASREngine
 from backend.asr.registry import ModelRegistry
 from backend.asr.adapters import build_family_options, normalize_language_for_family
 from backend.asr.text_cleaner import clean_transcript_text
-from backend.utils.cuda import setup_cuda_dll_paths
+from backend.asr.native import resolve_backend, native_bundle_dir
+from backend.core.gpu_scheduler import gpu_arbiter
 from backend.utils.logger import logger
 
-setup_cuda_dll_paths()
-
-_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="asr_worker")
+# B5-1 (Hy3): số worker khớp với trần inference đồng thời. Trước đây hardcode 2 trong khi
+# `config.asr.max_inflight_infer = 1` ⇒ worker thứ hai không bao giờ có việc (một thread nền
+# thường trực dư thừa). Nay suy ra từ cấu hình; nếu người dùng nâng `max_inflight_infer`
+# thì executor cũng nới theo. Native transcribe.cpp vẫn giới hạn 1 stream in-flight/session
+# nên giá trị >1 chỉ hữu ích khi có nhiều session (xem A2-1/T2 trong báo cáo audit).
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(getattr(config.asr, "max_inflight_infer", 1) or 1)),
+    thread_name_prefix="asr_worker",
+)
 
 # Trần số commit chờ xử lý trước khi gộp (P4.5). Không còn `maxlen` vứt câu âm thầm.
 _MAX_PENDING_COMMITS = 6
@@ -360,11 +371,10 @@ class TranscribeEngine(BaseASREngine):
                 pass
             cls._shared_model = None
 
-        load_backend = "auto" if not self.backend or self.backend.lower() in ("auto", "none") else self.backend.lower()
-        if load_backend == "auto":
-            loaded_model = transcribe_cpp.Model(model_path)
-        else:
-            loaded_model = transcribe_cpp.Model(model_path, backend=load_backend)
+        # Chọn backend CÓ FALLBACK + log rõ ràng (xem backend/asr/native.py).
+        # `self.backend` là giá trị truyền lúc tạo engine; nếu rỗng thì lấy từ config.
+        load_backend = resolve_backend(self.backend or config.asr.backend)
+        loaded_model = transcribe_cpp.Model(model_path, backend=load_backend)
 
         session, supports_streaming, max_audio_samples = self._build_session(loaded_model)
 
@@ -380,10 +390,13 @@ class TranscribeEngine(BaseASREngine):
         detail = (
             f"(Arch: {getattr(loaded_model, 'arch', 'unknown')}, "
             f"Backend: {getattr(loaded_model, 'backend', 'unknown')}, "
+            f"yêu cầu: '{self.backend or config.asr.backend}', "
             f"Streaming: {supports_streaming}"
         )
         if max_audio_samples:
             detail += f", max_audio={max_audio_samples / 16000.0:.1f}s"
+        bundle = native_bundle_dir()
+        detail += f", native: {'bin/' if bundle else 'wheel đã cài'}"
         detail += ")"
         logger.info(f"Nạp thành công ASR Model '{model_key}'{detail}", extra={"module_tag": "ASR"})
         return loaded_model
@@ -429,11 +442,8 @@ class TranscribeEngine(BaseASREngine):
         t0 = time.perf_counter()
 
         # 1) Nạp ngoài lock: model cũ vẫn phục vụ preview bình thường.
-        load_backend = "auto" if not self.backend or self.backend.lower() in ("auto", "none") else self.backend.lower()
-        if load_backend == "auto":
-            new_model = transcribe_cpp.Model(model_path)
-        else:
-            new_model = transcribe_cpp.Model(model_path, backend=load_backend)
+        load_backend = resolve_backend(self.backend or config.asr.backend)
+        new_model = transcribe_cpp.Model(model_path, backend=load_backend)
         new_session, supports_streaming, max_audio_samples = self._build_session(new_model)
 
         old_session = old_model = None
@@ -503,7 +513,21 @@ class TranscribeEngine(BaseASREngine):
 
     # ------------------------------------------------------------------ ingress
     def feed_audio(self, audio_data: Any, timestamp: float = 0.0, vad_state: str = "") -> None:
-        """Nạp dữ liệu audio (bytes PCM Int16 hoặc ndarray Float32) vào buffer."""
+        """Nạp dữ liệu audio (bytes PCM Int16 hoặc ndarray Float32) vào buffer.
+
+        B3-1 (Hy3) — ĐÃ CÂN NHẮC VÀ GIỮ NGUYÊN: báo cáo audit đề xuất đổi ring buffer
+        sang Int16 để "bỏ conversion kép". Kiểm tra lại mã gốc cho thấy tiền đề đó không
+        đúng: `feed_audio` chỉ convert Int16->Float32 ĐÚNG MỘT LẦN rồi `write()` copy
+        Float32 vào buffer (không convert thêm). Đổi buffer sang Int16 sẽ:
+          * phá bảo đảm "Bit-Exact Integrity" mà `test_01_core_audio.py` đang chốt
+            (float32 ghi vào rồi đọc ra phải khớp tuyệt đối; Int16 gây sai số 1 LSB
+            ≈ 3.05e-5),
+          * đẩy thêm một phép convert Int16->Float32 lên ĐƯỜNG ĐỌC `get_slice()` (chạy
+            mỗi preview/commit), tức là đổi chỗ chứ không giảm việc,
+          * chỉ tiết kiệm 1,92 MB RAM / session (3,84 MB -> 1,92 MB) — không đáng kể so
+            với VRAM/RAM của pipeline.
+        Xem `report/audit/KE_HOACH_FIX_LOI_Hy3.md` mục "B3-1 — bị loại".
+        """
         if audio_data is None:
             return
 
@@ -806,8 +830,13 @@ class TranscribeEngine(BaseASREngine):
         with self._inflight_lock:
             return self._inflight
 
-    async def _infer_with_watchdog(self, audio_slice: np.ndarray) -> str:
+    async def _infer_with_watchdog(self, audio_slice: np.ndarray, *, is_commit: bool = False) -> str:
         """Chạy inference trong executor kèm 2 ĐỒNG HỒ canh chừng (F-39).
+
+        A2-1: `is_commit=True` mở **cửa sổ dành riêng GPU** (`GpuArbiter`) trong suốt lượt
+        inference, để job ưu tiên thấp (dịch/TTS) không KHỞI ĐỘNG chen vào và đẩy commit ra
+        sau. Chỉ có tác dụng khi `config.gpu.scheduler_enabled`; mặc định tắt nên không đổi
+        hành vi.
 
         Vì sao cần: `asyncio` huỷ task KHÔNG dừng được lời gọi native — thread C++ vẫn
         chạy và vẫn giữ `_infer_lock`. Đo thật cho thấy một `session.run()` có lúc chạy
@@ -826,6 +855,8 @@ class TranscribeEngine(BaseASREngine):
         """
         loop = asyncio.get_running_loop()
         self._begin_infer()
+        if is_commit:
+            gpu_arbiter.commit_begin()
         try:
             fut = loop.run_in_executor(_EXECUTOR, self._run_inference_sync, audio_slice)
             budget = float(getattr(config.asr, "inference_watchdog_sec", 8.0) or 0.0)
@@ -893,6 +924,8 @@ class TranscribeEngine(BaseASREngine):
                     continue
         finally:
             self._end_infer()
+            if is_commit:
+                gpu_arbiter.commit_end()
 
     def _publish_recompute_ratio(self) -> None:
         """FIX-10: công bố gauge lãng phí compute của preview (giá trị SỐNG, cập nhật mỗi vòng).
@@ -1098,7 +1131,7 @@ class TranscribeEngine(BaseASREngine):
             metrics_collector.increment_counter("asr.commit_reused_preview")
         else:
             t0 = time.perf_counter()
-            final_text = await self._infer_with_watchdog(audio_slice)
+            final_text = await self._infer_with_watchdog(audio_slice, is_commit=True)
             infer_ms = (time.perf_counter() - t0) * 1000.0
             metrics_collector.record_metric("asr", "commit_ms", infer_ms)
             metrics_collector.record_metric("asr", "commit_audio_sec", len(audio_slice) / 16000.0)

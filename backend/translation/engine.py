@@ -32,6 +32,7 @@ from backend.translation.base import BaseTranslator
 from backend.translation.registry import TranslationModelRegistry
 from backend.translation.prompts import get_prompt_strategy
 from backend.utils.model_download import ensure_model_file
+from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TRANSLATION
 
 _TRANS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="translation_worker")
 
@@ -328,8 +329,13 @@ class GGUFTranslator(BaseTranslator):
         target_lang: str = "vi",
         context: str = "",
     ) -> Dict[str, Any]:
-        """Async wrapper gọi hàm dịch trên thread pool."""
+        """Async wrapper gọi hàm dịch trên thread pool.
+
+        A2-1: đi qua `GpuArbiter` để nhường GPU nếu một commit ASR đang chạy. Khi
+        `config.gpu.scheduler_enabled` tắt (mặc định) thì đây là no-op.
+        """
         loop = asyncio.get_running_loop()
+        await gpu_arbiter.admit(PRIORITY_TRANSLATION)
         return await loop.run_in_executor(
             _TRANS_EXECUTOR,
             self._translate_sync,
@@ -413,7 +419,10 @@ class GGUFTranslator(BaseTranslator):
 
         Chạy generator đồng bộ trong `_TRANS_EXECUTOR` và chuyển partial qua một
         asyncio.Queue nhỏ (bỏ partial trung gian nếu consumer chậm — chỉ cần bản mới nhất).
+
+        A2-1: nhường GPU nếu commit ASR đang chạy (no-op khi scheduler tắt).
         """
+        await gpu_arbiter.admit(PRIORITY_TRANSLATION)
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=8)
         sentinel = object()

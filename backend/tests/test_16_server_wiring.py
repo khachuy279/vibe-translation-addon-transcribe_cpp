@@ -141,14 +141,22 @@ def test_stall_watchdog_dumps_threads_without_raising(capsys):
     assert "STALL WATCHDOG" in captured.err
 
 
-def test_cuda_warning_helper_never_raises():
-    """Cảnh báo CUDA phải an toàn kể cả khi provider không có backend CUDA."""
+def test_asr_backend_log_helper_never_raises():
+    """Log backend ASR lúc khởi động phải an toàn kể cả khi không có backend CUDA.
+
+    `provider` có thể là `None` khi chạy bằng bundle cục bộ trong `bin/`
+    (`TRANSCRIBE_LIBRARY`) — binding đi đường "dev-tree" nên không có tên provider PyPI.
+    `_asr_runtime_info()` quy đổi trường hợp đó thành "local-bin" và luôn kèm
+    `native_source`/`native_bundle_dir` để biết thư viện native đến từ đâu.
+    """
     import backend.main as main_mod
 
-    main_mod._warn_if_cuda_provider_missing()
+    main_mod._log_asr_backend_at_startup()
     info = main_mod._asr_runtime_info()
     assert isinstance(info, dict)
-    assert info.get("provider"), "phải đọc được tên provider"
+    assert info.get("provider"), "phải xác định được nguồn thư viện native"
+    assert info.get("native_source") in ("config", "default", "env", "installed", "unset")
+    assert isinstance(info.get("available_backends"), list)
 
 
 def test_config_response_exposes_streaming_and_protocol():
