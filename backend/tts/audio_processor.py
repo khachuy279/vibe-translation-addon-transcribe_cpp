@@ -37,9 +37,13 @@ class AudioProcessor:
         converted: List[np.ndarray] = []
         for item in items:
             if isinstance(item, np.ndarray):
-                arr = item.astype(np.float32)
+                # `np.asarray(..., dtype=...)` KHÔNG copy nếu dtype đã khớp; `.astype()`
+                # mặc định `copy=True` nên luôn tạo bản sao thừa (G-05 / audit Gemini).
+                arr = np.asarray(item, dtype=np.float32)
             elif isinstance(item, torch.Tensor):
-                arr = item.detach().cpu().numpy().astype(np.float32)
+                # `.cpu()` đã copy sang host; `.numpy()` là view trên bộ nhớ đó (zero-copy),
+                # còn `asarray` chỉ copy nếu dtype khác float32 (thường là float32 ⇒ 0 copy).
+                arr = np.asarray(item.detach().cpu().numpy(), dtype=np.float32)
             else:
                 logger.debug(f"Bỏ qua phần tử âm thanh không hợp lệ: {type(item)}", extra={"module_tag": "TTS"})
                 continue

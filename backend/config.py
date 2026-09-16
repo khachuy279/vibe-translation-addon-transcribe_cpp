@@ -262,6 +262,10 @@ class TranslationConfig(BaseModel):
     prompt_style: Optional[str] = None
     n_gpu_layers: int = -1
     # P4.3: trước đây các tham số này bị hardcode trong translation/engine.py.
+    # A5 (audit Gemini, đã kiểm chứng): KV cache ở đây RẤT nhỏ nên đừng tối ưu.
+    # Kiến trúc Hy-MT2-1.8B: 32 layer × 4 KV-head × head_dim 128 ⇒ KV cache f16 =
+    # 2×32×n_ctx×4×128×2 byte. n_ctx=512 → **33,6 MB** (không phải "~450 MB" như báo cáo
+    # Gemini ước lượng — sai ~13×). Hạ xuống 384 chỉ tiết kiệm ~8 MB ⇒ không đáng đổi.
     n_ctx: int = 512
     n_batch: int = 256
     # A1-1 (Hy3): cùng lý do như `ASRConfig.threads` — llama.cpp chỉ cần vài thread CPU để
@@ -287,6 +291,11 @@ class TTSConfig(BaseModel):
     engine: str = "omnivoice"  # PyTorch native OmniVoice
     model: str = "splendor1811/omnivoice-vietnamese"
     device: str = "cuda:0"
+    # A5 (audit Gemini, đã kiểm chứng): `speed != 1.0` BẬT một đường CHẬM —
+    # `AudioProcessor.apply_time_stretch()` dùng Phase Vocoder `scipy.signal.stft/istft`
+    # thuần CPU (~45-120 ms cho câu 3-5 s, đo theo báo cáo Gemini nhưng CHƯA đo lại ở đây).
+    # Ở mặc định 1.0 hàm thoát ngay ở dòng đầu (`abs(rate-1.0) < 0.02`) nên **không** nằm
+    # trên hot path. Nếu đổi speed, hãy đo lại `tts.infer_ms` trước khi kết luận có hồi quy.
     speed: float = 1.0
     num_inference_steps: int = 8
     default_voice: str = "speaker_01_0039.wav"
@@ -305,9 +314,9 @@ class AudioBufferConfig(BaseModel):
 
 class MetricsConfig(BaseModel):
     """Cấu hình đo lường hiệu năng thời gian thực."""
-    enabled: bool = True
+    enabled: bool = False
     alert_threshold_ms: float = 300.0
-    dump_report_on_disconnect: bool = True
+    dump_report_on_disconnect: bool = False
     report_file: str = "metrics_report.json"
 
 

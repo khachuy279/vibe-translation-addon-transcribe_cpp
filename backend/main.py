@@ -350,6 +350,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.debug(f"VAD cleanup notice: {e}", extra={"module_tag": "MAIN"})
 
+    # Lưới an toàn: nếu phiên không đóng sạch (Ctrl+C, kill, mất điện) thì đường
+    # `dump_report_on_disconnect` trong handler đã không chạy ⇒ ghi ở đây để không mất số liệu.
+    # Ví dụ đúng của việc này: người dùng chạy phiên 5 phút rồi tắt server và không tìm thấy
+    # `metrics_report.json` ở đâu cả.
+    try:
+        from backend.core.metrics import dump_metrics_report
+
+        dump_metrics_report("shutdown")
+    except Exception as e:
+        logger.debug(f"Metrics dump notice: {e}", extra={"module_tag": "MAIN"})
+
     logger.info("[SHUTDOWN] Hoàn tất tắt máy chủ an toàn.", extra={"module_tag": "MAIN"})
 
 
@@ -711,6 +722,21 @@ async def get_metrics():
     from backend.ws.handler import count_active_sessions
     metrics_collector.record_gauge("ws", "active_sessions", count_active_sessions())
     return metrics_collector.generate_report()
+
+
+@app.post("/api/metrics/dump")
+async def dump_metrics():
+    """Ghi metrics ra `metrics_report.json` NGAY (không cần kết thúc phiên).
+
+    Dùng khi đang chạy một phiên đo dài và muốn chốt số liệu mà không phải ngắt kết nối:
+        curl -k -X POST https://127.0.0.1:8765/api/metrics/dump
+    """
+    from backend.core.metrics import dump_metrics_report
+
+    path = await asyncio.to_thread(dump_metrics_report, "api_request")
+    if not path:
+        return {"status": "error", "detail": "metrics bị tắt hoặc ghi thất bại"}
+    return {"status": "ok", "path": path}
 
 
 @app.get("/api/metrics/pipeline")

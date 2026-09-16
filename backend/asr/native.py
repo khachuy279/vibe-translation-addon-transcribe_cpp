@@ -168,14 +168,15 @@ def bootstrap() -> None:
 
 #: Thứ tự ưu tiên khi backend yêu cầu không khả dụng.
 #:
-#: `auto` ưu tiên **Vulkan** vì đó là đường `transcribe.cpp` **hỗ trợ chính thức** (wheel trên
-#: PyPI) ⇒ chắc chắn chạy trên mọi máy. Bản CUDA là do dự án **tự build** và **chưa được kiểm
-#: chứng trên mọi cấu hình**, nên nó là **tuỳ chọn phải chỉ định rõ** (`backend="cuda"`), không
-#: phải mặc định. Muốn CUDA: đặt `asr.backend = "cuda"`.
+#: `auto` = "tốt nhất đang có": **CUDA trước** (đo được nhanh hơn Vulkan ~1,53×), rồi **fallback về
+#: Vulkan**. Vulkan được giữ làm **đích fallback** (và vẫn là lựa chọn hợp lệ) vì đó là đường
+#: `transcribe.cpp` **hỗ trợ chính thức** qua wheel trên PyPI ⇒ **chắc chắn chạy trên mọi máy**;
+#: bản CUDA là do dự án **tự build** nên không đảm bảo có mặt ở mọi cấu hình — khi thiếu,
+#: `resolve_backend()` tự chuyển về Vulkan kèm log WARNING.
 #:
-#:  * "auto"   -> vulkan trước, rồi cuda (nếu wheel/bundle không có Vulkan).
+#:  * "auto"   -> cuda trước, rồi vulkan.
 #:  * "cuda"   -> cuda trước; KHÔNG có thì **fallback về Vulkan**.
-#:  * "vulkan" -> chỉ Vulkan: chỉ định rõ thì không âm thầm chuyển sang CUDA.
+#:  * "vulkan" -> Vulkan trước (chỉ định rõ thì không tự chuyển sang CUDA trừ khi Vulkan không có).
 #:
 #: KHÔNG có "cpu" trong danh sách. Backend CPU vẫn tồn tại trong thư viện native
 #: (`bin/ggml-cpu.dll`) và **phải giữ lại** vì ggml dùng nó làm backend mặc định cho các
@@ -189,7 +190,7 @@ def bootstrap() -> None:
 #: CPU chạy *đúng* nhưng ở RTF 1,6 thì phụ đề luôn trễ dần và không bao giờ đuổi kịp video
 #: => không dùng làm lựa chọn, cũng không dùng làm đích fallback.
 _PREFERENCE: dict[str, Tuple[str, ...]] = {
-    "auto": ("vulkan", "cuda"),
+    "auto": ("cuda", "vulkan"),
     "cuda": ("cuda", "vulkan"),
     "vulkan": ("vulkan", "cuda"),
 }

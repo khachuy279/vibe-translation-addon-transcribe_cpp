@@ -29,7 +29,7 @@ from backend.ws.serializers import (
 )
 from backend.core.commit_manager import count_content_tokens
 from backend.ws.session import SessionState
-from backend.core.metrics import metrics_collector
+from backend.core.metrics import metrics_collector, dump_metrics_report
 from backend.utils.logger import get_logger
 
 logger = get_logger("ws.handler")
@@ -378,6 +378,13 @@ async def handle_ws(ws: WebSocket) -> None:
         metrics_collector.record_gauge("ws", "active_sessions", count_active_sessions())
         cleanup_ms = (time.perf_counter() - t_cleanup_start) * 1000.0 if t_cleanup_start else 0.0
         logger.info(f"Session {session.session_id}: Đã đóng và giải phóng tài nguyên hoàn tất ({cleanup_ms:.2f}ms)", extra={"module_tag": "WS"})
+
+        # Ghi metrics report khi phiên kết thúc. TRƯỚC ĐÂY ĐOẠN NÀY BỊ THIẾU:
+        # `config.metrics.dump_report_on_disconnect` / `report_file` là config CHẾT (không ai
+        # đọc) và `MetricsCollector.dump_json()` không có caller nào ⇒ `metrics_report.json`
+        # không bao giờ được tạo. Đặt trong `finally` nên vẫn ghi dù phiên kết thúc do lỗi.
+        if bool(getattr(config.metrics, "dump_report_on_disconnect", True)):
+            dump_metrics_report(reason=f"disconnect:{session.session_id[:8]}")
 
 
 async def _handle_text_message(session: SessionState, text: str) -> None:

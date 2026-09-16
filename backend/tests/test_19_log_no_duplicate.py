@@ -123,7 +123,16 @@ def test_write_error_before_any_output_is_silent():
 
 
 def test_identical_records_within_window_are_printed_once():
-    """Hai record giống hệt nhau trong cùng khoảng ngắn ⇒ chỉ in 1 lần."""
+    """Hai record giống hệt nhau trong cùng khoảng ngắn ⇒ chỉ in 1 lần.
+
+    PHẢI ghim `LOG_DEDUP_MS` tường minh. Bản trước dựa vào mặc định `_DEDUP_WINDOW_SEC = 0.05`
+    (50 ms) nên test chỉ xanh khi máy đủ nhanh: hai lần `emit()` liên tiếp phải cách nhau
+    < 50 ms. Chạy cả bộ test (tải nặng, nhiều I/O) thì khoảng cách đó vượt 50 ms ⇒ record thứ
+    hai KHÔNG bị chặn ⇒ `suppressed_records == 0` ⇒ đổ dù handler hoàn toàn đúng. Đây là test
+    flaky theo thiết kế, không phải lỗi sản phẩm. Ghim 1000 ms giữ nguyên ngữ nghĩa cần kiểm
+    ("trong cửa sổ thì chặn") mà bỏ phụ thuộc vào tốc độ máy.
+    """
+    os.environ["LOG_DEDUP_MS"] = "1000"
     stream = _FlakyStream()
     handler = _make_handler(stream)
     handler.emit(_record())

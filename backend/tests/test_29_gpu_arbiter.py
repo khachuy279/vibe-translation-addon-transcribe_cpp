@@ -45,11 +45,25 @@ def test_disabled_is_a_noop(arb):
     assert arb.stats()["blocked_total"] == 0
 
 
-def test_default_config_has_scheduler_disabled():
-    """Chốt: bật scheduler là quyết định phải đo, không được bật ngầm."""
-    from backend.config import GpuConfig
+def test_scheduler_state_is_observable_not_hardcoded():
+    """`scheduler_enabled` là QUYẾT ĐỊNH VẬN HÀNH, không phải hằng số để test khoá lại.
 
-    assert GpuConfig().scheduler_enabled is False
+    Bản trước của test này assert `GpuConfig().scheduler_enabled is False` để chốt rằng
+    "bật scheduler phải là quyết định có đo". Cách chốt đó sai chỗ: nó khoá một **giá trị
+    cấu hình** (đổi được bất cứ lúc nào, và người dùng đã đổi sang `True`), trong khi điều
+    thực sự cần bảo vệ là **khả năng quan sát** — phải luôn biết một file report được đo với
+    cờ nào, nếu không thì số liệu A/B vô nghĩa.
+
+    Vì vậy test này chốt: (1) cờ tồn tại và là bool, (2) cờ được ghi vào report.
+    """
+    from backend.config import GpuConfig
+    from backend.core.metrics import MetricsCollector
+
+    assert isinstance(GpuConfig().scheduler_enabled, bool)
+
+    snap = MetricsCollector._run_config_snapshot()
+    assert "gpu.scheduler_enabled" in snap, "report phải ghi lại cờ này để đọc được A/B"
+    assert isinstance(snap["gpu.scheduler_enabled"], bool)
 
 
 # ------------------------------------------------------------------- khi BẬT: nhường GPU
@@ -198,3 +212,78 @@ def test_slot_context_manager_runs_body(arb):
 
     asyncio.run(body())
     assert ran == [True]
+
+
+# ------------------------------------------------- A3: đánh thức bằng Event (không poll)
+def test_event_wakes_waiter_immediately_from_another_thread(arb):
+    """A3: `commit_end()` gọi từ THREAD khác phải đánh thức waiter NGAY.
+
+    Chứng minh bằng cách đặt `admit_poll_ms` rất lớn (500 ms) rồi đo: nếu vẫn dùng polling
+    thì `admit()` phải chờ ~500 ms; nếu Event hoạt động thì trả về gần như tức thì sau khi
+    `commit_end()` chạy ở thread khác.
+    """
+    config.gpu.scheduler_enabled = True
+    config.gpu.commit_reserve_ms = 30_000
+    config.gpu.admit_max_wait_ms = 30_000
+    config.gpu.admit_poll_ms = 500          # poll rất thô ⇒ chỉ Event mới cứu được
+
+    async def scenario():
+        arb.commit_begin()
+        loop = asyncio.get_running_loop()
+
+        async def end_from_thread_later():
+            await asyncio.sleep(0.15)
+            # chạy `commit_end` trong THREAD POOL, không phải event loop
+            await loop.run_in_executor(None, arb.commit_end)
+
+        t = asyncio.create_task(end_from_thread_later())
+        t0 = time.monotonic()
+        waited = await arb.admit(PRIORITY_TTS)
+        dt = (time.monotonic() - t0) * 1000.0
+        await t
+        return waited, dt
+
+    waited, dt = asyncio.run(scenario())
+    assert dt < 350.0, (
+        f"Event không đánh thức được (chờ {dt:.0f} ms, trong khi poll=500 ms) "
+        f"— có thể đang rơi về đường polling"
+    )
+    assert waited >= 100.0, "vẫn phải thực sự chờ commit xong"
+
+
+def test_event_notify_is_safe_without_waiters(arb):
+    """`commit_end()` không được raise khi chưa từng có waiter / loop đã đóng."""
+    config.gpu.scheduler_enabled = True
+    arb.commit_begin()
+    arb.commit_end()          # chưa có waiter nào ⇒ `_wake` là None
+    arb.commit_end()          # giảm quá số lần begin cũng không được âm
+    assert arb.stats()["commit_active"] == 0
+
+
+def test_waiter_on_new_loop_gets_fresh_event(arb):
+    """Hai `asyncio.run()` liên tiếp (loop khác nhau) đều phải được đánh thức."""
+    config.gpu.scheduler_enabled = True
+    config.gpu.commit_reserve_ms = 30_000
+    config.gpu.admit_max_wait_ms = 30_000
+    config.gpu.admit_poll_ms = 500
+
+    for _ in range(2):
+        arb.reset()
+
+        async def scenario():
+            arb.commit_begin()
+            loop = asyncio.get_running_loop()
+
+            async def ender():
+                await asyncio.sleep(0.1)
+                await loop.run_in_executor(None, arb.commit_end)
+
+            t = asyncio.create_task(ender())
+            t0 = time.monotonic()
+            await arb.admit(PRIORITY_TTS)
+            dt = (time.monotonic() - t0) * 1000.0
+            await t
+            return dt
+
+        dt = asyncio.run(scenario())
+        assert dt < 350.0, f"loop mới không được đánh thức (chờ {dt:.0f} ms)"

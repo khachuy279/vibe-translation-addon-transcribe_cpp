@@ -85,6 +85,10 @@ class GpuArbiter:
         # Thống kê (đọc không cần lock — chỉ để chẩn đoán/log)
         self._blocked_count: int = 0
         self._waited_ms_total: float = 0.0
+        # A3: kênh đánh thức async. `commit_end()` chạy trong THREAD ASR nên phải bắc cầu
+        # qua `loop.call_soon_threadsafe`; đây là lý do không thể chỉ dùng `asyncio.Event`.
+        self._wake: Optional[asyncio.Event] = None
+        self._wake_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ---------------------------------------------------------------- cấu hình hiệu dụng
     @staticmethod
@@ -116,14 +120,44 @@ class GpuArbiter:
             self._last_commit_ms = reserve_s * 1000.0
 
     def commit_end(self) -> None:
-        """Báo commit ASR đã xong."""
+        """Báo commit ASR đã xong. Đánh thức NGAY các job ưu tiên thấp đang chờ."""
         if not self.enabled():
             return
+        notify = False
         with self._lock:
             self._commit_active = max(0, self._commit_active - 1)
             if self._commit_active == 0:
                 # Hết commit ⇒ đóng cửa sổ ngay, không bắt dịch/TTS chờ hết hạn vô ích.
                 self._reserved_until = 0.0
+                notify = True
+        if notify:
+            self._wake_waiters()
+
+    # ------------------------------------------------------------- đánh thức async (A3)
+    def _event_for(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event:
+        """Event dùng chung cho các waiter; tạo mới nếu event loop đã đổi (ví dụ trong test)."""
+        with self._lock:
+            if self._wake is None or self._wake_loop is not loop:
+                self._wake = asyncio.Event()
+                self._wake_loop = loop
+            return self._wake
+
+    def _wake_waiters(self) -> None:
+        """`set()` Event từ thread bất kỳ (commit_end chạy trong thread ASR).
+
+        Không bao giờ raise ra ngoài: đánh thức là tối ưu, không được làm hỏng pipeline.
+        """
+        with self._lock:
+            ev, loop = self._wake, self._wake_loop
+        if ev is None or loop is None:
+            return
+        try:
+            if loop.is_closed():
+                return
+            loop.call_soon_threadsafe(ev.set)
+        except RuntimeError:
+            # Loop đóng giữa chừng — waiter cũng đã biến mất theo.
+            pass
 
     # ------------------------------------------------------------------ phía async
     def _defer_state(self) -> tuple[bool, float]:
@@ -154,16 +188,29 @@ class GpuArbiter:
         t0 = time.monotonic()
         deadline = t0 + max_wait_s
         name = stage_name(priority)
+        ev = self._event_for(asyncio.get_running_loop())
         metrics_collector.increment_counter("gpu.admit_blocked")
         with self._lock:
             self._blocked_count += 1
 
         while True:
+            # A3 (audit Gemini, đã kiểm chứng): đánh thức bằng Event thay vì ngủ đủ `poll_s`.
+            # `clear()` PHẢI đứng TRƯỚC `_defer_state()`: nếu `commit_end()` chạy giữa
+            # `clear()` và `await wait()` thì Event đã set ⇒ `wait()` trả về ngay, không mất
+            # tín hiệu. `poll_s` được giữ làm TRẦN của một lần chờ — nhờ vậy nếu có tín hiệu
+            # nào bị lỡ thì hành vi tệ nhất vẫn y hệt bản polling cũ (không hồi quy).
+            ev.clear()
             should_defer, remaining = self._defer_state()
             now = time.monotonic()
             if not should_defer or now >= deadline:
                 break
-            await asyncio.sleep(min(poll_s, remaining, max(0.0, deadline - now)))
+            timeout = min(poll_s, remaining, max(0.0, deadline - now))
+            if timeout <= 0:
+                break
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
 
         waited_ms = (time.monotonic() - t0) * 1000.0
         metrics_collector.record_metric("gpu", "admit_wait_ms", waited_ms)
@@ -205,6 +252,7 @@ class GpuArbiter:
             self._reserved_until = 0.0
             self._blocked_count = 0
             self._waited_ms_total = 0.0
+        self._wake_waiters()
 
 
 #: Singleton dùng chung toàn tiến trình.

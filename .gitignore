@@ -69,6 +69,11 @@ Thumbs.db
 # 8. Temporary Performance Reports & Logs
 perf_report.json
 perf_report_summary.txt
+# Sinh ra khi phiên WS kết thúc hoặc khi shutdown (xem backend/core/metrics.py
+# ::dump_metrics_report). Là artifact đo đạc, không phải mã nguồn.
+metrics_report.json
+# Bản đã đổi tên để so A/B (metrics_sched_ON.json / metrics_sched_OFF.json)
+metrics_sched_*.json
 
 # 9. G2/G3 — bản dựng CUDA ASR & toolchain cục bộ (không commit)
 # bin/                  : bundle native lúc chạy (transcribe.dll + ggml*.dll, gồm

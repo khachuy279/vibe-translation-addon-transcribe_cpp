@@ -33,7 +33,7 @@ Repository: [github.com/khachuy279/vibe-translation-addon-transcribe_cpp](https:
 - [Cài đặt](#-cài-đặt)
   - [Cách nhanh (khuyến nghị)](#cách-nhanh-khuyến-nghị)
   - [Cài đặt chi tiết (từng bước)](#cài-đặt-chi-tiết-từng-bước)
-  - [Bật ASR CUDA (tuỳ chọn)](#bật-asr-cuda-tuỳ-chọn)
+  - [Bundle ASR CUDA (backend mặc định)](#bundle-asr-cuda-backend-mặc-định)
 - [Chuẩn bị mô hình](#-chuẩn-bị-mô-hình)
 - [Khởi chạy backend](#-khởi-chạy-backend)
 - [Cài extension & sử dụng](#-cài-extension--sử-dụng)
@@ -80,21 +80,20 @@ Repository: [github.com/khachuy279/vibe-translation-addon-transcribe_cpp](https:
 
 | Backend | Nguồn | Trạng thái |
 | :--- | :--- | :--- |
-| **Vulkan** *(mặc định)* | Wheel `transcribe-cpp-native` trên PyPI | ✅ **Được transcribe.cpp hỗ trợ CHÍNH THỨC** ⇒ chắc chắn chạy được |
-| **CUDA** *(tuỳ chọn)* | `bin/` — do dự án **tự build** | ⚙️ Nhanh hơn ~1,53× nhưng **không đảm bảo chạy trên mọi máy** |
+| **CUDA** *(mặc định)* | `bin/` — do dự án **tự build** | ⚙️ Nhanh nhất — đo được **nhanh hơn Vulkan ~1,53×**, +243 MB VRAM |
+| **Vulkan** *(fallback)* | Wheel `transcribe-cpp-native` trên PyPI | ✅ **Được transcribe.cpp hỗ trợ CHÍNH THỨC** ⇒ **chắc chắn chạy trên mọi máy** |
 | CPU | Wheel `transcribe-cpp-native` | ❌ Chạy được nhưng **RTF ~1,6** (chậm hơn thời gian thực) ⇒ backend từ chối chọn |
 
 > [!IMPORTANT]
-> **Vì sao mặc định là Vulkan, không phải CUDA.** `transcribe.cpp` hỗ trợ Vulkan chính thức nên
-> wheel trên PyPI là đường **chắc chắn chạy**. Bản CUDA **không có trên PyPI**
+> **Vì sao vẫn giữ Vulkan — và nó tự động cứu bạn khi CUDA thiếu.** Bản CUDA **không có trên PyPI**
 > (`transcribe-cpp-native-cu12` chỉ là *name reservation* — wheel `0.0.0` ~1,4 KB, không có native
-> code), nên muốn có phải tự build; bản tự build **chưa được kiểm chứng trên mọi cấu hình máy**.
-> Vì vậy Vulkan là mặc định và CUDA là **tuỳ chọn có thể bật** — xem
-> [Bật ASR CUDA (tuỳ chọn)](#bật-asr-cuda-tuỳ-chọn).
+> code), nên nó là bản **dự án tự build** và **không đảm bảo có mặt trên mọi máy**. Vulkan thì
+> `transcribe.cpp` hỗ trợ **chính thức** qua wheel ⇒ đó là đường **chắc chắn chạy**. Vì vậy Vulkan
+> luôn là **đích fallback**: nếu `bin/ggml-cuda.dll` không có, backend **tự chuyển về Vulkan** và
+> ghi log WARNING nêu rõ — không cần cấu hình gì thêm.
 >
-> Backend hỗ trợ **fallback**: nếu backend được yêu cầu không khả dụng, nó tự chuyển về Vulkan và
-> ghi log **WARNING** nêu rõ lý do. Kiểm tra thực tế: `GET /health → asr_runtime`, hoặc log lúc
-> khởi động `[STARTUP] ASR backend: yêu cầu='...' → thực tế='...'`.
+> Kiểm tra thực tế: `GET /health → asr_runtime`, hoặc log lúc khởi động
+> `[STARTUP] ASR backend: yêu cầu='...' → thực tế='...'`.
 
 ---
 
@@ -209,27 +208,29 @@ python -c "import sys;sys.path.insert(0,'.');from backend.asr import native;from
 Kỳ vọng tối thiểu (chỉ wheel Vulkan): `backends: ['vulkan']`, `devices: vulkan=Vulkan0, cpu=CPU`.
 </details>
 
-### Bật ASR CUDA (tuỳ chọn)
+### Bundle ASR CUDA (backend mặc định)
 
-Chỉ làm khi bạn **muốn** và **chấp nhận** rằng bản CUDA là do dự án tự build (không phải đường
-được transcribe.cpp phát hành). Đo được: **nhanh hơn Vulkan ~1,53×**, độ chính xác tương đương,
-tốn thêm ~243 MB VRAM.
+`asr.backend` mặc định là `"cuda"`. Để nó chạy được, cần **bundle native trong `bin/`**:
+`bin/transcribe.dll` + `bin/ggml-*.dll` (gồm `ggml-cuda.dll`). Đo được: **nhanh hơn Vulkan ~1,53×**,
+độ chính xác tương đương, tốn thêm ~243 MB VRAM.
 
-1. **Lấy bundle.** Đặt sẵn `bin/transcribe.dll` + `bin/ggml-*.dll` (gồm `ggml-cuda.dll`).
-   Cách dựng lại: xem `external/build-tmp/build_cuda.bat` và
-   `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2 (dựng CUDA toolkit **không cần quyền admin**).
-2. **Chọn backend.** Sửa `backend/config.py` rồi **khởi động lại** backend:
-   ```python
-   asr.backend = "cuda"     # "auto" | "cuda" | "vulkan"
+1. **Kiểm tra bạn đã có bundle chưa:**
+   ```powershell
+   python -c "import sys;sys.path.insert(0,'.');from backend.asr import native as N;print('có sẵn:', sorted(N._available_kinds()))"
    ```
-   > Backend ASR được chốt **lúc nạp model** (thư viện native `dlopen` một lần cho cả tiến trình),
-   > nên **không đổi được qua `POST /api/config`** — hiện chưa có field đó. `GET /api/config` chỉ
-   > *hiển thị* giá trị đang dùng ở `native_backend`.
-3. **Kiểm tra.** Log khởi động phải ghi `Backend: CUDA0 ... native: bin/`. Nếu CUDA không khả dụng,
-   backend **tự fallback về Vulkan** và ghi WARNING nêu rõ lý do — không cần làm gì thêm.
+   Ra `['cuda', 'vulkan']` ⇒ đã có CUDA. Ra `['vulkan']` ⇒ **chưa có**, xem bước 2.
+2. **Lấy bundle.** Cách dựng lại: `external/build-tmp/build_cuda.bat`, hướng dẫn đầy đủ ở
+   `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2 (dựng CUDA toolkit **không cần quyền admin**).
+   Nếu không muốn tự build, cứ để nguyên: backend **tự fallback về Vulkan**.
+3. **Kiểm tra.** Log khởi động phải ghi `Backend: CUDA0 ... native: bin/`. Nếu không, nó ghi
+   `[WARNING] ... KHÔNG khả dụng ⇒ FALLBACK sang 'vulkan'` — đây là hành vi đúng, không phải lỗi.
 
-> `asr.backend = "auto"` ưu tiên **Vulkan** (đường chắc chắn chạy), rồi mới tới CUDA nếu Vulkan
-> không có. Muốn dùng CUDA thì chỉ định rõ `"cuda"`.
+> **Không đổi backend lúc chạy.** Backend ASR được chốt **lúc nạp model** (thư viện native `dlopen`
+> một lần cho cả tiến trình), nên **không đổi được qua `POST /api/config`** — hiện chưa có field đó.
+> Muốn đổi: sửa `backend/config.py` (`asr.backend = "vulkan"` / `"auto"` / `"cuda"`) rồi khởi động lại.
+> `GET /api/config` chỉ *hiển thị* giá trị đang dùng ở `native_backend`.
+>
+> Thứ tự fallback: `"cuda"` → cuda rồi vulkan · `"auto"` → cuda rồi vulkan · `"vulkan"` → vulkan rồi cuda.
 
 ---
 
@@ -426,7 +427,7 @@ Toàn bộ cấu hình tập trung ở `backend/config.py` (Pydantic v2). Các c
 | Cờ | Mặc định | Ý nghĩa |
 | :--- | :--- | :--- |
 | `ws.port` / `ws.protocol_version` | `8765` / `3` | Cổng WSS và phiên bản giao thức |
-| **`asr.backend`** | `"auto"` | `auto` (Vulkan trước, rồi CUDA) · `cuda` · `vulkan`. **Không có `cpu`** — CPU chạy ở RTF ~1,6 nên vô dụng cho phụ đề |
+| **`asr.backend`** | `"cuda"` | `cuda` (mặc định) · `auto` (cuda → vulkan) · `vulkan`. **Không có `cpu`** — CPU chạy ở RTF ~1,6 nên vô dụng cho phụ đề |
 | **`asr.backend_fallback`** | `True` | Tự fallback + ghi WARNING khi backend yêu cầu không khả dụng |
 | **`asr.use_local_native`** | `True` | Ưu tiên bundle trong `bin/` hơn provider đã cài |
 | **`asr.native_dir`** | `""` | Thư mục bundle; trống = `<project_root>/bin` |
@@ -544,10 +545,10 @@ transcript tham chiếu):
 
 1. **1 phiên / 1 video** — xem khối cảnh báo ở đầu tài liệu. Không có model pool.
 2. **ASR không tự tải model** — phải copy `.gguf` vào `backend/models/` (khác với model dịch và VAD).
-3. **ASR mặc định dùng Vulkan.** Bản CUDA **không có trên PyPI** (phải tự build vào `bin/`) và
-   **chưa được kiểm chứng trên mọi cấu hình máy**, nên Vulkan — đường được transcribe.cpp hỗ trợ
-   chính thức — vẫn là mặc định. Bật CUDA là tuỳ chọn: xem
-   [Bật ASR CUDA (tuỳ chọn)](#bật-asr-cuda-tuỳ-chọn).
+3. **ASR cần bundle CUDA trong `bin/` để chạy nhanh nhất.** Bản CUDA **không có trên PyPI** (phải
+   tự build), nên nếu `bin/ggml-cuda.dll` thiếu, backend **tự fallback về Vulkan** — đường
+   `transcribe.cpp` hỗ trợ chính thức, chắc chắn chạy, nhưng chậm hơn ~1,53×. Việc fallback được
+   ghi log WARNING rõ ràng; xem [Bundle ASR CUDA](#bundle-asr-cuda-backend-mặc-định).
 4. **Cửa sổ preview có đuôi độ trễ lẻ**: p50 ≈ 87 ms nhưng thỉnh thoảng spike ~2,5 s do tầng native
    dựng lại scheduler/compute context mỗi `run()`. Nhịp preview **bỏ nhịp** (không trôi) và commit
    được ưu tiên nên phụ đề chốt không bị chặn.
