@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, AsyncIterator, Dict, Optional
@@ -94,7 +95,7 @@ class GGUFTranslator(BaseTranslator):
             )
 
         logger.info(
-            f"Đang nạp mô hình dịch GGUF '{key}' từ: {gguf_path}",
+            f"Nạp model '{key}' ({Path(gguf_path).name})",
             extra={"module_tag": "TRANSLATE"},
         )
 
@@ -112,8 +113,7 @@ class GGUFTranslator(BaseTranslator):
         )
 
         logger.info(
-            f"Nạp thành công mô hình dịch '{key}' trên GPU "
-                f"(n_ctx={n_ctx}, n_batch={n_batch}, n_threads={n_threads})",
+            f"Model '{key}' sẵn sàng (GPU, ctx={n_ctx}, batch={n_batch}, threads={n_threads})",
             extra={"module_tag": "TRANSLATE"},
         )
         return llm, get_prompt_strategy(info.get("prompt_style", "tencent"))
@@ -144,7 +144,7 @@ class GGUFTranslator(BaseTranslator):
         with cls._infer_lock:
             pass  # hàng rào: không đóng model khi còn thread đang sinh token trên nó
         cls._close_llm_quietly(llm)
-        logger.info("Đã giải phóng mô hình dịch khỏi GPU VRAM.", extra={"module_tag": "TRANSLATE"})
+        logger.info("Model đã giải phóng khỏi GPU", extra={"module_tag": "TRANSLATE"})
 
     def _log_load_failure(self, exc: Exception) -> None:
         """Báo lỗi nạp model đúng MỘT lần (tránh spam mỗi câu) rồi trả nguyên văn gốc."""
@@ -258,7 +258,7 @@ class GGUFTranslator(BaseTranslator):
         try:
             self.load_model()
             self._translate_sync("Hello", source_lang="en", target_lang="vi")
-            logger.info(f"Pre-warm hoàn tất cho Translation model '{self.canonical_key}'", extra={"module_tag": "TRANSLATE"})
+            logger.info(f"Pre-warm hoàn tất ({self.canonical_key})", extra={"module_tag": "TRANSLATE"})
         except Exception as e:
             logger.warning(f"Pre-warm Translation warning: {e}", extra={"module_tag": "TRANSLATE"})
 

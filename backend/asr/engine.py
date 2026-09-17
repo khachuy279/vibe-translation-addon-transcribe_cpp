@@ -26,6 +26,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -138,7 +139,7 @@ class TranscribeEngine(BaseASREngine):
                     cls._shared_model = None
                     cls._shared_model_key = None
                     cls._shared_supports_streaming = False
-                    logger.info("Đã giải phóng model ASR khỏi GPU VRAM.", extra={"module_tag": "ASR"})
+                    logger.info("Model đã giải phóng khỏi GPU", extra={"module_tag": "ASR"})
 
     @staticmethod
     def _process_rss_mb() -> float:
@@ -169,11 +170,9 @@ class TranscribeEngine(BaseASREngine):
 
             pmc = _PMC()
             pmc.cb = ctypes.sizeof(_PMC)
-            fn = ctypes.windll.kernel32.K32GetProcessMemoryInfo
-            fn.argtypes = [wt.HANDLE, ctypes.POINTER(_PMC), wt.DWORD]
-            fn.restype = wt.BOOL
-            if fn(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
-                return pmc.WorkingSetSize / (1024.0 * 1024.0)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
+                return float(pmc.WorkingSetSize) / (1024.0 * 1024.0)
         except Exception:  # noqa: BLE001
             pass
         return 0.0
@@ -204,9 +203,7 @@ class TranscribeEngine(BaseASREngine):
         metrics_collector.increment_counter("asr.native_session_recycled")
         metrics_collector.record_gauge("asr", "recycle_growth_mb", growth)
         logger.warning(
-            f"RAM tiến trình tăng {growth:.0f} MB kể từ lúc nạp model "
-                f"(> ngưỡng {delta_mb:.0f} MB) — đóng phiên native để lần sau nạp lại sạch "
-                    f"(bộ nhớ phình nằm trong native/Vulkan, xem báo cáo §12.6).",
+            f"Tái nạp native session (RAM delta: +{growth:.0f} MB > ngưỡng {delta_mb:.0f} MB)",
             extra={"module_tag": "ASR"},
         )
         loop = asyncio.get_running_loop()
@@ -352,7 +349,7 @@ class TranscribeEngine(BaseASREngine):
         family = info.get("family", "")
 
         logger.info(
-            f"Đang nạp mô hình ASR '{model_key}'({family}) từ: {model_path}",
+            f"Nạp model '{model_key}' ({Path(model_path).name})",
             extra={"module_tag": "ASR"},
         )
 
@@ -387,18 +384,11 @@ class TranscribeEngine(BaseASREngine):
         # F-39: ghi mốc RSS ngay sau khi nạp xong để sau này biết đã phình bao nhiêu.
         cls._shared_rss_baseline_mb = self._process_rss_mb()
 
-        detail = (
-            f"(Arch: {getattr(loaded_model, 'arch', 'unknown')}, "
-            f"Backend: {getattr(loaded_model, 'backend', 'unknown')}, "
-            f"yêu cầu: '{self.backend or config.asr.backend}', "
-            f"Streaming: {supports_streaming}"
+        backend_name = getattr(loaded_model, "backend", "unknown")
+        logger.info(
+            f"Model '{model_key}' sẵn sàng (backend={backend_name}, streaming={supports_streaming})",
+            extra={"module_tag": "ASR"},
         )
-        if max_audio_samples:
-            detail += f", max_audio={max_audio_samples / 16000.0:.1f}s"
-        bundle = native_bundle_dir()
-        detail += f", native: {'bin/' if bundle else 'wheel đã cài'}"
-        detail += ")"
-        logger.info(f"Nạp thành công ASR Model '{model_key}'{detail}", extra={"module_tag": "ASR"})
         return loaded_model
 
     def _ensure_model_loaded(self) -> Any:
@@ -436,7 +426,7 @@ class TranscribeEngine(BaseASREngine):
 
         info = self.registry.get_model_info(model_key) or {}
         logger.info(
-            f"Đang nạp trước model '{model_key}'({info.get('family', '')}) để chuyển nóng...",
+            f"Nạp model '{model_key}' trước khi swap (zero-downtime)",
             extra={"module_tag": "ASR"},
         )
         t0 = time.perf_counter()
@@ -485,15 +475,14 @@ class TranscribeEngine(BaseASREngine):
                 self._end_infer()
             warm_ms = (time.perf_counter() - t_warm) * 1000.0
             metrics_collector.record_metric("asr", "model_warmup_ms", warm_ms)
-            logger.info(f"pre-warm model '{model_key}' xong trong {warm_ms:.0f}ms",
+            logger.info(f"Pre-warm ({model_key}, {warm_ms:.0f}ms)",
                         extra={"module_tag": "ASR"})
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"pre-warm model '{model_key}' thất bại: {exc}", extra={"module_tag": "ASR"})
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            f"Chuyển nóng model sang '{model_key}' xong trong {elapsed:.2f}s "
-                f"(Backend: {getattr(new_model, 'backend', 'unknown')}, Streaming: {supports_streaming})",
+            f"Đã swap sang '{model_key}' ({elapsed:.2f}s, backend={getattr(new_model, 'backend', 'unknown')})",
             extra={"module_tag": "ASR"},
         )
 
@@ -507,7 +496,6 @@ class TranscribeEngine(BaseASREngine):
         """
         try:
             self._preload_model(force_warm=True)
-            logger.info(f"Pre-warm hoàn tất cho ASR model '{self.model_key}'", extra={"module_tag": "ASR"})
         except Exception as e:
             logger.warning(f"Pre-warm ASR warning: {e}", extra={"module_tag": "ASR"})
 
@@ -1022,8 +1010,7 @@ class TranscribeEngine(BaseASREngine):
             metrics_collector.record_metric("asr", "warmup_short_ms", short_ms)
             metrics_collector.record_metric("asr", "warmup_long_ms", long_ms)
             logger.info(
-                f"Nạp trước + pre-warm model '{self.model_key}' xong "
-                    f"(warmup {short_sec:.1f}s={short_ms:.0f}ms + {long_sec:.1f}s={long_ms:.0f}ms). ",
+                f"Pre-warm ({short_sec:.1f}s={short_ms:.0f}ms + {long_sec:.1f}s={long_ms:.0f}ms)",
                 extra={"module_tag": "ASR"},
             )
         except Exception as exc:  # noqa: BLE001
@@ -1187,7 +1174,7 @@ class TranscribeEngine(BaseASREngine):
 
         if final_text:
             logger.info(
-                f"[utt={utt_id}] [{self.model_key}] [{reason}] '{final_text}' (infer={infer_ms:.1f}ms)",
+                f"[utt={utt_id}] [{reason}] (infer={infer_ms:.1f}ms): '{final_text}'",
                 extra={"module_tag": "ASR_COMMIT"},
             )
             # K4: E2E từ lúc VAD báo ngừng nói tới khi phát phụ đề gốc đã chốt.

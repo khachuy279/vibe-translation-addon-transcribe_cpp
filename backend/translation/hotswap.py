@@ -149,8 +149,7 @@ async def run_reserved(canonical_key: str, *, allow_download: Optional[bool] = N
     try:
         if needs_download(canonical_key):
             logger.info(
-                f"Model dịch '{canonical_key}' chưa có file cục bộ — tải về trước khi đổi model "
-                    f"(model đang chạy vẫn phục vụ bình thường).",
+                f"Tải model '{canonical_key}' trước khi swap (zero-downtime)",
                 extra={"module_tag": _TAG},
             )
             await asyncio.to_thread(
@@ -178,7 +177,7 @@ async def run_reserved(canonical_key: str, *, allow_download: Optional[bool] = N
         elapsed = time.time() - started
         _set_state(state="ready", error=None, finished_at=time.time(), elapsed_sec=round(elapsed, 1))
         logger.info(
-            f"Đã chuyển mô hình dịch sang '{canonical_key}' (tải+nạp trước, swap; không cần restart).",
+            f"Đã swap sang '{canonical_key}' ({elapsed:.1f}s)",
             extra={"module_tag": _TAG},
         )
     except Exception as exc:  # noqa: BLE001

@@ -359,7 +359,7 @@ class VADStreamProcessor:
                 state.is_speech = True
                 state.silence_samples = 0
                 logger.info(
-                    f"Speech START (prob={prob:.3f} >= threshold={self.threshold:.3f})",
+                    f"VAD: START (p={prob:.2f})",
                     extra={"module_tag": "VAD"},
                 )
                 if self.on_speech_start:
@@ -383,7 +383,7 @@ class VADStreamProcessor:
                 state.is_speech = False
                 state.silence_samples = 0
                 logger.info(
-                    f"Speech END (prob={prob:.3f} < threshold={self.threshold:.3f})",
+                    f"VAD: END (p={prob:.2f})",
                     extra={"module_tag": "VAD"},
                 )
                 if self.on_speech_end:
@@ -413,9 +413,7 @@ class VADStreamProcessor:
                     state.is_speech = False
                     state.silence_samples = 0
                     logger.info(
-                        f"Speech END silence timeout ({silence_elapsed_ms:.0f}ms >= "
-                            f"silence_limit={total_silence_limit_ms:.0f}ms, "
-                                f"prob={prob:.3f} < threshold={self.threshold:.3f})",
+                        f"VAD: END (timeout {silence_elapsed_ms:.0f}ms, p={prob:.2f})",
                         extra={"module_tag": "VAD"},
                     )
                     if self.on_speech_end:

@@ -222,7 +222,7 @@ class SentenceConfig(BaseModel):
     max_chars: int = 150
     # P2.3: giữ BẰNG `ASRConfig.preview_window_sec` để cửa sổ preview luôn bao trùm
     # trọn câu hiện tại => preview không mất ngữ cảnh so với commit (nguyên tắc P2).
-    max_duration_sec: float = 6.0          # Giới hạn tối đa độ dài 1 câu nói liên tục
+    max_duration_sec: float = 8.0          # Giới hạn tối đa độ dài 1 câu nói liên tục
     min_words_to_commit: int = 2           # Số từ tối thiểu để gửi sang dịch/TTS (lọc tiếng ậm ừ)
     split_on_stability: bool = True        # Tự động ngắt câu khi preview text ổn định
     stability_duration_sec: float = 0.6    # Thời gian (giây) preview text bất biến (P3: cắt ở ranh giới từ)

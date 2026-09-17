@@ -149,15 +149,14 @@ def bootstrap() -> None:
             _bundle_dir, _bundle_source = bundle, source
             if not too_late:
                 logger.info(
-                    f"ASR native: dùng bundle cục bộ '{lib}' (nguồn: {source}).",
+                    f"Native bundle: {bundle.name}/ (nguồn: {source})",
                     extra={"module_tag": _TAG},
                 )
         else:
             _bundle_dir, _bundle_source = None, "installed"
             if not too_late:
                 logger.info(
-                    "ASR native: không thấy bundle cục bộ trong bin/ — dùng provider "
-                    "transcribe-cpp-native đã cài (nếu có).",
+                    "Native bundle: không tìm thấy trong bin/ (dùng provider cài đặt)",
                     extra={"module_tag": _TAG},
                 )
 
@@ -291,15 +290,13 @@ def resolve_backend(requested: Optional[str], *, force_log: bool = False) -> str
     elif key != "auto" and chosen != prefs[0]:
         # Người dùng chỉ định rõ một backend mà nó không có ⇒ đây là FALLBACK, phải WARNING.
         logger.warning(
-            f"ASR backend: '{prefs[0]}' KHÔNG khả dụng ⇒ FALLBACK sang '{chosen}'. "
-            f"(yêu cầu='{key}', hiện có: {', '.join(sorted(avail))}; device: {backend_devices()})",
+            f"Backend '{prefs[0]}' không khả dụng -> Fallback '{chosen}' (yêu cầu='{key}', devices: {backend_devices()})",
             extra={"module_tag": _TAG},
         )
     else:
         # 'auto' chọn theo thứ tự ưu tiên — đó là hành vi bình thường, không phải fallback.
-        logger.info(
-            f"ASR backend: '{chosen}' (yêu cầu='{key}', hiện có: "
-            f"{', '.join(sorted(avail))}; device: {backend_devices()}).",
+        logger.debug(
+            f"Backend active: '{chosen}' (yêu cầu='{key}', devices: {backend_devices()})",
             extra={"module_tag": _TAG},
         )
 

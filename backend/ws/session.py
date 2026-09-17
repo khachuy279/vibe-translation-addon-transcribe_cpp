@@ -315,7 +315,7 @@ class SessionState:
             })
             try:
                 await hotswap.activate_model(canonical)
-                logger.info(f"Đã chuyển model dịch sang '{canonical}'(không cần restart).", extra={"module_tag": "WS"})
+                logger.info(f"Session {self.session_id[:8]}: Swapped translation -> '{canonical}'", extra={"module_tag": "WS"})
                 await self.send_json({
                     "type": "model_status", "stage": "translation",
                     "state": "ready", "model": canonical,
@@ -399,9 +399,9 @@ class SessionState:
                 self.config["asr_engine"] = target_asr
                 applied["asr_engine"] = target_asr
                 self._schedule_asr_model_switch(target_asr)
-                logger.info(f"Session {self.session_id}: Yêu cầu chuyển ASR Model sang '{target_asr}'(nạp nền)", extra={"module_tag": "WS"})
+                logger.info(f"Session {self.session_id[:8]}: Switching ASR -> '{target_asr}'", extra={"module_tag": "WS"})
             elif not registry.has_model(target_asr):
-                logger.warning(f"Session {self.session_id}: ASR model '{target_asr}' không có trong catalog — bỏ qua", extra={"module_tag": "WS"})
+                logger.warning(f"Session {self.session_id[:8]}: ASR model '{target_asr}' không tồn tại", extra={"module_tag": "WS"})
 
         if self.asr_engine and "source_lang" in self.config:
             self.asr_engine.set_language(self.config["source_lang"])
@@ -500,4 +500,4 @@ class SessionState:
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         metrics_collector.record_metric("session", "cleanup_ms", elapsed_ms)
-        logger.info(f"Session {self.session_id}: Fast Cleanup hoàn tất trong {elapsed_ms:.2f}ms", extra={"module_tag": "WS"})
+        logger.info(f"Session {self.session_id[:8]}: Cleanup hoàn tất ({elapsed_ms:.1f}ms)", extra={"module_tag": "WS"})

@@ -176,7 +176,7 @@ class OmniVoiceTTS(BaseTTSEngine):
                 raise RuntimeError("Thư viện omnivoice chưa được cài đặt")
 
             model_path = self._resolve_model_path()
-            logger.info(f"Đang nạp PyTorch OmniVoice model từ: '{model_path}' trên thiết bị {self.device}...", extra={"module_tag": "TTS"})
+            logger.info(f"OmniVoice đang nạp trên thiết bị {self.device}...", extra={"module_tag": "TTS"})
             t0 = time.perf_counter()
 
             torch_dtype = torch.float16 if self.device != "cpu" and "cuda" in str(self.device) else torch.float32
@@ -233,7 +233,7 @@ class OmniVoiceTTS(BaseTTSEngine):
 
             self._is_loaded = True
             elapsed = time.perf_counter() - t0
-            logger.info(f"PyTorch OmniVoice đã nạp và warm-up hoàn tất trong {elapsed:.2f}s!", extra={"module_tag": "TTS"})
+            logger.info(f"OmniVoice đã sẵn sàng ({elapsed:.2f}s)", extra={"module_tag": "TTS"})
 
     async def prewarm(self) -> bool:
         """Khởi động và nạp sẵn mô hình trong tiến trình nền."""
@@ -283,7 +283,7 @@ class OmniVoiceTTS(BaseTTSEngine):
                     torch.cuda.empty_cache()
                     with contextlib.suppress(Exception):
                         torch.cuda.ipc_collect()
-        logger.info("Đã giải phóng OmniVoice model và dọn sạch VRAM.", extra={"module_tag": "TTS"})
+        logger.info("OmniVoice đã giải phóng (VRAM cleared)", extra={"module_tag": "TTS"})
 
     def _synthesize_audio(self, text: str, voice_id: Optional[str], speed: float) -> Tuple[Optional[np.ndarray], float]:
         """Sinh audio float32 (bỏ qua bước mã hóa). Trả (audio, duration_sec)."""
@@ -351,8 +351,8 @@ class OmniVoiceTTS(BaseTTSEngine):
         elapsed_ms = int(infer_time * 1000)
         rtf = (infer_time / duration_sec) if duration_sec > 0 else 0.0
         logger.info(
-            f"({voice_name} in {elapsed_ms}ms, {duration_sec:.2f}s, "
-                f"speed={effective_speed:.2f}x, RTF: {rtf:.3f}): '{clean_text}'", extra={"module_tag": "TTS"}
+            f"Synth {elapsed_ms}ms | audio {duration_sec:.2f}s | RTF {rtf:.2f} | voice={voice_name}: '{clean_text}'",
+            extra={"module_tag": "TTS"},
         )
         return audio_np, duration_sec
 

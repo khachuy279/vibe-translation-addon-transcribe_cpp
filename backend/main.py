@@ -85,11 +85,10 @@ def _log_asr_backend_at_startup() -> None:
         effective = asr_native.resolve_backend(config.asr.backend)
 
         bundle = info.get("native_bundle_dir")
-        source_desc = f"bundle bin/ ({info.get('native_bundle_source')})" if bundle else "wheel đã cài"
+        source_desc = f"bin/ ({info.get('native_bundle_source')})" if bundle else "installed"
         line = (
-            f"[STARTUP] ASR backend: yêu cầu='{requested}' → thực tế='{effective}' | "
-            f"native: {source_desc} | có sẵn: {', '.join(avail) or 'không rõ'} | "
-            f"device: {info.get('devices')}"
+            f"[STARTUP] Backend={effective} (req={requested}) | "
+            f"native={source_desc} | devices={info.get('devices')}"
         )
         if effective != requested and requested not in ("auto",):
             logger.warning(line, extra={"module_tag": "ASR"})
@@ -98,9 +97,7 @@ def _log_asr_backend_at_startup() -> None:
 
         if "cuda" not in avail:
             logger.info(
-                "[STARTUP] ASR: không có backend CUDA trong thư viện native đang nạp. "
-                "Đặt bundle có `ggml-cuda.dll` vào bin/ để bật CUDA, hoặc đặt "
-                "asr.backend='vulkan' để chỉ định rõ.",
+                "[STARTUP] Không có CUDA backend trong native bundle (dùng Vulkan/CPU)",
                 extra={"module_tag": "ASR"},
             )
     except Exception as exc:  # noqa: BLE001
@@ -229,7 +226,6 @@ def _prewarm_asr() -> None:
     """Nạp + pre-warm ASR (blocking; gọi qua asyncio.to_thread)."""
     try:
         TranscribeEngine().prewarm()
-        logger.info("[STARTUP] ASR model đã được nạp & pre-warm thành công!", extra={"module_tag": "ASR"})
     except Exception as e:
         logger.warning(f"[STARTUP] Cảnh báo pre-warm ASR: {e}", exc_info=True, extra={"module_tag": "ASR"})
 
@@ -238,7 +234,6 @@ def _prewarm_translation() -> None:
     """Nạp model dịch (blocking; gọi qua asyncio.to_thread)."""
     try:
         get_translation_engine().load_model()
-        logger.info("[STARTUP] Translation model đã được nạp & pre-warm thành công!", extra={"module_tag": "TRANSLATE"})
     except Exception as e:
         logger.warning(f"[STARTUP] Cảnh báo pre-warm Translation: {e}", exc_info=True, extra={"module_tag": "TRANSLATE"})
 
@@ -249,7 +244,7 @@ def _prewarm_vad_default() -> None:
         vad = VADProcessor(vad_engine=config.vad.vad_engine)
         vad.feed_chunk(bytes(800))
         logger.info(
-            f"[STARTUP] VAD engine mặc định '{config.vad.vad_engine}' đã sẵn sàng!",
+            f"[STARTUP] Engine '{config.vad.vad_engine}' sẵn sàng",
             extra={"module_tag": "VAD"},
         )
     except Exception as e:
@@ -274,10 +269,10 @@ def _prewarm_vad_others() -> None:
         statuses = VADEngineFactory.prewarm_engines(others, threshold=config.vad.threshold)
         for name, status in statuses.items():
             if status == "ok":
-                logger.info(f"[STARTUP] VAD engine '{name}' nạp nền xong.",
+                logger.info(f"[STARTUP] Engine '{name}' nạp nền xong",
                             extra={"module_tag": "VAD"})
             else:
-                logger.warning(f"[STARTUP] VAD engine '{name}' nạp nền thất bại: {status}",
+                logger.warning(f"[STARTUP] Engine '{name}' nạp nền thất bại: {status}",
                                extra={"module_tag": "VAD"})
     except Exception as e:
         logger.warning(f"[STARTUP] Cảnh báo nạp nền VAD engines: {e}", extra={"module_tag": "VAD"})
@@ -287,7 +282,7 @@ def _prewarm_vad_others() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Khởi tạo và pre-warm trước (Pre-warm) song song toàn bộ các mô hình khi máy chủ khởi động."""
-    logger.info("[STARTUP] Đang nạp và pre-warm song song ASR, Translation & VAD...", extra={"module_tag": "MAIN"})
+    logger.info("[STARTUP] Pre-warming pipeline: ASR, Translation, VAD...", extra={"module_tag": "MAIN"})
 
     _log_asr_backend_at_startup()
 
@@ -319,9 +314,9 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"Không bật được stall watchdog: {exc}", extra={"module_tag": "MAIN"})
 
-    logger.info("[STARTUP] Toàn bộ mô hình đã được pre-warm song song và sẵn sàng phục vụ!", extra={"module_tag": "MAIN"})
+    logger.info("[STARTUP] Pipeline sẵn sàng phục vụ", extra={"module_tag": "MAIN"})
     yield
-    logger.info("[SHUTDOWN] Đang giải phóng toàn bộ tài nguyên GPU & RAM...", extra={"module_tag": "MAIN"})
+    logger.info("[SHUTDOWN] Giải phóng GPU & RAM...", extra={"module_tag": "MAIN"})
     for t in list(_background_tasks):
         if not t.done():
             t.cancel()
@@ -361,7 +356,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.debug(f"Metrics dump notice: {e}", extra={"module_tag": "MAIN"})
 
-    logger.info("[SHUTDOWN] Hoàn tất tắt máy chủ an toàn.", extra={"module_tag": "MAIN"})
+    logger.info("[SHUTDOWN] Máy chủ đã dừng", extra={"module_tag": "MAIN"})
 
 
 
@@ -761,7 +756,7 @@ def main():
         "ssl_certfile": cert_path,
         "ssl_keyfile": key_path,
     }
-    logger.info(f"Chế độ WSS (SSL) kích hoạt với cert: {cert_path}", extra={"module_tag": "MAIN"})
+    logger.info(f"WSS (SSL) active: {Path(cert_path).name}", extra={"module_tag": "MAIN"})
 
     try:
         uvicorn.run(
@@ -774,7 +769,7 @@ def main():
             **ssl_kwargs,
         )
     except KeyboardInterrupt:
-        logger.info("Nhận tín hiệu ngắt (Ctrl+C). Đã dừng máy chủ an toàn.", extra={"module_tag": "MAIN"})
+        logger.info("Nhận Ctrl+C. Dừng máy chủ.", extra={"module_tag": "MAIN"})
 
 
 

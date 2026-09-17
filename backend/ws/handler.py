@@ -283,7 +283,7 @@ async def handle_ws(ws: WebSocket) -> None:
     session = SessionState(safe_ws)
     metrics_collector.increment_counter("ws.sessions_connected")
     metrics_collector.record_checkpoint(f"session_start_{session.session_id[:8]}")
-    logger.info(f"Session {session.session_id}: Đã kết nối từ client", extra={"module_tag": "WS"})
+    logger.info(f"Client connected (session {session.session_id[:8]})", extra={"module_tag": "WS"})
 
     session.init_components()
     register_session(session)
@@ -333,7 +333,7 @@ async def handle_ws(ws: WebSocket) -> None:
             msg_type = message.get("type", "")
 
             if msg_type == "websocket.disconnect":
-                logger.info(f"Session {session.session_id}: Client ngắt kết nối", extra={"module_tag": "WS"})
+                logger.info(f"Client disconnected (session {session.session_id[:8]})", extra={"module_tag": "WS"})
                 break
             elif "text" in message:
                 await _handle_text_message(session, message["text"])
@@ -341,17 +341,17 @@ async def handle_ws(ws: WebSocket) -> None:
                 await _handle_binary_message(session, message["bytes"])
 
     except WebSocketDisconnect:
-        logger.info(f"Session {session.session_id}: Client ngắt kết nối an toàn", extra={"module_tag": "WS"})
+        logger.info(f"Client disconnected (session {session.session_id[:8]})", extra={"module_tag": "WS"})
     except asyncio.CancelledError:
         if session_error:
             logger.error(
-                f"Session {session.session_id}: Buộc đóng phiên do worker gặp sự cố: {session_error}",
+                f"Session {session.session_id[:8]}: Buộc đóng phiên do worker gặp sự cố: {session_error}",
                 extra={"module_tag": "WS"},
             )
         else:
-            logger.info(f"Session {session.session_id}: Phiên bị hủy", extra={"module_tag": "WS"})
+            logger.info(f"Session {session.session_id[:8]}: Phiên bị hủy", extra={"module_tag": "WS"})
     except Exception as e:
-        logger.warning(f"Session {session.session_id}: Kết thúc vòng lặp do lỗi ({e})", exc_info=True, extra={"module_tag": "WS"})
+        logger.warning(f"Session {session.session_id[:8]}: Kết thúc vòng lặp do lỗi ({e})", exc_info=True, extra={"module_tag": "WS"})
     finally:
         t_cleanup_start = time.perf_counter()
 
@@ -377,7 +377,7 @@ async def handle_ws(ws: WebSocket) -> None:
         metrics_collector.record_checkpoint(f"session_end_{session.session_id[:8]}")
         metrics_collector.record_gauge("ws", "active_sessions", count_active_sessions())
         cleanup_ms = (time.perf_counter() - t_cleanup_start) * 1000.0 if t_cleanup_start else 0.0
-        logger.info(f"Session {session.session_id}: Đã đóng và giải phóng tài nguyên hoàn tất ({cleanup_ms:.2f}ms)", extra={"module_tag": "WS"})
+        logger.info(f"Session {session.session_id[:8]} closed ({cleanup_ms:.1f}ms)", extra={"module_tag": "WS"})
 
         # Ghi metrics report khi phiên kết thúc. TRƯỚC ĐÂY ĐOẠN NÀY BỊ THIẾU:
         # `config.metrics.dump_report_on_disconnect` / `report_file` là config CHẾT (không ai
@@ -831,8 +831,8 @@ async def _process_tts_item(
                 e2e_tts_ms = (time.perf_counter() - queued_at) * 1000.0
                 metrics_collector.record_metric("pipeline", "e2e_sub_to_tts_ms", e2e_tts_ms)
                 logger.info(
-                    f"{duration_sec:.2f}s ({len(frame)} bytes) cho utt "
-                        f"'{utt_id}'(synth={synthesis_ms:.1f}ms, RTF={tts_rtf:.2f})", extra={"module_tag": "WS"}
+                    f"[utt={utt_id}] TTS binary: {duration_sec:.2f}s ({len(frame)}B) | synth={synthesis_ms:.0f}ms | RTF={tts_rtf:.2f}",
+                    extra={"module_tag": "WS"},
                 )
         elif audio_b64:
             out_msg = make_tts_audio_msg(
@@ -847,7 +847,10 @@ async def _process_tts_item(
             if sent:
                 e2e_tts_ms = (time.perf_counter() - queued_at) * 1000.0
                 metrics_collector.record_metric("pipeline", "e2e_sub_to_tts_ms", e2e_tts_ms)
-                logger.info(f"Gửi {duration_sec:.2f}s audio về client cho utt '{utt_id}'(synth={synthesis_ms:.1f}ms, RTF={tts_rtf:.2f})", extra={"module_tag": "WS"})
+                logger.info(
+                    f"[utt={utt_id}] TTS JSON: {duration_sec:.2f}s | synth={synthesis_ms:.0f}ms | RTF={tts_rtf:.2f}",
+                    extra={"module_tag": "WS"},
+                )
     except Exception as e:
         logger.error(f"Lỗi TTS synthesis: {e}", exc_info=True, extra={"module_tag": "WS"})
 

@@ -48,7 +48,7 @@ class SileroVADEngine(BaseVADEngine):
         if torch.get_num_threads() > 2:
             torch.set_num_threads(2)
 
-        logger.info(f"Đã nạp model Silero VAD (JIT) từ: {self.model_path}", extra={"module_tag": "VAD"})
+        logger.info("Model Silero (JIT) sẵn sàng", extra={"module_tag": "VAD"})
 
     def _resolve_model_path(self, explicit_path: Optional[Union[str, Path]]) -> Path:
         if explicit_path and Path(explicit_path).exists():

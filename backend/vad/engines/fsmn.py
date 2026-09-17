@@ -21,6 +21,10 @@ class FsmnVADEngine(BaseVADEngine):
         self.model_dir = self._resolve_model_dir(model_dir)
         self._ensure_model_files()
 
+        import logging as _logging
+        _logging.getLogger("funasr").setLevel(_logging.ERROR)
+        _logging.getLogger("modelscope").setLevel(_logging.ERROR)
+
         from funasr import AutoModel
         self.model = AutoModel(
             model=str(self.model_dir),
@@ -36,7 +40,7 @@ class FsmnVADEngine(BaseVADEngine):
         self.model.model.vad_opts.speech_to_sil_time_thres = int(cfg.speech_to_sil_time_thres)
         self.model.model.vad_opts.sil_to_speech_time_thres = int(cfg.sil_to_speech_time_thres)
 
-        logger.info(f"Đã nạp engine FSMN-VAD từ: {self.model_dir}", extra={"module_tag": "VAD"})
+        logger.info("Model FSMN sẵn sàng", extra={"module_tag": "VAD"})
 
     def _resolve_model_dir(self, explicit_dir: Optional[Union[str, Path]]) -> Path:
         if explicit_dir and Path(explicit_dir).exists():
