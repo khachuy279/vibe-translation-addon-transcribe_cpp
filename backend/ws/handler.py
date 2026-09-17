@@ -680,7 +680,7 @@ async def _process_translation_item(
     elapsed_ms = int((time.monotonic() - start_t) * 1000)
     metrics_collector.record_metric("translation", "infer_ms", float(elapsed_ms))
 
-    logger.info(f"[utt={clean_utt}] ({src_lang} -> {tgt_lang} in {elapsed_ms}ms): '{translated}'", extra={"module_tag": "WS"})
+    logger.info(f"[utt={clean_utt}] ({src_lang} -> {tgt_lang} in {elapsed_ms}ms): '{translated}'", extra={"module_tag": "TRANSLATE"})
     ctx_tracker.add(text, translated)
 
     # 1. Gói tin translation chuyên biệt
@@ -831,8 +831,8 @@ async def _process_tts_item(
                 e2e_tts_ms = (time.perf_counter() - queued_at) * 1000.0
                 metrics_collector.record_metric("pipeline", "e2e_sub_to_tts_ms", e2e_tts_ms)
                 logger.info(
-                    f"[utt={utt_id}] TTS binary: {duration_sec:.2f}s ({len(frame)}B) | synth={synthesis_ms:.0f}ms | RTF={tts_rtf:.2f}",
-                    extra={"module_tag": "WS"},
+                    f"[utt={utt_id}] binary: {duration_sec:.2f}s ({len(frame)}B) | synth={synthesis_ms:.0f}ms | RTF={tts_rtf:.2f}",
+                    extra={"module_tag": "TTS"},
                 )
         elif audio_b64:
             out_msg = make_tts_audio_msg(
@@ -848,11 +848,11 @@ async def _process_tts_item(
                 e2e_tts_ms = (time.perf_counter() - queued_at) * 1000.0
                 metrics_collector.record_metric("pipeline", "e2e_sub_to_tts_ms", e2e_tts_ms)
                 logger.info(
-                    f"[utt={utt_id}] TTS JSON: {duration_sec:.2f}s | synth={synthesis_ms:.0f}ms | RTF={tts_rtf:.2f}",
-                    extra={"module_tag": "WS"},
+                    f"[utt={utt_id}] json: {duration_sec:.2f}s | synth={synthesis_ms:.0f}ms | RTF={tts_rtf:.2f}",
+                    extra={"module_tag": "TTS"},
                 )
     except Exception as e:
-        logger.error(f"Lỗi TTS synthesis: {e}", exc_info=True, extra={"module_tag": "WS"})
+        logger.error(f"Lỗi synthesis: {e}", exc_info=True, extra={"module_tag": "TTS"})
 
 
 async def _tts_worker(session: SessionState) -> None:
