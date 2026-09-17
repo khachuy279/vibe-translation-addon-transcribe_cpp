@@ -22,6 +22,46 @@ class AudioCapture {
     this._workletPathActive = false;
     this._workletWatchdog = null;
     this._workletChunksSeen = 0;
+    // GainNode điều khiển ÂM LƯỢNG NGHE của tiếng gốc (auto-ducking). Xem `setDuckLevel`.
+    this.duckGain = null;
+    this.duckLevel = 1.0;
+  }
+
+  /**
+   * Có thể duck bằng GainNode không (đường MediaElementSource).
+   *
+   * VÌ SAO QUAN TRỌNG: nhánh capture cho ASR lấy từ `sourceNode`, mà `sourceNode` **đã bị
+   * nhân bởi `video.volume`**. Nếu duck bằng cách hạ `video.volume` thì ASR cũng nhận audio
+   * nhỏ đi — và ở 0% thì nhận **im lặng kỹ thuật số** ⇒ VAD không thấy tiếng nói ⇒ **mất
+   * phụ đề, mất dịch, mất TTS**. Duck bằng GainNode chỉ tác động lên nhánh NGHE, còn nhánh
+   * capture luôn full-scale ⇒ kéo slider về 0% vẫn giữ nguyên phụ đề.
+   */
+  supportsGainDucking() {
+    return !!this.duckGain;
+  }
+
+  /**
+   * Đặt mức âm lượng NGHE của tiếng gốc (0..1). Không đụng `video.volume`.
+   * Trả `true` nếu đã xử lý bằng gain; `false` để caller rơi về đường `video.volume`.
+   */
+  setDuckLevel(level) {
+    if (!this.duckGain) return false;
+    const v = Math.max(0, Math.min(1, Number(level)));
+    if (!isFinite(v)) return false;
+    this.duckLevel = v;
+    try {
+      const ctx = this.audioContext;
+      const now = ctx ? ctx.currentTime : 0;
+      // Ramp ngắn để không nghe tiếng "cụp" khi kéo slider.
+      if (this.duckGain.gain.setTargetAtTime) {
+        this.duckGain.gain.setTargetAtTime(v, now, 0.015);
+      } else {
+        this.duckGain.gain.value = v;
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
 
@@ -47,8 +87,22 @@ class AudioCapture {
           target.__bsAudioCtx = new AudioCtx({ latencyHint: "interactive" });
           try {
             target.__bsSourceNode = target.__bsAudioCtx.createMediaElementSource(target);
-            // Route to speakers so the user still hears the video
-            target.__bsSourceNode.connect(target.__bsAudioCtx.destination);
+            // TÁCH NHÁNH NGHE KHỎI NHÁNH CAPTURE.
+            //
+            // `createMediaElementSource` cho ra tín hiệu ĐÃ bị nhân bởi `video.volume`.
+            // Bản cũ nối thẳng `sourceNode -> destination` rồi duck bằng cách hạ
+            // `video.volume`, nên ASR (lấy từ cùng `sourceNode`) cũng bị hạ theo — và ở 0%
+            // thì ASR nhận im lặng ⇒ mất phụ đề/TTS.
+            //
+            // Nay: đưa một GainNode vào CHỈ nhánh nghe. Ducking điều khiển gain này, còn
+            // `video.volume` giữ nguyên giá trị người dùng đặt trên trang.
+            //
+            //   sourceNode ─┬─> duckGain ──> destination      (người dùng nghe)
+            //               └─> workletNode ──> ASR            (luôn full-scale)
+            target.__bsDuckGain = target.__bsAudioCtx.createGain();
+            target.__bsDuckGain.gain.value = 1.0;
+            target.__bsSourceNode.connect(target.__bsDuckGain);
+            target.__bsDuckGain.connect(target.__bsAudioCtx.destination);
           } catch (elemErr) {
             console.warn("[AudioCapture] createMediaElementSource failed, trying stream capture:", elemErr);
           }
@@ -57,7 +111,11 @@ class AudioCapture {
         if (target.__bsSourceNode) {
           this.audioContext = target.__bsAudioCtx;
           this.sourceNode = target.__bsSourceNode;
-          console.log("[AudioCapture] Source: MediaElementSource (direct video audio, routed to speakers)");
+          this.duckGain = target.__bsDuckGain || null;
+          console.log(
+            "[AudioCapture] Source: MediaElementSource (direct video audio, routed to speakers)" +
+            (this.duckGain ? " + duckGain (ducking không ảnh hưởng ASR)" : "")
+          );
         } else {
           // Fallback: captureStream / mozCaptureStream
           let stream = null;
@@ -360,18 +418,34 @@ class AudioCapture {
 
     if (this.sourceNode) {
       try { this.sourceNode.disconnect(); } catch (e) {}
-      // If sourceNode was cached on video, re-route it to destination so video audio still plays
+      // If sourceNode was cached on video, re-route it so video audio still plays.
+      // QUAN TRỌNG: nối lại QUA `__bsDuckGain` (không nối thẳng vào destination), nếu không
+      // lần capture sau sẽ đi vòng qua gain và ducking mất tác dụng. Đồng thời trả gain về 1.0
+      // để tiếng gốc hết bị nhỏ khi đã dừng capture.
       if (this.videoElement && this.videoElement.__bsSourceNode && this.audioContext) {
-        try { this.videoElement.__bsSourceNode.connect(this.audioContext.destination); } catch (e) {}
+        try {
+          const dg = this.videoElement.__bsDuckGain;
+          if (dg) {
+            try { dg.gain.value = 1.0; } catch (e) {}
+            this.videoElement.__bsSourceNode.connect(dg);
+          } else {
+            this.videoElement.__bsSourceNode.connect(this.audioContext.destination);
+          }
+        } catch (e) {}
       }
       this.sourceNode = null;
     }
+
+    // Trả ducking về mặc định và quên gain của phiên này (gain vẫn thuộc videoElement).
+    this.duckLevel = 1.0;
+    this.duckGain = null;
 
     // Clean up AudioContext if it belongs to a disconnected video element (preventing memory leak)
     if (this.videoElement && !this.videoElement.isConnected && this.videoElement.__bsAudioCtx) {
       try { this.videoElement.__bsAudioCtx.close(); } catch (e) {}
       delete this.videoElement.__bsAudioCtx;
       delete this.videoElement.__bsSourceNode;
+      delete this.videoElement.__bsDuckGain;
     }
 
     // Do NOT close cached target.__bsAudioCtx if video is still active in DOM

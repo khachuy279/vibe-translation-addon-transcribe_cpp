@@ -391,6 +391,12 @@
       };
       await audioCapture.start(video);
 
+      // Nối ducking vào ĐỒ THỊ AUDIO của capture. Từ đây slider 🔉 Original audio điều khiển
+      // GainNode trên nhánh NGHE, nên `video.volume` không bị đụng tới và ASR (lấy từ cùng
+      // `sourceNode`) luôn nhận audio full-scale ⇒ kéo về 0% vẫn còn phụ đề + TTS.
+      // Phải gọi SAU `start()` vì gain chỉ tồn tại sau khi đồ thị được dựng.
+      ttsPlayer.setDuckSink(audioCapture);
+
       // Initialize overlay for Top window or if already in Fullscreen
       if (window === window.top || document.fullscreenElement) {
         ensureOverlay(video);
@@ -404,6 +410,10 @@
         if (document.fullscreenElement && !overlayManager) {
           ensureOverlay(video);
         }
+        // Lưới an toàn thứ hai cho ducking: nhiều trang reset `video.volume` ngay khi bắt đầu
+        // phát (hoặc khi người dùng kéo thanh âm lượng của chính trang). Guard `volumechange`
+        // trong tts-player đã bắt phần lớn trường hợp; đây là bản áp lại ở mốc `play`/`playing`.
+        try { ttsPlayer.reapplyDucking(); } catch (e) {}
       };
 
       document.addEventListener("fullscreenchange", handleStateKeepAlive, { signal });
@@ -434,6 +444,8 @@
       captureAbortController = null;
     }
     ttsPlayer.destroy();
+    // Ngắt tham chiếu tới đồ thị audio sắp bị dỡ, để ducking không gọi vào sink đã chết.
+    try { ttsPlayer.setDuckSink(null); } catch (e) {}
     if (audioCapture) {
       try { audioCapture.stop(); } catch (e) {}
       audioCapture = null;
