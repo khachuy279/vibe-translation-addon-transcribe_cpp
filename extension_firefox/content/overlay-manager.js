@@ -14,9 +14,13 @@ class OverlayManager {
 
     this.subPosY = 10; // Default: 10% from bottom
     this.subWidth = 80; // Default: 80% width of video container
+    this.origFontPercent = 2.5; // Default: 2.5% of video height
+    this.transFontPercent = 4.2; // Default: 4.2% of video height
 
     this._onFullscreenChange = this._onFullscreenChange.bind(this);
+    this._onWindowResize = this._onWindowResize.bind(this);
     this._domObserver = null;
+    this._resizeObserver = null;
   }
 
   // ── Lifecycle ────────────────────────────────────────────
@@ -59,15 +63,24 @@ class OverlayManager {
     // Create renderer inside content area
     this.renderer = new SubtitleRenderer(contentArea);
 
+    // Initial scale calculation & resize observer
+    this._setupResizeObserver();
+    this._updateScale();
+
     // Listen for fullscreen changes
     document.addEventListener("fullscreenchange", this._onFullscreenChange);
     document.addEventListener("webkitfullscreenchange", this._onFullscreenChange);
     document.addEventListener("mozfullscreenchange", this._onFullscreenChange);
+    if (typeof window !== "undefined") {
+      window.addEventListener("resize", this._onWindowResize);
+    }
 
     // Use MutationObserver instead of polling interval to re-attach if host is detached by page DOM updates
     this._domObserver = new MutationObserver(() => {
       if (this.isActive && this.host && !this.host.isConnected) {
         this._attachHost();
+        this._setupResizeObserver();
+        this._updateScale();
       }
     });
     try {
@@ -85,6 +98,8 @@ class OverlayManager {
     this.targetVideo = video;
     if (this.isActive && this.host) {
       this._attachHost();
+      this._setupResizeObserver();
+      this._updateScale();
     }
   }
 
@@ -196,9 +211,88 @@ class OverlayManager {
     }
   }
 
+  _getVideoDimensions() {
+    let width = 0;
+    let height = 0;
+
+    if (this.targetVideo && this.targetVideo.isConnected) {
+      const rect = this.targetVideo.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        width = rect.width;
+        height = rect.height;
+      }
+    }
+
+    if ((!width || !height) && this.host && this.host.isConnected) {
+      const rect = this.host.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        width = rect.width;
+        height = rect.height;
+      }
+    }
+
+    if ((!width || !height) && typeof window !== "undefined") {
+      if (document.fullscreenElement || window.innerHeight > 0) {
+        width = window.innerWidth;
+        height = window.innerHeight;
+      }
+    }
+
+    return { width: width || 854, height: height || 480 };
+  }
+
+  _calculateFontSizes() {
+    const { width, height } = this._getVideoDimensions();
+    // Use height as the primary baseline for subtitle scaling.
+    // For narrow/portrait aspect ratios (where width < height * 0.8, e.g. Shorts/TikTok),
+    // clamp the effective height so subtitles don't overflow horizontally.
+    const effectiveHeight = Math.min(height, width * 0.8);
+
+    const origPct = this.origFontPercent || 2.5;
+    const transPct = this.transFontPercent || 4.2;
+
+    const origPx = Math.max(9, Math.min(60, (effectiveHeight * origPct) / 100));
+    const transPx = Math.max(12, Math.min(90, (effectiveHeight * transPct) / 100));
+
+    return { origPx, transPx, effectiveHeight, width, height };
+  }
+
+  _updateScale() {
+    if (!this.container) return;
+    const { origPx, transPx, effectiveHeight } = this._calculateFontSizes();
+    this.container.style.setProperty("--bs-orig-size", `${origPx.toFixed(1)}px`);
+    this.container.style.setProperty("--bs-trans-size", `${transPx.toFixed(1)}px`);
+    this.container.style.setProperty("--bs-video-height", `${effectiveHeight.toFixed(0)}px`);
+  }
+
+  _setupResizeObserver() {
+    if (typeof ResizeObserver === "undefined") return;
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
+
+    this._resizeObserver = new ResizeObserver(() => {
+      this._updateScale();
+    });
+
+    if (this.targetVideo && this.targetVideo.isConnected) {
+      this._resizeObserver.observe(this.targetVideo);
+    }
+    if (this.host && this.host.isConnected) {
+      this._resizeObserver.observe(this.host);
+    }
+  }
+
+  _onWindowResize() {
+    this._updateScale();
+  }
+
   _onFullscreenChange() {
     setTimeout(() => {
       this._attachHost();
+      this._setupResizeObserver();
+      this._updateScale();
     }, 100);
   }
 
@@ -208,6 +302,14 @@ class OverlayManager {
     document.removeEventListener("fullscreenchange", this._onFullscreenChange);
     document.removeEventListener("webkitfullscreenchange", this._onFullscreenChange);
     document.removeEventListener("mozfullscreenchange", this._onFullscreenChange);
+    if (typeof window !== "undefined") {
+      window.removeEventListener("resize", this._onWindowResize);
+    }
+
+    if (this._resizeObserver) {
+      try { this._resizeObserver.disconnect(); } catch (e) {}
+      this._resizeObserver = null;
+    }
 
     if (this._domObserver) {
       try { this._domObserver.disconnect(); } catch (e) {}
@@ -247,11 +349,21 @@ class OverlayManager {
         this.subWidth = settings.subWidth;
         this.container.style.setProperty("--bs-sub-width", `${settings.subWidth}%`);
       }
-      if (settings.origFontSize) {
-        this.container.style.setProperty("--bs-orig-size", `${settings.origFontSize}px`);
+      if (settings.origFontSize !== undefined && settings.origFontSize !== null) {
+        let val = parseFloat(settings.origFontSize);
+        if (!isNaN(val)) {
+          // Backward compatibility: if old px value (>= 8), convert to percent
+          if (val >= 8) val = (val / 480) * 100;
+          this.origFontPercent = Math.min(6.0, Math.max(0.8, val));
+        }
       }
-      if (settings.transFontSize) {
-        this.container.style.setProperty("--bs-trans-size", `${settings.transFontSize}px`);
+      if (settings.transFontSize !== undefined && settings.transFontSize !== null) {
+        let val = parseFloat(settings.transFontSize);
+        if (!isNaN(val)) {
+          // Backward compatibility: if old px value (>= 8), convert to percent
+          if (val >= 8) val = (val / 480) * 100;
+          this.transFontPercent = Math.min(9.0, Math.max(1.5, val));
+        }
       }
       if (settings.fontWeight) {
         this.container.style.setProperty("--bs-font-weight", settings.fontWeight);
@@ -264,6 +376,8 @@ class OverlayManager {
       } else {
         this.container.style.removeProperty("--bs-font-family");
       }
+
+      this._updateScale();
     }
   }
 
@@ -303,8 +417,8 @@ class OverlayManager {
   _getStyles() {
     return `
       .bs-overlay {
-        --bs-orig-size: 13px;
-        --bs-trans-size: 17px;
+        --bs-orig-size: 14px;
+        --bs-trans-size: 22px;
         --bs-font-weight: 600;
         --bs-font-family: "Noto Sans", "Noto Sans JP", "Noto Sans CJK JP", "Noto Sans SC", "Noto Sans CJK SC", "Inter", "Segoe UI", Arial, sans-serif;
         --bs-sub-bottom: 10%;
@@ -338,7 +452,7 @@ class OverlayManager {
       
       /* ── 3-Layer Subtitle Architecture ───────────────────── */
       
-      /* Layer 1: Lịch sử cũ (cuộn lên trên, font nhỏ hơn 2px, mờ nhẹ) */
+      /* Layer 1: Lịch sử cũ (cuộn lên trên, font nhỏ hơn ~12%, mờ nhẹ) */
       .bs-history-layer {
         display: flex;
         flex-direction: column;
@@ -352,18 +466,18 @@ class OverlayManager {
         user-select: none !important;
       }
       .bs-history-layer .bs-original {
-        font-size: calc(var(--bs-orig-size) - 2px);
+        font-size: calc(var(--bs-orig-size) * 0.88);
         color: rgba(255, 255, 255, 0.8);
       }
       .bs-history-layer .bs-translated {
-        font-size: calc(var(--bs-trans-size) - 2px);
+        font-size: calc(var(--bs-trans-size) * 0.88);
         color: #cbd5e1;
       }
 
       /* Layer 2: Tiêu điểm trung tâm CỐ ĐỊNH (Anchor Focus) */
       .bs-focus-layer {
         margin: 2px 0;
-        min-height: 36px;
+        min-height: calc(var(--bs-trans-size) + var(--bs-orig-size) + 4px);
         display: flex;
         flex-direction: column;
         justify-content: center;
@@ -387,7 +501,7 @@ class OverlayManager {
       /* Layer 3: Liveview đang nhận diện & chờ dịch (Dưới cùng, cố định chiều cao) */
       .bs-live-layer {
         margin-top: 2px;
-        min-height: 22px;
+        min-height: calc(var(--bs-orig-size) + 6px);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -409,13 +523,13 @@ class OverlayManager {
         padding: 0;
       }
       .bs-live-layer .bs-original {
-        font-size: calc(var(--bs-orig-size) - 2px);
+        font-size: calc(var(--bs-orig-size) * 0.88);
         color: #94a3b8;
         font-style: italic;
         display: inline;
       }
       .bs-live-layer .bs-translating {
-        font-size: 14px;
+        font-size: calc(var(--bs-orig-size) * 0.95);
         color: #fbbf24;
         font-style: normal;
         display: inline-block;
@@ -440,7 +554,7 @@ class OverlayManager {
       .bs-sentence {
         margin-bottom: 2px;
         padding: 1px 0;
-        max-height: 150px;
+        max-height: 50vh;
         transition: transform 0.25s ease, opacity 0.3s ease, max-height 0.35s ease, margin 0.35s ease, padding 0.35s ease;
         pointer-events: none !important;
         user-select: none !important;
@@ -486,7 +600,7 @@ class OverlayManager {
         user-select: none !important;
       }
       .bs-translating { 
-        font-size: 13px; 
+        font-size: calc(var(--bs-orig-size) * 0.95); 
         color: #fbbf24; 
         font-style: italic; 
         margin-top: 1px; 

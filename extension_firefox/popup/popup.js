@@ -104,8 +104,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       translationModel: selTranslationModel ? selTranslationModel.value : "xiaomi",
       subPosY: parseInt(rangeSubPosY ? rangeSubPosY.value : 10, 10) || 10,
       subWidth: parseInt(rangeSubWidth ? rangeSubWidth.value : 80, 10) || 80,
-      origFontSize: parseInt(rangeOrigSize ? rangeOrigSize.value : 13, 10) || 13,
-      transFontSize: parseInt(rangeTransSize ? rangeTransSize.value : 17, 10) || 17,
+      origFontSize: parseFloat(rangeOrigSize ? rangeOrigSize.value : 2.5) || 2.5,
+      transFontSize: parseFloat(rangeTransSize ? rangeTransSize.value : 4.2) || 4.2,
       fontWeight: parseInt(rangeFontWeight ? rangeFontWeight.value : 600, 10) || 600,
       fontFamily: selFontFamily ? selFontFamily.value : "default",
       maxLines: parseInt(rangeMaxLines ? rangeMaxLines.value : 3, 10) || 3,
@@ -123,6 +123,19 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     return cfg;
   }
 
+  function normalizeFontPercent(val, isTrans = false) {
+    if (val === undefined || val === null) return isTrans ? 4.2 : 2.5;
+    const num = parseFloat(val);
+    if (isNaN(num)) return isTrans ? 4.2 : 2.5;
+    // If value is >= 8, it was previously saved in pixels (e.g. 10 - 36 px)
+    if (num >= 8) {
+      const converted = (num / 480) * 100;
+      const clamped = isTrans ? Math.min(8.0, Math.max(2.0, converted)) : Math.min(5.0, Math.max(1.0, converted));
+      return Math.round(clamped * 10) / 10;
+    }
+    return isTrans ? Math.min(8.0, Math.max(2.0, num)) : Math.min(5.0, Math.max(1.0, num));
+  }
+
   function updateRangeLabels() {
     if (valVadSilence && rangeVadSilence) valVadSilence.textContent = rangeVadSilence.value;
     if (valVadThreshold && rangeVadThreshold) valVadThreshold.textContent = parseFloat(rangeVadThreshold.value).toFixed(2);
@@ -132,8 +145,14 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     }
     if (valSubPosY && rangeSubPosY) valSubPosY.textContent = rangeSubPosY.value;
     if (valSubWidth && rangeSubWidth) valSubWidth.textContent = rangeSubWidth.value;
-    if (valOrigSize && rangeOrigSize) valOrigSize.textContent = rangeOrigSize.value;
-    if (valTransSize && rangeTransSize) valTransSize.textContent = rangeTransSize.value;
+    if (valOrigSize && rangeOrigSize) {
+      const v = parseFloat(rangeOrigSize.value);
+      valOrigSize.textContent = isNaN(v) ? "2.5" : v.toFixed(1);
+    }
+    if (valTransSize && rangeTransSize) {
+      const v = parseFloat(rangeTransSize.value);
+      valTransSize.textContent = isNaN(v) ? "4.2" : v.toFixed(1);
+    }
     if (valFontWeight && rangeFontWeight) valFontWeight.textContent = rangeFontWeight.value;
     if (valMaxLines && rangeMaxLines) valMaxLines.textContent = rangeMaxLines.value;
     if (valTtsSpeed && selTtsSpeed) valTtsSpeed.textContent = selTtsSpeed.value || "1.0";
@@ -657,8 +676,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       if (s.translationModel && selTranslationModel) selTranslationModel.value = s.translationModel;
       if (s.subPosY !== undefined && rangeSubPosY) rangeSubPosY.value = s.subPosY;
       if (s.subWidth !== undefined && rangeSubWidth) rangeSubWidth.value = s.subWidth;
-      if (s.origFontSize) rangeOrigSize.value = s.origFontSize;
-      if (s.transFontSize) rangeTransSize.value = s.transFontSize;
+      if (s.origFontSize !== undefined && rangeOrigSize) {
+        rangeOrigSize.value = normalizeFontPercent(s.origFontSize, false);
+      }
+      if (s.transFontSize !== undefined && rangeTransSize) {
+        rangeTransSize.value = normalizeFontPercent(s.transFontSize, true);
+      }
       if (s.fontWeight && rangeFontWeight) rangeFontWeight.value = s.fontWeight;
       if (s.fontFamily) selFontFamily.value = s.fontFamily;
       if (s.maxLines && rangeMaxLines) rangeMaxLines.value = s.maxLines;

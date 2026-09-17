@@ -202,6 +202,10 @@
           Object.assign(settings, msg.settings);
           if (overlayManager) overlayManager.applySettings(settings);
           if (ttsPlayer) {
+            if (!ttsPlayer.targetVideo || !ttsPlayer.targetVideo.isConnected) {
+              const v = getVideo();
+              if (v) ttsPlayer.setTargetVideo(v, settings.ttsDucking !== false, settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25, !!settings.ttsEnabled);
+            }
             ttsPlayer.applySettings(
               settings.ttsDucking !== false,
               settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25,
@@ -465,6 +469,10 @@
       Object.assign(settings, s);
       if (overlayManager) overlayManager.applySettings(settings);
       if (ttsPlayer) {
+        if (!ttsPlayer.targetVideo || !ttsPlayer.targetVideo.isConnected) {
+          const v = getVideo();
+          if (v) ttsPlayer.setTargetVideo(v, settings.ttsDucking !== false, settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25, !!settings.ttsEnabled);
+        }
         ttsPlayer.applySettings(
           settings.ttsDucking !== false,
           settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25,

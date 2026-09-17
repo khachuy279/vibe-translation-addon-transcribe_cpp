@@ -226,6 +226,11 @@ class OmniVoiceTTS(BaseTTSEngine):
             except Exception as e:
                 logger.debug(f"Warmup notice: {e}", extra={"module_tag": "TTS"})
 
+            # Thu hồi toàn bộ bộ nhớ trung gian tạm thời trong quá trình nạp trọng số & trích xuất prompt
+            # Giảm Reserved VRAM từ ~6.0GB xuống ~2.0GB (tiết kiệm ~4.0GB VRAM)
+            if torch.cuda.is_available() and "cuda" in str(self.device):
+                torch.cuda.empty_cache()
+
             self._is_loaded = True
             elapsed = time.perf_counter() - t0
             logger.info(f"PyTorch OmniVoice đã nạp và warm-up hoàn tất trong {elapsed:.2f}s!", extra={"module_tag": "TTS"})
@@ -245,8 +250,22 @@ class OmniVoiceTTS(BaseTTSEngine):
         with self._init_lock:
             with self._infer_lock:
                 self._is_loaded = False
+
+                # Giải phóng LRU cache của transformers (anti-pattern @lru_cache trên class method
+                # _get_conv1d_layers giữ chặt instance model và 527 weight tensors khiến rò rỉ ~800MB allocated / ~2GB reserved VRAM)
+                try:
+                    from transformers.models.higgs_audio_v2_tokenizer.modeling_higgs_audio_v2_tokenizer import (
+                        HiggsAudioV2TokenizerPreTrainedModel,
+                    )
+                    if hasattr(HiggsAudioV2TokenizerPreTrainedModel._get_conv1d_layers, "cache_clear"):
+                        HiggsAudioV2TokenizerPreTrainedModel._get_conv1d_layers.cache_clear()
+                except Exception:
+                    pass
+
                 if self.model is not None:
                     try:
+                        if hasattr(self.model, "audio_tokenizer"):
+                            self.model.audio_tokenizer = None
                         del self.model
                     except Exception:
                         pass

@@ -300,7 +300,7 @@ class TTSConfig(BaseModel):
     num_inference_steps: int = 8
     default_voice: str = "speaker_01_0039.wav"
     voices_dir: str = str(VOICES_DIR)
-    volume: float = 0.8
+    volume: float = 1
     sample_rate: int = 24000
 
 
