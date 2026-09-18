@@ -384,7 +384,16 @@ async def handle_ws(ws: WebSocket) -> None:
         # đọc) và `MetricsCollector.dump_json()` không có caller nào ⇒ `metrics_report.json`
         # không bao giờ được tạo. Đặt trong `finally` nên vẫn ghi dù phiên kết thúc do lỗi.
         if bool(getattr(config.metrics, "dump_report_on_disconnect", True)):
-            dump_metrics_report(reason=f"disconnect:{session.session_id[:8]}")
+            # QWEN-Q14: serialize toàn bộ metrics + `json.dump` ra file là việc ĐỒNG BỘ;
+            # chạy thẳng ở đây sẽ chặn event loop giữa lúc phiên khác đang chạy (đóng A →
+            # treo B vài ms–chục ms). Đẩy sang thread như `main.py` đã làm cho `/api/metrics/dump`.
+            try:
+                await asyncio.to_thread(
+                    dump_metrics_report, f"disconnect:{session.session_id[:8]}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"Ghi metrics report lúc ngắt phiên thất bại (bỏ qua): {exc}",
+                             extra={"module_tag": "WS"})
 
 
 async def _handle_text_message(session: SessionState, text: str) -> None:

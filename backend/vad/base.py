@@ -92,6 +92,20 @@ class BaseVADEngine(ABC):
     default_threshold: float = 0.45
     native_frame_samples: int = 400  # Số sample cho 1 bước tính (mặc định 25ms @ 16kHz)
 
+    @classmethod
+    def prepare_files(cls) -> None:
+        """QWEN-Q2: tải các file model cần thiết — **KHÔNG** dựng engine.
+
+        Được `VADEngineFactory.get_engine()` gọi **TRƯỚC** khi lấy lock cấp lớp, vì
+        `hf_hub_download`/`snapshot_download` có thể mất hàng phút khi mạng chậm. Bản cũ
+        để việc tải nằm *trong* constructor, tức là *trong* lock cấp lớp ⇒ mọi đường chỉ
+        cần ĐỌC (`is_cached`, `peek_engine` — có trên event loop) bị chặn theo, treo cả
+        backend.
+
+        Mặc định no-op cho engine không cần tải file (ví dụ Silero lấy model từ package).
+        """
+        return None
+
     @abstractmethod
     def create_initial_state(self, threshold: Optional[float] = None) -> VADStreamState:
         """Tạo trạng thái ban đầu cho 1 session stream mới."""

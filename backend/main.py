@@ -26,14 +26,15 @@ _PROJECT_ROOT = _HERE.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Tối ưu hóa Intel OpenMP / PyTorch / MKL để triệt tiêu hiện tượng busy-spin gây 100% CPU trên đa nhân
-os.environ["KMP_BLOCKTIME"] = "0"
-os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
+# A1-1: giới hạn thread CPU + tắt busy-spin OpenMP/OpenBLAS.
+# Biến môi trường đã được đặt trong `backend/__init__.py` (chạy trước mọi submodule) —
+# gọi lại ở đây chỉ để tường minh và cho đường chạy `python backend/main.py`.
+from backend import apply_thread_limits  # noqa: E402
+
+apply_thread_limits()
 
 # Tắt thanh tiến trình tqdm của HuggingFace để không làm rác log console
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 # Thiết lập giới hạn luồng PyTorch CPU sớm nhất có thể
 try:
@@ -231,17 +232,46 @@ def _prewarm_asr() -> None:
 
 
 def _prewarm_translation() -> None:
-    """Nạp model dịch (blocking; gọi qua asyncio.to_thread)."""
+    """Nạp model dịch + chạy 1 câu giả để build kernel/graph (blocking; qua `to_thread`).
+
+    QWEN-Q3: trước đây chỉ gọi `load_model()` ⇒ lần dịch ĐẦU TIÊN vẫn phải compile kernel
+    CUDA ngay trên câu thật của người dùng (đó là một phần giải thích
+    `translation.infer_ms` max ~2061 ms trong khi p50 chỉ 433 ms).
+    `GGUFTranslator.prewarm()` đã tồn tại nhưng **không có call-site nào** ngoài test —
+    nay nối vào đây. Đổi lại: khởi động chậm thêm ~1–3 s để mọi câu sau đều nhanh.
+    """
     try:
-        get_translation_engine().load_model()
+        get_translation_engine().prewarm()
     except Exception as e:
         logger.warning(f"[STARTUP] Cảnh báo pre-warm Translation: {e}", exc_info=True, extra={"module_tag": "TRANSLATE"})
 
 
-def _prewarm_vad_default() -> None:
-    """P1.9: nạp engine VAD đang dùng NGAY (cần cho audio đầu tiên)."""
+def _prewarm_tts() -> None:
+    """Nạp model lồng tiếng (blocking; gọi qua `asyncio.to_thread`).
+
+    QWEN-Q3: lifespan trước đây KHÔNG prewarm TTS, nên `_synthesize_audio` nạp lazy
+    (`tts/engine.py`: `if not self._is_loaded: self.load_model()`) ⇒ câu lồng tiếng ĐẦU
+    TIÊN của mỗi lần bật TTS phải trả giá vài GB trọng số + warmup (nhiều giây) — đúng
+    câu người dùng vừa chờ. Chỉ chạy khi `config.tts.enabled` để không chiếm VRAM vô ích.
+    """
     try:
-        vad = VADProcessor(vad_engine=config.vad.vad_engine)
+        get_tts_engine().load_model()
+    except Exception as e:
+        logger.warning(f"[STARTUP] Cảnh báo pre-warm TTS: {e}", exc_info=True, extra={"module_tag": "TTS"})
+
+
+def _prewarm_vad_default() -> None:
+    """P1.9: nạp engine VAD đang dùng NGAY (cần cho audio đầu tiên).
+
+    QWEN-Q2: dùng `VADProcessor.prewarm()` (ĐỒNG BỘ, có chủ đích) thay vì dựa vào
+    `__init__`/`feed_chunk` — hai đường đó nay KHÔNG nạp model nữa (chúng chạy trên
+    event loop / đường hot). Hàm này đã được gọi qua `asyncio.to_thread` (xem `lifespan`)
+    nên chặn ở đây là đúng chỗ. `auto_load=False` để `__init__` không hẹn nạp ở thread
+    nền song song với `prewarm()` (tránh nạp 2 lần).
+    """
+    try:
+        vad = VADProcessor(vad_engine=config.vad.vad_engine, auto_load=False)
+        vad.prewarm()
         vad.feed_chunk(bytes(800))
         logger.info(
             f"[STARTUP] Engine '{config.vad.vad_engine}' sẵn sàng",
@@ -286,12 +316,17 @@ async def lifespan(app: FastAPI):
 
     _log_asr_backend_at_startup()
 
-    results = await asyncio.gather(
+    prewarm_jobs = [
         asyncio.to_thread(_prewarm_asr),
         asyncio.to_thread(_prewarm_translation),
         asyncio.to_thread(_prewarm_vad_default),
-        return_exceptions=True,
-    )
+    ]
+    # QWEN-Q3: TTS trước đây KHÔNG có trong lifespan ⇒ câu lồng tiếng ĐẦU TIÊN phải trả
+    # giá nạp vài GB trọng số. Chỉ prewarm khi người dùng thật sự bật TTS (không chiếm VRAM).
+    if bool(getattr(config.tts, "enabled", False)):
+        prewarm_jobs.append(asyncio.to_thread(_prewarm_tts))
+
+    results = await asyncio.gather(*prewarm_jobs, return_exceptions=True)
     for res in results:
         if isinstance(res, Exception):
             logger.warning(f"[STARTUP] Lỗi thành phần trong quá trình prewarm: {res}", extra={"module_tag": "MAIN"})

@@ -34,6 +34,7 @@ from backend.translation.registry import TranslationModelRegistry
 from backend.translation.prompts import get_prompt_strategy
 from backend.utils.model_download import ensure_model_file
 from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TRANSLATION
+from backend.utils.text_repetition import collapse_repetitions
 
 _TRANS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="translation_worker")
 
@@ -138,13 +139,92 @@ class GGUFTranslator(BaseTranslator):
 
     @classmethod
     def _release_llm(cls, llm: Optional[Any]) -> None:
-        """Giải phóng một model dịch (chờ lượt suy luận đang chạy trên nó kết thúc trước)."""
+        """Giải phóng một model dịch (chờ lượt suy luận đang chạy trên nó kết thúc trước).
+
+        ⚠️ Hàng rào `with cls._infer_lock: pass` chỉ bảo vệ được thread CHƯA vào vùng
+        suy luận. Nó KHÔNG bảo vệ thread đã đọc con trỏ `_shared_llm` rồi mới xếp hàng
+        chờ lock — đó chính là Q1 (race use-after-free). Vì vậy `_translate_sync` /
+        `_translate_stream_sync` BẮT BUỘC phải đọc lại con trỏ SAU khi đã giữ lock
+        (xem `_snapshot_infer_state`).
+        """
         if llm is None:
             return
         with cls._infer_lock:
             pass  # hàng rào: không đóng model khi còn thread đang sinh token trên nó
         cls._close_llm_quietly(llm)
         logger.info("Model đã giải phóng khỏi GPU", extra={"module_tag": "TRANSLATE"})
+
+    def _snapshot_infer_state(self):
+        """Q1 (P0): ảnh chụp NHẤT QUÁN của model + cấu hình sinh. GỌI KHI ĐANG GIỮ `_infer_lock`.
+
+        Vì sao phải đọc trong lock: `reconfigure()` / `load_model()` / `unload_model()`
+        đổi `_shared_llm` rồi gọi `_release_llm(old)` — mà `_release_llm` chỉ `close()`
+        SAU khi đã đi qua `_infer_lock`. Nên con trỏ đọc khi đang giữ `_infer_lock`
+        **chắc chắn còn sống**; còn con trỏ đọc TRƯỚC lock có thể đã bị đóng.
+
+        Lấy luôn `_shared_lock` để ảnh chụp không bị "nửa cũ nửa mới": `reconfigure()`
+        ghi cả `_shared_llm`, `_shared_model_key`, `self.cfg`, `self.prompt_strategy`
+        trong CÙNG một `_shared_lock`. Thứ tự `_infer_lock` → `_shared_lock` là thứ tự
+        DUY NHẤT được phép trong dự án (xem `asr/engine.py:13-22`); chiều ngược lại
+        không tồn tại vì `load_model`/`reconfigure` nhả `_shared_lock` TRƯỚC khi chờ
+        `_infer_lock` (qua `_release_llm`), nên không thể deadlock.
+        """
+        cls = self.__class__
+        with cls._shared_lock:
+            return cls._shared_llm, cls._shared_model_key, self.cfg, self.prompt_strategy
+
+    def _shared_config_snapshot(self):
+        """QWEN-Q1: ảnh chụp `(model_key, cfg, prompt_strategy)` dưới `_shared_lock`.
+
+        RẺ — chỉ lấy `_shared_lock` (giữ vài µs, KHÔNG chờ inference), nên dùng được
+        TRƯỚC khi build prompt. Cần thiết vì `reconfigure()` ghi `canonical_key`, `self.cfg`
+        và `self.prompt_strategy` trong cùng một `_shared_lock`: đọc rời ba thứ đó ra có
+        thể ghép **key model mới với prompt/cfg cũ** ⇒ prompt của model cũ gửi cho model
+        mới (chất lượng câu đó giảm, không phải crash nhưng vẫn sai).
+
+        Đây KHÔNG phải lồng lock: `_shared_lock` được nhả trước khi xin `_infer_lock`, nên
+        thứ tự `_infer_lock` → `_shared_lock` vẫn là thứ tự duy nhất được dùng khi lồng.
+        """
+        cls = self.__class__
+        with cls._shared_lock:
+            return cls._shared_model_key, self.cfg, self.prompt_strategy
+
+    def _prepare_infer(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        context: str,
+        key: Optional[str],
+        cfg: TranslationConfig,
+        strategy: Any,
+    ):
+        """Tính `(prompt, kwargs)` cho một cặp (model key, cfg, prompt strategy). KHÔNG giữ lock.
+
+        Tách ra để `_translate_sync` build prompt NGOÀI lock (giữ nguyên đặc tính của
+        FIX-04), nhưng vẫn build lại được NGAY TRONG lock nếu `reconfigure()` đổi model
+        đúng vào lúc giữa hai bước (Q1).
+        """
+        info = self.registry.get_model(key) or {}
+        kwargs = {
+            "max_tokens": cfg.max_tokens,
+            "temperature": cfg.temperature if cfg.temperature is not None else info.get("temperature", 0.7),
+            "top_p": cfg.top_p if cfg.top_p is not None else info.get("top_p", 0.6),
+            "top_k": cfg.top_k if cfg.top_k is not None else info.get("top_k", 20),
+            "repeat_penalty": (
+                cfg.repetition_penalty if cfg.repetition_penalty is not None
+                else info.get("repetition_penalty", 1.05)
+            ),
+            "stop": strategy.get_stop_tokens(),
+        }
+        prompt = strategy.build_prompt(
+            text=text,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            context=context,
+            use_context=cfg.use_context,
+        )
+        return prompt, kwargs
 
     def _log_load_failure(self, exc: Exception) -> None:
         """Báo lỗi nạp model đúng MỘT lần (tránh spam mỗi câu) rồi trả nguyên văn gốc."""
@@ -280,41 +360,38 @@ class GGUFTranslator(BaseTranslator):
             self._log_load_failure(exc)
             return {"translated_text": text, "elapsed_ms": 0.0}
 
-        llm = self.__class__._shared_llm
-        if llm is None:
+        # Chỉ để KIỂM TRA SỚM (khỏi build prompt vô ích). TUYỆT ĐỐI không dùng con trỏ này
+        # để gọi model — xem `_snapshot_infer_state()` bên trong `_infer_lock` (Q1).
+        if self.__class__._shared_llm is None:
             return {"translated_text": text, "elapsed_ms": 0.0}
 
-        info = self.registry.get_model(self.canonical_key) or {}
-        temperature = self.cfg.temperature if self.cfg.temperature is not None else info.get("temperature", 0.7)
-        top_p = self.cfg.top_p if self.cfg.top_p is not None else info.get("top_p", 0.6)
-        top_k = self.cfg.top_k if self.cfg.top_k is not None else info.get("top_k", 20)
-        repetition_penalty = self.cfg.repetition_penalty if self.cfg.repetition_penalty is not None else info.get("repetition_penalty", 1.05)
-
-        prompt = self.prompt_strategy.build_prompt(
-            text=text,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            context=context,
-            use_context=self.cfg.use_context,
+        built_key, built_cfg, built_strategy = self._shared_config_snapshot()
+        prompt, kwargs = self._prepare_infer(
+            text, source_lang, target_lang, context,
+            built_key, built_cfg, built_strategy,
         )
-        stop_tokens = self.prompt_strategy.get_stop_tokens()
 
         with self.__class__._infer_lock:
+            # Q1 (P0 — race use-after-free): đọc LẠI con trỏ SAU khi đã giữ lock.
+            llm, shared_key, cfg, strategy = self._snapshot_infer_state()
+            if llm is None:
+                # Model bị unload trong lúc ta build prompt.
+                return {"translated_text": text, "elapsed_ms": 0.0}
+            if shared_key != built_key:
+                # `reconfigure()` đã đổi model giữa lúc build prompt ⇒ prompt vừa build
+                # thuộc model CŨ. Build lại cho khớp model sẽ thực sự chạy.
+                prompt, kwargs = self._prepare_infer(
+                    text, source_lang, target_lang, context,
+                    shared_key, cfg, strategy,
+                )
             t0 = time.perf_counter()
-            output = llm(
-                prompt,
-                max_tokens=self.cfg.max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repeat_penalty=repetition_penalty,
-                stop=stop_tokens,
-            )
+            output = llm(prompt, **kwargs)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
             raw_text = output["choices"][0]["text"].strip()
-            # Dọn dẹp khoảng trắng
-            clean_out = raw_text.replace("<|im_end|>", "").strip()
+            # Dọn dẹp khoảng trắng + gộp cụm lặp: model dịch cũng "kẹt vòng" khi đầu vào là
+            # chuỗi lặp (ca thật: ASR trả 'ha ha ha…' ⇒ dịch trả về ~150 lần 'ha' trong 2395 ms).
+            clean_out = collapse_repetitions(raw_text.replace("<|im_end|>", "").strip())
 
             return {
                 "translated_text": clean_out,
@@ -366,37 +443,30 @@ class GGUFTranslator(BaseTranslator):
             self._log_load_failure(exc)
             yield text
             return
-        llm = self.__class__._shared_llm
-        if llm is None:
+        # Chỉ KIỂM TRA SỚM — không dùng con trỏ này để gọi model (Q1).
+        if self.__class__._shared_llm is None:
             yield text
             return
 
-        info = self.registry.get_model(self.canonical_key) or {}
-        temperature = self.cfg.temperature if self.cfg.temperature is not None else info.get("temperature", 0.7)
-        top_p = self.cfg.top_p if self.cfg.top_p is not None else info.get("top_p", 0.6)
-        top_k = self.cfg.top_k if self.cfg.top_k is not None else info.get("top_k", 20)
-        repetition_penalty = (
-            self.cfg.repetition_penalty if self.cfg.repetition_penalty is not None
-            else info.get("repetition_penalty", 1.05)
+        built_key, built_cfg, built_strategy = self._shared_config_snapshot()
+        prompt, kwargs = self._prepare_infer(
+            text, source_lang, target_lang, context,
+            built_key, built_cfg, built_strategy,
         )
-        prompt = self.prompt_strategy.build_prompt(
-            text=text, source_lang=source_lang, target_lang=target_lang,
-            context=context, use_context=self.cfg.use_context,
-        )
-        stop_tokens = self.prompt_strategy.get_stop_tokens()
 
         with self.__class__._infer_lock:
+            # Q1 (P0): đọc LẠI con trỏ SAU khi đã giữ lock (xem `_snapshot_infer_state`).
+            llm, shared_key, cfg, strategy = self._snapshot_infer_state()
+            if llm is None:
+                yield text
+                return
+            if shared_key != built_key:
+                prompt, kwargs = self._prepare_infer(
+                    text, source_lang, target_lang, context,
+                    shared_key, cfg, strategy,
+                )
             acc = ""
-            for chunk in llm(
-                prompt,
-                max_tokens=self.cfg.max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repeat_penalty=repetition_penalty,
-                stop=stop_tokens,
-                stream=True,
-            ):
+            for chunk in llm(prompt, **kwargs, stream=True):
                 try:
                     piece = chunk["choices"][0].get("text", "")
                 except (KeyError, IndexError, TypeError):
@@ -404,7 +474,9 @@ class GGUFTranslator(BaseTranslator):
                 if not piece:
                     continue
                 acc += piece
-                yield acc
+                # Gộp cụm lặp NGAY trên bản streaming: nếu model kẹt vòng thì phụ đề không
+                # phình thành một bức tường chữ (và độ dài hiển thị bị chặn trên).
+                yield collapse_repetitions(acc)
             if not acc:
                 return
 

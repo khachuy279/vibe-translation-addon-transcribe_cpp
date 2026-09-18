@@ -117,9 +117,16 @@ class WSClient {
         this.port.onDisconnect.addListener(() => {
           this.isConnected = false;
           this._stopPing();
+          this.port = null;
           if (!settled) {
             settled = true;
             reject(new Error("Background bridge disconnected"));
+          } else {
+            // QWEN-E6: Firefox kill port của service worker khi SW idle (~30 s). Bản cũ chỉ
+            // xử lý nhánh `!settled` ⇒ khi port chết SAU khi đã nối, không ai hẹn nối lại:
+            // phiên "sống sót ảo" — người dùng tưởng đang chạy nhưng không còn phụ đề mới.
+            this._emit("disconnected", { code: 1006, reason: "background port closed" });
+            this._scheduleReconnect();
           }
         });
 

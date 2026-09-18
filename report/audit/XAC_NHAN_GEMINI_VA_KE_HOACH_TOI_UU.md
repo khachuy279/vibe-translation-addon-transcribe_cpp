@@ -10,12 +10,17 @@
 
 ## 0. TÓM TẮT ĐIỀU HÀNH
 
+> ⚠️ **ĐÍNH CHÍNH 2025-09-17:** mục G-01 trong tài liệu này **đã sai** và đã được sửa (§2.1).
+> Số đo "1,0–1,67×" là **artefact của harness chạy ở 8× tốc độ thật**; đo lại ở **1× realtime cho
+> 8,75–9,23×**. **Gemini đúng ở finding "preview 9×".** Xem
+> `report/audit/XAC_NHAN_QWEN_VA_DINH_CHINH.md`.
+
 Báo cáo Gemini đúng về **phần lớn cấu trúc** (đọc mã chính xác, `file:line` khớp), nhưng
-**các con số định lượng bị phóng đại nghiêm trọng**, và **2/15 finding sai hẳn**. Nếu áp dụng
+**một số con số định lượng bị phóng đại**, và **2/15 finding sai hẳn**. Nếu áp dụng
 nguyên văn lộ trình của họ, ta sẽ:
 
-- Đầu tư vào "incremental Mel cache" (Phase 3, 5 ngày, rủi ro cao) để đổi lấy thứ **chỉ chiếm
-  1,0–1,67× chứ không phải 9×**.
+- ~~Đầu tư vào "incremental Mel cache"…~~ → **NGƯỢC LẠI: đây chính là việc nên làm** (ratio thật
+  8,75–9,23×, xem §2.1b). Mục này là **kết luận sai của tôi**, không phải của Gemini.
 - Viết lại kiến trúc đa phiên theo một mô hình mà **thư viện native tuyên bố không hỗ trợ**.
 - Giải phóng "450 MB VRAM" từ KV cache — con số thật là **33,6 MB**.
 - "Sửa" một cache vốn **đã được chặn ở 8 entry**.
@@ -24,20 +29,20 @@ nguyên văn lộ trình của họ, ta sẽ:
 
 | Kết luận | Số lượng | Gồm |
 | :--- | :---: | :--- |
-| ✅ Đúng, giữ nguyên mức độ | 7 | G-05, G-07, G-08, G-09, G-11, G-12, G-13 |
-| ⚠️ Đúng về cấu trúc, **SAI về mức độ** | 3 | G-01 (9× → 1,0–1,67×), G-04 (20–40% → không tái lập), G-10 |
+| ✅ Đúng, giữ nguyên mức độ | 8 | **G-01 (đã sửa — trước đây tôi xếp sai vào nhóm dưới)**, G-05, G-07, G-08, G-09, G-11, G-12, G-13 |
+| ⚠️ Đúng về cấu trúc, **SAI về mức độ** | 2 | G-04 (20–40% → không tái lập), G-10 |
 | 🔶 Đúng nhưng **fix đề xuất KHÔNG an toàn** | 1 | G-03 |
 | 🔶 Đúng nhưng **không đáng làm** | 1 | G-15 |
 | ❌ **SAI hẳn** | 2 | G-02, G-14 |
 | ❓ Không kiểm chứng được / phóng đại | 1 | con số VRAM & "audio drift 5–15 s" |
 
-**3 con số then chốt của báo cáo Gemini đều sai:**
+**Con số then chốt của báo cáo Gemini (sau đính chính):**
 
-| Gemini nói | Đo/kiểm thực tế | Sai số |
+| Gemini nói | Đo/kiểm thực tế | Kết luận |
 | :--- | :--- | :--- |
-| Preview lãng phí **9×** | **1,00 – 1,67×** | phóng đại ~5–9× |
-| `n_ctx=512` tốn **~450 MB** VRAM | **33,6 MB** (32 layer × 4 KV-head × 128 dim × 2 × 2 byte) | phóng đại **~13×** |
-| Vulkan+CUDA gây **+20–40%** latency | p50 **không đổi** (187–199 vs 195–202 ms) | không tái lập |
+| Preview lãng phí **9×** | **8,75 – 9,23×** (1× realtime) | ✅ **Gemini ĐÚNG** — số "1,00–1,67×" cũ của tôi là artefact 8× pacing |
+| `n_ctx=512` tốn **~450 MB** VRAM | **33,6 MB** (32 layer × 4 KV-head × 128 dim × 2 × 2 byte) | ❌ phóng đại **~13×** |
+| Vulkan+CUDA gây **+20–40%** latency | p50 **không đổi** (187–199 vs 195–202 ms) | ❌ không tái lập |
 
 ---
 
@@ -45,7 +50,7 @@ nguyên văn lộ trình của họ, ta sẽ:
 
 | ID | Gemini claim | Kết luận | Bằng chứng |
 | :--- | :--- | :---: | :--- |
-| **G-01** | Preview recompute **9×** trên cửa sổ 6 s | ⚠️ **Sai mức độ** | Đo `preview_recompute_ratio` (metric FIX-10 có sẵn trong code): **1,00 / 1,67 / 1,58** trên 3 file dài 19 s / 88 s / 28 s. Xem §2.1 |
+| **G-01** | Preview recompute **9×** trên cửa sổ 6 s | ✅ **ĐÚNG** (⚠️ **tôi từng bác bỏ sai**) | Số đo cũ của tôi (**1,00 / 1,67 / 1,58**) chạy ở **8× pacing** nên bị bóp méo — ratio tỉ lệ thuận với tốc độ pacing (`asr/engine.py:1317`). **Đo lại 1× realtime: 8,75 – 9,23×**; QWEN đo phiên thật: 6,83× (window 6 s). Gemini đúng. Xem §2.1 + `XAC_NHAN_QWEN_VA_DINH_CHINH.md` §2 |
 | **G-02** | Tạo **Session Pool** N session dùng chung weights để chạy đa phiên | ❌ **SAI** | `transcribe_cpp.Model.__doc__`: *"at most one run/stream may be IN FLIGHT across all sessions of a model at a time — sessions share the model's compute backend, so overlapping runs race... or **load one Model per worker** for true parallelism."* Xem §2.2 |
 | **G-03** | `_infer_lock` giữ suốt generator streaming | 🔶 **Đúng, fix không an toàn** | `translation/engine.py:388-409` xác nhận. Nhưng **1 `llama_context` dùng chung**: nhả lock giữa các chunk cho phép inference khác ghi đè KV cache ⇒ hỏng dữ liệu. Xem §2.3 |
 | **G-04** | Vulkan(ASR)+CUDA gây **+20–40%** latency do context switch | ⚠️ **Không tái lập** | Đo 2 thứ tự: ASR p50 Vulkan 199,4/186,9 vs CUDA 201,9/194,8 (**không chênh**). CUDA chỉ tốt hơn ở **đuôi** p95 (237→213, 249→203). Xem §2.4 |
@@ -75,7 +80,44 @@ nguyên văn lộ trình của họ, ta sẽ:
 
 ## 2. ĐÍNH CHÍNH CHI TIẾT
 
-### 2.1. G-01 — Lãng phí preview là **1,0–1,67×**, không phải 9×
+### 2.1. G-01 — ⚠️ **ĐÍNH CHÍNH: số đo 1,0–1,67× CỦA TÔI LÀ SAI. Ratio thật là 8,75–9,23× — Gemini ĐÚNG.**
+
+> **Sửa ngày 2025-09-17.** Mục dưới đây đã **bị bác bỏ bằng đo lại**. Giữ nguyên phần cũ để truy vết
+> lỗi phương pháp, nhưng **kết luận đúng** nằm ở §2.1b và ở
+> `report/audit/XAC_NHAN_QWEN_VA_DINH_CHINH.md` §2.
+
+**Lỗi phương pháp:** harness `run_paced(..., speed=…)` đẩy audio **nhanh hơn thời gian thật** `speed`
+lần, nhưng số vòng preview do **thời gian thực** quyết định (`poll_interval_ms=300`). Bộ đếm cộng theo
+**số vòng** (`asr/engine.py:1317`), nên `ratio ≈ số vòng ≈ độ_dài_câu / (0,3 × speed)`. Chạy ở **8×**
+⇒ ratio bị đo **thấp giả tạo đúng ~8 lần** (1,58 ≈ 3,8 / (0,3 × 8)). Con số 1,0–1,67× là **artefact
+của harness**, không phải hành vi hệ thống — và nó đã dẫn tôi tới khuyến nghị **sai** ở mục C.1.
+
+**Cách đo cũ (SAI):** chạy `test_08_streaming_latency.run_paced` ở 8× tốc độ →
+`_stream_asr_tokens`, đọc gauge `asr.preview_recompute_ratio` mà code đã instrument sẵn (FIX-10).
+Script: `external/build-tmp/g01_measure_ratio.py`.
+
+#### 2.1b. Đo lại ở **1× (realtime)** — `external/build-tmp/g01_ratio_1x.py`
+
+`SPEED=1.0`, `poll=300 ms`, `preview_window_sec=8.0`, backend CUDA:
+
+| File | Audio | Đưa qua model | Audio thật | **ratio** |
+| :--- | ---: | ---: | ---: | ---: |
+| `Japanese_5s.wav` | 5,1 s | **45,7 s** | 5,0 s | **9,23** |
+| `Chinese_noise_28s.wav` | 28,3 s | **42,5 s** | 4,8 s | **8,75** |
+
+| Nguồn | Ratio | Đánh giá |
+| :--- | ---: | :--- |
+| Gemini (bản gốc) | ~9× | ✅ **ĐÚNG** |
+| QWEN (phiên thật, window 6 s) | 6,83× | ✅ **ĐÚNG** |
+| Tôi (8× pacing) | 1,00–1,67× | ❌ **SAI — artefact harness** |
+| **Đo lại 1×** | **8,75–9,23×** | ✅ chuẩn |
+
+⇒ Mỗi giây audio thật tốn **~9 giây** inference ASR. **Gemini đúng, QWEN đúng, tôi sai.**
+Khuyến nghị **C.1 phải đảo ngược** (xem bảng cuối §3).
+
+---
+
+#### (nội dung gốc, đã bị bác bỏ — chỉ để truy vết)
 
 **Cách đo:** chạy **chính pipeline streaming thật** (`test_08_streaming_latency.run_paced` →
 `_stream_asr_tokens`), đọc gauge `asr.preview_recompute_ratio` mà code đã instrument sẵn (FIX-10).
@@ -87,18 +129,20 @@ Script: `external/build-tmp/g01_measure_ratio.py`.
 | `English_multiple_kinds_of_noise_88s` | 88,2 s | 9,5 s | 5,7 s | **1,67** |
 | `Chinese_noise_28s` | 28,3 s | 9,9 s | 6,3 s | **1,58** |
 
-**Vì sao Gemini sai:** họ giả định preview chạy **đều đặn mỗi 300 ms** từ 0,35 s tới 5,8 s (16 vòng),
-mỗi vòng tính lại toàn bộ cửa sổ. Thực tế code đã có 4 cơ chế chặn điều đó:
+**~~Vì sao Gemini sai~~ (lập luận ĐÃ BỊ BÁC BỎ — các "cơ chế chặn" dưới đây CHỈ giới hạn số vòng
+xuống ~9 vòng/câu, KHÔNG đưa ratio về 1,0; chúng không hề mâu thuẫn với con số 9×):**
 
-1. `preview_adaptive_backoff` (P2.4b) — **tự giãn nhịp** khi inference chậm (`preview_slow_ms=350`).
-2. `preview_yielded_to_commit` — bỏ vòng preview khi có commit đang chờ.
-3. `defer_preview` — chỉ cho `max_inflight_infer=1` inference cùng lúc.
-4. `preview_window_sec=6.0` chặn trần, và `_finalize_recompute_metrics` **reset bộ đếm mỗi câu**.
+> 1. `preview_adaptive_backoff` (P2.4b) — **tự giãn nhịp** khi inference chậm (`preview_slow_ms=350`).
+> 2. `preview_yielded_to_commit` — bỏ vòng preview khi có commit đang chờ.
+> 3. `defer_preview` — chỉ cho `max_inflight_infer=1` inference cùng lúc.
+> 4. `preview_window_sec` chặn trần (hiện mặc định **8.0**, không phải 6.0), và
+>    `_finalize_recompute_metrics` **reset bộ đếm mỗi câu**. → Điểm 4 chính là điều làm phép đo ở
+>    **8× pacing** sai: bộ đếm reset mỗi câu + số vòng do thời gian thực quyết định.
 
-**Ý nghĩa cho kế hoạch:** cận trên thật của lợi ích từ incremental Mel cache là **~40%** compute ASR
-(1,67→1,0), không phải "giảm 40–60% GPU ASR compute" như Gemini hứa. Với **2/3 file đo được ratio ≤ 1,6**
-và ASR đã ở RTF 0,02–0,03 (thừa 30–50×), đây **không phải** ưu tiên. Hạ từ CRITICAL xuống **P3 — chỉ làm
-nếu có số đo trên phiên thật chứng minh cần**.
+**Ý nghĩa cho kế hoạch (ĐÃ SỬA):** với `preview_window_sec=8`, ratio thật **8,75–9,23×** ⇒ cận trên lợi
+ích từ incremental/reuse preview **không phải ~40% mà là ~85–90%** compute ASR. Duty cycle ASR ≈ 30%
+GPU **chỉ riêng cho preview** ở 1 phiên realtime. Đây **là ưu tiên CAO**, không phải P3: đảo ngược
+hoàn toàn khuyến nghị cũ ở mục C.1 (§3).
 
 ### 2.2. G-02 — Kiến trúc "Session Pool chia sẻ weights" **không khả thi**
 
@@ -346,7 +390,7 @@ khi 430 ms dịch mới là phần lớn độ trễ.
 
 | # | Việc | Điều kiện tiên quyết |
 | :--- | :--- | :--- |
-| **C.1** | Incremental / adaptive preview (mel cache) | **Bắt buộc** đo `preview_recompute_ratio` trên phiên video thật trước. Ngưỡng: nếu ratio **< 2,5** thì **KHÔNG làm** (lợi ích < 30% compute ASR, mà ASR chỉ chiếm phần nhỏ của e2e). Đo hiện tại: **1,0–1,67** ⇒ **chưa đủ lý do** |
+| **C.1** | Incremental / adaptive preview (mel cache) | ✅ **NÊN LÀM — ưu tiên cao** (đảo ngược khuyến nghị cũ). Ngưỡng đặt ra là "ratio < 2,5 thì KHÔNG làm"; đo lại ở **1× realtime cho ratio 8,75–9,23×**, vượt ngưỡng **~3,5 lần**. Bước rẻ nhất trước: **bật `preview_reuse_for_commit`** (`config.py:178`, code có sẵn, chạy `test_09` A/B WER). Số đo cũ "1,0–1,67 ⇒ chưa đủ lý do" là **SAI** (artefact 8× pacing) |
 | **C.2** | Dynamic `n_ctx` cho dịch | Tiết kiệm thật **~8 MB** (384 vs 512 ctx). **Không đáng** — loại |
 | **C.3** | GPU time-stretch (torch.stft trên CUDA) | Chỉ có lợi khi `speed != 1.0`. Đo thật thời gian `apply_time_stretch()` trước; nếu < 60 ms thì để nguyên |
 
@@ -356,7 +400,7 @@ khi 430 ms dịch mới là phần lớn độ trễ.
 | :--- | :--- |
 | Task 1.1: "Ép `asr.backend='cuda'` mặc định, chấm dứt Vulkan+CUDA" | G-04 **không tái lập**: p50 không chênh. Vulkan là đường `transcribe.cpp` **hỗ trợ chính thức** nên phải giữ làm fallback. *(Bạn đã đặt default `cuda` — hợp lý vì tốc độ 1,53×, nhưng lý do **không phải** tranh chấp.)* |
 | Task 2.1: "Nhả `_infer_lock` giữa các chunk" | **Nguy hiểm** — hỏng KV cache (§2.3) |
-| Task 3.1: Incremental Mel cache (5 ngày) | Lợi ích thật 1,0–1,67× ⇒ < 40% compute ASR, không phải "40–60% GPU" (§2.1) |
+| Task 3.1: Incremental Mel cache / bật `preview_reuse_for_commit` | ✅ **NÊN LÀM — ưu tiên cao.** Lợi ích thật **8,75–9,23×** ở 1× realtime ⇒ tới **~90% compute ASR preview** (§2.1b). Khuyến nghị cũ "1,0–1,67× ⇒ không đáng" là **SAI** (artefact 8× pacing) |
 | Task 3.2: Session Pool chia sẻ weights | **Không khả thi** — binding cấm (§2.2) |
 | G-14: "bounded cache cho VoiceClonePrompt" | Đã bounded ở 8 entry từ trước (§2.5) |
 | G-15: ring-buffer queue | `K ≤ 32`, chỉ khi quá tải ⇒ không đáng (§1) |
@@ -450,7 +494,10 @@ khi số đo không ủng hộ (như A.2 và A.4 ở Phase A).
 ---
 
 **Tài liệu liên quan:** `BAO_CAO_AUDIT_HIEU_NANG_Gemini.md` (bản gốc),
+`BAO_CAO_AUDIT_HIEU_NANG_QWEN.md` (audit QWEN),
+`XAC_NHAN_QWEN_VA_DINH_CHINH.md` (**thẩm định QWEN + 5 đính chính, gồm đính chính §2.1 của tài liệu này**),
 `KE_HOACH_FIX_LOI_Hy3.md` (§4.1.2–4.3b: gate build CUDA, hạ tầng `bin/`, GpuArbiter),
 `05_measurements_and_status.md`.
-**Script đo sinh ra tài liệu này:** `external/build-tmp/g01_measure_ratio.py` (§2.1),
-`g04_contention.py` (§2.4), `g_kv_verify.py` (§1).
+**Script đo sinh ra tài liệu này:** `external/build-tmp/g01_measure_ratio.py` (§2.1 — **lỗi 8× pacing**),
+`g01_ratio_1x.py` (**đo lại 1× — số đúng**), `g04_contention.py` (§2.4), `g_kv_verify.py` (§1),
+`g02_min_silence_frame.py` + `g03_health_cost.py` (thẩm định Q11/Q9).

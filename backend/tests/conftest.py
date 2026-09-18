@@ -30,7 +30,16 @@ setup_cuda_dll_paths()
 # với `0xc0000139` (STATUS_ENTRYPOINT_NOT_FOUND) — tiến trình chết cứng khi import.
 # `backend/main.py` tình cờ đúng thứ tự này (asr.engine nạp trước translation.engine);
 # ở đây ta chốt thứ tự tường minh cho MỌI module test.
+#
+# ⚠️ NHƯNG phải để `backend.asr` BOOTSTRAP trước: `bootstrap()` đặt `TRANSCRIBE_LIBRARY`
+# trỏ vào bundle `bin/` (nếu có). Nếu `import transcribe_cpp` chạy trước, native của WHEEL
+# (chỉ Vulkan) đã vào `sys.modules` và bundle `bin/` (CUDA) KHÔNG áp được — cả suite test
+# sẽ chạy sai backend so với bản phát hành. Thứ tự đúng vẫn bảo toàn yêu cầu nạp DLL ở
+# trên, vì `transcribe_cpp` vẫn được nạp TRƯỚC `llama_cpp`.
 try:  # pragma: no cover - phụ thuộc môi trường
+    from backend.asr import native as _asr_native
+
+    _asr_native.bootstrap()
     import transcribe_cpp  # noqa: F401
 except Exception:
     pass

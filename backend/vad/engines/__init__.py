@@ -4,6 +4,7 @@ import threading
 from typing import Dict, Tuple, Any, Optional
 
 from backend.config import config
+from backend.utils.logger import logger
 from backend.vad.base import BaseVADEngine
 from backend.vad.engines.firered import FireRedVADEngine
 from backend.vad.engines.fsmn import FsmnVADEngine
@@ -17,10 +18,28 @@ class VADEngineFactory:
 
     _engines: Dict[str, BaseVADEngine] = {}
     _lock: threading.RLock = threading.RLock()
+    # QWEN-Q2: lock RIÊNG cho bước tải file model. Không dùng chung `_lock` vì
+    # `_lock` còn bảo vệ pool — mà `is_cached()`/`peek_engine()` (được EVENT LOOP gọi
+    # ở `VADProcessor.__init__`/`apply_engine_change`) cũng lấy `_lock`. Giữ `_lock`
+    # qua một lượt `hf_hub_download` vài phút = treo cả backend.
+    _prepare_lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def _factory_for(cls, engine: str):
+        if engine == "firered-vad":
+            return FireRedVADEngine
+        if engine == "silero-vad":
+            return SileroVADEngine
+        return FsmnVADEngine
 
     @classmethod
     def get_engine(cls, engine_name: str) -> BaseVADEngine:
-        """Lấy hoặc khởi tạo instance Engine VAD dùng chung."""
+        """Lấy hoặc khởi tạo instance Engine VAD dùng chung (double-checked locking).
+
+        QWEN-Q2: bước TẢI model chạy **ngoài** `_lock`, dưới `_prepare_lock` riêng. Bản
+        cũ giữ `_lock` suốt constructor ⇒ trong lúc tải model, mọi `is_cached()` /
+        `peek_engine()` từ event loop bị chặn theo.
+        """
         engine = (engine_name or "firered-vad").lower().strip()
         if engine not in SUPPORTED_VAD_ENGINES:
             engine = "firered-vad"
@@ -29,13 +48,25 @@ class VADEngineFactory:
             if engine in cls._engines:
                 return cls._engines[engine]
 
-            if engine == "firered-vad":
-                instance = FireRedVADEngine()
-            elif engine == "silero-vad":
-                instance = SileroVADEngine()
-            else:  # fsmn-vad
-                instance = FsmnVADEngine()
+        # ── NGOÀI `_lock`: có thể chậm (tải model) ───────────────────────────────
+        # `_prepare_lock` chỉ chặn các luồng ĐANG TẢI cùng lúc (tránh hai luồng cùng ghi
+        # vào một cache dir), KHÔNG chặn đường đọc trạng thái.
+        with cls._prepare_lock:
+            try:
+                cls._factory_for(engine).prepare_files()
+            except Exception as exc:  # noqa: BLE001
+                # Không tải được file ⇒ vẫn thử dựng engine (có thể engine tự xử lý hoặc
+                # báo lỗi rõ hơn). Không được để lỗi tải che mất nguyên nhân thật.
+                logger.warning(
+                    f"Chuẩn bị file model cho VAD engine '{engine}' gặp lỗi "
+                        f"({type(exc).__name__}: {exc}) — vẫn thử dựng engine.",
+                    extra={"module_tag": "VAD"},
+                )
 
+        with cls._lock:
+            if engine in cls._engines:      # luồng khác đã dựng xong trong lúc ta tải
+                return cls._engines[engine]
+            instance = cls._factory_for(engine)()
             cls._engines[engine] = instance
             return instance
 

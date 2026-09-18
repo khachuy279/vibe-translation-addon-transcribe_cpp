@@ -44,15 +44,37 @@ class MetricsCollector:
         self._lock = threading.Lock()
         self._start_time = time.time()
 
+    @staticmethod
+    def _enabled() -> bool:
+        """QWEN-Q10: `config.metrics.enabled=False` phải THẬT SỰ tắt việc ĐO.
+
+        Bản cũ: cờ này chỉ được đọc ở `dump_metrics_report`, còn `record_latency` /
+        `increment_counter` / `record_gauge` / `record_checkpoint` chạy **vô điều kiện**
+        ⇒ mục "tắt metrics cho nhanh" là **config nói dối**, và toàn bộ chi phí (lock toàn
+        cục, deque append, percentile) luôn bật.
+
+        Đọc `config` mỗi lần gọi (1 `getattr`) để bật/tắt được lúc runtime như mọi config
+        khác. Đây là `if` rẻ, KHÔNG lấy lock khi đang tắt.
+        """
+        try:
+            from backend.config import config
+
+            return bool(getattr(config.metrics, "enabled", True))
+        except Exception:  # noqa: BLE001
+            # Không đọc được config (import vòng lúc khởi động) ⇒ giữ hành vi cũ: BẬT.
+            return True
+
     def record_latency(self, stage: str, latency_ms: float) -> None:
         """Ghi nhận thời gian thực thi (ms) cho một công đoạn."""
-        if latency_ms < 0:
+        if not self._enabled() or latency_ms < 0:
             return
         with self._lock:
             self._latencies[stage].append(latency_ms)
 
     def record_gauge(self, stage: str, name: str, value: float) -> None:
         """Ghi giá trị tức thời (độ sâu queue, số mục đang chờ...). Ghi đè giá trị cũ."""
+        if not self._enabled():
+            return
         try:
             v = float(value)
         except (TypeError, ValueError):
@@ -70,6 +92,8 @@ class MetricsCollector:
 
     def increment_counter(self, name: str, count: int = 1) -> None:
         """Tăng bộ đếm sự kiện (ví dụ sample drop, dedup skip)."""
+        if not self._enabled():
+            return
         with self._lock:
             self._counters[name] += count
 
@@ -204,6 +228,8 @@ class MetricsCollector:
 
     def record_checkpoint(self, name: str) -> None:
         """Ghi nhận checkpoint thời gian (bounded, tự đẩy mục cũ nhất ra)."""
+        if not self._enabled():
+            return
         with self._lock:
             self._checkpoints[name] = time.time()
             self._checkpoints.move_to_end(name)

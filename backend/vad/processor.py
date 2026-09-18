@@ -51,6 +51,7 @@ class VADStreamProcessor:
         on_speech_start: Optional[Callable[[], None]] = None,
         on_speech_end: Optional[Callable[[], None]] = None,
         engine_override: Optional[BaseVADEngine] = None,
+        auto_load: bool = True,
     ):
         self.sample_rate = sample_rate
         self.vad_engine = (vad_engine or "firered-vad").lower().strip()
@@ -74,6 +75,7 @@ class VADStreamProcessor:
         self._desired_engine: Optional[str] = None
         self._engine_load_thread: Optional[threading.Thread] = None
         self._vad_enabled_warned: bool = False
+        self._engine_not_ready_warned: bool = False
         # P4.6: đánh dấu đã force_end/reset. Vì model nay chạy NGOÀI lock nên một batch
         # có thể đang bay khi force_end() được gọi; kết quả của batch đó phải bị BỎ để
         # không sinh ra speech START mới sau khi phiên đã được chốt/đóng.
@@ -89,7 +91,29 @@ class VADStreamProcessor:
             self._frame_size_bytes = self._frame_samples * 2
             self._state = self._new_state(engine_override, self.threshold)
         else:
-            self._ensure_engine()
+            # ══ QWEN-Q2 (P0) ══════════════════════════════════════════════════════
+            # `__init__` chạy TRÊN EVENT LOOP (`ws/handler.py` → `SessionState.
+            # init_components()` → đây). Bản cũ gọi `_ensure_engine()` ở đây, đường xuống
+            # `VADEngineFactory.get_engine()` — mà constructor engine có thể gọi
+            # `hf_hub_download` (hàng phút nếu mạng chậm) TRONG lock cấp lớp ⇒ asyncio
+            # không preempt được code đồng bộ ⇒ TOÀN BỘ backend đứng hình (mọi phiên WS,
+            # health, REST, heartbeat).
+            #
+            # Nay `__init__` chỉ làm việc RẺ:
+            #  • engine đã có trong pool (đường thường gặp — đã prewarm lúc khởi động)
+            #    ⇒ lấy tham chiếu, CHƯA dựng state (state để VAD worker dựng ở chunk đầu,
+            #    vì `create_initial_state` của Silero nạp JIT model = chậm);
+            #  • engine chưa có ⇒ hẹn nạp ở thread nền, không chặn ai.
+            # `auto_load=False` dành cho caller sẽ tự gọi `prewarm()` ngay sau đó
+            # (`main._prewarm_vad_default`) — tránh nạp hai lần song song.
+            engine = VADEngineFactory.peek_engine(self.vad_engine)
+            if engine is not None:
+                self._engine = engine
+                self._frame_samples = getattr(engine, "native_frame_samples", 400)
+                self._frame_size_bytes = self._frame_samples * 2
+            elif auto_load:
+                self._desired_engine = self.vad_engine
+                self._spawn_engine_load(self.vad_engine)
 
     # ------------------------------------------------------------------ helpers
     def _max_pre_frames(self, frame_samples: int) -> int:
@@ -102,15 +126,63 @@ class VADStreamProcessor:
         state.pre_speech_ring = deque(maxlen=self._max_pre_frames(frame_samples))
         return state
 
-    def _ensure_engine(self) -> None:
-        """Đảm bảo engine và session state đã được khởi tạo (off-lock)."""
+    def _new_bare_state(self) -> VADStreamState:
+        """QWEN-Q5: `VADStreamState` **RỖNG** (chưa có cache của engine).
+
+        Dùng cho `reset()`: rẻ O(1) nên gọi được trên event loop (đường tua video gọi
+        `vad.reset()`), nhưng vẫn cho **identity mới** để batch đang bay bị bỏ.
+        Cả ba engine đều tự khởi tạo cache ở frame kế tiếp — `is_speech` kiểm
+        `firered_postprocessor is None` / `silero_iterator is None` / `not fsmn_cache`.
+
+        ⚠️ Phải gán lại `pre_speech_ring` có `maxlen`: `VADStreamState` khai
+        `default_factory=deque` **không giới hạn**, nên một state rỗng dựng thẳng sẽ rò RAM
+        (mỗi frame im lặng được append mãi).
+        """
+        state = VADStreamState()
+        state.pre_speech_ring = deque(maxlen=self._max_pre_frames(self._frame_samples))
+        return state
+
+    def _ensure_engine(self) -> bool:
+        """Đảm bảo engine VÀ session state sẵn sàng. **KHÔNG BAO GIỜ tải/nạp model.**
+
+        QWEN-Q2: bản cũ gọi thẳng `VADEngineFactory.get_engine()` — hàm này có thể TẢI
+        model từ HuggingFace. Đường gọi gồm `VADProcessor.__init__` (event loop!) và
+        `feed_chunk` (VAD worker). Nay hàm chỉ lấy engine **đã có sẵn trong pool**
+        (`peek_engine`, chỉ đọc biến); nếu chưa có thì hẹn nạp ở thread nền và trả `False`
+        để caller BỎ chunk thay vì treo.
+
+        Trả `True` nếu engine + state đã sẵn sàng.
+        """
         if self._engine is None:
-            self._engine = VADEngineFactory.get_engine(self.vad_engine)
-            self._frame_samples = getattr(self._engine, "native_frame_samples", 400)
+            engine = VADEngineFactory.peek_engine(self.vad_engine)
+            if engine is None:
+                self._spawn_engine_load(self.vad_engine)
+                return False
+            self._engine = engine
+            self._frame_samples = getattr(engine, "native_frame_samples", 400)
             self._frame_size_bytes = self._frame_samples * 2
 
         if self._state is None:
+            # Chậm với Silero (nạp JIT model) — nhưng đây là VAD worker thread, KHÔNG phải
+            # event loop, nên không treo đường mạng.
             self._state = self._new_state(self._engine, self.threshold)
+        return True
+
+    def prewarm(self) -> bool:
+        """QWEN-Q2: nạp engine + state **ĐỒNG BỘ**. CHỈ gọi từ thread nền.
+
+        Dùng cho đường prewarm lúc khởi động (`main._prewarm_vad_default` chạy trong
+        `asyncio.to_thread`) và cho test. Không được gọi trên event loop.
+        """
+        engine = VADEngineFactory.get_engine(self.vad_engine)
+        state = self._new_state(engine, self.threshold)
+        with self._lock:
+            self._engine = engine
+            self._frame_samples = getattr(engine, "native_frame_samples", 400)
+            self._frame_size_bytes = self._frame_samples * 2
+            self._state = state
+            self._desired_engine = None
+        return True
 
     # ------------------------------------------------------------------ cấu hình
     def apply_engine_change(self, engine_name: str) -> None:
@@ -151,8 +223,13 @@ class VADStreamProcessor:
             t0 = time.perf_counter()
             try:
                 VADEngineFactory.get_engine(engine_name)
-                if self._engine is None:
-                    self._ensure_engine()
+                # QWEN-Q2: KHÔNG gọi `_ensure_engine()` ở đây nữa — hàm đó nay là
+                # non-blocking (có thể trả False ngay). Dựng state tường minh qua
+                # `apply_engine_change` (tạo state NGOÀI `self._lock`, gán TRONG lock), và
+                # nếu engine vẫn chưa gán được (đã có engine khác đang chạy) thì để
+                # `_ensure_engine` lo ở chunk kế tiếp.
+                if self._engine is None or self._state is None:
+                    self.apply_engine_change(engine_name)
                 logger.info(
                     f"Đã nạp xong engine '{engine_name}' trong {time.perf_counter() - t0:.2f}s "
                         f"(sẽ kích hoạt ở chunk kế tiếp).",
@@ -243,7 +320,21 @@ class VADStreamProcessor:
                 metrics_collector.increment_counter("vad.enabled_flag_forced_on")
             self.enabled = True
 
-        self._ensure_engine()
+        # QWEN-Q2: nếu engine chưa sẵn sàng thì BỎ chunk này thay vì nạp/tải model ngay
+        # trên đường hot. Trước đây dòng này gọi thẳng factory ⇒ có thể tải model hàng
+        # phút ngay giữa lúc đang nhận audio. Nay việc nạp do thread nền lo; chỉ mất audio
+        # của những chunk đến trước khi engine xong (đường thường gặp: đã prewarm lúc khởi
+        # động nên không bao giờ rơi vào đây).
+        if not self._ensure_engine():
+            metrics_collector.increment_counter("vad.chunks_dropped_engine_not_ready")
+            if not self._engine_not_ready_warned:
+                self._engine_not_ready_warned = True
+                logger.warning(
+                    f"Engine VAD '{self.vad_engine}' chưa nạp xong — BỎ các chunk đến sớm "
+                        f"(đang nạp ở thread nền, sẽ tự dùng ở chunk sau).",
+                    extra={"module_tag": "VAD"},
+                )
+            return
 
         # P4.6 / F-13: TÁCH phần chạy model RA NGOÀI `self._lock`.
         # Trước đây `engine.is_speech()` (một forward PyTorch mỗi frame 25 ms) chạy BÊN
@@ -428,24 +519,39 @@ class VADStreamProcessor:
         P4.6: hàm này KHÔNG còn bị block bởi inference VAD (model chạy ngoài lock).
         Đồng thời đánh dấu `_stopped` để batch inference đang bay bị bỏ, tránh sinh
         speech START mới sau khi đã chốt/đóng phiên.
+
+        QWEN-Q4: callback được gọi **NGOÀI** `self._lock` (giống bước 3 của `feed_chunk`).
+        Bản cũ gọi `on_speech_end()` khi ĐANG giữ lock ⇒ chuỗi ngược dòng
+        (`on_speech_end` → ASR lấy `asr._lock` + `call_soon_threadsafe`) tạo thứ tự lock
+        VAD→ASR *từ trong lock*; chỉ cần một callback tương lai gọi ngược vào VAD
+        (`update_config`/`reset`) là deadlock cổ điển, và giữ lock suốt callback còn chặn
+        `feed_chunk` của chính phiên đó xếp hàng (head-of-line).
         """
+        callback: Optional[Callable[[], None]] = None
         with self._lock:
             self._stopped = True
             if self._state and self._state.is_speech:
                 self._state.is_speech = False
                 self._state.silence_samples = 0
-                if self.on_speech_end:
-                    try:
-                        self.on_speech_end()
-                    except Exception as e:
-                        logger.error(f"VAD on_speech_end callback error: {e}", extra={"module_tag": "VAD"})
+                callback = self.on_speech_end
+        if callback:
+            try:
+                callback()
+            except Exception as e:
+                logger.error(f"VAD on_speech_end callback error: {e}", extra={"module_tag": "VAD"})
 
     def reset(self) -> None:
-        """Reset trạng thái processor (cho phép nhận audio trở lại)."""
+        """Reset trạng thái processor (cho phép nhận audio trở lại).
+
+        QWEN-Q5: phải gán `VADStreamState` **MỚI**, KHÔNG `reset()` in-place. `feed_chunk`
+        bỏ kết quả của batch đang bay bằng so sánh **IDENTITY**
+        (`if self._state is not state or self._stopped`) — sửa field in-place giữ nguyên
+        identity nên batch cũ vẫn ghi được vào state vừa reset ⇒ trộn trạng thái câu cũ
+        với câu mới (đếm im lặng sai, START/END lệch).
+        """
         with self._lock:
             self._stopped = False
-            if self._state:
-                self._state.reset()
+            self._state = self._new_bare_state()
             self._overflow_count = 0
 
 

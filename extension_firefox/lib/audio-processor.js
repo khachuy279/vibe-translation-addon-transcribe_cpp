@@ -17,6 +17,10 @@
 const DEFAULT_TARGET_RATE = 16000;
 const DEFAULT_CHUNK_SIZE = 1024;
 
+// QWEN-E5: lọc thông thấp TRƯỚC khi decimation khi tỉ lệ là số nguyên >= 2.
+// Boxcar `ratio` tap: rẻ (1 phép cộng/mẫu vào), đủ để chặn gập phổ trên Nyquist đích.
+const BOXCAR_MIN_RATIO = 2;
+
 class AudioCaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -25,6 +29,9 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
     this.chunkSize = opts.chunkSize || DEFAULT_CHUNK_SIZE;
     // `sampleRate` = rate của AudioContext (thường 48000). Tỉ lệ resample.
     this.ratio = sampleRate / this.targetRate;
+    // QWEN-E5: tỉ lệ nguyên (48k→16k = 3) làm `frac` luôn bằng 0 ⇒ nội suy tuyến tính suy
+    // biến thành decimation trần, không lọc chống aliasing. Bật boxcar cho trường hợp đó.
+    this._useBoxcar = Number.isInteger(this.ratio) && this.ratio >= BOXCAR_MIN_RATIO;
 
     // Pha dư của bộ resample (chỉ số nguồn dạng phân số còn nợ cho block kế tiếp).
     this.phase = 0;
@@ -69,6 +76,48 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
       this.resampleBuffer = new Float32Array(maxOut);
     }
     const out = this.resampleBuffer;
+
+    // QWEN-E5: với tỉ lệ NGUYÊN (48k→16k ⇒ ratio = 3.0), `src` luôn là số nguyên
+    // (`phase` khởi tạo nguyên và cộng `ratio` nguyên) ⇒ `frac` LUÔN = 0 ⇒ vòng nội suy
+    // tuyến tính bên dưới SUY BIẾN thành "giữ 1 mẫu, bỏ (ratio-1) mẫu" — decimation trần,
+    // KHÔNG lọc chống aliasing. Mọi năng lượng trên Nyquist đích (8 kHz: cymbal,
+    // sibilance, hiss của nhạc nền) GẤP NGƯỢC vào dải thoại 0–8 kHz làm méo phổ mà ASR
+    // phải ăn. Với ratio >= 2 ta lọc thông thấp bằng boxcar `ratio` tap trước khi lấy mẫu
+    // (đúng cho decimation tỉ lệ nguyên; rẻ: 1 phép cộng/mẫu vào).
+    if (this._useBoxcar) {
+      const r = this.ratio;
+      const h = r - 1;
+      if (!this._boxcarHist || this._boxcarHist.length !== h) {
+        this._boxcarHist = new Float32Array(h);
+      }
+      // Nối (r-1) mẫu cuối block TRƯỚC vào đầu block này để cửa sổ không bị hụt ở biên
+      // (kẹp biên sẽ tạo artifact chu kỳ 128 mẫu ≈ 2,7 ms).
+      const extLen = h + input.length;
+      if (!this._boxcarExt || this._boxcarExt.length < extLen) {
+        this._boxcarExt = new Float32Array(extLen + 8);
+      }
+      const ext = this._boxcarExt;
+      if (h > 0) ext.set(this._boxcarHist, 0);
+      ext.set(input, h);
+
+      const inv = 1 / r;
+      let srcI = h + this.phase;
+      let n = 0;
+      while (srcI < extLen) {
+        // Cửa sổ r tap KẾT THÚC tại `srcI` (trễ nhóm (r-1)/2 mẫu — ở 48 kHz với r=3 là
+        // 1 mẫu ≈ 21 µs, không đáng kể). `srcI >= h` nên `srcI - k >= 0` luôn đúng.
+        let acc = 0;
+        for (let k = 0; k < r; k++) {
+          acc += ext[srcI - k];
+        }
+        out[n++] = acc * inv;
+        srcI += r;
+      }
+      this.phase = srcI - extLen;
+      if (h > 0) this._boxcarHist.set(input.subarray(input.length - h));
+      return n === out.length ? out : out.subarray(0, n);
+    }
+
     let src = this.phase;
     let n = 0;
     while (src < input.length) {

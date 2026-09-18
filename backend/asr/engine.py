@@ -744,7 +744,18 @@ class TranscribeEngine(BaseASREngine):
             except Exception:
                 pass
 
-            return clean_transcript_text(raw_text)
+            cleaned = clean_transcript_text(raw_text)
+            # Decoder "kẹt vòng": ca thật 2026-09-18 — tiếng cười nền làm model sinh 256 token
+            # toàn `ha` (1,5 s GPU ở ASR, rồi 2,4 s GPU ở dịch, phụ đề một dòng khổng lồ).
+            # `clean_transcript_text` đã gộp; ở đây ĐO để biết tần suất và để lại dấu vết.
+            if raw_text and len(raw_text) >= 80 and len(cleaned) < len(raw_text) * 0.4:
+                metrics_collector.increment_counter("asr.output_repetition_collapsed")
+                logger.warning(
+                    f"Đầu ra ASR bị LẶP VÒNG và đã gộp: {len(raw_text)} → {len(cleaned)} ký tự "
+                        f"({(1 - len(cleaned) / len(raw_text)) * 100:.0f}% bị cắt).",
+                    extra={"module_tag": "ASR"},
+                )
+            return cleaned
 
     # ------------------------------------------------------------------ commit
     def _pop_commit_request(self) -> Optional[Dict[str, Any]]:

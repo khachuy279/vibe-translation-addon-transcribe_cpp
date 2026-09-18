@@ -68,6 +68,51 @@
   const VIDEO_SCAN_MIN_INTERVAL_MS = 250;
   let lastVideoScanAt = 0;
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // CẢNH BÁO "VIDEO ĐANG TẮT TIẾNG ⇒ MẤT PHỤ ĐỀ"
+  //
+  // Extension lấy audio bằng `createMediaElementSource`. Theo spec Web Audio (và đúng như
+  // Firefox đã chuẩn hoá — bug 2010427 + WPT "MediaElementAudioSourceNode output reflects
+  // HTMLMediaElement effective volume change"), đầu ra của node đó **đã bị nhân bởi
+  // `video.volume` và `muted`**.
+  //
+  // ĐÃ ĐO THẬT (external/build-tmp/volume_vs_asr.py + volume_vs_asr_1p7b.py + vad_vs_amplitude.py)
+  // để biết mức nào mới thực sự nguy hiểm:
+  //
+  //   scale  0.50  0.30  0.10  0.05  0.01       0.00
+  //   ASR    không đổi suốt tới -60 dBFS      -> 1.0000  (sai 100%)
+  //   VAD    vẫn phát hiện (không hề về 0)    -> 0 đoạn   (mất hẳn)
+  //
+  // Nghĩa là: **giảm nhỏ volume KHÔNG làm hỏng nhận dạng** — nhân một tín hiệu với hằng số
+  // không đổi SNR nội tại của nó, và cả VAD lẫn ASR đều bất biến biên độ trong dải rất rộng.
+  // Chỉ có ĐÚNG GIÁ TRỊ 0 (mute, hoặc volume = 0) mới phá huỷ thông tin: `x * 0 = 0` là mất
+  // vĩnh viễn, không cách nào khôi phục.
+  //
+  // Vì vậy cảnh báo dưới đây chỉ kêu khi tín hiệu bị nhân bởi 0 — không kêu khi người dùng
+  // chỉ hạ nhỏ. Slider 🔉 Original audio trong popup không gây ra vấn đề này vì nó điều khiển
+  // GainNode trên nhánh nghe, không đụng `video.volume`.
+  // ─────────────────────────────────────────────────────────────────────────────
+  let captureSilenceWarned = false;
+
+  function checkCaptureAudibility(video) {
+    if (!isCapturing || !video) return;
+    // Chỉ 0 mới chết. Dùng ngưỡng rất nhỏ để không báo động nhầm khi người dùng hạ nhỏ.
+    const silent = !!video.muted || video.volume <= 1e-4;
+    if (silent && !captureSilenceWarned) {
+      captureSilenceWarned = true;
+      console.warn(
+        "[BS] ⚠️ Trình phát đang TẮT HẲN TIẾNG (muted hoặc volume = 0). Extension lấy audio qua " +
+        "createMediaElementSource nên tín hiệu gửi ASR bị nhân với 0 ⇒ im lặng kỹ thuật số ⇒ " +
+        "SẼ KHÔNG CÓ PHỤ ĐỀ/DỊCH/TTS. Hãy bật tiếng lại cho trình phát. " +
+        "(Hạ nhỏ volume thì KHÔNG sao: đã đo thấy VAD và ASR bất biến biên độ tới -60 dBFS. " +
+        "Muốn hạ tiếng gốc mà không ảnh hưởng ASR thì dùng slider '🔉 Original audio' trong popup.)"
+      );
+    } else if (!silent && captureSilenceWarned) {
+      captureSilenceWarned = false;
+      console.log("[BS] Trình phát đã có tiếng trở lại — ASR nhận được audio.");
+    }
+  }
+
   /**
    * FIX-01: bắt đầu hỏi service worker xem socket đã rút hết hàng đợi chưa.
    * Chỉ chạy khi capture ĐANG bị tạm dừng (không còn frame nào để nó tự biết).
@@ -414,6 +459,8 @@
         // phát (hoặc khi người dùng kéo thanh âm lượng của chính trang). Guard `volumechange`
         // trong tts-player đã bắt phần lớn trường hợp; đây là bản áp lại ở mốc `play`/`playing`.
         try { ttsPlayer.reapplyDucking(); } catch (e) {}
+        // Cảnh báo nếu trình phát đang tắt tiếng ⇒ ASR sẽ không nhận được gì.
+        checkCaptureAudibility(video);
       };
 
       document.addEventListener("fullscreenchange", handleStateKeepAlive, { signal });
@@ -422,7 +469,10 @@
       if (video) {
         video.addEventListener("play", handleStateKeepAlive, { signal });
         video.addEventListener("playing", handleStateKeepAlive, { signal });
+        // Người dùng kéo volume/mute của trình phát ⇒ kiểm tra ngay (im lặng là lỗi khó đoán).
+        video.addEventListener("volumechange", handleStateKeepAlive, { signal });
       }
+      checkCaptureAudibility(video);
 
       console.log("[BS] Capture started");
       return { success: true };
@@ -438,6 +488,7 @@
 
   async function cleanup() {
     isCapturing = false;
+    captureSilenceWarned = false;   // phiên sau phải được cảnh báo lại từ đầu
     stopBackpressureProbe();   // FIX-01: không để timer probe sống sót qua Stop
     if (captureAbortController) {
       try { captureAbortController.abort(); } catch (e) {}

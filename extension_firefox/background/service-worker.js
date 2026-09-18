@@ -274,14 +274,24 @@ api.runtime.onConnect.addListener((port) => {
   });
 });
 
-// Broadcast subtitle events from capturing iframe to Top frame / all frames
+// Broadcast subtitle events from capturing iframe to the TOP frame.
+// QWEN-E3: `content-script.js` chỉ gửi `BROADCAST_SUBTITLE` khi `window !== window.top`,
+// tức frame đang capture là iframe con và đích cần vẽ là frame TRÊN CÙNG. Bản cũ gọi
+// `tabs.sendMessage(tabId, ...)` **KHÔNG có `frameId`** ⇒ mỗi sự kiện phụ đề được giao tới
+// MỌI content script của MỌI iframe trong tab (YouTube có hàng chục: ads, embed, ITP).
+// Mỗi frame thức dậy, parse message rồi tự loại bỏ (content-script: "no video, not
+// capturing → ignore") — CPU đốt miễn phí × số frame × tốc độ event.
+// Frame đang capture đã tự render cục bộ trước khi broadcast, nên gửi thẳng frame 0 là đủ
+// và cũng tránh gửi ngược lại chính nó.
+const TOP_FRAME_ID = 0;
+
 api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action === "BROADCAST_SUBTITLE" && sender.tab?.id) {
     api.tabs.sendMessage(sender.tab.id, {
       action: "SUBTITLE_RENDER",
       eventType: msg.eventType,
       payload: msg.payload
-    }).catch(() => {});
+    }, { frameId: TOP_FRAME_ID }).catch(() => {});
   }
 });
 

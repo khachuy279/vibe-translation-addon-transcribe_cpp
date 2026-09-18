@@ -43,18 +43,32 @@ class FsmnVADEngine(BaseVADEngine):
         logger.info("Model FSMN sẵn sàng", extra={"module_tag": "VAD"})
 
     def _resolve_model_dir(self, explicit_dir: Optional[Union[str, Path]]) -> Path:
+        return self.resolve_model_dir(explicit_dir)
+
+    @staticmethod
+    def resolve_model_dir(explicit_dir: Optional[Union[str, Path]] = None) -> Path:
         if explicit_dir and Path(explicit_dir).exists():
             return Path(explicit_dir)
         return MODELS_DIR / "fsmn_vad"
 
-    def _ensure_model_files(self) -> None:
+    @classmethod
+    def prepare_files(cls) -> None:
+        """QWEN-Q2: tải model NGOÀI lock cấp lớp. Xem `BaseVADEngine.prepare_files`."""
+        cls._ensure_files_in(cls.resolve_model_dir())
+
+    @staticmethod
+    def _ensure_files_in(model_dir: Path) -> None:
         """Đảm bảo các file model FSMN tồn tại."""
-        self.model_dir.mkdir(parents=True, exist_ok=True)
+        model_dir.mkdir(parents=True, exist_ok=True)
         required = ["model.pt", "am.mvn", "config.yaml", "configuration.json"]
-        if not all((self.model_dir / f).exists() for f in required):
+        if not all((model_dir / f).exists() for f in required):
             from huggingface_hub import snapshot_download
             logger.info("Đang tải model FSMN-VAD từ HuggingFace...", extra={"module_tag": "VAD"})
-            snapshot_download("funasr/fsmn-vad", local_dir=str(self.model_dir))
+            snapshot_download("funasr/fsmn-vad", local_dir=str(model_dir))
+
+    def _ensure_model_files(self) -> None:
+        """Giữ lại cho tương thích: uỷ quyền cho `_ensure_files_in`."""
+        self._ensure_files_in(self.model_dir)
 
     def create_initial_state(self, threshold: Optional[float] = None) -> VADStreamState:
         cfg = config.vad.fsmn

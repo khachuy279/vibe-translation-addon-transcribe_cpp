@@ -77,9 +77,13 @@ metrics_sched_*.json
 
 # 9. G2/G3 — bản dựng CUDA ASR & toolchain cục bộ (không commit)
 # bin/                  : bundle native lúc chạy (transcribe.dll + ggml*.dll, gồm
-#                         ggml-cuda.dll). Ứng dụng nạp từ đây qua TRANSCRIBE_LIBRARY
-#                         (backend/asr/native.py). Nội dung đều là *.dll nên đã bị mục 2b
-#                         chặn; khai báo thêm cho tường minh.
+#                         ggml-cuda.dll, tổng ~121 MB). Ứng dụng nạp từ đây qua
+#                         TRANSCRIBE_LIBRARY (backend/asr/native.py).
+#                         QUYẾT ĐỊNH §4.2: đã `git rm --cached bin/*.dll` — DLL không
+#                         còn được theo dõi git (mỗi lần build lại CUDA tạo diff nhị
+#                         phân 68 MB). Chặn tường minh ở đây để `git status` sạch;
+#                         bundle phân phối lại bằng script build trong external/.
+#                         LƯU Ý: git KHÔNG còn backup cho bin/ nữa.
 # external/cuda-toolkit : CUDA toolkit dựng từ wheel pip (nvcc/cublas/headers) ~1,4 GB
 # external/build-cuda   : cây build CMake của transcribe.cpp với backend CUDA
 # external/build-tmp    : log/script/JSON tạm của quá trình đo G2/G3

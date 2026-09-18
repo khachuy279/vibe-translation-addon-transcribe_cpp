@@ -68,7 +68,15 @@ class FireRedVADConfig(BaseModel):
     threshold: Optional[float] = None
     smooth_window_size: int = 5
     min_speech_frame: int = 8       # 8 frames * 25 ms tối thiểu xác nhận bắt đầu nói
-    min_silence_frame: int = 60     # 20 frames * 25 ms tối thiểu xác nhận kết thúc nói
+    # 60 frames * 25 ms = 1500 ms. ⚠️ QWEN-Q11 đã kiểm chứng: giá trị này CHỈ điều khiển
+    # event `is_speech_end` của chính engine FireRed, mà event đó luôn đến SAU khi tầng
+    # `VADProcessor` đã tự chốt câu bằng `vad.silence_duration_ms` (mặc định 600 ms).
+    # Lý do: `processor` đọc `VADResult.is_speech` = quyết định NGƯỠNG TỪNG FRAME
+    # (`stream_vad_postprocessor.py:64,68`), không phải trạng thái máy trạng thái. Nên đây
+    # là **config CHẾT** với đường FireRed — đổi nó KHÔNG làm câu chốt sớm/muộn hơn.
+    # Muốn chỉnh độ trễ chốt câu: sửa `VADConfig.silence_duration_ms`.
+    # (Comment cũ ghi sai số khung — đã sửa.)
+    min_silence_frame: int = 60
     pad_start_frame: int = 5        # 5 frames * 25 ms pre-padding
 
 
@@ -163,7 +171,7 @@ class ASRConfig(BaseModel):
     # Giữ giá trị >= SentenceConfig.max_duration_sec để cửa sổ luôn bao trùm trọn câu
     # hiện tại => preview thấy cùng ngữ cảnh như commit => KHÔNG mất độ chính xác.
     # Đặt 0 để tắt (quay lại hành vi cũ: transcribe từ đầu câu mỗi lần).
-    preview_window_sec: float = 6.0
+    preview_window_sec: float = 8.0
     # P2.4: lịch preview theo nhịp cố định (bỏ nhịp nếu inference vượt hạn).
     preview_fixed_rate: bool = True
     # P2.4b: TỰ ĐIỀU CHỈNH NHỊP. Khi backend ASR có đuôi độ trễ (spike), giữ nhịp cố định
@@ -287,7 +295,7 @@ class TranslationConfig(BaseModel):
 
 class TTSConfig(BaseModel):
     """Cấu hình tổng hợp giọng nói Voice Cloning OmniVoice."""
-    enabled: bool = True
+    enabled: bool = False
     engine: str = "omnivoice"  # PyTorch native OmniVoice
     model: str = "splendor1811/omnivoice-vietnamese"
     device: str = "cuda:0"
@@ -314,7 +322,17 @@ class AudioBufferConfig(BaseModel):
 
 class MetricsConfig(BaseModel):
     """Cấu hình đo lường hiệu năng thời gian thực."""
-    enabled: bool = False
+
+    # QWEN-Q10: cờ này TRƯỚC ĐÂY là "config nói dối" — chỉ được đọc ở
+    # `dump_metrics_report`, còn `record_latency` / `increment_counter` / `record_gauge` /
+    # `record_checkpoint` chạy VÔ ĐIỀU KIỆN ⇒ "tắt metrics cho nhanh" không có tác dụng.
+    # Nay cờ được gate THẬT ở đầu mọi hàm ghi (xem `MetricsCollector._enabled`).
+    #
+    # ⚠️ Vì vậy mặc định phải là **True**: bản cũ để `False` mà việc ghi vẫn luôn chạy, nên
+    # `False` mới là hành vi thực tế. Đổi mặc định sang True để (a) không mất metrics ở mọi
+    # đường không tự set cờ (`main.py`, harness, test), (b) `False` từ nay mới thực sự tắt.
+    # Ai muốn tắt: `config.metrics.enabled = False`.
+    enabled: bool = True
     alert_threshold_ms: float = 300.0
     dump_report_on_disconnect: bool = False
     report_file: str = "metrics_report.json"

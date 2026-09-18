@@ -21,6 +21,9 @@ class OverlayManager {
     this._onWindowResize = this._onWindowResize.bind(this);
     this._domObserver = null;
     this._resizeObserver = null;
+    // QWEN-E1: đối tượng mà `_resizeObserver` hiện đang theo dõi (null nếu chưa dựng).
+    this._roVideo = null;
+    this._roHost = null;
   }
 
   // ── Lifecycle ────────────────────────────────────────────
@@ -95,12 +98,42 @@ class OverlayManager {
   }
 
   attachToVideo(video) {
+    const sameTarget = !!video && video === this.targetVideo;
     this.targetVideo = video;
     if (this.isActive && this.host) {
+      // QWEN-E1: đây là đường chạy trên MỖI SỰ KIỆN PHỤ ĐỀ (~3–7 lần/giây), không phải
+      // mỗi lần trang đổi DOM. Nếu vẫn đúng video đó, host còn trong DOM và vẫn nằm đúng
+      // chỗ thì KHÔNG có gì phải dựng lại:
+      //   • ResizeObserver đã theo dõi video + host (co giãn do nó lo),
+      //   • fullscreen có `_onFullscreenChange` riêng,
+      //   • host bị trang gỡ ra thì `_domObserver` bắt và gắn lại.
+      // Bản cũ chạy đủ chuỗi mỗi sự kiện: `getComputedStyle` + `_setupResizeObserver`
+      // (disconnect + `new ResizeObserver` + 2 observe = cấp phát mới) + 1–2
+      // `getBoundingClientRect` = FORCED SYNCHRONOUS LAYOUT ⇒ jank rõ trên DOM dày.
+      if (sameTarget && this.host.isConnected && this._hostInPlace()) {
+        return;
+      }
       this._attachHost();
       this._setupResizeObserver();
       this._updateScale();
     }
+  }
+
+  _hostInPlace() {
+    /** QWEN-E1: host có đang nằm đúng chỗ cho `targetVideo` không? — kiểm RẺ.
+
+     * Dùng `parentElement.contains(video)` (duyệt cây DOM, KHÔNG ép layout) thay vì
+     * `getComputedStyle`/`getBoundingClientRect`. Nhờ vậy vẫn TỰ CHỮA được: trang chuyển
+     * video sang container khác ⇒ cha cũ không còn chứa video ⇒ trả false ⇒ gắn lại.
+     */
+    const parent = this.host && this.host.parentElement;
+    if (!parent) return false;
+    if (!this.targetVideo || !this.targetVideo.isConnected) return false;
+    if (parent === document.body) {
+      // Nhánh dự phòng (fallback body): chỉ còn đúng nếu thật sự không có container nào.
+      return !this._findPlayerContainer(this.targetVideo);
+    }
+    return parent.contains(this.targetVideo);
   }
 
   _findPlayerContainer(video) {
@@ -267,6 +300,15 @@ class OverlayManager {
 
   _setupResizeObserver() {
     if (typeof ResizeObserver === "undefined") return;
+    // QWEN-E1: chỉ dựng lại khi ĐỐI TƯỢNG theo dõi thật sự đổi. Trước đây mỗi lần gọi là
+    // một lần `disconnect()` + `new ResizeObserver()` + 2 `observe()` (cấp phát mới), mà
+    // đường phụ đề gọi nó vài lần mỗi giây.
+    const wantVideo = this.targetVideo && this.targetVideo.isConnected ? this.targetVideo : null;
+    const wantHost = this.host && this.host.isConnected ? this.host : null;
+    if (this._resizeObserver && this._roVideo === wantVideo && this._roHost === wantHost) {
+      return;
+    }
+
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
@@ -276,12 +318,14 @@ class OverlayManager {
       this._updateScale();
     });
 
-    if (this.targetVideo && this.targetVideo.isConnected) {
-      this._resizeObserver.observe(this.targetVideo);
+    if (wantVideo) {
+      this._resizeObserver.observe(wantVideo);
     }
-    if (this.host && this.host.isConnected) {
-      this._resizeObserver.observe(this.host);
+    if (wantHost) {
+      this._resizeObserver.observe(wantHost);
     }
+    this._roVideo = wantVideo;
+    this._roHost = wantHost;
   }
 
   _onWindowResize() {
@@ -310,6 +354,8 @@ class OverlayManager {
       try { this._resizeObserver.disconnect(); } catch (e) {}
       this._resizeObserver = null;
     }
+    this._roVideo = null;
+    this._roHost = null;
 
     if (this._domObserver) {
       try { this._domObserver.disconnect(); } catch (e) {}

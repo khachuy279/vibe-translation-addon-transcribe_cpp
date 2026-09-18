@@ -37,22 +37,36 @@ class FireRedVADEngine(BaseVADEngine):
         logger.info("Model FireRed Stream sẵn sàng", extra={"module_tag": "VAD"})
 
     def _resolve_model_dir(self, explicit_dir: Optional[Union[str, Path]]) -> Path:
+        return self.resolve_model_dir(explicit_dir)
+
+    @staticmethod
+    def resolve_model_dir(explicit_dir: Optional[Union[str, Path]] = None) -> Path:
         if explicit_dir and Path(explicit_dir).exists():
             return Path(explicit_dir)
         return MODELS_DIR / "firered_stream" / "Stream-VAD"
 
-    def _ensure_model_files(self) -> None:
+    @classmethod
+    def prepare_files(cls) -> None:
+        """QWEN-Q2: tải model NGOÀI lock cấp lớp. Xem `BaseVADEngine.prepare_files`."""
+        cls._ensure_files_in(cls.resolve_model_dir())
+
+    @staticmethod
+    def _ensure_files_in(model_dir: Path) -> None:
         """Tự động tải model từ HuggingFace nếu chưa tồn tại cục bộ."""
-        self.model_dir.mkdir(parents=True, exist_ok=True)
-        cmvn_file = self.model_dir / "cmvn.ark"
-        model_file = self.model_dir / "model.pth.tar"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        cmvn_file = model_dir / "cmvn.ark"
+        model_file = model_dir / "model.pth.tar"
 
         if not cmvn_file.exists() or not model_file.exists():
             from huggingface_hub import hf_hub_download
             logger.info("Đang tải model FireRed Stream-VAD từ HuggingFace...", extra={"module_tag": "VAD"})
-            parent_dir = self.model_dir.parent
+            parent_dir = model_dir.parent
             hf_hub_download("FireRedTeam/FireRedVAD", "Stream-VAD/cmvn.ark", local_dir=str(parent_dir))
             hf_hub_download("FireRedTeam/FireRedVAD", "Stream-VAD/model.pth.tar", local_dir=str(parent_dir))
+
+    def _ensure_model_files(self) -> None:
+        """Giữ lại cho tương thích: uỷ quyền cho `_ensure_files_in`."""
+        self._ensure_files_in(self.model_dir)
 
     def create_initial_state(self, threshold: Optional[float] = None) -> VADStreamState:
         from fireredvad.core.stream_vad_postprocessor import StreamVadPostprocessor

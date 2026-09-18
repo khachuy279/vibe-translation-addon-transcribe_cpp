@@ -87,10 +87,22 @@ def test_disconnect_path_is_wired_in_handler():
     """Chốt ở mức mã nguồn: cleanup phiên PHẢI gọi dump khi config bật.
 
     Đây chính là mắt xích từng bị thiếu — nếu ai xoá nó, test này đổ.
+
+    QWEN-Q14: lời gọi nay đi qua `asyncio.to_thread(dump_metrics_report, reason)` để KHÔNG
+    serialize + `json.dump` đồng bộ trên event loop giữa lúc phiên khác đang chạy. Vì vậy
+    chấp nhận cả hai dạng, nhưng BẮT BUỘC phải đẩy sang thread.
     """
     src = (PROJECT_ROOT / "backend" / "ws" / "handler.py").read_text(encoding="utf-8")
     assert "dump_report_on_disconnect" in src, "cleanup phiên phải đọc config này"
-    assert "dump_metrics_report(" in src, "cleanup phiên phải gọi dump_metrics_report()"
+    assert ("dump_metrics_report(" in src) or ("dump_metrics_report," in src), (
+        "cleanup phiên phải gọi dump_metrics_report()"
+    )
+    idx = src.index("dump_report_on_disconnect")
+    body = src[idx:idx + 900]
+    assert "asyncio.to_thread(" in body and "dump_metrics_report" in body, (
+        "QWEN-Q14: `dump_metrics_report` phải chạy trong thread, không đồng bộ trên loop"
+    )
+    assert "dump_metrics_report(reason=" not in body, "còn call-site đồng bộ trên loop"
 
 
 def test_shutdown_path_is_wired_in_main():

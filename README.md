@@ -296,10 +296,11 @@ inference — giữ nguyên vì nếu không warm thì câu dịch **đầu tiê
 ```text
 [STARTUP] Đang nạp và pre-warm song song ASR, Translation & VAD...
 [ASR] ASR native: dùng bundle cục bộ '...\bin\transcribe.dll' (nguồn: default).   # chỉ khi có bin/
-[ASR] [STARTUP] ASR backend: yêu cầu='auto' → thực tế='vulkan' | native: bundle bin/ | có sẵn: cuda, vulkan | device: cuda=CUDA0, vulkan=Vulkan0, cpu=CPU
-[ASR] Nạp thành công ASR Model 'qwen3-asr-1.7b'(Arch: qwen3_asr, Backend: Vulkan0, yêu cầu: 'auto', Streaming: False, max_audio=..., native: bin/)
+[ASR] [STARTUP] Backend=cuda (req=cuda) | native=bin/ (default) | devices=cuda=CUDA0, vulkan=Vulkan0, cpu=CPU
+[ASR] Nạp thành công ASR Model 'qwen3-asr-1.7b'(Arch: qwen3_asr, Backend: CUDA0, yêu cầu: 'cuda', Streaming: False, max_audio=..., native: bin/)
 [TRANSLATE] Nạp thành công mô hình dịch 'tencent' trên GPU (n_ctx=512, n_batch=256, n_threads=4)
-[VAD] Đã nạp model FireRed Stream-VAD từ: backend/models/firered_stream/Stream-VAD
+[VAD] Model FireRed Stream sẵn sàng
+[VAD] [STARTUP] Engine 'firered-vad' sẵn sàng
 [MAIN] Chế độ WSS (SSL) kích hoạt với cert: backend/cert.pem
 INFO:  Uvicorn running on https://0.0.0.0:8765 (Press CTRL+C to quit)
 ```
@@ -502,7 +503,7 @@ trực tiếp được với số trên **pipeline streaming** — hãy dùng `/
 | K5 | Không mất câu; mọi drop/merge có counter | `commit_carried_over`, `pending_commits`, `commit_slice_clamped`, `commit_dropped_stale`… | ✅ |
 | K6 | WER không xấu đi | `reuse_preview_for_commit` bật ⇒ xấu hơn (+9,5 / +14,8 điểm ở 2 file đo ổn định) ⇒ giữ TẮT | ✅ |
 | K7 | VRAM đỉnh < 14 GB | **9,5 GB** (ASR + dịch 7B + TTS) | ✅ |
-| K8 | ASR dùng CUDA | **Đã làm được** bằng bundle tự build trong `bin/` — nhanh hơn Vulkan **1,53×**, WER tương đương (chênh 0,82 điểm % < sàn nhiễu 2,28–4,12), +243 MB VRAM. **Mặc định vẫn là Vulkan** vì đó là đường transcribe.cpp hỗ trợ chính thức | ⚙️ tuỳ chọn |
+| K8 | ASR dùng CUDA | **Đã làm được** bằng bundle tự build trong `bin/` — nhanh hơn Vulkan **1,53×**, WER tương đương (chênh 0,82 điểm % < sàn nhiễu 2,28–4,12), +243 MB VRAM. **Mặc định là CUDA**; Vulkan là đường transcribe.cpp hỗ trợ chính thức nên được giữ làm **fallback tự động** khi thiếu `bin/ggml-cuda.dll` (có WARNING) | ⚙️ mặc định |
 | K9 | Mọi control trong popup có tác dụng | 11/11 nhóm control có test | ✅ |
 | K10 | 0 crash khi đổi model lúc đang stream | soak **200 vòng** | ✅ |
 | K11 | Độ trễ capture phía client < 70 ms | **64 ms** (worklet gom 1024 mẫu @16 kHz) | ✅ (chờ xác nhận trên Firefox thật) |
@@ -549,6 +550,8 @@ transcript tham chiếu):
    tự build), nên nếu `bin/ggml-cuda.dll` thiếu, backend **tự fallback về Vulkan** — đường
    `transcribe.cpp` hỗ trợ chính thức, chắc chắn chạy, nhưng chậm hơn ~1,53×. Việc fallback được
    ghi log WARNING rõ ràng; xem [Bundle ASR CUDA](#bundle-asr-cuda-backend-mặc-định).
+   **Lưu ý:** `bin/` **không** nằm trong git (đã `git rm --cached` — xem §9 của `.gitignore`), nên
+   bản `git clone` mới **không có** DLL nào; phải tự build bundle theo hướng dẫn trên.
 4. **Cửa sổ preview có đuôi độ trễ lẻ**: p50 ≈ 87 ms nhưng thỉnh thoảng spike ~2,5 s do tầng native
    dựng lại scheduler/compute context mỗi `run()`. Nhịp preview **bỏ nhịp** (không trôi) và commit
    được ưu tiên nên phụ đề chốt không bị chặn.

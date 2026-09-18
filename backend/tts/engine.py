@@ -65,6 +65,18 @@ class OmniVoiceTTS(BaseTTSEngine):
         self._cudnn_disabled = False
         self._voice_prompt_cache: "OrderedDict[Tuple[str, str], Any]" = OrderedDict()  # LRU, max 8 entries
         self._voice_prompt_cache_max: int = 8
+        # QWEN-Q15: `_get_voice_clone_prompt` là check-then-act trên OrderedDict KHÔNG lock.
+        # Hai phiên (hai luồng `to_thread`) cùng dùng một giọng mới ⇒ cả hai tính
+        # VoiceClonePrompt (giải mã audio + trích embedding: hàng trăm ms CPU/GPU) rồi ghi
+        # cache đè nhau — lãng phí, và `move_to_end`/`popitem` chạy song song có thể ném
+        # RuntimeError. Lock RIÊNG (không dùng `_infer_lock`) để không chặn inference TTS
+        # của phiên khác lâu hơn mức cần.
+        self._voice_prompt_lock = threading.Lock()
+        # QWEN-Q15 (bổ sung): lock theo TỪNG giọng. Chỉ một lock chung thì hai phiên khác
+        # giọng phải xếp hàng vô ích; chỉ double-checked locking thì CÙNG một giọng vẫn bị
+        # tính prompt 2 lần (phần chậm nằm ngoài lock). Per-key lock cho cả hai tính chất.
+        self._voice_prompt_key_locks: "Dict[Tuple[str, str], threading.Lock]" = {}
+        self._voice_prompt_key_locks_guard = threading.Lock()
         self._init_lock = threading.RLock()
         self._infer_lock = threading.RLock()
         # A2-2 (Hy3): CUDA stream RIÊNG cho TTS thay vì đồng bộ toàn device.
@@ -135,33 +147,56 @@ class OmniVoiceTTS(BaseTTSEngine):
                         return self._invoke_generate(gen_kwargs)
                 raise
 
+    def _lock_for_voice(self, cache_key: Tuple[str, str]) -> threading.Lock:
+        """Lock riêng cho một `cache_key` giọng (QWEN-Q15). Số entry bị chặn trên."""
+        with self._voice_prompt_key_locks_guard:
+            lock = self._voice_prompt_key_locks.get(cache_key)
+            if lock is None:
+                # Giữ dict có trần: số giọng thật rất nhỏ, nhưng không để nó phình vô hạn.
+                if len(self._voice_prompt_key_locks) >= 32:
+                    self._voice_prompt_key_locks = {
+                        k: v for k, v in self._voice_prompt_key_locks.items()
+                        if k in self._voice_prompt_cache
+                    } or {cache_key: threading.Lock()}
+                lock = self._voice_prompt_key_locks.setdefault(cache_key, threading.Lock())
+            return lock
+
     def _get_voice_clone_prompt(self, ref_audio_path: str, ref_text: str) -> Optional[Any]:
         """Tạo hoặc lấy từ cache VoiceClonePrompt tái sử dụng cho mẫu giọng tham chiếu.
 
         Tiết kiệm ~70ms cho mỗi câu nói tiếp theo do không phải lặp lại Disk I/O,
         giải mã âm thanh và trích xuất embedding.
+
+        QWEN-Q15: check-then-act phải được bảo vệ. Dùng **lock theo từng giọng**
+        (`_lock_for_voice`) chứ không phải một lock chung: hai phiên khác giọng vẫn tính
+        song song, còn hai phiên CÙNG giọng mới thì chỉ tính prompt MỘT lần (mỗi lần tính
+        tốn hàng trăm ms: giải mã audio + trích embedding).
         """
         if self.model is None or not hasattr(self.model, "create_voice_clone_prompt"):
             return None
 
         cache_key = (ref_audio_path, ref_text)
-        if cache_key in self._voice_prompt_cache:
-            # LRU: promote to most-recently-used position
-            self._voice_prompt_cache.move_to_end(cache_key)
-            return self._voice_prompt_cache[cache_key]
+        with self._lock_for_voice(cache_key):
+            with self._voice_prompt_lock:
+                if cache_key in self._voice_prompt_cache:
+                    # LRU: promote to most-recently-used position
+                    self._voice_prompt_cache.move_to_end(cache_key)
+                    return self._voice_prompt_cache[cache_key]
 
-        try:
-            prompt = self.model.create_voice_clone_prompt(ref_audio=ref_audio_path, ref_text=ref_text)
-            self._voice_prompt_cache[cache_key] = prompt
-            # LRU eviction: xoa entry cu nhat neu vuot maxsize
-            if len(self._voice_prompt_cache) > self._voice_prompt_cache_max:
-                evicted_key, _ = self._voice_prompt_cache.popitem(last=False)
-                logger.debug(f"Đã xoá cache giọng cũ: {Path(evicted_key).name}", extra={"module_tag": "TTS"})
-            logger.debug(f"Đã lưu cache VoiceClonePrompt cho: {Path(ref_audio_path).name} (cache={len(self._voice_prompt_cache)})", extra={"module_tag": "TTS"})
+            try:
+                prompt = self.model.create_voice_clone_prompt(ref_audio=ref_audio_path, ref_text=ref_text)
+            except Exception as e:
+                logger.debug(f"Không tạo được cache VoiceClonePrompt ({e}), dùng thẳng ref_audio.", extra={"module_tag": "TTS"})
+                return None
+
+            with self._voice_prompt_lock:
+                self._voice_prompt_cache[cache_key] = prompt
+                # LRU eviction: xoa entry cu nhat neu vuot maxsize
+                if len(self._voice_prompt_cache) > self._voice_prompt_cache_max:
+                    evicted_key, _ = self._voice_prompt_cache.popitem(last=False)
+                    logger.debug(f"Đã xoá cache giọng cũ: {Path(evicted_key).name}", extra={"module_tag": "TTS"})
+                logger.debug(f"Đã lưu cache VoiceClonePrompt cho: {Path(ref_audio_path).name} (cache={len(self._voice_prompt_cache)})", extra={"module_tag": "TTS"})
             return prompt
-        except Exception as e:
-            logger.debug(f"Không tạo được cache VoiceClonePrompt ({e}), dùng thẳng ref_audio.", extra={"module_tag": "TTS"})
-            return None
 
     def load_model(self) -> None:
         """Nạp và warm-up mô hình OmniVoice vào GPU memory."""
