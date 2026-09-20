@@ -53,6 +53,7 @@ from backend.config import config, SUPPORTED_LANGUAGES
 from backend.vad import SUPPORTED_VAD_ENGINES, VADProcessor
 from backend.asr.registry import ModelRegistry
 from backend.asr.engine import TranscribeEngine
+from backend.asr import hotswap as asr_hotswap
 from backend.translation.engine import GGUFTranslationEngine, get_translation_engine, reset_translation_engine
 from backend.translation.registry import TranslationModelRegistry
 from backend.translation import hotswap as translation_hotswap
@@ -203,6 +204,29 @@ async def _activate_translation_model_bg(canonical_key: str, allow_download: boo
         except Exception as e:  # noqa: BLE001
             logger.debug(
                 f"Không cập nhật được translation_model cho session {getattr(sess, 'session_id', '?')}: {e}",
+                extra={"module_tag": "MAIN"},
+            )
+
+
+async def _activate_asr_model_bg(target_model: str, allow_download: bool = True) -> None:
+    """Tác vụ nền: tải (nếu cần) + nạp model ASR rồi thông báo cho các phiên đang chạy.
+
+    Trạng thái được `asr_hotswap` giữ lại để popup hỏi tiến độ qua `/api/config`.
+    """
+    from backend.ws.handler import get_active_sessions
+
+    try:
+        await asr_hotswap.run_reserved(target_model, allow_download=allow_download)
+    except Exception:
+        # asr_hotswap đã log + lưu trạng thái "error" cho popup đọc.
+        return
+
+    for sess in get_active_sessions():
+        try:
+            sess.config["asr_engine"] = target_model
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                f"Không cập nhật được asr_engine cho session {getattr(sess, 'session_id', '?')}: {e}",
                 extra={"module_tag": "MAIN"},
             )
 
@@ -495,6 +519,13 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             "stream_translation": config.translation.stream_tokens,
             "native_backend": config.asr.backend,
         },
+        "asr": {
+            "active_model": active_key,
+            "auto_download": getattr(config.asr, "auto_download", True),
+            "download": asr_hotswap.status(),
+            "available_models": registry.list_models(),
+        },
+        "asr_download": asr_hotswap.status(),
         "translation": {
             "model": config.translation.model,
             "gguf_file": config.translation.gguf_file,
@@ -552,12 +583,59 @@ async def update_backend_config(req: SwitchModelRequest):
     target_model = req.model_id or req.asr_engine
 
     if target_model:
+        clean_target = (target_model or "").strip().lower()
+        if not registry.has_model(clean_target):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Mô hình '{target_model}' không có trong catalog models.yaml",
+            )
+
+        active_key = registry.get_active_model_key()
+        if asr_hotswap.needs_download(clean_target):
+            if not asr_hotswap.auto_download_enabled():
+                model_path = registry.resolve_model_path(clean_target)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Chưa có file GGUF cục bộ cho ASR: {model_path}. Hãy copy file vào backend/models "
+                        f"hoặc bật ASRConfig.auto_download để backend tự tải."
+                    ),
+                )
+            if asr_hotswap.is_busy() and not asr_hotswap.is_busy(clean_target):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Đang tải/nạp model ASR '{asr_hotswap.status().get('model')}', vui lòng đợi.",
+                )
+            snapshot = asr_hotswap.reserve(clean_target)
+            if snapshot.get("started"):
+                track_background_task(
+                    _activate_asr_model_bg(clean_target, bool(snapshot.get("allow_download"))),
+                    name=f"asr_activate_{clean_target}",
+                )
+            payload = _build_config_response(include_catalog=False)
+            payload.update({
+                "download_state": "downloading",
+                "detail": (
+                    f"Đang tải model ASR '{clean_target}' về backend/models (chạy nền). "
+                    f"Model '{active_key}' hiện tại vẫn hoạt động bình thường."
+                ),
+                "asr_engine": clean_target,
+                "model_id": clean_target,
+                "download": asr_hotswap.status(),
+            })
+            logger.info(
+                f"Model ASR '{clean_target}' chưa có file — đã xếp lịch tải nền; "
+                f"giữ nguyên model đang chạy '{active_key}'.",
+                extra={"module_tag": "MAIN"},
+            )
+            return JSONResponse(status_code=202, content=payload)
+
         try:
-            registry.set_active_model_key(target_model)
-            engine = TranscribeEngine(target_model)
+            registry.set_active_model_key(clean_target)
+            engine = TranscribeEngine(clean_target)
             # prepare_model nạp model mới NGOÀI lock rồi swap nguyên tử dưới _infer_lock.
-            await asyncio.to_thread(engine.prepare_model, target_model)
-            logger.info(f"Đã chuyển đổi ASR Model sang: '{target_model}'(nạp trước + swap)", extra={"module_tag": "MAIN"})
+            await asyncio.to_thread(engine.prepare_model, clean_target)
+            logger.info(f"Đã chuyển đổi ASR Model sang: '{clean_target}'(nạp trước + swap)", extra={"module_tag": "MAIN"})
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 

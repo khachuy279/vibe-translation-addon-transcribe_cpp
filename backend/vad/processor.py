@@ -492,19 +492,23 @@ class VADStreamProcessor:
                 total_silence_limit_ms = float(self.silence_duration_ms)
                 grace_hangover_ms = min(float(self.hangover_ms), total_silence_limit_ms * 0.5)
 
-                if silence_elapsed_ms <= grace_hangover_ms:
-                    # Vẫn nằm trong vùng ân hạn Hangover -> Tiếp tục gửi cho ASR
-                    if self.on_speech_chunk:
-                        callbacks_to_fire.append(
-                            (self.on_speech_chunk, (frame_bytes, frame_ts, VADState.SPEECH.value))
-                        )
+                # if silence_elapsed_ms <= grace_hangover_ms:
+                #     # Vẫn nằm trong vùng ân hạn Hangover -> Tiếp tục gửi cho ASR
+                #     # logger.info(
+                #     #     f"Hangover (silence {silence_elapsed_ms:.0f}ms < silence_elapsed_ms={grace_hangover_ms:.2f}ms)",
+                #     #     extra={"module_tag": "VAD"},
+                #     # )
+                #     if self.on_speech_chunk:
+                #         callbacks_to_fire.append(
+                #             (self.on_speech_chunk, (frame_bytes, frame_ts, VADState.SPEECH.value))
+                #         )
 
                 if silence_elapsed_ms >= total_silence_limit_ms:
                     # Đạt ngưỡng im lặng chốt câu -> SILENCE
                     state.is_speech = False
                     state.silence_samples = 0
                     logger.info(
-                        f"END (timeout {silence_elapsed_ms:.0f}ms, p={prob:.2f})",
+                        f"END (silence {silence_elapsed_ms:.0f}ms >= limit_ms={total_silence_limit_ms:.2f}ms, p={prob:.2f})",
                         extra={"module_tag": "VAD"},
                     )
                     if self.on_speech_end:

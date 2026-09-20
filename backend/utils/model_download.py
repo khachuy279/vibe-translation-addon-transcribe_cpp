@@ -172,23 +172,26 @@ def _monitor_progress(
     stop: threading.Event,
     interval: float,
     label: str,
+    stage: str = "TRANSLATE",
 ) -> None:
     """Log tiến độ mỗi `interval` giây trong lúc tải (luồng nền, tự dừng khi xong)."""
     started = time.time()
+    tag = stage.upper()
+    kind = "ASR" if tag == "ASR" else "dịch"
     while not stop.wait(interval):
         done = _incomplete_bytes(local_dir)
         done_mb = _mb(done)
         pct = f"{done / total_bytes * 100:.0f}%" if total_bytes else "?"
         _set_state(key, downloaded_bytes=done, total_bytes=total_bytes, percent=(done / total_bytes * 100.0) if total_bytes else None)
         logger.info(
-            f"Đang tải model dịch '{label}' về máy: {done_mb} MB"
+            f"Đang tải model {kind} '{label}' về máy: {done_mb} MB"
             f"{f'/{_mb(total_bytes)} MB ({pct})' if total_bytes else ''} "
             f"— {time.time() - started:.0f}s",
-            extra={"module_tag": "TRANSLATE"},
+            extra={"module_tag": tag},
         )
 
 
-def _move_into_place(downloaded_path: str, target: Path) -> Path:
+def _move_into_place(downloaded_path: str, target: Path, stage: str = "TRANSLATE") -> Path:
     """Chuẩn hoá vị trí file: `resolve_gguf_path()` chỉ biết `MODELS_DIR/<tên file>`."""
     src = Path(downloaded_path)
     if src.resolve() == target.resolve():
@@ -198,7 +201,7 @@ def _move_into_place(downloaded_path: str, target: Path) -> Path:
         os.replace(src, target)
         return target
     except OSError as exc:  # khác ổ đĩa ⇒ copy rồi xoá
-        logger.debug(f"os.replace không dùng được ({exc}); chuyển sang copy.", extra={"module_tag": "TRANSLATE"})
+        logger.debug(f"os.replace không dùng được ({exc}); chuyển sang copy.", extra={"module_tag": stage.upper()})
         import shutil
 
         shutil.copy2(src, target)
@@ -213,6 +216,7 @@ def ensure_model_file(
     allow_download: bool = True,
     label: Optional[str] = None,
     progress_interval: float = DEFAULT_PROGRESS_INTERVAL_SEC,
+    stage: str = "TRANSLATE",
 ) -> str:
     """Trả về đường dẫn file GGUF cục bộ, tải từ HuggingFace nếu chưa có.
 
@@ -227,10 +231,14 @@ def ensure_model_file(
     if is_available(repo_id, filename, local_dir):
         return str(target)
 
+    tag = stage.upper()
+    kind = "ASR" if tag == "ASR" else "dịch"
+    cfg_attr = "ASRConfig.auto_download" if tag == "ASR" else "TranslationConfig.auto_download"
+
     if not allow_download:
         raise ModelFileMissing(
             f"Chưa có file GGUF cục bộ: {target}. "
-            f"Có thể bật tự động tải (TranslationConfig.auto_download) hoặc tải tay từ "
+            f"Có thể bật tự động tải ({cfg_attr}) hoặc tải tay từ "
             f"https://huggingface.co/{repo_id}/blob/main/{filename}."
         )
 
@@ -251,6 +259,7 @@ def ensure_model_file(
             key,
             state="downloading",
             model=display,
+            stage=stage,
             repo_id=repo_id,
             filename=Path(filename).name,
             downloaded_bytes=0,
@@ -260,15 +269,15 @@ def ensure_model_file(
             started_at=time.time(),
         )
         logger.info(
-            f"Model dịch '{display}' chưa có ở {target} — bắt đầu tải từ '{repo_id}'"
-            f"{f' ({_mb(total_bytes)} MB)' if total_bytes else ''}. Đang dịch vẫn dùng model hiện tại.",
-            extra={"module_tag": "TRANSLATE"},
+            f"Model {kind} '{display}' chưa có ở {target} — bắt đầu tải từ '{repo_id}'"
+            f"{f' ({_mb(total_bytes)} MB)' if total_bytes else ''}. Model hiện tại vẫn hoạt động bình thường.",
+            extra={"module_tag": tag},
         )
 
         stop = threading.Event()
         monitor = threading.Thread(
             target=_monitor_progress,
-            args=(key, Path(local_dir), total_bytes, stop, max(1.0, float(progress_interval)), display),
+            args=(key, Path(local_dir), total_bytes, stop, max(1.0, float(progress_interval)), display, stage),
             name="model_download_progress",
             daemon=True,
         )
@@ -290,7 +299,7 @@ def ensure_model_file(
         finally:
             stop.set()
 
-        final_path = _move_into_place(str(downloaded), target)
+        final_path = _move_into_place(str(downloaded), target, stage=stage)
         elapsed = time.perf_counter() - t0
         size = None
         try:
@@ -307,7 +316,7 @@ def ensure_model_file(
             elapsed_sec=round(elapsed, 1),
         )
         logger.info(
-            f"Đã tải xong model dịch '{display}': {final_path} ({_mb(size)} MB) trong {elapsed:.0f}s.",
-            extra={"module_tag": "TRANSLATE"},
+            f"Đã tải xong model {kind} '{display}': {final_path} ({_mb(size)} MB) trong {elapsed:.0f}s.",
+            extra={"module_tag": tag},
         )
         return str(final_path)

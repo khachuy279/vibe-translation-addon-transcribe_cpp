@@ -165,6 +165,10 @@ class ASRConfig(BaseModel):
     # Đo thật (report §17): K2 giảm từ ~1,29 s xuống ~0,62 s. Đặt False để tắt.
     wake_on_speech_start: bool = True
     models_yaml: str = str(MODELS_YAML_PATH)
+    # Nếu file GGUF của model ASR được chọn chưa có trong `backend/models` thì tự tải từ
+    # HuggingFace (repo và file ghi trong models.yaml). Tải chạy ở luồng nền, KHÔNG bao giờ
+    # chạy trên hot path nhận dạng từng frame; tắt bằng cách đặt false.
+    auto_download: bool = True
 
     # --- P2.3: cửa sổ preview -------------------------------------------------
     # Chỉ PREVIEW bị cửa sổ hoá; commit luôn dùng toàn bộ ngữ cảnh câu (nguyên tắc P1).

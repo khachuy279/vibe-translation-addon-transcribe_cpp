@@ -385,6 +385,16 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       }
     }
 
+    // Backend có thể đang tải/nạp model ASR ở nền ⇒ báo rõ để người dùng biết
+    const asrDl = data.asr_download || (data.asr && data.asr.download);
+    if (asrDl && asrDl.model && (asrDl.state === "downloading" || asrDl.state === "loading")) {
+      const verb = asrDl.state === "downloading" ? "tải" : "nạp";
+      const note = asrDl.state === "downloading" ? ` (${describeDownloadProgress(asrDl)})` : "";
+      showMsg(`⏳ Backend đang ${verb} model ASR '${asrDl.model}'${note} ở chế độ nền. Model hiện tại vẫn nhận diện bình thường.`, "info");
+    } else if (asrDl && asrDl.state === "error" && asrDl.error) {
+      showMsg(`❌ Model ASR '${asrDl.model || "?"}' lỗi: ${asrDl.error}`, "error");
+    }
+
     return true;
   }
 
@@ -429,15 +439,20 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-        timeout: 120000,
+        timeout: 180000,
       });
 
-      if (!res || !res.ok) {
+      if (res && res.status === 202) {
+        // Backend chưa có file GGUF ⇒ trả 202 và tải trong nền (model cũ vẫn chạy).
+        const body = await res.json().catch(() => ({}));
+        showMsg(`⏳ ${body.detail || `Đang tải model ASR ${labelDesc} về máy (chạy nền).`}`, "info");
+        await waitForAsrActivation(newAsr, labelDesc);
+      } else if (!res || !res.ok) {
         const errorDetail = res ? await res.text() : "Network error";
         throw new Error(errorDetail);
       }
 
-      const result = await res.json();
+      const result = res.status === 202 ? (await (await fetchBackend("/api/config", { timeout: 15000 })).json().catch(() => ({}))) : (await res.json());
       lastActiveAsr = result.engine || newAsr;
       lastActiveVad = result.vad_engine || newVad;
       lastActiveLang = result.source_lang || newLang;
@@ -491,6 +506,55 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (dl.percent != null) return `${Math.round(dl.percent)}%`;
     if (dl.downloaded_mb != null) return `${dl.downloaded_mb} MB`;
     return "đang tải";
+  }
+
+  // Chờ backend tải (nếu thiếu file) + nạp model ASR. Backend trả HTTP 202 và làm việc
+  // trong nền, nên popup hỏi tiến độ qua /api/config cho tới khi ready/error.
+  async function waitForAsrActivation(modelId, shortDesc) {
+    const deadline = Date.now() + MODEL_DOWNLOAD_TIMEOUT_MS;
+    let lastNote = "";
+
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, MODEL_DOWNLOAD_POLL_MS));
+
+      let data = null;
+      try {
+        const res = await fetchBackend("/api/config", { timeout: 15000 });
+        if (!res || !res.ok) continue;
+        data = await res.json();
+      } catch (e) {
+        continue;
+      }
+
+      const asr = data.asr || {};
+      const dl = data.asr_download || asr.download || {};
+      if (dl.model && dl.model !== modelId) continue; // lượt tải của model khác
+
+      if (dl.state === "downloading") {
+        const note = describeDownloadProgress(dl);
+        if (note !== lastNote) {
+          lastNote = note;
+          if (statusBadge) statusBadge.textContent = `Tải ${shortDesc} ${note}`;
+          showMsg(`⏳ Đang tải model ASR ${shortDesc} về máy: ${note}. Model hiện tại vẫn nhận diện bình thường.`, "info");
+        }
+        continue;
+      }
+      if (dl.state === "loading") {
+        if (statusBadge) statusBadge.textContent = `Nạp ${shortDesc}...`;
+        if (lastNote !== "loading") {
+          lastNote = "loading";
+          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU...`, "info");
+        }
+        continue;
+      }
+      if (dl.state === "error") {
+        throw new Error(dl.error || `Tải/nạp model ASR ${shortDesc} thất bại`);
+      }
+      if (dl.state === "ready" || data.engine === modelId || asr.active_model === modelId) {
+        return true;
+      }
+    }
+    throw new Error("Hết thời gian chờ tải model ASR (30 phút). Kiểm tra mạng rồi thử lại.");
   }
 
   // Chờ backend tải (nếu thiếu file) + nạp model dịch. Backend trả HTTP 202 và làm việc

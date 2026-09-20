@@ -92,3 +92,7 @@ metrics_sched_*.json
 external/cuda-toolkit/
 external/build-cuda/
 external/build-tmp/
+
+
+# 10. WAV
+wav_test/google_fleurs

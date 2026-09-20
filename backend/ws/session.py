@@ -228,27 +228,69 @@ class SessionState:
 
     # ------------------------------------------------------------ model switching
     def _schedule_asr_model_switch(self, model_key: str) -> None:
-        """P1.8: nạp trước model ASR rồi swap, có thông báo trạng thái qua WS."""
-        engine = self.asr_engine
-        if engine is None:
+        """P1.8: nạp trước model ASR rồi swap, có thông báo trạng thái qua WS (tự tải nếu thiếu file)."""
+        from backend.asr import hotswap as asr_hotswap
+        from backend.asr.registry import ModelRegistry
+
+        registry = ModelRegistry.get_instance()
+        clean_key = (model_key or "").strip().lower()
+        if not registry.has_model(clean_key):
+            logger.warning(f"Model ASR '{model_key}' không có trong catalog — bỏ qua.", extra={"module_tag": "WS"})
+            self._spawn(self.send_json({
+                "type": "model_status", "stage": "asr",
+                "state": "error", "model": model_key,
+                "message": "Không có trong models.yaml",
+            }))
             return
+
+        try:
+            model_path = registry.resolve_model_path(clean_key)
+        except Exception as exc:  # noqa: BLE001
+            model_path = ""
+            logger.warning(f"Không resolve được GGUF cho ASR '{clean_key}': {exc}", extra={"module_tag": "WS"})
+
+        needs_download = asr_hotswap.needs_download(clean_key)
+        if needs_download and not asr_hotswap.auto_download_enabled():
+            logger.warning(
+                f"Model ASR '{clean_key}' chưa có file GGUF cục bộ "
+                f"({model_path or 'không xác định'}) và auto_download đang tắt — GIỮ NGUYÊN model "
+                f"hiện tại '{config.asr.active_model}'.",
+                extra={"module_tag": "WS"},
+            )
+            self._spawn(self.send_json({
+                "type": "model_status", "stage": "asr",
+                "state": "error", "model": clean_key,
+                "message": f"Chưa có file GGUF cục bộ: {model_path}",
+            }))
+            return
+
+        if asr_hotswap.is_busy() and not asr_hotswap.is_busy(clean_key):
+            self._spawn(self.send_json({
+                "type": "model_status", "stage": "asr",
+                "state": "error", "model": clean_key,
+                "message": f"Đang tải/nạp model ASR khác ({asr_hotswap.status().get('model')})",
+            }))
+            return
+
+        self.config["asr_engine"] = clean_key
 
         async def _run() -> None:
             await self.send_json({
                 "type": "model_status", "stage": "asr",
-                "state": "loading", "model": model_key,
+                "state": "downloading" if needs_download else "loading", "model": clean_key,
             })
             try:
-                await asyncio.to_thread(engine.prepare_model, model_key)
+                await asr_hotswap.activate_model(clean_key)
+                logger.info(f"Session {self.session_id[:8]}: Swapped ASR -> '{clean_key}'", extra={"module_tag": "WS"})
                 await self.send_json({
                     "type": "model_status", "stage": "asr",
-                    "state": "ready", "model": model_key,
+                    "state": "ready", "model": clean_key,
                 })
             except Exception as exc:  # noqa: BLE001
-                logger.error(f"Chuyển ASR model sang '{model_key}' thất bại: {exc}", exc_info=True, extra={"module_tag": "WS"})
+                logger.error(f"Chuyển ASR model sang '{clean_key}' thất bại: {exc}", exc_info=True, extra={"module_tag": "WS"})
                 await self.send_json({
                     "type": "model_status", "stage": "asr",
-                    "state": "error", "model": model_key, "message": str(exc),
+                    "state": "error", "model": clean_key, "message": str(exc),
                 })
 
         self._spawn(_run())

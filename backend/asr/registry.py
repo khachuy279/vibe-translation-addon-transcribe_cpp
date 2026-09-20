@@ -91,6 +91,46 @@ class ModelRegistry:
         except Exception:  # noqa: BLE001
             return False
 
+    def needs_download(self, model_key: Optional[str] = None) -> bool:
+        """True nếu file GGUF của model ASR chưa có cục bộ."""
+        return not self.is_downloaded(model_key)
+
+    def repo_id(self, model_key: Optional[str] = None) -> str:
+        """Repo HuggingFace của model (trường `hf_repo` trong models.yaml)."""
+        info = self.get_model_info(model_key)
+        return str((info or {}).get("hf_repo", "") or "")
+
+    def file_name(self, model_key: Optional[str] = None) -> str:
+        """Tên file GGUF của model (trường `file` trong models.yaml)."""
+        info = self.get_model_info(model_key)
+        return str((info or {}).get("file", "") or "")
+
+    def ensure_model_file(
+        self,
+        model_key: Optional[str] = None,
+        *,
+        allow_download: bool = True,
+        progress_interval: float = 10.0,
+    ) -> str:
+        """Đảm bảo file GGUF của model ASR đã có sẵn trên đĩa, tự tải từ HuggingFace nếu cần."""
+        from backend.utils.model_download import ensure_model_file as _dl_ensure
+
+        key = model_key or self._active_model_key
+        repo = self.repo_id(key)
+        filename = self.file_name(key)
+        if not repo or not filename:
+            raise ValueError(f"Model ASR '{key}' thiếu hf_repo hoặc file trong models.yaml")
+
+        return _dl_ensure(
+            repo_id=repo,
+            filename=filename,
+            local_dir=MODELS_DIR,
+            allow_download=allow_download,
+            label=key,
+            progress_interval=progress_interval,
+            stage="ASR",
+        )
+
     def is_streaming_model(self, model_key: Optional[str] = None) -> bool:
         """Kiểm tra xem model có phải là kiến trúc streaming (session.stream) không."""
         info = self.get_model_info(model_key)
@@ -98,8 +138,11 @@ class ModelRegistry:
             return False
         return info.get("architecture_type") == "streaming"
 
-    def resolve_model_path(self, model_key: Optional[str] = None) -> str:
-        """Tìm đường dẫn file GGUF cục bộ của model."""
+    def resolve_model_path(self, model_key: Optional[str] = None, *, allow_download: bool = False) -> str:
+        """Tìm đường dẫn file GGUF cục bộ của model (tuỳ chọn tự tải nếu allow_download=True)."""
+        if allow_download:
+            return self.ensure_model_file(model_key, allow_download=True)
+
         info = self.get_model_info(model_key)
         if not info:
             raise ValueError(f"Không tìm thấy thông tin cho model key: {model_key}")

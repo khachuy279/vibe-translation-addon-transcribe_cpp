@@ -343,7 +343,10 @@ class TranscribeEngine(BaseASREngine):
 
         model_path = self.registry.resolve_model_path(model_key)
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"File model GGUF không tồn tại: {model_path}")
+            if getattr(config.asr, "auto_download", True):
+                model_path = self.registry.ensure_model_file(model_key, allow_download=True)
+            else:
+                raise FileNotFoundError(f"File model GGUF không tồn tại: {model_path}")
 
         info = self.registry.get_model_info(model_key) or {}
         family = info.get("family", "")
@@ -401,7 +404,7 @@ class TranscribeEngine(BaseASREngine):
                 return cls._shared_model
             return self._load_model_locked(self.model_key)
 
-    def prepare_model(self, model_key: str) -> None:
+    def prepare_model(self, model_key: str, *, allow_download: Optional[bool] = None) -> None:
         """P1.8: nạp model mới rồi SWAP nguyên tử, không gián đoạn inference hiện tại.
 
         Model mới được nạp **ngoài** lock (chậm, vài giây) nên preview vẫn phục vụ
@@ -420,9 +423,16 @@ class TranscribeEngine(BaseASREngine):
 
         model_path = self.registry.resolve_model_path(model_key)
         if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"File model GGUF không tồn tại cho '{model_key}': {model_path}"
+            can_download = (
+                bool(allow_download) if allow_download is not None
+                else getattr(config.asr, "auto_download", True)
             )
+            if can_download:
+                model_path = self.registry.ensure_model_file(model_key, allow_download=True)
+            else:
+                raise FileNotFoundError(
+                    f"File model GGUF không tồn tại cho '{model_key}': {model_path}"
+                )
 
         info = self.registry.get_model_info(model_key) or {}
         logger.info(
