@@ -490,7 +490,7 @@ class VADStreamProcessor:
                 state.silence_samples += frame_samples
                 silence_elapsed_ms = (state.silence_samples / self.sample_rate) * 1000.0
                 total_silence_limit_ms = float(self.silence_duration_ms)
-                grace_hangover_ms = min(float(self.hangover_ms), total_silence_limit_ms * 0.5)
+                # grace_hangover_ms = min(float(self.hangover_ms), total_silence_limit_ms * 0.5)
 
                 # if silence_elapsed_ms <= grace_hangover_ms:
                 #     # Vẫn nằm trong vùng ân hạn Hangover -> Tiếp tục gửi cho ASR

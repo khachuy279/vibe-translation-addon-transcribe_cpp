@@ -51,6 +51,10 @@ class VADStreamState:
     # State riêng cho FireRed-VAD
     firered_postprocessor: Optional[Any] = None
     firered_caches: Optional[Any] = None
+    # Cửa sổ trượt 25 ms (400 samples) dùng để tạo ĐÚNG 1 frame mỗi `frame_hop` samples.
+    # Xem `backend/vad/engines/firered.py` + scratch/vad_frame_ab.py: model cần 1 frame
+    # mỗi 10 ms (FRAME_SHIFT_SAMPLE=160), không phải mỗi 25 ms.
+    firered_window: Optional[Any] = None
 
     # State riêng cho Silero VAD
     silero_iterator: Optional[Any] = None
@@ -73,6 +77,7 @@ class VADStreamState:
         if self.firered_postprocessor is not None:
             self.firered_postprocessor.reset()
         self.firered_caches = None
+        self.firered_window = None
 
         if self.silero_iterator is not None:
             self.silero_iterator.reset_states()

@@ -66,6 +66,36 @@ class WSConfig(BaseModel):
 class FireRedVADConfig(BaseModel):
     """Cấu hình chuyên biệt cho FireRed-VAD (Xiaohongshu DFSMN)."""
     threshold: Optional[float] = None
+    # ── BƯỚC NHẢY FRAME (đo thực 2026-09-21) ────────────────────────────────────
+    # Upstream (`fireredvad/core/constants.py`) phân biệt rõ hai đại lượng:
+    #     FRAME_LENGTH_SAMPLE = 400  (cửa sổ 25 ms)
+    #     FRAME_SHIFT_SAMPLE  = 160  (bước nhảy **10 ms**)  ⇒ 100 frame/giây
+    # `KaldifeatFbank` tạo `OnlineFbank` MỚI mỗi lần gọi, `frame_shift=10ms`,
+    # `snip_edges=True` ⇒ input 400 mẫu cho ĐÚNG 1 frame. Bản cũ gọi `extract()` mỗi
+    # 400 mẫu ⇒ chỉ **40 frame/giây**, tức model bị cho ăn sai nhịp 2,5×.
+    #
+    # ĐO THỰC trên 8 clip FLEURS (scratch/vad_frame_ab.py):
+    #   hop 25 ms: 40,0 fps | is_speech 62,9% | **1,00 segment** | segment TB 8,48 s
+    #   hop 10 ms: 99,8 fps | is_speech 60,0% | **1,62 segment** | segment TB 5,69 s
+    #   `detect_full` của upstream (tham chiếu offline): 99,8 fps | 60,0% | 1,62 segment
+    # ⇒ hop 10 ms **TRÙNG KHÍT** tham chiếu upstream; hop 25 ms **gộp segment** (1,00 thay
+    #   vì 1,62) và làm segment dài hơn 49%. Đồng thời mọi tham số ĐẾM FRAME của
+    #   postprocessor bị giãn 2,5× về thời gian thật:
+    #       min_speech_frame 8  : 200 ms -> 80 ms
+    #       pad_start_frame  5  : 125 ms -> 50 ms
+    #       min_silence_frame 60: 1500 ms -> 600 ms  (vẫn > silence_duration_ms 450 ms
+    #                            ⇒ cờ VAD Silence vẫn là thứ chốt câu, GIỮ ĐÚNG Ý ĐỊNH)
+    #       max_speech_frame 2000: 50 s -> 20 s
+    #   Với 100 frame/giây, `VADProcessor` cũng đếm im lặng mịn hơn (10 ms thay vì 25 ms).
+    #
+    # ⚠️ CHI PHÍ: 100 forward/giây thay vì 40 ⇒ VAD tốn **2,5× CPU** (RTF 0,130 -> 0,326,
+    #    ~1,2 nhân). Vẫn nhanh hơn thời gian thực 3×.
+    # ⚠️ LỢI ÍCH CER **CHƯA CHỨNG MINH**: qua pipeline thật trên JA30, hop 10 ms cho
+    #    11,89% so với 12,42% của hop 25 ms (Δ +0,53 điểm) nhưng CI95 = [−1,96; +3,57]
+    #    ⇒ KHÔNG có ý nghĩa thống kê ở n=30. Đang xác nhận trên 650 clip.
+    #    Lý do giữ mặc định 10 ms là **đúng theo tham chiếu upstream**, không phải vì CER.
+    # Đặt 25 để quay lại hành vi cũ (nhanh hơn, nhưng lệch tham chiếu).
+    frame_hop_ms: int = 10
     smooth_window_size: int = 5
     min_speech_frame: int = 8       # 8 frames * 25 ms tối thiểu xác nhận bắt đầu nói
     # 60 frames * 25 ms = 1500 ms. ⚠️ QWEN-Q11 đã kiểm chứng: giá trị này CHỈ điều khiển
@@ -109,8 +139,16 @@ class VADConfig(BaseModel):
     enabled: bool = True
     vad_engine: str = "firered-vad"  # firered-vad, silero-vad, fsmn-vad
     threshold: float = 0.45
-    silence_duration_ms: int = 600   # Thời gian im lặng (ms) để kích hoạt ngắt câu
+    # ✅ ĐO THỰC 2026-09-21 (vòng 2 tiếng Nhật, 650 clip FLEURS, kiểm định cặp
+    # bootstrap 4000 lần): 600 -> **450** giảm CER pipeline **0,997 điểm %**
+    # (CI95 [−1,299; −0,700], 172 clip tốt hơn / 78 xấu hơn) so với `base`, và là
+    # mức tốt nhất trong nhóm VAD. 300 là trung tính (0,7× sàn nhiễu 0,27).
+    # Xem report/audit/18_KE_HOACH_TEST_TIENG_NHAT.md §3.7.
+    silence_duration_ms: int = 450   # Thời gian im lặng (ms) để kích hoạt ngắt câu
     hangover_ms: int = 400           # Giữ trạng thái nói thêm hangover_ms phòng ngắt quãng
+    # ⚠️ 300 -> 500 là THẢM HỌA: đo thực CER pipeline 13,2% -> **30,5%**, p95 commit
+    # 1451 ms. Đệm trước dài hơn làm kéo audio trước khi nói vào đầu mỗi đoạn và phá
+    # vỡ ranh giới. GIỮ NGUYÊN 300.
     pre_speech_buffer_ms: int = 300  # Đệm âm thanh trước khi bắt đầu nói để tránh mất phụ âm đầu
     sample_rate: int = 16000
 
@@ -147,7 +185,37 @@ class ASRConfig(BaseModel):
     backend: str = "cuda"
     # Khi backend yêu cầu không khả dụng thì tự fallback theo thứ tự ưu tiên và ghi log
     # WARNING nêu rõ lý do. Đặt False để lỗi nổi lên thay vì âm thầm đổi backend.
+    # ⚠️ Từ khi có `require_gpu` (bên dưới), cờ này CHỈ còn điều khiển việc đổi giữa các
+    # backend GPU (cuda <-> vulkan). Nó KHÔNG bao giờ cho phép rơi xuống CPU.
     backend_fallback: bool = True
+    # --- BẮT BUỘC GPU (đo thực 2026-09-20) ---------------------------------------
+    # `backend` ở trên chỉ là *yêu cầu*. Trước đây khi nó không khả dụng,
+    # `native.resolve_backend()` âm thầm fallback và chỉ ghi WARNING ⇒ một máy không có GPU
+    # vẫn "chạy được", nhưng ASR rơi xuống CPU ở RTF ~2,55 (đo thật: `cohere-transcribe`
+    # 71,9 s cho 28,2 s audio, tức chậm hơn thời gian thực 2,5 lần) ⇒ phụ đề không bao giờ
+    # đuổi kịp video mà không có lỗi nào nổi lên.
+    #
+    # Nguy hiểm hơn: NGAY CẢ khi model nạp ra `backend=CUDA0`, ggml vẫn có thể gán một phần
+    # graph cho backend CPU dự phòng. Đo bằng `GGML_SCHED_DEBUG=2` trên RTX 5060 Ti:
+    #   * `qwen3-asr-1.7b`   : 4052/4052 node trên CUDA0 ⇒ **0 op trên CPU**
+    #   * `cohere-transcribe`: 7398 CUDA0 + **192 CPU** (48× `FLASH_ATTN` + 48× `SIGMOID`,
+    #     đúng 1 cặp mỗi encoder block) ⇒ RTF 0,104 (so với 0,020 của qwen) và ăn ~3,4 nhân CPU.
+    # Vì vậy chỉ nhìn log "backend=CUDA0" là KHÔNG đủ để kết luận đang chạy GPU.
+    #
+    # `require_gpu = True` (mặc định) thực thi hai tầng:
+    #   1. Python: `native.resolve_backend()` **NÉM LỖI** (`GpuRequiredError`) khi không có
+    #      backend GPU nào khả dụng, thay vì fallback im lặng.
+    #   2. Native: đặt `GGML_SCHED_REQUIRE_GPU=1` để tầng native **từ chối** mọi graph có op
+    #      bị gán cho backend CPU, kèm tên op trong log (xem
+    #      `external/transcribe.cpp/patches/ggml/0002-require-gpu-no-cpu-fallback.patch`).
+    #      LƯU Ý: cần bundle native đã build lại mới có hiệu lực; bundle cũ bỏ qua env này.
+    #
+    # ⚠️ HỆ QUẢ ĐÃ ĐO: với tầng (2) bật, `cohere-transcribe` **sẽ lỗi** vì nó cần 48×
+    # `FLASH_ATTN` + 48× `SIGMOID` trên CPU — tức nó KHÔNG thể chạy GPU-only trên bản port
+    # hiện tại. `qwen3-asr-1.7b` không bị ảnh hưởng (đã 100% GPU).
+    # Đặt False chỉ khi CHỦ ĐÍCH chấp nhận chạy CPU (chậm hơn thời gian thực) hoặc khi cần
+    # chẩn đoán. Biến môi trường `TRANSCRIBE_REQUIRE_GPU=0` cũng hạ được cờ này.
+    require_gpu: bool = True
     # --- Bundle native cục bộ (`bin/`) ------------------------------------------
     # Ưu tiên bundle trong `bin/` (bản dựng cục bộ, có thể gồm ggml-cuda.dll) hơn provider
     # `transcribe-cpp-native` đã cài trong site-packages. Xem backend/asr/native.py.
@@ -175,7 +243,8 @@ class ASRConfig(BaseModel):
     # Giữ giá trị >= SentenceConfig.max_duration_sec để cửa sổ luôn bao trùm trọn câu
     # hiện tại => preview thấy cùng ngữ cảnh như commit => KHÔNG mất độ chính xác.
     # Đặt 0 để tắt (quay lại hành vi cũ: transcribe từ đầu câu mỗi lần).
-    preview_window_sec: float = 8.0
+    # ✅ ĐO THỰC 2026-09-21: 8.0 -> 15.0, đi kèm `sentence.max_duration_sec` 8 -> 15.
+    preview_window_sec: float = 15.0
     # P2.4: lịch preview theo nhịp cố định (bỏ nhịp nếu inference vượt hạn).
     preview_fixed_rate: bool = True
     # P2.4b: TỰ ĐIỀU CHỈNH NHỊP. Khi backend ASR có đuôi độ trễ (spike), giữ nhịp cố định
@@ -234,7 +303,13 @@ class SentenceConfig(BaseModel):
     max_chars: int = 150
     # P2.3: giữ BẰNG `ASRConfig.preview_window_sec` để cửa sổ preview luôn bao trùm
     # trọn câu hiện tại => preview không mất ngữ cảnh so với commit (nguyên tắc P2).
-    max_duration_sec: float = 8.0          # Giới hạn tối đa độ dài 1 câu nói liên tục
+    # ✅ ĐO THỰC 2026-09-21 (vòng 2 tiếng Nhật, JA30 rồi 650 clip): 8.0 -> **15.0**.
+    # 12 / 15 / 20 cho kết quả TƯƠNG ĐƯƠNG nhau (13,44 / 13,19 / 13,44% trên JA30, sàn
+    # nhiễu 0,27) nên 15 được chọn làm điểm cân bằng: đủ dài để không chẻ câu dài kiểu
+    # FLEURS, đủ ngắn để trần mảnh commit (×1.5 = 22,5 s) không phình.
+    # Chỉ đổi `max_duration_sec` đã giảm CER 0,762 điểm % (CI95 [−1,028; −0,488]).
+    # Xem report/audit/18_KE_HOACH_TEST_TIENG_NHAT.md §3.7.
+    max_duration_sec: float = 15.0         # Giới hạn tối đa độ dài 1 câu nói liên tục
     min_words_to_commit: int = 2           # Số từ tối thiểu để gửi sang dịch/TTS (lọc tiếng ậm ừ)
     split_on_stability: bool = True        # Tự động ngắt câu khi preview text ổn định
     stability_duration_sec: float = 0.6    # Thời gian (giây) preview text bất biến (P3: cắt ở ranh giới từ)
@@ -250,7 +325,10 @@ class SentenceConfig(BaseModel):
     # Đặt False để quay lại hành vi cũ (chỉ chốt theo VAD silence).
     enable_tier234: bool = True
     # P2.7: câu kế tiếp lùi lại bao nhiêu ms để không mất từ ở ranh giới cắt.
-    boundary_overlap_ms: int = 250
+    # ✅ ĐO THỰC 2026-09-21: 250 -> **0**. Chồng lấn làm từ ở ranh giới bị nhận dạng
+    # HAI LẦN (insertion) mà `trim_boundary_overlap` không gỡ hết. Kèm với
+    # `max_duration_sec` 8 -> 15, đổi cả hai giảm 0,762 điểm % CER (có ý nghĩa thống kê).
+    boundary_overlap_ms: int = 0
     # P2.1: nếu mảnh cắt ra quá ngắn (< min_words_to_commit) thì gộp vào câu kế tiếp
     # thay vì để tầng trên lọc bỏ (tránh mất chữ).
     carry_over_short_fragment: bool = True
