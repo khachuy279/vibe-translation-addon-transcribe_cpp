@@ -7,12 +7,19 @@
 2. Engine VAD chỉ nhận **view chỉ-đọc** của đúng buffer đó (không thể sửa audio của ASR).
 3. Buffer ASR nhận đúng chuỗi byte đó (kiểm tra qua `TranscribeEngine.feed_audio`), và
    chuyển Int16 → Float32 `/32768` là hoàn nguyên được bit-exact (chia luỹ thừa 2).
+4. `silence_duration_ms = 0/None` ⇒ engine dùng mặc định docs; `> 0` ⇒ nó là **điều kiện
+   số 1** để chốt END (processor là bên quyết định, ghi đè `min_silence_frame`…).
 """
 
 import numpy as np
 import pytest
 
-from backend.tests.fakes import make_silence_pcm, make_speech_pcm, pcm_to_int16_bytes
+from backend.tests.fakes import (
+    FakeVADEngine,
+    make_silence_pcm,
+    make_speech_pcm,
+    pcm_to_int16_bytes,
+)
 
 
 def _feed_all(proc, payload: bytes, chunk_bytes: int = 640) -> None:
@@ -205,3 +212,140 @@ def test_prewarm_giu_dung_maxlen_pre_roll(monkeypatch):
     )
     proc.reset()
     assert proc._state.pre_roll.maxlen == 3, "state sau `reset()` cũng phải giữ đúng maxlen"
+
+
+# ─────────────────────────── VAD Silence = 0 => docs; > 0 => điều kiện số 1 ──────────
+
+
+class _EarlyEndVADEngine(FakeVADEngine):
+    """Engine 'hỏng': tự chốt END sau đúng 1 frame im lặng, KHÔNG tôn trọng `silence_ms`.
+
+    Dùng để chứng minh ở chế độ ghi đè, quyết định của processor thắng quyết định của engine.
+    """
+
+    def is_speech(self, frame_int16, state, threshold=None, silence_ms=None):
+        return super().is_speech(frame_int16, state, threshold=threshold, silence_ms=25)
+
+
+def _do_override(engine, *, silence_ms, speech_sec: float = 1.0, silence_sec: float = 2.0):
+    """Chạy 1 phiên với engine cho trước; trả (mẫu cuối có bằng chứng, mẫu chốt END, lý do)."""
+    from backend.vad.processor import VADProcessor
+    from backend.tests.fakes import make_silence_pcm, make_speech_pcm, pcm_to_int16_bytes
+
+    proc = VADProcessor(
+        vad_engine="firered-vad",
+        threshold=None,
+        silence_duration_ms=silence_ms,
+        engine_override=engine,
+        auto_load=False,
+    )
+    recorded = {"last_evidence": 0, "end_sample": None, "reason": None, "samples": 0}
+
+    original = engine.is_speech
+
+    def _wrapped(frame, state, threshold=None, silence_ms=None):
+        res = original(frame, state, threshold=threshold, silence_ms=silence_ms)
+        recorded["samples"] += len(frame)
+        if res.is_speech:
+            recorded["last_evidence"] = recorded["samples"]
+        return res
+
+    engine.is_speech = _wrapped  # type: ignore[method-assign]
+
+    original_close = proc._close_utterance
+
+    def _close_spy(state, callbacks, *, reason, detail, prob):
+        recorded["end_sample"] = state.total_samples_processed
+        recorded["reason"] = reason
+        return original_close(state, callbacks, reason=reason, detail=detail, prob=prob)
+
+    proc._close_utterance = _close_spy  # type: ignore[method-assign]
+
+    pcm = np.concatenate([
+        make_silence_pcm(0.3),
+        make_speech_pcm(speech_sec, amplitude=0.3),
+        make_silence_pcm(silence_sec),
+    ])
+    payload = pcm_to_int16_bytes(pcm)
+    _feed_all(proc, payload, chunk_bytes=640)
+    return recorded
+
+
+def test_silence_duong_la_dieu_kien_so_1_chot_end():
+    """`silence_duration_ms > 0` ⇒ END đúng sau `silence_duration_ms` im lặng."""
+    from backend.tests.fakes import FakeVADEngine
+
+    hop = FakeVADEngine.frame_samples
+    for silence_ms in (300, 700, 1400):
+        rec = _do_override(FakeVADEngine(), silence_ms=silence_ms)
+        assert rec["end_sample"] is not None, f"silence={silence_ms}: không chốt được câu"
+        silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+        assert abs(silent_ms - silence_ms) <= 2 * hop / 16000 * 1000, (
+            f"silence={silence_ms}: END ở {silent_ms:.0f} ms im lặng (lệch quá 2 frame)"
+        )
+        # Với engine TỐT, hai điều kiện trùng frame: engine cũng END đúng lúc đó nên lý do
+        # có thể là `engine_end`. Điều bắt buộc là THỜI ĐIỂM (kiểm ở trên).
+        assert rec["reason"] in ("engine_end", "silence_override")
+
+
+def test_silence_duong_ghi_de_end_som_cua_engine():
+    """END sớm của engine bị BỎ QUA khi popup đặt VAD Silence > 0 (điều kiện số 1)."""
+    hop = _EarlyEndVADEngine.frame_samples
+    silence_ms = 700
+
+    rec = _do_override(_EarlyEndVADEngine(), silence_ms=silence_ms)
+    silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+    assert rec["reason"] == "silence_override", (
+        "engine tự END sớm nhưng processor phải chờ đủ silence_duration_ms "
+        f"(lý do nhận được: {rec['reason']})"
+    )
+    assert silent_ms >= silence_ms, (
+        f"câu bị chốt sau {silent_ms:.0f} ms im lặng — sớm hơn yêu cầu {silence_ms} ms"
+    )
+    assert silent_ms <= silence_ms + 2 * hop / 16000 * 1000
+
+
+def test_silence_bang_0_thi_engine_quyet_dinh():
+    """`silence_duration_ms = None` ⇒ tôn trọng END của engine (mặc định docs của nó)."""
+    rec = _do_override(_EarlyEndVADEngine(), silence_ms=None)
+    assert rec["reason"] == "engine_end"
+    silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+    # Engine giả này chốt sau đúng 1 frame (25 ms) im lặng.
+    assert silent_ms <= 2 * _EarlyEndVADEngine.frame_samples / 16000 * 1000
+
+
+def test_gat_silence_ve_0_giua_cau_khong_treo_cau():
+    """Edge case: đang ghi đè (700 ms) mà người dùng gạt VAD Silence về 0 giữa câu.
+
+    Engine đã phát END sớm và bị hoãn (`engine_end_pending`); khi chế độ đổi về docs, frame
+    kế tiếp phải tôn trọng quyết định đó — nếu không, câu sẽ treo vĩnh viễn.
+    """
+    from backend.vad.processor import VADProcessor
+    from backend.tests.fakes import make_silence_pcm, make_speech_pcm, pcm_to_int16_bytes
+
+    proc = VADProcessor(
+        vad_engine="firered-vad",
+        silence_duration_ms=700,
+        engine_override=_EarlyEndVADEngine(),
+        auto_load=False,
+    )
+    ends = []
+    proc.on_speech_end = lambda: ends.append(proc._state.total_samples_processed)
+    proc.on_speech_chunk = lambda *_: None
+
+    speech = pcm_to_int16_bytes(make_speech_pcm(0.8, amplitude=0.3))
+    silence = pcm_to_int16_bytes(make_silence_pcm(1.5))
+    _feed_all(proc, speech)
+    assert proc._state.is_speech is True
+
+    # 0,2 s im lặng: engine đã muốn END (mặc định nội bộ 25 ms) nhưng bị hoãn vì < 700 ms.
+    _feed_all(proc, silence[: int(0.2 * 16000) * 2])
+    assert not ends, "chưa đủ 700 ms im lặng thì chưa được chốt"
+    assert proc._state.is_speech is True
+    assert proc._state.engine_end_pending is True
+
+    # Người dùng gạt VAD Silence về 0 ⇒ chế độ docs; frame im lặng kế tiếp phải chốt câu.
+    proc.update_config(silence_duration_ms=0)
+    _feed_all(proc, silence[int(0.2 * 16000) * 2:])
+    assert ends, "gạt về 0 mà câu vẫn treo ⇒ quyết định END của engine bị mất"
+    assert proc._state.is_speech is False

@@ -3,16 +3,16 @@
 - **Video**: `5BDj0ow5hnA` · cửa sổ **900–1500 s** (nhãn phủ liên tục)
 - **Audio test**: `wav_test\vad\derived\5BDj0ow5hnA_900s_600s_16k_mono.wav` (600.0 s, 16 kHz mono Int16, kênh 0 như plugin)
 - **Nhãn**: 98 dòng CSV, so khớp ở độ phân giải 10 ms (`SPEECH_*` = nói, `NO_SPEECH` = lặng)
-- **Sinh lúc**: 2026-09-21 23:01:53
+- **Sinh lúc**: 2026-09-21 23:46:07
 - **Pipeline**: `plugin → VAD → ASR`; VAD chỉ chuyển tiếp **byte nguyên bản** (kiểm tra `mismatches = 0` bên dưới).
 
 ## 1. Kết quả từng engine (mặc định docs: `threshold=None`, `silence=None`)
 
 | Engine | Hop | Trần pre-roll | P | R | F1 | Accuracy | Segment (pred/GT) | Onset trung vị | RTF | Byte sai lệch |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `firered-vad` | 160 mẫu | 13 frame | 0.907 | 0.929 | **0.918** | 0.878 | 123 / 46 | 100.0 ms | 0.332 | 0 |
-| `silero-vad` | 512 mẫu | 2 frame | 0.952 | 0.496 | **0.652** | 0.613 | 113 / 46 | 95.0 ms | 0.022 | 0 |
-| `fsmn-vad` | 960 mẫu | 11 frame | 0.882 | 0.694 | **0.777** | 0.708 | 59 / 46 | 815.0 ms | 0.053 | 0 |
+| `firered-vad` | 160 mẫu | 13 frame | 0.907 | 0.929 | **0.918** | 0.878 | 123 / 46 | 100.0 ms | 0.331 | 0 |
+| `silero-vad` | 512 mẫu | 2 frame | 0.952 | 0.496 | **0.652** | 0.613 | 113 / 46 | 95.0 ms | 0.023 | 0 |
+| `fsmn-vad` | 960 mẫu | 11 frame | 0.882 | 0.694 | **0.777** | 0.708 | 59 / 46 | 815.0 ms | 0.056 | 0 |
 
 ## 2. Ngưỡng hồi quy đã chốt (thấp hơn số đo để tránh dao động nhỏ)
 

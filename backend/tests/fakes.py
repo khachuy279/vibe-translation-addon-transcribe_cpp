@@ -143,7 +143,7 @@ class FakeVADEngine(BaseVADEngine):
 
         res = VADResult(
             probability=min(1.0, rms / max(1e-6, self.rms_threshold)),
-            is_speech=is_speech_frame,
+            is_speech=is_speech_frame,   # bằng chứng của RIÊNG frame này (không phải state)
         )
 
         if is_speech_frame:
@@ -163,7 +163,6 @@ class FakeVADEngine(BaseVADEngine):
                     res.event = "END"
                     res.lookback_frames = 0
 
-        res.is_speech = session.in_speech
         return res
 
 

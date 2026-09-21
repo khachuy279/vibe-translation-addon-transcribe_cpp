@@ -449,13 +449,29 @@ class VADStreamProcessor:
         """Áp kết quả VAD của MỘT frame vào state và thu thập callback cần gọi.
 
         Caller phải giữ `self._lock`. Không chạy model ở đây (xem P4.6).
+
+        Hai chế độ chốt câu:
+
+        * **Mặc định docs** (`silence_duration_ms` là None/0): `START`/`END` của engine là
+          nguồn sự thật duy nhất — engine dùng đúng tham số im lặng trong docs của nó.
+        * **Ghi đè** (`silence_duration_ms > 0`, popup "VAD Silence" > 0): processor là bên
+          chốt `END`, sau ĐÚNG `silence_duration_ms` im lặng kể từ frame cuối cùng có bằng
+          chứng tiếng nói (`VADResult.is_speech`) — tức `silence_duration_ms` là **điều kiện
+          số 1**, ghi đè `min_silence_frame` / `min_silence_duration_ms` /
+          `max_end_silence_time`. Engine phát END sớm hơn thì bị bỏ qua; engine phát muộn
+          hơn (hoặc không phát) thì processor vẫn chốt đúng hạn.
         """
         state.total_samples_processed += self._frame_samples
         prob = float(res.probability or 0.0)
+        if res.is_speech:
+            state.last_speech_sample = state.total_samples_processed
 
         if res.event == "START":
             if not state.is_speech:
                 state.is_speech = True
+                state.engine_end_pending = False
+                # Mốc đếm im lặng bắt đầu từ chính frame mở đoạn.
+                state.last_speech_sample = max(state.last_speech_sample, state.total_samples_processed)
                 logger.info(f"START (p={prob:.2f})", extra={"module_tag": "VAD"})
                 if self.on_speech_start:
                     callbacks_to_fire.append((self.on_speech_start, ()))
@@ -476,12 +492,38 @@ class VADStreamProcessor:
                 )
             return
 
-        if res.event == "END":
+        if state.is_speech and self.silence_duration_ms is not None:
+            # ── CHẾ ĐỘ GHI ĐÈ: `silence_duration_ms` là điều kiện số 1 ────────────────
+            silent_ms = (state.total_samples_processed - state.last_speech_sample) / self.sample_rate * 1000.0
+            # END "cưỡng bức" của engine (vd trần `max_speech_frame`) đến khi frame hiện
+            # tại VẪN còn bằng chứng tiếng nói ⇒ tôn trọng ngay, không chờ đủ im lặng.
+            forced_split = res.event == "END" and bool(res.is_speech)
+            if forced_split or silent_ms >= float(self.silence_duration_ms):
+                self._close_utterance(
+                    state,
+                    callbacks_to_fire,
+                    reason=("engine_end" if res.event == "END" else "silence_override"),
+                    detail=f"im lặng {silent_ms:.0f}ms >= {self.silence_duration_ms}ms",
+                    prob=prob,
+                )
+                state.pre_roll.append((frame_bytes, frame_ts))
+                return
+            if res.event == "END":
+                # Engine muốn đóng nhưng chưa đủ im lặng theo yêu cầu ⇒ HOÃN. Ghi nhớ để nếu
+                # người dùng gạt VAD Silence về 0 thì frame sau tôn trọng ngay (không treo câu).
+                state.engine_end_pending = True
+            # Chưa đủ im lặng: giữ câu mở và tiếp tục chuyển tiếp audio.
+            if self.on_speech_chunk:
+                callbacks_to_fire.append(
+                    (self.on_speech_chunk, (frame_bytes, frame_ts, VADState.SPEECH.value))
+                )
+            return
+
+        if res.event == "END" or (state.engine_end_pending and state.is_speech):
             if state.is_speech:
-                state.is_speech = False
-                logger.info(f"END (p={prob:.2f})", extra={"module_tag": "VAD"})
-                if self.on_speech_end:
-                    callbacks_to_fire.append((self.on_speech_end, ()))
+                self._close_utterance(
+                    state, callbacks_to_fire, reason="engine_end", detail="", prob=prob
+                )
             # Frame kết thúc đoạn nằm trong phần im lặng ⇒ đệm cho đoạn kế tiếp.
             state.pre_roll.append((frame_bytes, frame_ts))
             return
@@ -494,6 +536,22 @@ class VADStreamProcessor:
         else:
             # SILENCE: giữ lại tối đa `max_lookback_frames` frame để xả khi START.
             state.pre_roll.append((frame_bytes, frame_ts))
+
+    def _close_utterance(
+        self,
+        state: VADStreamState,
+        callbacks_to_fire: List[Tuple[Callable, tuple]],
+        *,
+        reason: str,
+        detail: str,
+        prob: float,
+    ) -> None:
+        """Chốt câu hiện tại (SILENCE) và thu thập callback `on_speech_end`. Caller giữ lock."""
+        state.is_speech = False
+        suffix = f", {detail}" if detail else ""
+        logger.info(f"END [{reason}{suffix}] (p={prob:.2f})", extra={"module_tag": "VAD"})
+        if self.on_speech_end:
+            callbacks_to_fire.append((self.on_speech_end, ()))
 
     @staticmethod
     def _safe_callback(fn: Callable[[], None]) -> None:

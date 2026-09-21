@@ -83,8 +83,12 @@
             <label>⏱️ VAD Silence</label>
             <span class="val-badge"><span id="valVadSilence">0</span><span id="valVadSilenceUnit"></span></span>
           </div>
-          <!-- 0 = OFF: để chính VAD dùng mặc định trong docs của nó (FireRed 600 ms,
-               Silero 100 ms, FSMN 800 ms). Không còn hangover/pre-speech ở tầng processor. -->
+          <!-- 0 = OFF: để chính VAD dùng mặc định trong docs của nó (FireRed 200 ms,
+               Silero 100 ms, FSMN 800 ms).
+               > 0: `silenceDurationMs` là ĐIỀU KIỆN SỐ 1 để chốt câu — backend tự chốt
+               Speech END sau ĐÚNG ngần ấy ms im lặng, ghi đè min_silence_frame /
+               min_silence_duration_ms / max_end_silence_time của engine.
+               Không còn hangover/pre-speech ở tầng processor. -->
           <input type="range" id="rangeVadSilence" min="0" max="1500" step="50" value="0">
         </div>
         <div class="setting-group flex-1">

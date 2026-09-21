@@ -8,7 +8,7 @@
     "labels": 98,
     "frame_ms": 10
   },
-  "generated_at": "2026-09-21 23:01:53",
+  "generated_at": "2026-09-21 23:46:07",
   "engines": {
     "firered-vad": {
       "engine": "firered-vad",
@@ -17,7 +17,7 @@
       "starts": 123,
       "ends": 122,
       "elapsed_sec": 198.9,
-      "rtf": 0.3315,
+      "rtf": 0.3314,
       "integrity": {
         "frames": 44958,
         "mismatches": 0,
@@ -52,8 +52,8 @@
       "pre_roll_frames": 2,
       "starts": 121,
       "ends": 120,
-      "elapsed_sec": 13.0,
-      "rtf": 0.0216,
+      "elapsed_sec": 13.6,
+      "rtf": 0.0226,
       "integrity": {
         "frames": 7120,
         "mismatches": 0,
@@ -88,8 +88,8 @@
       "pre_roll_frames": 11,
       "starts": 98,
       "ends": 97,
-      "elapsed_sec": 32.1,
-      "rtf": 0.0535,
+      "elapsed_sec": 33.8,
+      "rtf": 0.0563,
       "integrity": {
         "frames": 5763,
         "mismatches": 0,

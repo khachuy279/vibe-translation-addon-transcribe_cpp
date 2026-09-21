@@ -144,7 +144,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const off = !ms || ms <= 0;
       valVadSilence.textContent = off ? "0" : String(ms);
       const unit = document.getElementById("valVadSilenceUnit");
-      if (unit) unit.textContent = off ? " (mặc định VAD)" : "ms";
+      if (unit) unit.textContent = off ? " (OFF)" : "ms";
     }
     if (valVadThreshold && rangeVadThreshold) valVadThreshold.textContent = parseFloat(rangeVadThreshold.value).toFixed(2);
     if (valMinWords && rangeMinWords) {

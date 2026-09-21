@@ -191,9 +191,12 @@ class SileroVADEngine(BaseVADEngine):
             res = session.iterator(torch.from_numpy(samples))
 
         session.frames += 1
+        # `is_speech` = BẰNG CHỨNG của riêng frame này (xác suất ≥ ngưỡng), KHÔNG phải
+        # `iterator.triggered` (triggered giữ nguyên True suốt `min_silence_samples` nên
+        # không dùng để đếm im lặng được).
         result = VADResult(
             probability=float(session.probe.last_prob),
-            is_speech=bool(getattr(session.iterator, "triggered", False)),
+            is_speech=float(session.probe.last_prob) >= eff_threshold,
         )
         if res:
             if "start" in res:
@@ -206,7 +209,6 @@ class SileroVADEngine(BaseVADEngine):
                 result.is_speech = True
             elif "end" in res:
                 result.event = EVENT_END
-                result.is_speech = False
         return result
 
     @staticmethod

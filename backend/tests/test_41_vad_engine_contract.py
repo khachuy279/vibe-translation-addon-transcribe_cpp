@@ -404,6 +404,99 @@ def test_silence_bang_0_nghia_la_dung_mac_dinh_engine():
     assert it.min_silence_samples == pytest.approx(config.vad.silero.min_silence_duration_ms * 16.0)
 
 
+# ─────────────────────────────────────────────── 6. VAD Silence: 0 = docs, >0 = ghi đè
+
+
+#: Mặc định im lặng trong docs của từng engine (ms) — dùng để kiểm chế độ `silence=0`.
+_DOCS_SILENCE_MS = {"firered-vad": 200, "silero-vad": 100, "fsmn-vad": 800}
+
+
+def _run_silence_case(engine_name: str, pcm_bytes: bytes, silence_ms):
+    """Chạy 1 phiên và trả (mẫu cuối có bằng chứng, mẫu chốt END, lý do chốt)."""
+    from backend.vad.processor import VADStreamProcessor
+
+    hop = _HOP_SAMPLES[engine_name]
+    rec = {"last_evidence": 0, "end_sample": None, "reason": None, "samples": 0}
+    proc = VADStreamProcessor(vad_engine=engine_name, silence_duration_ms=silence_ms)
+    proc.prewarm()
+
+    original = proc._engine.is_speech
+
+    def _wrapped(frame, state, threshold=None, silence_ms=None):
+        res = original(frame, state, threshold=threshold, silence_ms=silence_ms)
+        rec["samples"] += len(frame)
+        if res.is_speech:
+            rec["last_evidence"] = rec["samples"]
+        return res
+
+    proc._engine.is_speech = _wrapped  # type: ignore[method-assign]
+
+    original_close = proc._close_utterance
+
+    def _close_spy(state, callbacks, *, reason, detail, prob):
+        rec["end_sample"] = state.total_samples_processed
+        rec["reason"] = reason
+        return original_close(state, callbacks, reason=reason, detail=detail, prob=prob)
+
+    proc._close_utterance = _close_spy  # type: ignore[method-assign]
+
+    chunk_bytes = int(16000 * _CHUNK_SEC) * 2
+    for i in range(0, len(pcm_bytes), chunk_bytes):
+        proc.feed_chunk(pcm_bytes[i:i + chunk_bytes], capture_timestamp=(i / 2) / 16000.0)
+
+    rec["hop"] = hop
+    return rec
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("engine_name", ENGINES)
+def test_vad_silence_bang_0_dung_mac_dinh_docs(engine_name, stream):
+    """Popup `VAD Silence = 0` ⇒ ENGINE tự chốt câu (không có ghi đè của processor).
+
+    Phép đo chính xác giá trị mặc định docs nằm ở `test_chieu_silence_va_threshold_xuong_field_native`
+    (field native khớp config) và `test_config_3_engine_khop_docs` (config khớp thư viện);
+    ở đây chốt thêm: (a) câu vẫn được chốt, (b) lý do là `engine_end` — tức processor KHÔNG
+    can thiệp, (c) với engine có bằng chứng từng frame, im lặng thực tế ngắn hơn mức ghi đè
+    700 ms (chứng minh ghi đè thật sự có tác dụng).
+    """
+    rec = _run_silence_case(engine_name, stream["bytes"], None)
+    assert rec["end_sample"] is not None, "không chốt được câu"
+    assert rec["reason"] == "engine_end", (
+        f"{engine_name}: chế độ VAD Silence = 0 phải để engine tự chốt, nhận {rec['reason']}"
+    )
+
+    silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+    hop_ms = rec["hop"] / 16000 * 1000
+    print(f"[{engine_name}] VAD Silence=0 (docs) → chốt sau {silent_ms:.0f} ms im lặng "
+          f"(mặc định docs: {_DOCS_SILENCE_MS[engine_name]} ms, hop {hop_ms:.0f} ms)")
+
+    # FSMN ở chế độ docs chưa bật `output_frame_probs` nên "bằng chứng" = state của engine
+    # (flip đúng frame END) ⇒ phép đo này bằng 0, không dùng để so sánh được.
+    if engine_name != "fsmn-vad":
+        assert silent_ms < 700 - 2 * hop_ms, (
+            f"{engine_name}: mặc định docs ({silent_ms:.0f} ms) không ngắn hơn mức ghi đè 700 ms "
+            f"⇒ ghi đè không có tác dụng"
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("engine_name", ENGINES)
+def test_vad_silence_duong_la_dieu_kien_so_1(engine_name, stream):
+    """Popup `VAD Silence = 700` ⇒ chốt câu sau ĐÚNG 700 ms im lặng, ghi đè giá trị native."""
+    silence_ms = 700
+    rec = _run_silence_case(engine_name, stream["bytes"], silence_ms)
+    assert rec["end_sample"] is not None, "không chốt được câu"
+    silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+    tolerance = 2 * rec["hop"] / 16000 * 1000 + 1.0
+    assert abs(silent_ms - silence_ms) <= tolerance, (
+        f"{engine_name}: chốt sau {silent_ms:.0f} ms im lặng; yêu cầu {silence_ms} ms "
+        f"(dung sai {tolerance:.0f} ms = 2 frame)"
+    )
+    assert silent_ms >= silence_ms - tolerance
+    print(f"[{engine_name}] VAD Silence=700 → chốt sau {silent_ms:.0f} ms im lặng "
+          f"(mặc định docs: {_DOCS_SILENCE_MS[engine_name]} ms)")
+
+
 # ─────────────────────────────────────────────── 5. đổi engine giữa câu
 
 

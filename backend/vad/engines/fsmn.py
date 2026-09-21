@@ -175,6 +175,10 @@ class FsmnVADEngine(BaseVADEngine):
 
         eff_threshold, eff_silence_ms = self._resolve_effective(threshold, silence_ms)
         self._sync_runtime_config(session, eff_threshold, eff_silence_ms)
+        # Chế độ "silence_duration_ms là điều kiện số 1" cần xác suất TỪNG FRAME làm bằng
+        # chứng. Bật một chiều (không bao giờ tắt) để không đua trên model dùng chung.
+        if silence_ms is not None:
+            self._ensure_frame_probs()
 
         import torch
 
@@ -194,9 +198,15 @@ class FsmnVADEngine(BaseVADEngine):
         session.frames += 1
         signals: List[Any] = res[0].get("value", []) if res else []
 
+        # `is_speech` = BẰNG CHỨNG của riêng frame này (xác suất frame ≥ ngưỡng) để
+        # processor đếm im lặng khi `silence_duration_ms > 0`. Nếu chưa bật
+        # `output_frame_probs` (mặc định docs) thì lấy trạng thái máy trạng thái làm bảo hiểm.
+        last_prob = self._last_frame_prob(session)
+        evidence = last_prob >= eff_threshold if last_prob > 0.0 else session.in_speech
+
         result = VADResult(
-            probability=self._last_frame_prob(session),
-            is_speech=session.in_speech,
+            probability=last_prob,
+            is_speech=evidence,
         )
         for sig in signals:
             if not sig or len(sig) < 2:
@@ -244,6 +254,21 @@ class FsmnVADEngine(BaseVADEngine):
             return float(score) if score is not None else 0.0
         except (TypeError, ValueError):
             return 0.0
+
+    def _ensure_frame_probs(self) -> None:
+        """Bật `output_frame_probs` (mặc định docs là False) khi phiên cần override silence.
+
+        Đây là chi tiết THỰC THI để lấy bằng chứng từng frame; không đổi ngữ nghĩa phát
+        hiện của FSMN và không đổi giá trị config (vẫn False theo docs cho tới khi cần).
+        """
+        opts = self.model.model.vad_opts
+        if not getattr(opts, "output_frame_probs", False):
+            opts.output_frame_probs = True
+            logger.info(
+                "FSMN: bật `output_frame_probs` để có bằng chứng từng frame cho chế độ "
+                "silence_duration_ms (popup VAD Silence > 0).",
+                extra={"module_tag": "VAD"},
+            )
 
     def _sync_runtime_config(self, session: _Session, threshold: float, silence_ms: int) -> None:
         """Áp cấu hình runtime lên `stats` của phiên (đổi ngưỡng/silence giữa phiên)."""

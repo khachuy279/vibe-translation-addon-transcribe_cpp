@@ -41,7 +41,10 @@ class VADResult:
             thụ trước frame hiện tại nhưng vẫn thuộc đoạn nói (do pre-padding của chính
             VAD, ví dụ `pad_start_frame` của FireRed). Processor dùng con số này để xả
             đúng phần audio đã đệm, tránh mất phụ âm đầu.
-        is_speech: trạng thái nói/im theo máy trạng thái của engine (thông tin).
+        is_speech: **bằng chứng tiếng nói của RIÊNG frame này** (ví dụ: xác suất frame ≥
+            ngưỡng), KHÔNG phải trạng thái máy trạng thái của engine. Processor dùng nó
+            cho chế độ `silence_duration_ms > 0` (đếm im lặng để chốt câu); ở chế độ mặc
+            định docs thì event `START`/`END` mới là nguồn sự thật.
     """
     probability: float = 0.0
     event: Optional[str] = None
@@ -90,6 +93,16 @@ class VADStreamState:
     is_speech: bool = False
     total_samples_processed: int = 0
 
+    #: Tổng số mẫu tại frame CUỐI CÙNG có bằng chứng tiếng nói (`VADResult.is_speech`).
+    #: Dùng cho chế độ `silence_duration_ms > 0`: processor tự chốt END sau đúng
+    #: `silence_duration_ms` im lặng, không phụ thuộc việc engine có tôn trọng tham số hay không.
+    last_speech_sample: int = 0
+
+    #: Engine ĐÃ muốn đóng đoạn nhưng bị chế độ ghi đè hoãn lại (chưa đủ `silence_duration_ms`).
+    #: Nếu người dùng gạt VAD Silence về 0 giữa câu, frame kế tiếp sẽ tôn trọng quyết định này
+    #: thay vì để câu treo.
+    engine_end_pending: bool = False
+
     #: Mốc thời gian (giây, theo đồng hồ client) của BYTE ĐẦU TIÊN đang nằm trong
     #: `raw_buffer`. Cần thiết vì một frame có thể vắt qua nhiều chunk client gửi (ví dụ
     #: hop 60 ms của FSMN với chunk 20 ms) — nếu lấy `capture_timestamp` của chunk hiện
@@ -103,6 +116,8 @@ class VADStreamState:
         self.pre_roll.clear()
         self.is_speech = False
         self.total_samples_processed = 0
+        self.last_speech_sample = 0
+        self.engine_end_pending = False
         self.stream_ts = 0.0
 
 

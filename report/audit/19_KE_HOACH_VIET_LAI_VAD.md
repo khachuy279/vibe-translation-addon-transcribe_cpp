@@ -490,3 +490,39 @@ hàm lồng nhau. `_module_tag()` trả **tập** giá trị có thể có, và:
   khẳng định nó vẫn bắt đúng `None` (thiếu) và `WS.HANDLER`/`asr` (ngoài danh sách chuẩn).
 
 Nhờ vậy quy ước logging giữ nguyên độ chặt mà `pytest` tầng A xanh hoàn toàn.
+
+### 10.6 Điều chỉnh `⏱️ VAD Silence` (theo yêu cầu lượt sau)
+
+**Ngữ nghĩa chốt:**
+
+| Giá trị popup | Hành vi |
+|---|---|
+| `0` (off) | `VADConfig.silence_duration_ms = None` ⇒ **engine quyết định** theo đúng mặc định docs (FireRed `min_silence_frame=20` = 200 ms · Silero 100 ms · FSMN 800 ms). Processor KHÔNG can thiệp: lý do chốt câu là `engine_end`. |
+| `> 0` | `silence_duration_ms` là **ĐIỀU KIỆN SỐ 1**: processor tự chốt `END` sau ĐÚNG ngần ấy ms im lặng; `END` sớm của engine bị bỏ qua; engine phát muộn/không phát thì processor vẫn chốt đúng hạn (ghi đè `min_silence_frame` / `min_silence_duration_ms` / `max_end_silence_time`). `END` "cưỡng bức" của engine (vd trần `max_speech_frame`) vẫn được tôn trọng ngay vì frame đó còn bằng chứng tiếng nói. |
+
+**Thay đổi mã:**
+
+* `VADResult.is_speech` được định nghĩa lại thành **bằng chứng tiếng nói của riêng frame**
+  (không phải state máy trạng thái): FireRed giữ nguyên (`frame_result.is_speech`), Silero chuyển
+  sang `prob ≥ threshold` (thay vì `iterator.triggered` — vốn giữ `True` suốt `min_silence_samples`),
+  FSMN dùng xác suất frame và **bật `output_frame_probs` một chiều** khi phiên cần override
+  (config vẫn để `False` theo docs), fake engine dùng quyết định RMS từng frame.
+* `VADStreamState.last_speech_sample`: mốc mẫu của frame cuối có bằng chứng → nguồn cho đồng hồ im lặng.
+* `processor._apply_frame_result()` tách 2 nhánh (docs / ghi đè) + `_close_utterance()` để log rõ
+  lý do chốt (`engine_end` / `silence_override`).
+
+**Đo trên engine thật** (`test_41`, audio tiếng nói + đuôi lặng, mốc = frame cuối có bằng chứng):
+
+| Engine | VAD Silence = 0 (docs) | VAD Silence = 700 |
+|---|---|---|
+| firered-vad | 200 ms (đúng 200 ms docs) | **700 ms** |
+| silero-vad | 192 ms (docs 100 ms + pad/hysteresis) | **704 ms** |
+| fsmn-vad | 720 ms (docs 800 ms) | **720 ms** |
+
+Test chốt hành vi: `test_42` (tier A, không model) — `silence=0` để engine quyết định, `>0` chốt
+đúng hạn kể cả khi engine "hỏng" tự END sau 1 frame; `test_41` — cùng phép đo trên cả 3 model thật.
+
+**Edge case đã xử lý**: đang ghi đè (`>0`) mà người dùng gạt slider về `0` giữa câu. Engine có
+thể đã phát `END` sớm và bị hoãn; nếu ta quên quyết định đó thì câu treo vĩnh viễn. Nay
+`VADStreamState.engine_end_pending` ghi nhớ "engine đã muốn đóng", và ở chế độ docs frame kế
+tiếp tôn trọng ngay (`test_42::test_gat_silence_ve_0_giua_cau_khong_treo_cau`).
