@@ -38,7 +38,8 @@ class AudioChunk:
 class SpeechSegment:
     """Đoạn âm thanh chứa tiếng nói đã được VAD xác định ranh giới."""
     utterance_id: str
-    pcm_data: np.ndarray             # Mảng float32 toàn vẹn (đã gồm pre-roll và hangover/post-roll)
+    pcm_data: np.ndarray             # Mảng float32 toàn vẹn (đã gồm pre-roll do CHÍNH VAD yêu cầu
+                                     # và đuôi im lặng theo `min_silence` của engine)
     sample_rate: int = 16000
     start_sample_idx: int = 0
     end_sample_idx: int = 0

@@ -275,6 +275,20 @@ Trạng thái tải xem ở `GET /api/config → translation.download` (popup hi
 > ⚠️ Lần đầu chọn một VAD engine mới cần mạng để tải model (chạy một lần, sau đó offline).
 > **ASR thì KHÔNG tự tải** — phải copy file `.gguf` vào `backend/models/` (API chỉ báo `is_downloaded`).
 
+**VAD — kiến trúc & toàn vẹn tín hiệu** (chi tiết: `report/audit/19_KE_HOACH_VIET_LAI_VAD.md`):
+
+- Mỗi engine dùng **đúng API công khai trong docs**: `FireRedStreamVad.from_pretrained(...)`,
+  `silero_vad.VADIterator(...)`, `funasr.AutoModel.generate(cache=…, is_final=False, chunk_size=…)`.
+  Config backend khớp **1-1** với dataclass/tham số của từng thư viện.
+- **VAD là tap thụ động**: audio `plugin → VAD → ASR` là **byte nguyên bản** của client — không
+  resample, không gain, không clip, không lượng tử hoá lại (chốt bằng `test_42_vad_signal_integrity.py`).
+- **Không còn `hangover_ms` / `pre_speech_buffer_ms`**: hangover và pre-padding nay do chính VAD
+  quyết định. Khi VAD phát `START`, processor xả lại đúng số frame mà VAD yêu cầu
+  (`VADResult.lookback_frames`) ⇒ không mất phụ âm đầu và không kéo audio cũ vào.
+- Đồng hồ chốt câu do engine quyết định (`min_silence_frame` của FireRed = 60 frame × 10 ms = 600 ms;
+  Silero `min_silence_duration_ms`; FSMN `max_end_silence_time`), có lưới an toàn 4 bậc của
+  `CommitManager` ở tầng ASR.
+
 **Giọng mẫu TTS:** đặt `.wav` (kèm `.txt` transcript nếu có) vào `backend/voices/` và khai báo trong
 `backend/voices/voices.json`. Có sẵn script tải mẫu từ dataset tiếng Việt:
 
@@ -432,8 +446,12 @@ Toàn bộ cấu hình tập trung ở `backend/config.py` (Pydantic v2). Các c
 | **`asr.backend_fallback`** | `True` | Tự fallback + ghi WARNING khi backend yêu cầu không khả dụng |
 | **`asr.use_local_native`** | `True` | Ưu tiên bundle trong `bin/` hơn provider đã cài |
 | **`asr.native_dir`** | `""` | Thư mục bundle; trống = `<project_root>/bin` |
-| `vad.vad_engine` / `vad.threshold` | `firered-vad` / `0,45` | Engine VAD và ngưỡng phát hiện nói |
-| `vad.silence_duration_ms` / `hangover_ms` | `600` / `400` | Im lặng để ngắt câu / giữ trạng thái nói |
+| `vad.vad_engine` | `firered-vad` | Engine VAD: `firered-vad` · `silero-vad` · `fsmn-vad` (mỗi engine có config riêng, xem §VAD bên dưới) |
+| `vad.threshold` | `None` | `None` = dùng **đúng mặc định trong docs** của engine đang chọn (FireRed 0.4 · Silero 0.5 · FSMN 0.6). Đặt số ⇒ ghi đè |
+| `vad.silence_duration_ms` | `None` | `None` (popup hiển thị **0/Silence = off**) = để chính VAD quyết định theo config của nó. Đặt số ⇒ chiếu xuống field native (`min_silence_frame` / `min_silence_duration_ms` / `max_end_silence_time`) |
+| `vad.firered` | `FireRedStreamVadConfig` | `use_gpu`, `smooth_window_size`, `speech_threshold`, `pad_start_frame`, `min_speech_frame`, `max_speech_frame`, `min_silence_frame`, `chunk_max_frame` |
+| `vad.silero` | `VADIterator` | `threshold`, `min_silence_duration_ms`, `speech_pad_ms` |
+| `vad.fsmn` | `VADXOptions` (streaming) | `chunk_size_ms`, `speech_noise_thres`, `max_end_silence_time`, `speech_to_sil_time_thres`, `sil_to_speech_time_thres`, `window_size_ms`, `lookback_time_start_point`, `lookahead_time_end_point`, `dynamic_silence`, `output_frame_probs` |
 | `asr.min_transcribe_sec` | `0,35` | Audio tối thiểu để có preview đầu tiên |
 | `asr.preview_window_sec` | `6,0` | Cửa sổ preview ⇒ chi phí preview bị chặn trên |
 | `asr.max_inflight_infer` | `1` | Số suy luận song song (chống phình hàng đợi) |

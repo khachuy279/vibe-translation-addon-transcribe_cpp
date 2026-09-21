@@ -9,7 +9,7 @@ Hỗ trợ:
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 try:
     import os as _os
@@ -64,108 +64,125 @@ class WSConfig(BaseModel):
     tts_queue_maxsize: int = 32
 
 class FireRedVADConfig(BaseModel):
-    """Cấu hình chuyên biệt cho FireRed-VAD (Xiaohongshu DFSMN)."""
-    threshold: Optional[float] = None
-    # ── BƯỚC NHẢY FRAME (đo thực 2026-09-21) ────────────────────────────────────
-    # Upstream (`fireredvad/core/constants.py`) phân biệt rõ hai đại lượng:
-    #     FRAME_LENGTH_SAMPLE = 400  (cửa sổ 25 ms)
-    #     FRAME_SHIFT_SAMPLE  = 160  (bước nhảy **10 ms**)  ⇒ 100 frame/giây
-    # `KaldifeatFbank` tạo `OnlineFbank` MỚI mỗi lần gọi, `frame_shift=10ms`,
-    # `snip_edges=True` ⇒ input 400 mẫu cho ĐÚNG 1 frame. Bản cũ gọi `extract()` mỗi
-    # 400 mẫu ⇒ chỉ **40 frame/giây**, tức model bị cho ăn sai nhịp 2,5×.
-    #
-    # ĐO THỰC trên 8 clip FLEURS (scratch/vad_frame_ab.py):
-    #   hop 25 ms: 40,0 fps | is_speech 62,9% | **1,00 segment** | segment TB 8,48 s
-    #   hop 10 ms: 99,8 fps | is_speech 60,0% | **1,62 segment** | segment TB 5,69 s
-    #   `detect_full` của upstream (tham chiếu offline): 99,8 fps | 60,0% | 1,62 segment
-    # ⇒ hop 10 ms **TRÙNG KHÍT** tham chiếu upstream; hop 25 ms **gộp segment** (1,00 thay
-    #   vì 1,62) và làm segment dài hơn 49%. Đồng thời mọi tham số ĐẾM FRAME của
-    #   postprocessor bị giãn 2,5× về thời gian thật:
-    #       min_speech_frame 8  : 200 ms -> 80 ms
-    #       pad_start_frame  5  : 125 ms -> 50 ms
-    #       min_silence_frame 60: 1500 ms -> 600 ms  (vẫn > silence_duration_ms 450 ms
-    #                            ⇒ cờ VAD Silence vẫn là thứ chốt câu, GIỮ ĐÚNG Ý ĐỊNH)
-    #       max_speech_frame 2000: 50 s -> 20 s
-    #   Với 100 frame/giây, `VADProcessor` cũng đếm im lặng mịn hơn (10 ms thay vì 25 ms).
-    #
-    # ⚠️ CHI PHÍ: 100 forward/giây thay vì 40 ⇒ VAD tốn **2,5× CPU** (RTF 0,130 -> 0,326,
-    #    ~1,2 nhân). Vẫn nhanh hơn thời gian thực 3×.
-    # ⚠️ LỢI ÍCH CER **CHƯA CHỨNG MINH**: qua pipeline thật trên JA30, hop 10 ms cho
-    #    11,89% so với 12,42% của hop 25 ms (Δ +0,53 điểm) nhưng CI95 = [−1,96; +3,57]
-    #    ⇒ KHÔNG có ý nghĩa thống kê ở n=30. Đang xác nhận trên 650 clip.
-    #    Lý do giữ mặc định 10 ms là **đúng theo tham chiếu upstream**, không phải vì CER.
-    # Đặt 25 để quay lại hành vi cũ (nhanh hơn, nhưng lệch tham chiếu).
-    frame_hop_ms: int = 10
-    smooth_window_size: int = 5
-    min_speech_frame: int = 8       # 8 frames * 25 ms tối thiểu xác nhận bắt đầu nói
-    # 60 frames * 25 ms = 1500 ms. ⚠️ QWEN-Q11 đã kiểm chứng: giá trị này CHỈ điều khiển
-    # event `is_speech_end` của chính engine FireRed, mà event đó luôn đến SAU khi tầng
-    # `VADProcessor` đã tự chốt câu bằng `vad.silence_duration_ms` (mặc định 600 ms).
-    # Lý do: `processor` đọc `VADResult.is_speech` = quyết định NGƯỠNG TỪNG FRAME
-    # (`stream_vad_postprocessor.py:64,68`), không phải trạng thái máy trạng thái. Nên đây
-    # là **config CHẾT** với đường FireRed — đổi nó KHÔNG làm câu chốt sớm/muộn hơn.
-    # Muốn chỉnh độ trễ chốt câu: sửa `VADConfig.silence_duration_ms`.
-    # (Comment cũ ghi sai số khung — đã sửa.)
-    min_silence_frame: int = 60
-    pad_start_frame: int = 5        # 5 frames * 25 ms pre-padding
+    """Cấu hình FireRed-VAD — khớp 1-1 `fireredvad.FireRedStreamVadConfig`.
+
+    Nguồn: `external/FireRedVAD/fireredvad/stream_vad.py` (dataclass gốc) + ví dụ chính
+    thức trong README và `fireredvad/bin/stream_vad.py`. Mọi trường dưới đây được truyền
+    NGUYÊN VẸN vào `FireRedStreamVad.from_pretrained(model_dir, config)`.
+
+    Hình học frame (upstream `fireredvad/core/constants.py`, KHÔNG cấu hình được):
+        FRAME_LENGTH_SAMPLE = 400  (cửa sổ 25 ms)
+        FRAME_SHIFT_SAMPLE  = 160  (bước nhảy 10 ms) ⇒ 100 frame/giây
+    """
+    use_gpu: bool = False           # docs: CPU cho đường realtime (GPU để chạy batch lớn)
+    smooth_window_size: int = 5     # cửa sổ làm mượt xác suất (số frame)
+    speech_threshold: float = 0.4   # ngưỡng xác suất để coi 1 frame là tiếng nói
+    #   ↑ dataclass upstream mặc định 0.5, nhưng ví dụ CHÍNH THỨC trong README/CLI
+    #     (`fireredvad/bin/stream_vad.py --speech_threshold 0.4`) và yêu cầu của dự án dùng
+    #     0.4; đổi sang 0.5 nếu muốn bám sát dataclass.
+    pad_start_frame: int = 5        # số frame đệm trước khi báo START (pre-padding của VAD)
+    min_speech_frame: int = 8       # số frame thoả ngưỡng liên tiếp để xác nhận START
+    max_speech_frame: int = 2000    # trần 1 đoạn nói: 2000 frame * 10 ms = 20 s
+    # ── ĐỘ TRỄ CHỐT CÂU = ĐÚNG MẶC ĐỊNH DOCS ─────────────────────────────────────
+    # `FireRedStreamVadConfig` của upstream (external/FireRedVAD/fireredvad/stream_vad.py)
+    # khai báo mặc định **20 frame**, và vì `FRAME_SHIFT_SAMPLE = 160` mẫu = 10 ms
+    # (`fireredvad/core/constants.py`) nên 20 frame = **200 ms**.
+    # (Cách đọc cũ 25 ms/frame là SAI nhịp so với upstream, cho ra 500 ms — không dùng nữa.)
+    # Kiến trúc mới: processor CHỈ nghe event START/END của engine nên tham số này CHÍNH LÀ
+    # độ trễ chốt câu của FireRed — QWEN-Q11 chỉ đúng khi processor còn tự đếm im lặng;
+    # xem report/audit/19_KE_HOACH_VIET_LAI_VAD.md.
+    # Muốn đổi: sửa số này, hoặc để `VADConfig.silence_duration_ms` chiếu xuống
+    # (`round(ms / 10)`).
+    min_silence_frame: int = 20
+    chunk_max_frame: int = 30000    # chỉ dùng cho `detect_full` (chia lô) — không dùng khi stream
 
 
 class SileroVADConfig(BaseModel):
-    """Cấu hình chuyên biệt cho Silero VAD."""
-    threshold: Optional[float] = None
-    neg_threshold_offset: float = 0.15  # Negative threshold = threshold - offset
+    """Cấu hình Silero VAD — khớp 1-1 `silero_vad.VADIterator` (silero-vad 6.2.1).
+
+    Nguồn: docstring chính thức của `VADIterator`:
+        VADIterator(model, threshold=0.5, sampling_rate=16000,
+                    min_silence_duration_ms=100, speech_pad_ms=30)
+
+    `sampling_rate` không cấu hình được: VADIterator chỉ nhận 8000 hoặc 16000, pipeline
+    dùng 16 kHz. Ngưỡng âm để đóng đoạn (`neg_threshold`) bị thư viện hardcode bằng
+    `threshold - 0.15` nên KHÔNG có knob riêng.
+    """
+    threshold: float = 0.5
     min_silence_duration_ms: int = 100
     speech_pad_ms: int = 30
 
 
 class FsmnVADConfig(BaseModel):
-    """Cấu hình chuyên biệt cho FSMN-VAD (Alibaba FunASR)."""
-    speech_noise_thres: Optional[float] = None
-    max_end_silence_time: int = 1500
-    speech_to_sil_time_thres: int = 200
-    sil_to_speech_time_thres: int = 100
+    """Cấu hình FSMN-VAD (Alibaba FunASR) — khớp `VADXOptions` + đường streaming.
 
-    @property
-    def threshold(self) -> Optional[float]:
-        return self.speech_noise_thres
+    Nguồn: `funasr/models/fsmn_vad_streaming/model.py` (VADXOptions) và ví dụ streaming
+    chính thức (`DynamicStreamingVAD.feed`):
+        model.generate(input=[chunk], cache=cache, is_final=False, chunk_size=<ms>, ...)
 
-    @threshold.setter
-    def threshold(self, val: Optional[float]) -> None:
-        self.speech_noise_thres = val
+    `chunk_size_ms` CHÍNH LÀ `chunk_size` truyền vào `generate()` (đơn vị ms) — cũng là
+    bước nhảy frame của engine (60 ms = 960 mẫu @16 kHz).
+    """
+    chunk_size_ms: int = 60
+    speech_noise_thres: float = 0.6
+    max_end_silence_time: int = 800
+    speech_to_sil_time_thres: int = 150
+    sil_to_speech_time_thres: int = 150
+    window_size_ms: int = 200
+    #: Điểm bắt đầu được lùi lại bao nhiêu ms (`do_extend`, mặc định bật ở VADXOptions).
+    #: ẢNH HƯỞNG TRỰC TIẾP tới pre-roll: engine phải giữ đủ audio để xả lại phần này.
+    lookback_time_start_point: int = 200
+    #: Điểm kết thúc được nhìn trước bao nhiêu ms (`do_extend`).
+    lookahead_time_end_point: int = 100
+    dynamic_silence: bool = False    # ngưỡng cố định = hành vi docs gốc (không lịch động)
+    output_frame_probs: bool = False # bật nếu muốn probability thật (tốn thêm CPU)
 
 
 class VADConfig(BaseModel):
-    """Cấu hình tổng hợp cho Voice Activity Detection."""
+    """Cấu hình tổng hợp cho Voice Activity Detection (mỗi engine một config riêng)."""
     enabled: bool = True
     vad_engine: str = "firered-vad"  # firered-vad, silero-vad, fsmn-vad
-    threshold: float = 0.45
-    # ✅ ĐO THỰC 2026-09-21 (vòng 2 tiếng Nhật, 650 clip FLEURS, kiểm định cặp
-    # bootstrap 4000 lần): 600 -> **450** giảm CER pipeline **0,997 điểm %**
-    # (CI95 [−1,299; −0,700], 172 clip tốt hơn / 78 xấu hơn) so với `base`, và là
-    # mức tốt nhất trong nhóm VAD. 300 là trung tính (0,7× sàn nhiễu 0,27).
-    # Xem report/audit/18_KE_HOACH_TEST_TIENG_NHAT.md §3.7.
-    silence_duration_ms: int = 450   # Thời gian im lặng (ms) để kích hoạt ngắt câu
-    hangover_ms: int = 400           # Giữ trạng thái nói thêm hangover_ms phòng ngắt quãng
-    # ⚠️ 300 -> 500 là THẢM HỌA: đo thực CER pipeline 13,2% -> **30,5%**, p95 commit
-    # 1451 ms. Đệm trước dài hơn làm kéo audio trước khi nói vào đầu mỗi đoạn và phá
-    # vỡ ranh giới. GIỮ NGUYÊN 300.
-    pre_speech_buffer_ms: int = 300  # Đệm âm thanh trước khi bắt đầu nói để tránh mất phụ âm đầu
     sample_rate: int = 16000
+    # ── HAI KNOB CHUNG CỦA POPUP — được CHIẾU xuống field native của engine đang chọn ──
+    # (bảng chiếu: report/audit/19_KE_HOACH_VIET_LAI_VAD.md §2.2)
+    #   threshold           -> firered.speech_threshold | silero.threshold | fsmn.speech_noise_thres
+    #   silence_duration_ms -> firered.min_silence_frame = round(ms/10)
+    #                          | silero.min_silence_duration_ms
+    #                          | fsmn.max_end_silence_time
+    # ⚠️ Mặc định của CẢ HAI là `None` = **KHÔNG ghi đè**: dùng đúng giá trị mặc định của
+    # từng engine (đúng docs). Đây cũng là mặc định của popup — "⏱️ VAD Silence = 0/off"
+    # nghĩa là để chính VAD quyết định (0 gửi từ popup cũng được quy về None).
+    threshold: Optional[float] = None
+    silence_duration_ms: Optional[int] = None
 
     firered: FireRedVADConfig = Field(default_factory=FireRedVADConfig)
     silero: SileroVADConfig = Field(default_factory=SileroVADConfig)
     fsmn: FsmnVADConfig = Field(default_factory=FsmnVADConfig)
 
-    @model_validator(mode="after")
-    def _sync_thresholds(self) -> "VADConfig":
-        """Đồng bộ ngưỡng mặc định cho các sub-engine nếu chưa cấu hình riêng."""
-        if self.firered.threshold is None:
-            self.firered.threshold = self.threshold
-        if self.silero.threshold is None:
-            self.silero.threshold = self.threshold
-        if self.fsmn.speech_noise_thres is None:
-            self.fsmn.speech_noise_thres = self.threshold
-        return self
+    @property
+    def engine_config(self) -> Any:
+        """Sub-config của engine đang chọn (fallback về FireRed nếu tên không hợp lệ)."""
+        key = (self.vad_engine or "firered-vad").lower().strip()
+        if key == "silero-vad":
+            return self.silero
+        if key == "fsmn-vad":
+            return self.fsmn
+        return self.firered
+
+    @property
+    def effective_threshold(self) -> float:
+        """Ngưỡng đang có hiệu lực: knob chung nếu được đặt, ngược lại mặc định engine."""
+        if self.threshold is not None:
+            return float(self.threshold)
+        cfg = self.engine_config
+        return float(getattr(cfg, "speech_threshold", None)
+                     or getattr(cfg, "threshold", None)
+                     or getattr(cfg, "speech_noise_thres", 0.5))
+
+    @property
+    def effective_silence_ms(self) -> Optional[int]:
+        """Độ dài im lặng đang có hiệu lực (None = để engine tự quyết định)."""
+        return None if self.silence_duration_ms is None else int(self.silence_duration_ms)
 
 
 class ASRConfig(BaseModel):
@@ -215,7 +232,7 @@ class ASRConfig(BaseModel):
     # hiện tại. `qwen3-asr-1.7b` không bị ảnh hưởng (đã 100% GPU).
     # Đặt False chỉ khi CHỦ ĐÍCH chấp nhận chạy CPU (chậm hơn thời gian thực) hoặc khi cần
     # chẩn đoán. Biến môi trường `TRANSCRIBE_REQUIRE_GPU=0` cũng hạ được cờ này.
-    require_gpu: bool = True
+    require_gpu: bool = False
     # --- Bundle native cục bộ (`bin/`) ------------------------------------------
     # Ưu tiên bundle trong `bin/` (bản dựng cục bộ, có thể gồm ggml-cuda.dll) hơn provider
     # `transcribe-cpp-native` đã cài trong site-packages. Xem backend/asr/native.py.
@@ -398,7 +415,7 @@ class AudioBufferConfig(BaseModel):
     """Cấu hình Circular Ring Buffer cho Audio Ingress."""
     sample_rate: int = 16000
     capacity_sec: float = 60.0             # Dung lượng cố định 60 giây audio (~960,000 samples Float32)
-    chunk_size_samples: int = 400          # Kích thước frame chuẩn cho VAD (25ms @ 16kHz)
+    chunk_size_samples: int = 400          # độ dài 1 mẩu PCM phía client (~25 ms @ 16 kHz); KHÔNG phải frame VAD
     max_speech_segment_sec: float = 30.0   # Độ dài tối đa 1 đoạn phát âm
 
 

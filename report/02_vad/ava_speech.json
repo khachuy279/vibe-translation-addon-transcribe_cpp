@@ -1,0 +1,176 @@
+{
+  "dataset": "AVA-Speech",
+  "video_id": "5BDj0ow5hnA",
+  "segment": {
+    "start_sec": 900.0,
+    "duration_sec": 600.0,
+    "wav": "wav_test\\vad\\derived\\5BDj0ow5hnA_900s_600s_16k_mono.wav",
+    "labels": 98,
+    "frame_ms": 10
+  },
+  "generated_at": "2026-09-21 23:01:53",
+  "engines": {
+    "firered-vad": {
+      "engine": "firered-vad",
+      "hop_samples": 160,
+      "pre_roll_frames": 13,
+      "starts": 123,
+      "ends": 122,
+      "elapsed_sec": 198.9,
+      "rtf": 0.3315,
+      "integrity": {
+        "frames": 44958,
+        "mismatches": 0,
+        "bytes": 14386560
+      },
+      "metrics": {
+        "frames": 60000,
+        "speech_gt_pct": 73.18,
+        "speech_pred_pct": 74.93,
+        "accuracy": 0.8782,
+        "precision": 0.907,
+        "recall": 0.9288,
+        "f1": 0.9178,
+        "gt_segments": 46,
+        "pred_segments": 123,
+        "onset_median_ms": 100.0,
+        "onset_p90_ms": 2085.0
+      },
+      "floors": {
+        "f1": 0.85,
+        "recall": 0.85,
+        "precision": 0.8,
+        "accuracy": 0.8,
+        "rtf_max": 0.6,
+        "onset_median_ms_max": 200
+      },
+      "measured_note": "F1 0,918 · R 0,929 · P 0,907 · RTF 0,333"
+    },
+    "silero-vad": {
+      "engine": "silero-vad",
+      "hop_samples": 512,
+      "pre_roll_frames": 2,
+      "starts": 121,
+      "ends": 120,
+      "elapsed_sec": 13.0,
+      "rtf": 0.0216,
+      "integrity": {
+        "frames": 7120,
+        "mismatches": 0,
+        "bytes": 7290880
+      },
+      "metrics": {
+        "frames": 60000,
+        "speech_gt_pct": 73.18,
+        "speech_pred_pct": 38.13,
+        "accuracy": 0.6131,
+        "precision": 0.9523,
+        "recall": 0.4962,
+        "f1": 0.6524,
+        "gt_segments": 46,
+        "pred_segments": 113,
+        "onset_median_ms": 95.0,
+        "onset_p90_ms": 9620.0
+      },
+      "floors": {
+        "f1": 0.55,
+        "recall": 0.4,
+        "precision": 0.85,
+        "accuracy": 0.55,
+        "rtf_max": 0.1,
+        "onset_median_ms_max": 200
+      },
+      "measured_note": "F1 0,652 · R 0,496 · P 0,952 · RTF 0,022"
+    },
+    "fsmn-vad": {
+      "engine": "fsmn-vad",
+      "hop_samples": 960,
+      "pre_roll_frames": 11,
+      "starts": 98,
+      "ends": 97,
+      "elapsed_sec": 32.1,
+      "rtf": 0.0535,
+      "integrity": {
+        "frames": 5763,
+        "mismatches": 0,
+        "bytes": 11064960
+      },
+      "metrics": {
+        "frames": 60000,
+        "speech_gt_pct": 73.18,
+        "speech_pred_pct": 57.63,
+        "accuracy": 0.7083,
+        "precision": 0.8818,
+        "recall": 0.6944,
+        "f1": 0.777,
+        "gt_segments": 46,
+        "pred_segments": 59,
+        "onset_median_ms": 815.0,
+        "onset_p90_ms": 9100.0
+      },
+      "floors": {
+        "f1": 0.7,
+        "recall": 0.6,
+        "precision": 0.8,
+        "accuracy": 0.65,
+        "rtf_max": 0.15,
+        "onset_median_ms_max": 1000
+      },
+      "measured_note": "F1 0,777 · R 0,694 · P 0,882 · RTF 0,063"
+    }
+  },
+  "firered_threshold_sweep": {
+    "0.3": {
+      "frames": 12000,
+      "speech_gt_pct": 72.58,
+      "speech_pred_pct": 79.56,
+      "accuracy": 0.8461,
+      "precision": 0.8594,
+      "recall": 0.942,
+      "f1": 0.8988,
+      "gt_segments": 9,
+      "pred_segments": 17,
+      "onset_median_ms": 240.0,
+      "onset_p90_ms": 2498.0
+    },
+    "0.4": {
+      "frames": 12000,
+      "speech_gt_pct": 72.58,
+      "speech_pred_pct": 78.01,
+      "accuracy": 0.8492,
+      "precision": 0.8686,
+      "recall": 0.9335,
+      "f1": 0.8999,
+      "gt_segments": 9,
+      "pred_segments": 19,
+      "onset_median_ms": 260.0,
+      "onset_p90_ms": 2504.0
+    },
+    "0.5": {
+      "frames": 12000,
+      "speech_gt_pct": 72.58,
+      "speech_pred_pct": 75.53,
+      "accuracy": 0.8428,
+      "precision": 0.8764,
+      "recall": 0.9121,
+      "f1": 0.8939,
+      "gt_segments": 9,
+      "pred_segments": 26,
+      "onset_median_ms": 330.0,
+      "onset_p90_ms": 2322.0
+    },
+    "0.6": {
+      "frames": 12000,
+      "speech_gt_pct": 72.58,
+      "speech_pred_pct": 71.94,
+      "accuracy": 0.8211,
+      "precision": 0.8801,
+      "recall": 0.8723,
+      "f1": 0.8762,
+      "gt_segments": 9,
+      "pred_segments": 29,
+      "onset_median_ms": 360.0,
+      "onset_p90_ms": 2492.0
+    }
+  }
+}

@@ -14,6 +14,7 @@ Cách tiếp cận:
 from collections import deque
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
 import numpy as np
@@ -88,39 +89,91 @@ class StableTextEngine(FakeInferenceEngine):
 
 
 class FakeVADEngine(BaseVADEngine):
-    """VAD xác định theo năng lượng RMS của frame (không cần model)."""
+    """VAD xác định theo năng lượng RMS của frame (không cần model).
+
+    Sau khi viết lại tầng VAD, engine **phải tự phát START/END** (processor không còn suy
+    diễn từ `is_speech` từng frame). Fake này mô phỏng đúng hành vi cũ để các test tầng A
+    giữ nguyên ngữ nghĩa:
+
+    * `START` ở frame vượt ngưỡng đầu tiên, xin **1 frame pre-roll** (giống vòng đệm
+      `pre_speech_buffer_ms=0` cũ ⇒ `deque(maxlen=1)`).
+    * `END` sau đúng `silence_ms` im lặng (mặc định 450 ms = 18 frame 25 ms, trùng
+      `VADConfig.silence_duration_ms` cũ).
+    """
 
     name = "fake-vad"
-    native_frame_samples = 400  # 25ms @ 16kHz
+    frame_samples = 400          # 25 ms @ 16 kHz
     default_threshold = 0.45
+    max_lookback_frames = 1      # giống pre-roll 1 frame của bản cũ
+    min_speech_frames = 1
+
+    #: Im lặng mặc định khi phiên không cấu hình `silence_duration_ms` (None = "off").
+    default_silence_ms = 450
 
     def __init__(self, rms_threshold: float = 0.02):
         self.rms_threshold = float(rms_threshold)
 
-    def create_initial_state(self, threshold: Optional[float] = None) -> VADStreamState:
-        return VADStreamState()
+    def create_initial_state(
+        self,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
+    ) -> VADStreamState:
+        state = VADStreamState()
+        state.engine_state = _FakeVADSession()
+        return state
 
     def is_speech(
         self,
-        chunk_float32: Optional[np.ndarray],
+        frame_int16: np.ndarray,
         state: VADStreamState,
-        threshold: float,
-        chunk_raw: Optional[bytes] = None,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
     ) -> VADResult:
-        if chunk_raw is not None:
-            arr = np.frombuffer(chunk_raw, dtype=np.int16).astype(np.float32) / 32768.0
-        elif chunk_float32 is not None:
-            arr = np.asarray(chunk_float32, dtype=np.float32)
-        else:
-            arr = np.zeros(0, dtype=np.float32)
+        session: _FakeVADSession = state.engine_state
+        if session is None:
+            session = _FakeVADSession()
+            state.engine_state = session
 
-        if arr.size == 0:
-            rms = 0.0
-        else:
-            rms = float(np.sqrt(np.dot(arr, arr) / arr.size))
+        arr = np.asarray(frame_int16, dtype=np.float32) / 32768.0
+        rms = float(np.sqrt(np.dot(arr, arr) / arr.size)) if arr.size else 0.0
+        is_speech_frame = rms > self.rms_threshold
 
-        is_speech = rms > self.rms_threshold
-        return VADResult(is_speech=is_speech, probability=min(1.0, rms / max(1e-6, self.rms_threshold)), event=None)
+        eff_silence_ms = self.default_silence_ms if silence_ms is None else int(silence_ms)
+        silence_frames = max(1, int(round(eff_silence_ms / 25.0)))
+
+        res = VADResult(
+            probability=min(1.0, rms / max(1e-6, self.rms_threshold)),
+            is_speech=is_speech_frame,
+        )
+
+        if is_speech_frame:
+            session.silence_run = 0
+            if not session.in_speech:
+                session.speech_run += 1
+                if session.speech_run >= self.min_speech_frames:
+                    session.in_speech = True
+                    res.event = "START"
+                    res.lookback_frames = self.max_lookback_frames
+        else:
+            session.speech_run = 0
+            if session.in_speech:
+                session.silence_run += 1
+                if session.silence_run >= silence_frames:
+                    session.in_speech = False
+                    res.event = "END"
+                    res.lookback_frames = 0
+
+        res.is_speech = session.in_speech
+        return res
+
+
+@dataclass
+class _FakeVADSession:
+    """Máy trạng thái nhỏ của `FakeVADEngine`."""
+
+    in_speech: bool = False
+    speech_run: int = 0
+    silence_run: int = 0
 
 
 class FakeTranslator:

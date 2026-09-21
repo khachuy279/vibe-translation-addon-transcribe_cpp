@@ -27,10 +27,10 @@ class _SlowVADEngine(FakeVADEngine):
         self.delay = delay
         self.calls = 0
 
-    def is_speech(self, chunk_float32, state, threshold, chunk_raw=None):
+    def is_speech(self, frame_int16, state, threshold=None, silence_ms=None):
         self.calls += 1
         time.sleep(self.delay)
-        return super().is_speech(chunk_float32, state, threshold, chunk_raw=chunk_raw)
+        return super().is_speech(frame_int16, state, threshold=threshold, silence_ms=silence_ms)
 
 
 # ------------------------------------------------------------------ P4.6 / F-13
@@ -45,9 +45,8 @@ def test_vad_model_runs_outside_lock(session_factory):
 
     slow = _SlowVADEngine(delay=0.25)
     proc._engine = slow
-    proc._state = proc._new_state(slow, proc.threshold)
-    proc._frame_samples = 400
-    proc._frame_size_bytes = 800
+    proc._attach_engine(slow)
+    proc._state = proc._new_state(slow)
     proc._stopped = False
 
     # 800 bytes = 2 frame ⇒ inference mất ~0.5 s
@@ -74,7 +73,8 @@ def test_vad_batch_discarded_after_force_end(session_factory):
     proc = session.vad_processor
     slow = _SlowVADEngine(delay=0.2)
     proc._engine = slow
-    proc._state = proc._new_state(slow, proc.threshold)
+    proc._attach_engine(slow)
+    proc._state = proc._new_state(slow)
     proc._stopped = False
 
     speech = (b"\x10\x27" * 400)  # biên độ ~0.3 ⇒ vượt ngưỡng RMS

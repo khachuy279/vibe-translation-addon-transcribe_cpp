@@ -96,8 +96,9 @@ external/build-tmp/
 
 # 10. WAV
 wav_test/google_fleurs
-# Junction tr? t?i external/build-cuda và external/cuda-toolkit: CMakeCache/ninja trong
-# external/build-cuda ghi du?ng d?n tuy?t d?i d?ng .build-cuda/.cuda-toolkit, nên 2 junction này
-# gi? cho vi?c build l?i CUDA ho?t d?ng mà không ph?i sinh l?i cache t? d?u.
+# Junction tr? t?i external/build-cuda vï¿½ external/cuda-toolkit: CMakeCache/ninja trong
+# external/build-cuda ghi du?ng d?n tuy?t d?i d?ng .build-cuda/.cuda-toolkit, nï¿½n 2 junction nï¿½y
+# gi? cho vi?c build l?i CUDA ho?t d?ng mï¿½ khï¿½ng ph?i sinh l?i cache t? d?u.
 /.build-cuda/
 /.cuda-toolkit/
+wav_test/vad

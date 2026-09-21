@@ -500,13 +500,24 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
         "resolved_vad": config.vad.vad_engine,
         "vad_engine": config.vad.vad_engine,
         "available_vad_engines": list(SUPPORTED_VAD_ENGINES),
-        "vad_silence_duration_ms": config.vad.silence_duration_ms,
-        "silence_duration_ms": config.vad.silence_duration_ms,
-        "hangover_ms": config.vad.hangover_ms,
-        "vad_threshold": config.vad.threshold,
+        # 0 = "off": để chính VAD dùng mặc định trong docs của nó (giá trị None ở backend).
+        "vad_silence_duration_ms": config.vad.effective_silence_ms or 0,
+        "silence_duration_ms": config.vad.effective_silence_ms or 0,
+        "vad_threshold": config.vad.effective_threshold,
         "min_words_to_commit": config.sentence.min_words_to_commit,
         "source_lang": config.asr.language,
         "supported_languages": SUPPORTED_LANGUAGES,
+        # Config RIÊNG của từng engine VAD (khớp 1-1 docs) để client/quản trị xem được.
+        "vad": {
+            "engine": config.vad.vad_engine,
+            "threshold": config.vad.threshold,
+            "silence_duration_ms": config.vad.silence_duration_ms,
+            "effective_threshold": config.vad.effective_threshold,
+            "effective_silence_ms": config.vad.effective_silence_ms,
+            "firered": config.vad.firered.model_dump(),
+            "silero": config.vad.silero.model_dump(),
+            "fsmn": config.vad.fsmn.model_dump(),
+        },
         # P2.x: thông số streaming để popup hiển thị/chỉnh được và client biết backend đang làm gì
         "streaming": {
             "preview_window_sec": config.asr.preview_window_sec,
@@ -648,7 +659,9 @@ async def update_backend_config(req: SwitchModelRequest):
     if req.vad_threshold is not None:
         config.vad.threshold = req.vad_threshold
     if req.silence_duration_ms is not None:
-        config.vad.silence_duration_ms = req.silence_duration_ms
+        # 0 = "off" ⇒ None = dùng đúng mặc định của engine (xem report/audit/19_…).
+        raw_ms = int(req.silence_duration_ms)
+        config.vad.silence_duration_ms = raw_ms if raw_ms > 0 else None
     if req.min_words_to_commit is not None:
         config.sentence.min_words_to_commit = max(0, req.min_words_to_commit)
     if req.target_lang is not None:
@@ -747,7 +760,9 @@ async def update_backend_config(req: SwitchModelRequest):
     if req.vad_threshold is not None:
         session_payload["vad_threshold"] = req.vad_threshold
     if req.silence_duration_ms is not None:
-        session_payload["silence_duration_ms"] = req.silence_duration_ms
+        # 0 = "off": gửi nguyên 0 xuống phiên, `SessionState.apply_config` quy về None
+        # (= dùng mặc định của engine).
+        session_payload["silence_duration_ms"] = int(req.silence_duration_ms)
     if req.min_words_to_commit is not None:
         session_payload["min_words_to_commit"] = req.min_words_to_commit
     if req.target_lang is not None:

@@ -414,7 +414,6 @@ async def _handle_text_message(session: SessionState, text: str) -> None:
                     f"(vad={session.config.get('vad_engine')}, "
                         f"threshold={session.config.get('vad_threshold')}, "
                         f"silence={session.config.get('silence_duration_ms')}ms, "
-                        f"hangover={session.config.get('hangover_ms')}ms, "
                         f"min_words={session.config.get('min_words_to_commit')}, "
                         f"lang: {session.config.get('source_lang')} -> {session.config.get('target_lang')}, "
                         f"tts={session.config.get('tts_enabled')}, "

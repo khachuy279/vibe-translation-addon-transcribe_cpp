@@ -47,7 +47,6 @@ class SessionConfigPayload(BaseModel):
     vad_threshold: Optional[float] = Field(default=None, alias="vadThreshold")
     threshold: Optional[float] = None
     silence_duration_ms: Optional[int] = Field(default=None, alias="silenceDurationMs")
-    hangover_ms: Optional[int] = Field(default=None, alias="hangoverMs")
     vad_enabled: Optional[bool] = Field(default=None, alias="vadEnabled")
     tts_enabled: Optional[bool] = Field(default=None, alias="ttsEnabled")
     tts_voice: Optional[str] = Field(default=None, alias="ttsVoice")
@@ -81,9 +80,9 @@ class SessionConfig:
             "translation_model": getattr(config.translation, "base", "tencent"),
             "asr_engine": ModelRegistry.get_instance().get_active_model_key(),
             "vad_engine": config.vad.vad_engine,
-            "vad_threshold": config.vad.threshold,
-            "silence_duration_ms": config.vad.silence_duration_ms,
-            "hangover_ms": config.vad.hangover_ms,
+            # None = dùng đúng mặc định của từng VAD engine (popup hiển thị "0/off").
+            "vad_threshold": config.vad.effective_threshold,
+            "silence_duration_ms": config.vad.effective_silence_ms,
             "vad_enabled": config.vad.enabled,
             "min_words_to_commit": config.sentence.min_words_to_commit,
             "tts_enabled": config.tts.enabled,
@@ -204,9 +203,8 @@ class SessionState:
             sample_rate=config.vad.sample_rate,
             vad_engine=self.config.get("vad_engine", config.vad.vad_engine),
             threshold=self.config["vad_threshold"],
+            # None (hoặc 0) = để chính VAD quyết định theo config riêng của nó.
             silence_duration_ms=self.config["silence_duration_ms"],
-            hangover_ms=self.config["hangover_ms"],
-            pre_speech_buffer_ms=config.vad.pre_speech_buffer_ms,
             enabled=self.config["vad_enabled"],
             on_speech_chunk=self.asr_engine.feed_audio,
             on_speech_start=self.asr_engine.on_speech_start,
@@ -408,9 +406,9 @@ class SessionState:
         if vad_th is not None:
             updates["vad_threshold"] = float(vad_th)
         if parsed.silence_duration_ms is not None:
-            updates["silence_duration_ms"] = int(parsed.silence_duration_ms)
-        if parsed.hangover_ms is not None:
-            updates["hangover_ms"] = int(parsed.hangover_ms)
+            # 0 (hoặc âm) = "off" ⇒ để VAD dùng mặc định trong docs của nó.
+            raw_ms = int(parsed.silence_duration_ms)
+            updates["silence_duration_ms"] = raw_ms if raw_ms > 0 else None
         if parsed.vad_enabled is not None:
             updates["vad_enabled"] = bool(parsed.vad_enabled)
 
@@ -498,7 +496,6 @@ class SessionState:
                 vad_engine=self.config.get("vad_engine"),
                 threshold=self.config.get("vad_threshold"),
                 silence_duration_ms=self.config.get("silence_duration_ms"),
-                hangover_ms=self.config.get("hangover_ms"),
                 enabled=self.config.get("vad_enabled"),
             )
 

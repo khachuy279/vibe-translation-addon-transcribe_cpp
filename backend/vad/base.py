@@ -1,128 +1,164 @@
-"""Base Classes và Data Structures cho Module Voice Activity Detection (VAD)."""
+"""Base Classes và Data Structures cho Module Voice Activity Detection (VAD).
+
+Triết lý (xem `report/audit/19_KE_HOACH_VIET_LAI_VAD.md`):
+
+1. **Engine sở hữu state machine.** Mọi quyết định nói/im do chính VAD (theo docs của
+   từng thư viện) đưa ra qua event `START`/`END`. Processor **không** tự đoán bằng
+   `is_speech` từng frame và **không** có đồng hồ im lặng riêng ⇒ không còn chuyện
+   "VAD nói A, processor hiểu B".
+2. **VAD là tap thụ động.** Engine chỉ ĐỌC frame PCM Int16 mà processor đưa; không
+   resample, không gain, không clip, không lượng tử hoá lại. Audio tới ASR là **đúng
+   byte** client gửi.
+3. **Hình học frame nằm trong engine.** `frame_samples` là BƯỚC NHẢY (hop) mà processor
+   phải cắt; engine tự lo cửa sổ phân tích (ví dụ FireRed: cửa sổ 400 mẫu, hop 160 mẫu)
+   nên ASR không bao giờ nhận mẫu chồng lấn.
+"""
 
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Optional, Tuple
 import numpy as np
 
 
 SUPPORTED_VAD_ENGINES = ("firered-vad", "silero-vad", "fsmn-vad")
 
+#: Giá trị hợp lệ của `VADResult.event`.
+EVENT_START = "START"
+EVENT_END = "END"
+
 
 @dataclass(slots=True)
 class VADResult:
-    """Kết quả phân tích VAD của 1 frame âm thanh."""
-    is_speech: bool
-    probability: float
-    event: Optional[str] = None  # 'START', 'END', hoặc None
+    """Kết quả VAD của MỘT bước nhảy (hop) âm thanh.
+
+    Attributes:
+        probability: xác suất tiếng nói thô (0..1) — chỉ để log/metric, KHÔNG dùng để
+            chuyển trạng thái.
+        event: `"START"`, `"END"` hoặc `None`. Đây là **nguồn sự thật duy nhất** cho
+            việc mở/đóng một đoạn nói.
+        lookback_frames: chỉ có ý nghĩa khi `event == "START"` — số frame ĐÃ được tiêu
+            thụ trước frame hiện tại nhưng vẫn thuộc đoạn nói (do pre-padding của chính
+            VAD, ví dụ `pad_start_frame` của FireRed). Processor dùng con số này để xả
+            đúng phần audio đã đệm, tránh mất phụ âm đầu.
+        is_speech: trạng thái nói/im theo máy trạng thái của engine (thông tin).
+    """
+    probability: float = 0.0
+    event: Optional[str] = None
+    lookback_frames: int = 0
+    is_speech: bool = False
 
     def __iter__(self):
-        yield self.is_speech
         yield self.probability
         yield self.event
+        yield self.lookback_frames
+        yield self.is_speech
 
     def __len__(self):
-        return 3
+        return 4
 
     def __getitem__(self, idx):
         if idx == 0:
-            return self.is_speech
-        elif idx == 1:
             return self.probability
-        elif idx == 2:
+        if idx == 1:
             return self.event
+        if idx == 2:
+            return self.lookback_frames
+        if idx == 3:
+            return self.is_speech
         raise IndexError("VADResult index out of range")
 
 
 @dataclass
 class VADStreamState:
-    """Trạng thái nội bộ cách ly theo từng session âm thanh."""
-    is_speech: bool = False
-    silence_samples: int = 0
-    total_samples_processed: int = 0
+    """Trạng thái cách ly theo từng phiên âm thanh (session-safe).
 
-    # Buffer đệm thô cho việc cắt frame
+    `engine_state` là state RIÊNG của engine và hoàn toàn opaque với processor (ví dụ:
+    `FireRedStreamVad` giữ model caches + postprocessor; Silero giữ `VADIterator`; FSMN
+    giữ `cache` dict). `None` = chưa khởi tạo; engine tự dựng ở frame kế tiếp.
+    """
+
+    engine_state: Optional[Any] = None
+
+    #: Buffer thô để cắt frame theo hop.
     raw_buffer: bytearray = field(default_factory=bytearray)
 
-    # Ring buffer chứa các frame trước khi nói (pre-speech buffer)
-    pre_speech_ring: Deque[Tuple[bytes, float]] = field(default_factory=deque)
+    #: Vòng đệm pre-roll: các frame đã tiêu thụ nhưng chưa gửi ASR (chỉ trong lúc im lặng).
+    #: `maxlen` do processor đặt = `engine.max_lookback_frames`.
+    pre_roll: Deque[Tuple[bytes, float]] = field(default_factory=deque)
 
-    # State riêng cho FireRed-VAD
-    firered_postprocessor: Optional[Any] = None
-    firered_caches: Optional[Any] = None
-    # Cửa sổ trượt 25 ms (400 samples) dùng để tạo ĐÚNG 1 frame mỗi `frame_hop` samples.
-    # Xem `backend/vad/engines/firered.py` + scratch/vad_frame_ab.py: model cần 1 frame
-    # mỗi 10 ms (FRAME_SHIFT_SAMPLE=160), không phải mỗi 25 ms.
-    firered_window: Optional[Any] = None
+    is_speech: bool = False
+    total_samples_processed: int = 0
 
-    # State riêng cho Silero VAD
-    silero_iterator: Optional[Any] = None
-    silero_model: Optional[Any] = None
-    silero_probe: Optional[Any] = None
-
-    # State riêng cho FSMN-VAD
-    fsmn_cache: Optional[Dict[str, Any]] = None
-    fsmn_in_speech: bool = False
+    #: Mốc thời gian (giây, theo đồng hồ client) của BYTE ĐẦU TIÊN đang nằm trong
+    #: `raw_buffer`. Cần thiết vì một frame có thể vắt qua nhiều chunk client gửi (ví dụ
+    #: hop 60 ms của FSMN với chunk 20 ms) — nếu lấy `capture_timestamp` của chunk hiện
+    #: tại thì timestamp của frame bị lệch.
+    stream_ts: float = 0.0
 
     def reset(self) -> None:
-        """Reset toàn bộ bộ đệm và trạng thái."""
-        self.is_speech = False
-        self.silence_samples = 0
-        self.total_samples_processed = 0
-
+        """Reset về trạng thái rỗng (state engine sẽ được dựng lại ở frame kế tiếp)."""
+        self.engine_state = None
         self.raw_buffer.clear()
-        self.pre_speech_ring.clear()
-
-        if self.firered_postprocessor is not None:
-            self.firered_postprocessor.reset()
-        self.firered_caches = None
-        self.firered_window = None
-
-        if self.silero_iterator is not None:
-            self.silero_iterator.reset_states()
-        if self.silero_probe is not None:
-            self.silero_probe.last_prob = 0.0
-
-        if self.fsmn_cache is not None:
-            self.fsmn_cache.clear()
-        self.fsmn_cache = None
-        self.fsmn_in_speech = False
+        self.pre_roll.clear()
+        self.is_speech = False
+        self.total_samples_processed = 0
+        self.stream_ts = 0.0
 
 
 class BaseVADEngine(ABC):
-    """Abstract Base Class cho các Engine VAD."""
+    """Abstract Base Class cho các Engine VAD.
+
+    Hợp đồng tối thiểu — engine nào cũng phải:
+      * công bố `frame_samples` (hop) để processor cắt frame ĐÚNG nhịp của model;
+      * công bố `max_lookback_frames` (trần pre-roll suy ra từ config của chính nó);
+      * cấp state riêng cho mỗi phiên qua `create_initial_state()`;
+      * trả `VADResult.event` khi mở/đóng đoạn nói.
+    """
 
     name: str = ""
-    default_threshold: float = 0.45
-    native_frame_samples: int = 400  # Số sample cho 1 bước tính (mặc định 25ms @ 16kHz)
+    default_threshold: float = 0.5
+    #: BƯỚC NHẢY (hop) tính bằng mẫu @16 kHz mà processor phải cắt.
+    frame_samples: int = 160
+    #: Trần số frame pre-roll (đệm trước START) mà engine có thể yêu cầu xả lại.
+    max_lookback_frames: int = 0
 
     @classmethod
     def prepare_files(cls) -> None:
         """QWEN-Q2: tải các file model cần thiết — **KHÔNG** dựng engine.
 
         Được `VADEngineFactory.get_engine()` gọi **TRƯỚC** khi lấy lock cấp lớp, vì
-        `hf_hub_download`/`snapshot_download` có thể mất hàng phút khi mạng chậm. Bản cũ
-        để việc tải nằm *trong* constructor, tức là *trong* lock cấp lớp ⇒ mọi đường chỉ
-        cần ĐỌC (`is_cached`, `peek_engine` — có trên event loop) bị chặn theo, treo cả
-        backend.
+        `hf_hub_download`/`snapshot_download` có thể mất hàng phút khi mạng chậm.
 
         Mặc định no-op cho engine không cần tải file (ví dụ Silero lấy model từ package).
         """
         return None
 
     @abstractmethod
-    def create_initial_state(self, threshold: Optional[float] = None) -> VADStreamState:
-        """Tạo trạng thái ban đầu cho 1 session stream mới."""
+    def create_initial_state(
+        self,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
+    ) -> VADStreamState:
+        """Tạo trạng thái ban đầu cho 1 phiên stream mới.
+
+        `silence_ms = None` ⇒ dùng đúng giá trị im lặng mặc định trong config của engine
+        (đúng docs). Ngược lại engine chiếu `silence_ms` xuống field native của mình.
+        """
         pass
 
     @abstractmethod
     def is_speech(
         self,
-        chunk_float32: Optional[np.ndarray],
+        frame_int16: np.ndarray,
         state: VADStreamState,
-        threshold: float,
-        chunk_raw: Optional[bytes] = None,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
     ) -> VADResult:
-        """Xử lý 1 frame âm thanh và cập nhật state (hỗ trợ cả float32 và raw Int16 PCM bytes)."""
+        """Xử lý ĐÚNG `frame_samples` mẫu PCM Int16 và cập nhật state.
+
+        ⚠️ `frame_int16` là **view chỉ-đọc** trên buffer của processor: engine TUYỆT ĐỐI
+        không được sửa tại chỗ (đó là audio sẽ tới ASR). Mọi chuyển đổi
+        (Int16 → Float32/Int16 chuẩn hoá) chỉ được tạo **bản sao** cho model.
+        """
         pass

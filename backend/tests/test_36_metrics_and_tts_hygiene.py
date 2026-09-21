@@ -180,8 +180,16 @@ def test_dump_metrics_report_o_cleanup_di_qua_thread():
 
 # ─────────────────────────────────────────────── Q11
 
-def test_comment_min_silence_frame_khong_con_sai():
-    """Q11: comment phải khớp giá trị và ghi rõ đây là config CHẾT với FireRed."""
+def test_comment_min_silence_frame_khop_docs_va_khong_con_sai():
+    """Q11 (cập nhật ở lượt viết lại VAD): giá trị phải ĐÚNG mặc định docs (20 frame) và
+    comment phải nói rõ đây là knob CHỐT CÂU thật của kiến trúc mới.
+
+    Bối cảnh: `min_silence_frame` từng bị ghi là "config CHẾT" vì processor bản cũ tự đếm
+    im lặng bằng `silence_duration_ms`. Kiến trúc mới chỉ nghe event START/END của engine
+    nên tham số này là knob thật ⇒ giá trị phải quay về đúng mặc định của
+    `FireRedStreamVadConfig` (20 frame = 200 ms). Xem
+    `report/audit/19_KE_HOACH_VIET_LAI_VAD.md`.
+    """
     src = (ROOT / "backend" / "config.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
 
@@ -191,19 +199,28 @@ def test_comment_min_silence_frame_khong_con_sai():
             for stmt in node.body:
                 if isinstance(stmt, ast.AnnAssign) and getattr(stmt.target, "id", "") == "min_silence_frame":
                     value = ast.literal_eval(stmt.value)
-    assert value == 60, f"giá trị min_silence_frame đổi thành {value} — test này cần cập nhật"
+    assert value == 20, (
+        f"`min_silence_frame` phải là 20 theo đúng mặc định docs "
+        f"(20 frame × 10 ms = 200 ms), đang là {value}"
+    )
 
     idx = src.index("min_silence_frame")
     comment_block = src[max(0, idx - 1400):idx]
     stale = "# 20 frames * 25 ms tối thiểu xác nhận kết thúc nói"
     assert stale not in comment_block, f"comment cũ vẫn còn nguyên: {stale!r}"
-    assert "60 frames" in comment_block and "1500 ms" in comment_block, (
-        "comment phải nêu đúng 60 frames = 1500 ms"
+    assert "20 frame" in comment_block and "200 ms" in comment_block, (
+        "comment phải nêu đúng 20 frame = 200 ms (mặc định docs)"
     )
-    assert "CHẾT" in comment_block or "chết" in comment_block, (
-        "phải ghi rõ `min_silence_frame` là config CHẾT với đường FireRed (QWEN-Q11) — "
-        "muốn chỉnh độ trễ chốt câu thì sửa `silence_duration_ms`"
+    assert "10 ms" in comment_block, (
+        "comment phải nêu đơn vị frame của upstream: 1 frame = FRAME_SHIFT_SAMPLE = 10 ms"
+    )
+    assert "chốt câu" in comment_block, (
+        "phải ghi rõ đây là knob CHỐT CÂU thật của kiến trúc mới (không còn là config chết)"
     )
     assert "silence_duration_ms" in comment_block, (
-        "comment phải chỉ người đọc sang `silence_duration_ms`"
+        "comment phải chỉ người đọc sang `VADConfig.silence_duration_ms` (đường ghi đè)"
+    )
+    assert "CHẾT" not in comment_block, (
+        "không được giữ lại khẳng định cũ 'config CHẾT' — kiến trúc mới chỉ nghe event "
+        "START/END của engine nên `min_silence_frame` LÀ knob chốt câu"
     )

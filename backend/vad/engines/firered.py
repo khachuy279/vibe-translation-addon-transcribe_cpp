@@ -1,52 +1,98 @@
-"""Engine FireRed-VAD (DFSMN SOTA Streaming VAD - Xiaohongshu / FireRedTeam)."""
+"""Engine FireRed-VAD (DFSMN SOTA Streaming VAD — Xiaohongshu / FireRedTeam).
 
+Bản viết lại dùng **đúng API công khai trong docs** của gói `fireredvad`:
+
+    from fireredvad import FireRedStreamVad, FireRedStreamVadConfig
+
+    vad_config = FireRedStreamVadConfig(
+        use_gpu=False, smooth_window_size=5, speech_threshold=0.4,
+        pad_start_frame=5, min_speech_frame=8, max_speech_frame=2000,
+        min_silence_frame=20, chunk_max_frame=30000)
+    stream_vad = FireRedStreamVad.from_pretrained("pretrained_models/FireRedVAD/Stream-VAD", vad_config)
+
+Hình học frame (upstream `fireredvad/core/constants.py`, không đổi được):
+    FRAME_LENGTH_SAMPLE = 400 (cửa sổ 25 ms) · FRAME_SHIFT_SAMPLE = 160 (hop 10 ms)
+
+Vì `AudioFeat.extract()` tạo `OnlineFbank` MỚI mỗi lần gọi với `snip_edges=True`, một
+cửa sổ 400 mẫu cho ĐÚNG 1 frame — nên engine tự gom cửa sổ trượt 400 mẫu (KHÔNG zero-pad
+như bản cũ: frame đầu tiên chỉ được phát khi đã có đủ 400 mẫu THẬT, giống hệt
+`vad_framewise` của upstream) rồi gọi `detect_frame()` mỗi 160 mẫu.
+
+State (`FireRedStreamVad`) gồm model caches + postprocessor nên **phải tạo mới cho mỗi
+phiên**; trọng số chỉ 2,3 MB nên chi phí chấp nhận được (đo trong
+`backend/tests/test_41_vad_engine_contract.py`).
+"""
+
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, List, Optional, Union
+
 import numpy as np
-import torch
 
 from backend.config import config, MODELS_DIR
-from backend.vad.base import BaseVADEngine, VADResult, VADStreamState
+from backend.vad.base import (
+    EVENT_END,
+    EVENT_START,
+    BaseVADEngine,
+    VADResult,
+    VADStreamState,
+)
 from backend.utils.logger import logger
+
+#: Hình học frame của upstream (`fireredvad/core/constants.py`).
+FRAME_LENGTH_SAMPLE = 400   # cửa sổ 25 ms
+FRAME_SHIFT_SAMPLE = 160    # hop 10 ms
+
+
+@dataclass
+class _Session:
+    """State riêng của FireRed cho 1 phiên: model VAD + bộ gom cửa sổ 400 mẫu."""
+
+    vad: Any
+    pending: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int16))
+
+    def push(self, frame_int16: np.ndarray) -> List[np.ndarray]:
+        """Nạp thêm `frame_int16` và trả các cửa sổ 400 mẫu MỚI đã đủ (0 hoặc 1 mỗi lần).
+
+        `pending` luôn ngắn hơn `window + hop` mẫu nên chi phí cấp phát ở đây không đáng
+        kể (~1 KB/frame, 100 frame/giây).
+        """
+        self.pending = (
+            np.concatenate((self.pending, frame_int16))
+            if self.pending.size
+            else np.array(frame_int16, dtype=np.int16, copy=True)
+        )
+        windows: List[np.ndarray] = []
+        while self.pending.size >= FRAME_LENGTH_SAMPLE:
+            windows.append(self.pending[:FRAME_LENGTH_SAMPLE])
+            self.pending = self.pending[FRAME_SHIFT_SAMPLE:]
+        return windows
 
 
 class FireRedVADEngine(BaseVADEngine):
-    """Engine VAD FireRed chính thức sử dụng gói fireredvad."""
+    """Engine VAD FireRed sử dụng gói `fireredvad` theo đúng docs."""
 
     name = "firered-vad"
-    default_threshold = config.vad.firered.threshold or config.vad.threshold
-    #: Cửa sổ phân tích của model = 25 ms (upstream `FRAME_LENGTH_SAMPLE`). CỐ ĐỊNH.
-    frame_window_samples = 400
-    #: Bước nhảy mặc định = 10 ms (upstream `FRAME_SHIFT_SAMPLE`). `__init__` ghi đè
-    #: theo `config.vad.firered.frame_hop_ms`. Bản cũ để 400 (25 ms) ⇒ sai nhịp 2,5×.
-    native_frame_samples = 160  # 10ms @ 16kHz
+    default_threshold = 0.4
+    #: Bước nhảy processor phải cắt = FRAME_SHIFT_SAMPLE (10 ms).
+    frame_samples = FRAME_SHIFT_SAMPLE
 
     def __init__(self, model_dir: Optional[Union[str, Path]] = None):
-        # Bước nhảy theo cấu hình (mặc định 10 ms). VADProcessor đọc
-        # `native_frame_samples` để quyết định cắt frame đầu vào, nên đặt ở instance.
-        hop_ms = int(getattr(config.vad.firered, "frame_hop_ms", 10) or 10)
-        self.native_frame_samples = max(1, int(16000 * hop_ms / 1000))
-        self.model_dir = self._resolve_model_dir(model_dir)
+        self.model_dir = self.resolve_model_dir(model_dir)
         self._ensure_model_files()
 
-        from fireredvad.core.audio_feat import AudioFeat
-        from fireredvad.core.detect_model import DetectModel
+        cfg = config.vad.firered
+        # Pre-roll tối đa mà VAD có thể yêu cầu xả lại khi báo START:
+        # các frame thuộc `pad_start_frame` + số frame cần để xác nhận (`min_speech_frame`).
+        self.max_lookback_frames = max(0, int(cfg.pad_start_frame) + int(cfg.min_speech_frame))
 
-        cmvn_path = str(self.model_dir / "cmvn.ark")
-        self.audio_feat = AudioFeat(cmvn_path)
-        self.vad_model = DetectModel.from_pretrained(str(self.model_dir))
-        self.vad_model.eval()
-        self.vad_model.cpu()
+        logger.info(
+            f"FireRed-VAD sẵn sàng (cửa sổ {FRAME_LENGTH_SAMPLE} mẫu, hop {FRAME_SHIFT_SAMPLE} mẫu, "
+            f"model_dir={self.model_dir})",
+            extra={"module_tag": "VAD"},
+        )
 
-        # Giới hạn PyTorch CPU threads xuống 2 để tránh đánh thức toàn bộ nhân CPU 40 lần/giây
-        if torch.get_num_threads() > 2:
-            torch.set_num_threads(2)
-
-        logger.info("Model FireRed Stream sẵn sàng", extra={"module_tag": "VAD"})
-
-    def _resolve_model_dir(self, explicit_dir: Optional[Union[str, Path]]) -> Path:
-        return self.resolve_model_dir(explicit_dir)
-
+    # ------------------------------------------------------------------ model files
     @staticmethod
     def resolve_model_dir(explicit_dir: Optional[Union[str, Path]] = None) -> Path:
         if explicit_dir and Path(explicit_dir).exists():
@@ -76,91 +122,91 @@ class FireRedVADEngine(BaseVADEngine):
         """Giữ lại cho tương thích: uỷ quyền cho `_ensure_files_in`."""
         self._ensure_files_in(self.model_dir)
 
-    def create_initial_state(self, threshold: Optional[float] = None) -> VADStreamState:
-        from fireredvad.core.stream_vad_postprocessor import StreamVadPostprocessor
+    # ------------------------------------------------------------------ config
+    def _resolve_effective(self, threshold: Optional[float], silence_ms: Optional[int]):
+        """Giải giá trị đang có hiệu lực: knob phiên (nếu có) hay mặc định config engine."""
+        cfg = config.vad.firered
+        eff_threshold = float(threshold) if threshold is not None else float(cfg.speech_threshold)
+        if silence_ms is None:
+            eff_silence_frames = int(cfg.min_silence_frame)
+        else:
+            # 1 frame = 10 ms ⇒ ms -> frame, tối thiểu 1 frame.
+            eff_silence_frames = max(1, int(round(float(silence_ms) / 10.0)))
+        return eff_threshold, eff_silence_frames
+
+    def _build_config(self, threshold: Optional[float], silence_ms: Optional[int]):
+        """Dựng `FireRedStreamVadConfig` từ config backend (khớp 1-1 field của docs)."""
+        from fireredvad import FireRedStreamVadConfig
 
         cfg = config.vad.firered
-        active_thresh = threshold if threshold is not None else (cfg.threshold or config.vad.threshold)
+        eff_threshold, eff_silence_frames = self._resolve_effective(threshold, silence_ms)
+        return FireRedStreamVadConfig(
+            use_gpu=bool(cfg.use_gpu),
+            smooth_window_size=int(cfg.smooth_window_size),
+            speech_threshold=eff_threshold,
+            pad_start_frame=int(cfg.pad_start_frame),
+            min_speech_frame=int(cfg.min_speech_frame),
+            max_speech_frame=int(cfg.max_speech_frame),
+            min_silence_frame=eff_silence_frames,
+            chunk_max_frame=int(cfg.chunk_max_frame),
+        )
+
+    def create_initial_state(
+        self,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
+    ) -> VADStreamState:
+        from fireredvad import FireRedStreamVad
+
+        vad_config = self._build_config(threshold, silence_ms)
+        stream_vad = FireRedStreamVad.from_pretrained(str(self.model_dir), vad_config)
 
         state = VADStreamState()
-        state.firered_postprocessor = StreamVadPostprocessor(
-            smooth_window_size=cfg.smooth_window_size,
-            speech_threshold=active_thresh,
-            pad_start_frame=cfg.pad_start_frame,
-            min_speech_frame=cfg.min_speech_frame,
-            max_speech_frame=2000,
-            min_silence_frame=cfg.min_silence_frame,
-        )
-        state.firered_caches = None
+        state.engine_state = _Session(vad=stream_vad)
         return state
 
+    # ------------------------------------------------------------------ streaming
     def is_speech(
         self,
-        chunk_float32: Optional[np.ndarray],
+        frame_int16: np.ndarray,
         state: VADStreamState,
-        threshold: float,
-        chunk_raw: Optional[bytes] = None,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
     ) -> VADResult:
-        if state.firered_postprocessor is None:
-            init_s = self.create_initial_state(threshold)
-            state.firered_postprocessor = init_s.firered_postprocessor
-            state.firered_caches = init_s.firered_caches
+        session: Optional[_Session] = state.engine_state
+        if session is None:
+            session = _Session(vad=self.create_initial_state(threshold, silence_ms).engine_state.vad)
+            state.engine_state = session
 
-        # Cập nhật threshold động nếu có thay đổi
-        if threshold is not None and state.firered_postprocessor.speech_threshold != threshold:
-            state.firered_postprocessor.speech_threshold = float(threshold)
+        eff_threshold, eff_silence_frames = self._resolve_effective(threshold, silence_ms)
+        self._sync_runtime_config(session.vad, eff_threshold, eff_silence_frames)
 
-        # Tránh roundtrip F32 -> I16: ưu tiên dùng trực tiếp chunk_raw Int16 nếu có
-        if chunk_raw is not None:
-            chunk_int16 = np.frombuffer(chunk_raw, dtype=np.int16)
-        elif chunk_float32 is not None:
-            arr = np.asarray(chunk_float32, dtype=np.float32)
-            chunk_int16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype(np.int16)
-        else:
-            raise ValueError("Cần cung cấp ít nhất chunk_raw hoặc chunk_float32 cho FireRed VAD")
+        result = VADResult()
+        for window in session.push(frame_int16):
+            frame_result = session.vad.detect_frame(window)
+            result.probability = float(frame_result.smoothed_prob)
+            result.is_speech = bool(frame_result.is_speech)
+            if frame_result.is_speech_end:
+                result.event = EVENT_END
+                result.lookback_frames = 0
+            elif frame_result.is_speech_start:
+                # `speech_start_frame` là frame 1-based mà VAD coi là mép đầu đoạn nói
+                # (đã trừ `pad_start_frame`). Số frame cần xả lại = frame hiện tại - mép đầu.
+                result.event = EVENT_START
+                result.lookback_frames = max(0, int(frame_result.frame_idx) - int(frame_result.speech_start_frame))
+        return result
 
-        # ── CỬA SỔ TRƯỢT 25 ms, BƯỚC NHẢY 10 ms ─────────────────────────────────
-        # `AudioFeat.extract()` dùng `OnlineFbank` MỚI mỗi lần gọi với `frame_shift=10ms`
-        # và `snip_edges=True` ⇒ input 400 samples cho ĐÚNG 1 frame. Vì vậy để có 1 frame
-        # mỗi 10 ms ta phải tự duy trì cửa sổ 400 samples và trượt đi 160 samples mỗi lần,
-        # thay vì đưa thẳng 160 samples (sẽ ra 0 frame).
-        win_len = self.frame_window_samples
-        prev = state.firered_window
-        if prev is None:
-            prev = np.zeros(win_len, dtype=np.int16)
-        n = chunk_int16.shape[0]
-        if n >= win_len:
-            window = chunk_int16[-win_len:]
-        else:
-            # Giữ `win_len - n` mẫu CUỐI của cửa sổ trước rồi nối phần mới.
-            # ⚠️ Phải là `prev[-(win_len - n):]` (lấy từ CUỐI). Viết `prev[win_len - n:]`
-            # là sai: trên mảng 400 phần tử, `prev[240:]` chỉ còn 160 phần tử ⇒ cửa sổ
-            # ngắn dần (400 → 320) và model nhận 0 frame ⇒ RuntimeError.
-            window = np.concatenate((prev[-(win_len - n):], chunk_int16))
-        state.firered_window = window
-
-        feat, _ = self.audio_feat.extract(window)
-        with torch.no_grad():
-            probs, state.firered_caches = self.vad_model.forward(
-                feat.unsqueeze(0), caches=state.firered_caches
-            )
-
-        raw_prob = probs.squeeze().tolist()
-        if isinstance(raw_prob, list):
-            prob_val = float(raw_prob[-1]) if raw_prob else 0.0
-        else:
-            prob_val = float(raw_prob)
-
-        frame_result = state.firered_postprocessor.process_one_frame(prob_val)
-
-        event = None
-        if frame_result.is_speech_start:
-            event = "START"
-        elif frame_result.is_speech_end:
-            event = "END"
-
-        return VADResult(
-            is_speech=bool(frame_result.is_speech),
-            probability=float(frame_result.smoothed_prob),
-            event=event,
-        )
+    @staticmethod
+    def _sync_runtime_config(vad: Any, threshold: float, silence_frames: int) -> None:
+        """Áp cấu hình runtime lên postprocessor đang chạy (đổi ngưỡng/silence giữa phiên)."""
+        post = getattr(vad, "postprocessor", None)
+        if post is None:
+            return
+        if float(post.speech_threshold) != float(threshold):
+            post.speech_threshold = float(threshold)
+            if getattr(vad, "config", None) is not None:
+                vad.config.speech_threshold = float(threshold)
+        if int(post.min_silence_frame) != int(silence_frames):
+            post.min_silence_frame = int(silence_frames)
+            if getattr(vad, "config", None) is not None:
+                vad.config.min_silence_frame = int(silence_frames)

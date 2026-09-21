@@ -83,7 +83,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
     const duckingPercent = parseInt(rangeDuckingLevel ? rangeDuckingLevel.value : 25, 10);
     const speedVal = selTtsSpeed ? (selTtsSpeed.value || "1.0") : "1.0";
-    const vadSilenceMs = parseInt(rangeVadSilence ? rangeVadSilence.value : 600, 10) || 600;
+    const rawSilence = rangeVadSilence ? parseInt(rangeVadSilence.value, 10) : 0;
+    // 0 = OFF: backend hiểu là "để chính VAD dùng mặc định trong docs của nó".
+    const vadSilenceMs = isNaN(rawSilence) ? 0 : Math.max(0, rawSilence);
     const rawThresh = rangeVadThreshold ? parseFloat(rangeVadThreshold.value) : 0.5;
     const vadThresholdVal = isNaN(rawThresh) ? 0.5 : rawThresh;
     const rawMinWords = rangeMinWords ? parseInt(rangeMinWords.value, 10) : 2;
@@ -137,7 +139,13 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   }
 
   function updateRangeLabels() {
-    if (valVadSilence && rangeVadSilence) valVadSilence.textContent = rangeVadSilence.value;
+    if (valVadSilence && rangeVadSilence) {
+      const ms = parseInt(rangeVadSilence.value, 10);
+      const off = !ms || ms <= 0;
+      valVadSilence.textContent = off ? "0" : String(ms);
+      const unit = document.getElementById("valVadSilenceUnit");
+      if (unit) unit.textContent = off ? " (mặc định VAD)" : "ms";
+    }
     if (valVadThreshold && rangeVadThreshold) valVadThreshold.textContent = parseFloat(rangeVadThreshold.value).toFixed(2);
     if (valMinWords && rangeMinWords) {
       const mw = parseInt(rangeMinWords.value, 10);
@@ -334,8 +342,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     }
 
     if (selVadEngine) selVadEngine.value = activeVad;
-    if (rangeVadSilence && (data.vad_silence_duration_ms || data.silence_duration_ms) && !rangeVadSilence.dataset.userEdited) {
-      rangeVadSilence.value = data.vad_silence_duration_ms || data.silence_duration_ms;
+    if (rangeVadSilence && data.silence_duration_ms !== undefined && !rangeVadSilence.dataset.userEdited) {
+      // Backend trả 0 khi "để VAD tự quyết định" ⇒ hiển thị đúng 0 (OFF).
+      rangeVadSilence.value = data.silence_duration_ms;
       updateRangeLabels();
     }
     if (rangeVadThreshold && data.vad_threshold !== undefined && !rangeVadThreshold.dataset.userEdited) {
@@ -426,7 +435,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const payload = {
         asr_engine: newAsr,
         vad_engine: newVad,
-        silence_duration_ms: parseInt(rangeVadSilence ? rangeVadSilence.value : 600, 10) || 600,
+        silence_duration_ms: (() => {
+          const raw = parseInt(rangeVadSilence ? rangeVadSilence.value : 0, 10);
+          return isNaN(raw) ? 0 : Math.max(0, raw);   // 0 = "để VAD tự quyết định"
+        })(),
         vad_threshold: !isNaN(parseFloat(rangeVadThreshold?.value)) ? parseFloat(rangeVadThreshold.value) : 0.5,
         min_words_to_commit: !isNaN(parseInt(rangeMinWords?.value, 10)) ? Math.max(0, parseInt(rangeMinWords.value, 10)) : 2,
         source_lang: newLang,
@@ -720,7 +732,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       if (s.asrEngine && selAsrEngine) selAsrEngine.value = s.asrEngine;
       if (s.vadEngine && selVadEngine) selVadEngine.value = s.vadEngine;
       if ((s.vadSilenceDurationMs !== undefined || s.silenceDurationMs !== undefined) && rangeVadSilence) {
-        rangeVadSilence.value = s.vadSilenceDurationMs || s.silenceDurationMs;
+        const saved = s.vadSilenceDurationMs !== undefined ? s.vadSilenceDurationMs : s.silenceDurationMs;
+        // `||` sẽ biến 0 (OFF) thành giá trị khác ⇒ phải dùng kiểm tra tường minh.
+        const ms = parseInt(saved, 10);
+        rangeVadSilence.value = isNaN(ms) ? 0 : Math.max(0, ms);
         rangeVadSilence.dataset.userEdited = "true";
       }
       if ((s.vadThreshold !== undefined || s.vad_threshold !== undefined || s.threshold !== undefined) && rangeVadThreshold) {

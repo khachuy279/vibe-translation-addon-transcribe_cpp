@@ -36,16 +36,16 @@ class _SlowVADEngine(FakeVADEngine):
         super().__init__()
         self.delay = delay
 
-    def is_speech(self, chunk_float32, state, threshold, chunk_raw=None):
+    def is_speech(self, frame_int16, state, threshold=None, silence_ms=None):
         time.sleep(self.delay)
-        return super().is_speech(chunk_float32, state, threshold, chunk_raw)
+        return super().is_speech(frame_int16, state, threshold=threshold, silence_ms=silence_ms)
 
 
 def _proc(monkeypatch, engine=None, **cb):
     """VADProcessor với engine giả đã sẵn sàng (không đụng pool toàn cục)."""
     proc = VADProcessor(vad_engine="firered-vad", **cb)
-    proc._engine = engine or FakeVADEngine()
-    proc._state = proc._new_state(proc._engine, proc.threshold)
+    proc._attach_engine(engine or FakeVADEngine())
+    proc._state = proc._new_state(proc._engine)
     proc._stopped = False
     return proc
 
@@ -87,14 +87,14 @@ def test_reset_lam_batch_dang_bay_bi_bo(monkeypatch):
     )
 
 
-def test_state_sau_reset_van_co_pre_speech_ring_gioi_han(monkeypatch):
-    """State rỗng phải được gắn `pre_speech_ring` có `maxlen`, nếu không sẽ rò RAM."""
+def test_state_sau_reset_van_co_pre_roll_ring_gioi_han(monkeypatch):
+    """State rỗng phải được gắn `pre_roll` có `maxlen`, nếu không sẽ rò RAM."""
     proc = _proc(monkeypatch)
     proc.reset()
-    ring = proc._state.pre_speech_ring
+    ring = proc._state.pre_roll
     assert isinstance(ring, deque)
-    assert ring.maxlen == proc._max_pre_frames(proc._frame_samples), (
-        "`VADStreamState.pre_speech_ring` mặc định là deque KHÔNG giới hạn ⇒ phải gán lại maxlen"
+    assert ring.maxlen == max(1, proc._max_lookback_frames), (
+        "`VADStreamState.pre_roll` mặc định là deque KHÔNG giới hạn ⇒ phải gán lại maxlen"
     )
 
 
@@ -102,7 +102,8 @@ def test_reset_khong_goi_engine_create_initial_state(monkeypatch):
     """`reset()` chạy trên event loop ⇒ KHÔNG được nạp lại JIT model của Silero."""
     calls = []
     engine = FakeVADEngine()
-    engine.create_initial_state = lambda threshold=None: (calls.append(1), FakeVADEngine().create_initial_state(threshold))[1]
+    engine.create_initial_state = lambda threshold=None, silence_ms=None: (
+        calls.append(1), FakeVADEngine().create_initial_state(threshold, silence_ms))[1]
     proc = _proc(monkeypatch, engine=engine)
     calls.clear()
 

@@ -270,7 +270,7 @@ def test_prewarm_nap_dong_bo_engine_va_state(monkeypatch):
     assert proc.prewarm() is True
     assert proc._engine is fake
     assert proc._state is not None
-    assert proc._frame_samples == fake.native_frame_samples
+    assert proc._frame_samples == fake.frame_samples
 
 
 # ─────────────────────────────────────────────── 5. chốt ở mức mã nguồn

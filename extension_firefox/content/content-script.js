@@ -16,7 +16,15 @@
   const PROTOCOL_VERSION = 3;
 
   function buildWsConfig(cfg) {
-    const silence = cfg.silenceDurationMs || cfg.vadSilenceDurationMs || cfg.silence_duration_ms || 300;
+    // 0 = OFF: để backend dùng mặc định trong docs của VAD engine đang chọn
+    // (FireRed 600 ms · Silero 100 ms · FSMN 800 ms). KHÔNG dùng `||` vì 0 là giá trị hợp lệ
+    // và có nghĩa ("off") — `|| 300` cũ sẽ âm thầm biến OFF thành 300 ms.
+    const rawSilence =
+      cfg.silenceDurationMs !== undefined ? cfg.silenceDurationMs :
+      (cfg.vadSilenceDurationMs !== undefined ? cfg.vadSilenceDurationMs :
+        (cfg.silence_duration_ms !== undefined ? cfg.silence_duration_ms : 0));
+    const parsedSilence = parseInt(rawSilence, 10);
+    const silence = isNaN(parsedSilence) ? 0 : Math.max(0, parsedSilence);
     const out = {
       type: "set_config",
       action: "configure",

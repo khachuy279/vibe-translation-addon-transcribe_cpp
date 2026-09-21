@@ -79,7 +79,8 @@ def test_pre_roll_start_is_at_first_speech_chunk(session_factory):
     total_before = engine.audio_buffer.total_written
     _feed_speech(session, 0.3)           # bắt đầu nói
 
-    # pre_speech_buffer_ms mặc định 300ms => pre-roll tối đa ~4800 samples
+    # Pre-roll tối đa do CHÍNH VAD quyết định (`max_lookback_frames` của engine) và được
+    # xả khi VAD phát START — không còn knob `pre_speech_buffer_ms` (đã xoá).
     assert engine._speech_start_sample >= 0
     assert engine.audio_buffer.total_written > total_before
     # Điểm bắt đầu không được vượt quá số sample đã ghi

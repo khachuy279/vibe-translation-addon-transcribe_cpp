@@ -85,7 +85,12 @@ class VADEngineFactory:
             return cls._engines.get(engine)
 
     @classmethod
-    def prewarm_engines(cls, names, threshold: Optional[float] = None) -> Dict[str, str]:
+    def prewarm_engines(
+        cls,
+        names,
+        threshold: Optional[float] = None,
+        silence_ms: Optional[int] = None,
+    ) -> Dict[str, str]:
         """P1.9: nạp trước nhiều engine để chuyển nóng không phải tải/nạp model.
 
         Trả về dict {engine_name: "ok" | "error: ..."} để caller log rõ.
@@ -98,9 +103,9 @@ class VADEngineFactory:
                 continue
             try:
                 engine = cls.get_engine(key)
-                # create_initial_state cũng tốn thời gian (Silero load JIT model) nên
-                # warm luôn một lần rồi bỏ state — state thật là per-session.
-                engine.create_initial_state(threshold=threshold)
+                # `create_initial_state` cũng tốn thời gian (Silero nạp JIT model) nên warm
+                # luôn một lần rồi bỏ state — state thật là per-session.
+                engine.create_initial_state(threshold=threshold, silence_ms=silence_ms)
                 results[key] = "ok"
             except Exception as exc:  # noqa: BLE001
                 results[key] = f"error: {type(exc).__name__}: {exc}"

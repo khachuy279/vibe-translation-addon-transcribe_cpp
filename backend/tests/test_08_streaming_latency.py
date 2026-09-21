@@ -118,10 +118,8 @@ async def run_paced(
     session.vad_processor = VADProcessor(
         sample_rate=config.vad.sample_rate,
         vad_engine=config.vad.vad_engine,
-        threshold=config.vad.threshold,
-        silence_duration_ms=config.vad.silence_duration_ms,
-        hangover_ms=config.vad.hangover_ms,
-        pre_speech_buffer_ms=config.vad.pre_speech_buffer_ms,
+        threshold=config.vad.effective_threshold,
+        silence_duration_ms=config.vad.effective_silence_ms,
         enabled=True,
         on_speech_chunk=engine.feed_audio,
         on_speech_start=engine.on_speech_start,
@@ -232,7 +230,8 @@ def main() -> int:
     print(f"audio        : {len(audio) / 16000:.2f}s nói liên tục (nguồn {wav.name})")
     print(f"speed        : {args.speed}x   poll_interval={poll}ms")
     print(f"preview_win  : {config.asr.preview_window_sec}s  max_duration={config.sentence.max_duration_sec}s")
-    print(f"vad          : {config.vad.vad_engine}  silence={config.vad.silence_duration_ms}ms")
+    print(f"vad          : {config.vad.vad_engine}  "
+          f"silence={config.vad.effective_silence_ms if config.vad.effective_silence_ms else 'mặc định engine'}ms")
     print(f"TRANSCRIBE_PERF_DEBUG={'1' if os.environ.get('TRANSCRIBE_PERF_DEBUG') else '0'}")
     print("-" * 78)
 

@@ -81,9 +81,11 @@
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>⏱️ VAD Silence</label>
-            <span class="val-badge"><span id="valVadSilence">450</span>ms</span>
+            <span class="val-badge"><span id="valVadSilence">0</span><span id="valVadSilenceUnit"></span></span>
           </div>
-          <input type="range" id="rangeVadSilence" min="300" max="1500" step="50" value="450">
+          <!-- 0 = OFF: để chính VAD dùng mặc định trong docs của nó (FireRed 600 ms,
+               Silero 100 ms, FSMN 800 ms). Không còn hangover/pre-speech ở tầng processor. -->
+          <input type="range" id="rangeVadSilence" min="0" max="1500" step="50" value="0">
         </div>
         <div class="setting-group flex-1">
           <div class="label-with-value">
@@ -232,16 +234,16 @@
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>🔤 Origin size</label>
-            <span class="val-badge"><span id="valOrigSize">1.6</span>%</span>
+            <span class="val-badge"><span id="valOrigSize">2.0</span>%</span>
           </div>
-          <input type="range" id="rangeOrigSize" min="1.0" max="3.0" step="0.1" value="1.6">
+          <input type="range" id="rangeOrigSize" min="1.0" max="3.0" step="0.1" value="2.0">
         </div>
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>🔠 Translate size</label>
-            <span class="val-badge"><span id="valTransSize">3</span>%</span>
+            <span class="val-badge"><span id="valTransSize">4.0</span>%</span>
           </div>
-          <input type="range" id="rangeTransSize" min="2.0" max="5.0" step="0.1" value="3">
+          <input type="range" id="rangeTransSize" min="2.0" max="5.0" step="0.1" value="4.0">
         </div>
       </div>
 

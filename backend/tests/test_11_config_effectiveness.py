@@ -50,13 +50,22 @@ def test_legacy_threshold_alias_applies(session_factory, restore_config):
     assert session.vad_processor.threshold == pytest.approx(0.61)
 
 
-def test_silence_and_hangover_apply(session_factory, restore_config):
+def test_silence_applies_va_0_tra_ve_mac_dinh_engine(session_factory, restore_config):
+    """`silenceDurationMs` đi thẳng vào engine; **0 = off** ⇒ quay về mặc định của engine.
+
+    (Bản cũ còn assert `hangover_ms` — tham số này đã bị xoá vì VAD tự lo hangover.)
+    """
     session = session_factory()
-    session.apply_config({"silenceDurationMs": 700, "hangoverMs": 250})
+    session.apply_config({"silenceDurationMs": 700})
     assert session.vad_processor.silence_duration_ms == 700
-    assert session.vad_processor.hangover_ms == 250
     assert session.config.get("silence_duration_ms") == 700
-    assert session.config.get("hangover_ms") == 250
+
+    session.apply_config({"silenceDurationMs": 0})
+    assert session.vad_processor.silence_duration_ms is None, "0 = off ⇒ để engine tự quyết"
+    assert session.config.get("silence_duration_ms") is None
+
+    assert not hasattr(session.vad_processor, "hangover_ms")
+    assert not hasattr(session.vad_processor, "pre_speech_buffer_ms")
 
 
 def test_tts_settings_apply(session_factory, restore_config):
