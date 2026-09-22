@@ -7,7 +7,30 @@ from typing import Set
 
 from backend.utils.logger import logger
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+def _configure_alloc_conf() -> None:
+    """Đặt biến cấu hình allocator của torch ĐÚNG TÊN theo phiên bản.
+
+    Torch đổi tên `PYTORCH_CUDA_ALLOC_CONF` → `PYTORCH_ALLOC_CONF` và cảnh báo deprecation
+    khi thấy biến CŨ còn được đặt:
+        `[W...] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead`
+    (ĐO THỰC: cảnh báo này xuất hiện với **torch 2.9.1** ⇒ mốc đổi tên là 2.9, KHÔNG phải 2.12.)
+
+    Cách chọn: torch ≥ 2.9 → CHỈ đặt tên mới (torch cũ hơn không biết biến này nên sẽ bỏ qua);
+    torch < 2.9 → đặt tên cũ. Dùng `importlib.metadata` để biết phiên bản mà KHÔNG import torch.
+    """
+    name = "PYTORCH_CUDA_ALLOC_CONF"
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        parts = _pkg_version("torch").split("+")[0].split(".")
+        if (int(parts[0]), int(parts[1])) >= (2, 9):
+            name = "PYTORCH_ALLOC_CONF"
+    except Exception:  # noqa: BLE001 - thiếu torch/chuỗi lạ → giữ tên cũ
+        pass
+    os.environ.setdefault(name, "expandable_segments:True")
+
+
+_configure_alloc_conf()
 
 _cuda_paths_initialized: bool = False
 _init_lock = threading.RLock()
@@ -65,6 +88,37 @@ def setup_cuda_dll_paths() -> None:
                 bin_dir = os.path.join(env_val, "bin")
                 if os.path.isdir(bin_dir):
                     dll_dirs.add(os.path.abspath(bin_dir))
+
+        # 2b. CUDA toolkit 13 đi kèm repo (`external/cuda-toolkit` hoặc `.cuda-toolkit`).
+        # VÌ SAO CẦN: bundle ASR CUDA trong `bin/` (`ggml-cuda.dll`) link với
+        # `cudart64_13.dll` / `cublas64_13.dll` / `cublasLt64_13.dll`. Trước đây các DLL này
+        # đến từ `torch/lib` (torch bản CUDA), nhưng môi trường có thể dùng torch CPU-only
+        # (đã gặp: torch 2.12.0+cu130 -> 2.9.1 CPU) ⇒ CUDA backend **không nạp được** dù
+        # `bin/ggml-cuda.dll` còn nguyên. Toolkit đã có sẵn trong repo (pip wheel dùng để
+        # build) nên đăng ký luôn ⇒ bundle CUDA tự đủ, không phụ thuộc bản torch nào.
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        for toolkit_root in (
+            os.path.join(project_root, "external", "cuda-toolkit"),
+            os.path.join(project_root, ".cuda-toolkit"),
+        ):
+            candidates = [
+                os.path.join(toolkit_root, "nvidia", "cu13", "bin", "x86_64"),
+                os.path.join(toolkit_root, "nvidia", "cu13", "bin"),
+            ]
+            # Glob nhẹ nhàng: chấp nhận mọi phiên bản cu* nếu sau này nâng toolkit.
+            nvidia_root = os.path.join(toolkit_root, "nvidia")
+            if os.path.isdir(nvidia_root):
+                try:
+                    for item in os.listdir(nvidia_root):
+                        candidates.append(os.path.join(nvidia_root, item, "bin", "x86_64"))
+                        candidates.append(os.path.join(nvidia_root, item, "bin"))
+                except OSError:
+                    pass
+            for cand in candidates:
+                if os.path.isdir(cand) and any(
+                    f.startswith("cudart64") for f in os.listdir(cand)
+                ):
+                    dll_dirs.add(os.path.abspath(cand))
 
         # 3. Tìm trong Program Files NVIDIA GPU Computing Toolkit
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")

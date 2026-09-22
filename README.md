@@ -109,7 +109,9 @@ python -m venv .venv
 .venv\Scripts\activate
 
 # Cài TẤT CẢ thư viện runtime (đã gồm torch CUDA + llama.cpp CUDA)
-pip install -r backend\requirements.txt
+# -c backend/constraints.txt: GHIM torch/torchaudio/torchvision theo bộ CUDA, để pip báo lỗi
+# thay vì âm thầm hạ torch xuống bản CPU (xem mục "Nâng cấp gói phụ thuộc mà không phá torch CUDA")
+pip install -r backend\requirements.txt -c backend\constraints.txt
 ```
 
 `backend/requirements.txt` đã khai báo sẵn `--extra-index-url` cho hai gói **không có bản CUDA trên
@@ -147,10 +149,16 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 # Nếu driver của bạn CHỈ hỗ trợ CUDA 12.x, dùng cu124 thay thế:
 # pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+# ⚠️ Đổi torch sang cu124 thì phải đổi CẢ llama.cpp sang whl/cu124 (Bước 3) và thêm
+#    `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12`, nếu không `import llama_cpp` sẽ nổ.
 ```
 
-`backend/utils/cuda.py` tự đăng ký `torch/lib` vào đường tìm DLL, nên `cudart64_*.dll`,
-`cublas64_*.dll` của torch được dùng chung cho cả ASR CUDA (nếu bật) và llama.cpp.
+`backend/utils/cuda.py` tự đăng ký đường tìm DLL theo thứ tự: `torch/lib` → **CUDA 13 toolkit
+trong repo** (`external/cuda-toolkit/nvidia/cu13/bin/x86_64`, hoặc `.cuda-toolkit/…`) → `CUDA_PATH`
+→ Program Files. Nhờ vậy bundle ASR CUDA trong `bin/` **không phụ thuộc bản torch nào**: chỉ cần
+`cudart64_13.dll` / `cublas64_13.dll` / `cublasLt64_13.dll` có trong toolkit đã dùng để build.
+(Đã gặp thực tế: torch bị đổi sang bản CPU-only ⇒ `torch/lib` hết CUDA runtime ⇒ CUDA backend
+không nạp được dù `bin/ggml-cuda.dll` còn nguyên; nay lấy từ toolkit nên vẫn chạy.)
 
 **Kiểm tra:**
 ```powershell
@@ -163,8 +171,10 @@ python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.
 <summary><b>Bước 3 — llama.cpp cho dịch GGUF (bắt buộc có CUDA)</b></summary>
 
 ```powershell
-pip install "llama-cpp-python>=0.3.22,<0.4" `
+pip install "llama-cpp-python==0.3.22" `
   --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# wheel cu124 cần runtime CUDA 12 (torch cu130 không có bản 12):
+pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12
 ```
 
 **Kiểm tra GPU offload đã bật chưa** (phải in `True`):
@@ -172,41 +182,126 @@ pip install "llama-cpp-python>=0.3.22,<0.4" `
 python -c "import sys;sys.path.insert(0,'.');from backend.utils.cuda import setup_cuda_dll_paths;setup_cuda_dll_paths();from llama_cpp import llama_cpp as L;print('GPU offload:',L.llama_supports_gpu_offload())"
 ```
 
-> ⚠️ Nếu in `False` (hoặc lỗi *Failed to load shared library ... llama.dll*), bạn đang có bản **CPU**.
-> Bản CPU vẫn dịch được nhưng rất chậm. Cách xử lý: cài lại bằng index ở trên, hoặc build từ source:
-> ```powershell
-> $env:CMAKE_ARGS="-DGGML_CUDA=on"; $env:FORCE_CMAKE="1"
-> pip install llama-cpp-python --no-binary llama-cpp-python   # cần CUDA Toolkit + MSVC
-> ```
+> ⚠️ **Vì sao GHIM 0.3.22 (đã đo trên Ryzen 5 5600X)**
+> * Các wheel llama.cpp MỚI (0.3.25–0.3.35, kể cả cu130) được build kèm **AVX-512**:
+>   `ggml-cpu.dll` chứa **7.177 lệnh `zmm`**. CPU không có AVX-512 (Zen 3, phần lớn Intel phổ
+>   thông) sẽ nổ ngay khi nạp model: `OSError: [WinError -1073741795] … 0xc000001d`
+>   (STATUS_ILLEGAL_INSTRUCTION) — **kể cả khi chạy CPU-only**.
+> * Wheel `0.3.22` (cu124) đo được **0** lệnh `zmm` ⇒ chạy tốt cả CPU lẫn GPU.
+> * Kiểm tra một wheel bất kỳ trước khi dùng (0 dòng = an toàn):
+>   ```powershell
+>   dumpbin /disasm .venv\Lib\site-packages\llama_cpp\lib\ggml-cpu.dll | findstr zmm
+>   ```
+> * Muốn dùng CUDA 13 (một major duy nhất với torch/bundle ASR): build từ source, tắt
+>   `GGML_NATIVE` để ggml tự chọn tập lệnh theo CPU:
+>   ```powershell
+>   $env:CMAKE_ARGS="-DGGML_CUDA=on -DGGML_NATIVE=OFF"; $env:FORCE_CMAKE="1"
+>   pip install llama-cpp-python --no-binary llama-cpp-python
+>   ```
+
+> ⚠️ Nếu `GPU offload` in `False`, bạn đang có bản **CPU** (vẫn dịch được nhưng rất chậm).
+> Cách xử lý: cài lại bằng index ở trên, hoặc build từ source.
 </details>
 
 <details>
 <summary><b>Bước 4 — ASR native (Vulkan — bắt buộc)</b></summary>
 
 ```powershell
-pip install transcribe-cpp-native
+pip install transcribe-cpp transcribe-cpp-native
 ```
-Đây là provider **được hỗ trợ chính thức** (Vulkan + CPU) và là mặc định của backend.
+⚠️ **Phải cài CẢ HAI**: `transcribe-cpp-native` là thư viện native, `transcribe-cpp` là binding
+Python. Thiếu binding ⇒ log `transcribe_cpp package chưa được cài đặt!`,
+`/health → asr_runtime.devices = "n/a"` và **không có backend ASR nào** (dù `bin/ggml-cuda.dll`
+còn nguyên). `transcribe-cpp-native` là provider **được hỗ trợ chính thức** (Vulkan + CPU) và là
+mặc định của backend.
 </details>
 
 <details>
 <summary><b>Bước 5 — VAD + TTS + tiện ích</b></summary>
 
 ```powershell
-pip install fireredvad silero-vad funasr omnivoice huggingface_hub
+pip install fireredvad silero-vad funasr onnxruntime omnivoice huggingface_hub
 # tuỳ chọn — chỉ cần khi tải file giọng mẫu từ HuggingFace Dataset:
 pip install datasets
 ```
+⚠️ `onnxruntime` là **bắt buộc kèm `silero-vad` ≥ 6.2**: gói này `import onnxruntime` ngay ở cấp
+module dù ta chỉ dùng đường JIT, nên thiếu nó thì engine Silero không nạp được
+(`ModuleNotFoundError: No module named 'onnxruntime'`). Metadata của silero-vad không khai báo
+điều này — thiếu sót của gói, không phải của dự án.
 </details>
 
 <details>
 <summary><b>Bước 6 — Kiểm tra toàn bộ môi trường</b></summary>
 
 ```powershell
-python -c "import sys;sys.path.insert(0,'.');from backend.asr import native;from backend.utils.logger import get_logger;print('backends:', sorted(native._available_kinds()));print('devices :', native.backend_devices())"
+python -m backend.utils.env_check          # torch có phải bản CUDA không?
+python -c "import sys;sys.path.insert(0,'.');from backend.asr import native;print('backends:', sorted(native._available_kinds()));print('devices :', native.backend_devices())"
 ```
 Kỳ vọng tối thiểu (chỉ wheel Vulkan): `backends: ['vulkan']`, `devices: vulkan=Vulkan0, cpu=CPU`.
+Nếu bạn cài torch CUDA và/hoặc có bundle trong `bin/`: `backends: ['cuda', 'vulkan', 'cpu']`.
 </details>
+
+### ⚠️ Nâng cấp gói phụ thuộc mà không phá torch CUDA
+
+**Sự cố đã xảy ra (2026-09-22)**: `pip install -U silero-vad` (6.2.2) làm pip phân giải lại và
+cài **torch CPU-only**: `2.12.0+cu130` → `2.9.1+cpu`, kéo theo `torchaudio 2.9.1+cpu`, để lại
+`torchvision 0.27.0+cu130` mồ côi ⇒ TTS/dịch mất GPU (ASR vẫn chạy CUDA nhờ runtime lấy từ
+toolkit trong repo).
+
+**Nguyên nhân không phải silero-vad**: metadata của nó chỉ ghi `Requires: packaging, torch,
+torchaudio` (không giới hạn phiên bản). Vấn đề là interpreter Python này **dùng chung** với các
+gói có ràng buộc torch xung đột nhau:
+
+| Gói | Ràng buộc torch |
+| :--- | :--- |
+| `whisperx 3.8.6` | `torch~=2.8.0`, `torchvision~=0.23.0` |
+| `compressed-tensors 0.18.0` | `torch>=2.10.0` |
+| `torchvision 0.27.0+cu130` | `torch==2.12.0` |
+
+Giao của ba ràng buộc này **rỗng**, nên pip "giải" bằng cách lấy bản torch mới nhất thoả
+`whisperx` **từ PyPI — nơi torch là bản CPU-only**.
+
+**Cách phòng (theo thứ tự hiệu quả):**
+
+1. **Interpreter riêng cho dự án (khuyến nghị nhất)** — thoát hẳn khỏi xung đột với
+   whisperx/vibevoice/qwen-asr:
+   ```powershell
+   py -3.13 -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r backend/requirements.txt -c backend/constraints.txt
+   ```
+2. **Cài gói "lá" bằng `--no-deps`** — silero-vad/fireredvad/funasr chỉ cần torch đã có sẵn,
+   nên không cần để pip đụng vào cây phụ thuộc:
+   ```powershell
+   pip install -U silero-vad --no-deps
+   pip install -U fireredvad --no-deps
+   ```
+3. **Luôn kèm file ràng buộc** khi cài bất cứ thứ gì có thể chạm torch:
+   ```powershell
+   pip install -U <gói> -c backend/constraints.txt --extra-index-url https://download.pytorch.org/whl/cu130
+   ```
+   `backend/constraints.txt` ghim `torch/torchaudio/torchvision` theo bộ CUDA đã đo. Khi xung đột,
+   pip sẽ **báo lỗi `ResolutionImpossible`** thay vì âm thầm hạ torch — hỏng to và rõ.
+4. **Kiểm tra sau mỗi lần cài** (cũng tự chạy lúc backend khởi động và có trong `GET /health`):
+   ```powershell
+   python -m backend.utils.env_check        # exit 1 nếu torch không phải bản CUDA
+   ```
+   Lúc khởi động, backend ghi WARNING nếu môi trường torch có vấn đề; `/health → torch` cho biết
+   `version`, `cuda_build`, `cuda_available`, `problems`.
+
+**Nếu đã lỡ bị hạ torch** — cài lại đúng bộ CUDA (⚠️ `torchaudio` **đi sau torch một bậc**:
+index cu130 chỉ có tới `2.11.0+cu130`, KHÔNG có `2.12.x` — đừng "sửa cho khớp số" sẽ ra lỗi
+`Could not find a version that satisfies the requirement`):
+
+```powershell
+pip index versions torchaudio --index-url https://download.pytorch.org/whl/cu130   # xem bản có thật
+pip install torch==2.12.0+cu130 torchaudio==2.11.0+cu130 torchvision==0.27.0+cu130 `
+  --index-url https://download.pytorch.org/whl/cu130
+python -m backend.utils.env_check
+```
+`env_check` so theo **tag CUDA** (`+cu130`) chứ không so số phiên bản, nên bộ
+`2.12.0 + 2.11.0 + 0.27.0` được coi là hợp lệ.
+
 
 ### Bundle ASR CUDA (backend mặc định)
 
@@ -562,10 +657,15 @@ transcript tham chiếu):
 | Triệu chứng | Nguyên nhân & cách xử lý |
 | :--- | :--- |
 | Popup báo **Server Offline** dù backend đang chạy | Chưa chấp nhận chứng chỉ tự ký: mở `https://localhost:8765` → *Nâng cao → Tiếp tục*, rồi mở lại popup |
+| Log `transcribe_cpp package chưa được cài đặt!` + `/health → asr_runtime.devices = "n/a"` | Thiếu **binding** `transcribe-cpp` (chỉ cài `-native`). Cài `pip install "transcribe-cpp>=0.2.3"` rồi khởi động lại. Kiểm nhanh: `python -m backend.utils.env_check` |
+| `ModuleNotFoundError: No module named 'onnxruntime'` ở engine Silero | `silero-vad` ≥ 6.2 import onnxruntime ở cấp module (không khai báo trong metadata) ⇒ `pip install onnxruntime` |
+| Lỗi `[Errno 10048] error while attempting to bind on address ('0.0.0.0', 8765)` | Đã có một backend khác đang giữ cổng 8765 (instance cũ chưa tắt). Tắt instance cũ (Ctrl+C) hoặc tìm tiến trình đang nghe cổng: `Get-NetTCPConnection -LocalPort 8765 -State Listen` |
 | `pip install transcribe-cpp-native-cu12` rồi vẫn không có CUDA | Gói này chỉ là *name reservation* (wheel `0.0.0` ~1,4 KB, không có native code). CUDA cho ASR **không phát hành qua PyPI** — phải tự build bundle vào `bin/` (xem [Bật ASR CUDA](#bật-asr-cuda-tuỳ-chọn)). Không có `bin/` thì ASR chạy **Vulkan**, đúng như thiết kế |
 | Log ghi `ASR backend: 'cuda' KHÔNG khả dụng ⇒ FALLBACK sang 'vulkan'` | Thư viện native đang nạp không có `ggml-cuda.dll`. Đây là **hành vi đúng** (fallback + log rõ). Kiểm tra `GET /health → asr_runtime.available_backends` |
 | Dịch rất chậm, `llama_supports_gpu_offload()` trả `False` | Bạn đang cài bản llama.cpp **CPU**. Cài lại bằng index CUDA (xem [Bước 3](#-cài-đặt)) |
-| Lỗi `Failed to load shared library ... llama.dll` khi import `llama_cpp` trực tiếp | Bình thường: DLL CUDA chỉ nằm trong `torch/lib`. Backend tự gọi `setup_cuda_dll_paths()` trước khi import. Nếu tự viết script, hãy import `backend.asr` (hoặc gọi `setup_cuda_dll_paths()`) **trước** `llama_cpp` |
+| Lỗi `Failed to load shared library ... llama.dll (or one of its dependencies)` | **Thiếu runtime CUDA khớp wheel**: llama.dll → ggml.dll → ggml-cuda.dll cần `cudart64_1x`/`cublas64_1x` (cu124 → bản 12, cu130 → bản 13). Cài `nvidia-cuda-runtime-cu12 nvidia-cublas-cu12` nếu dùng wheel cu124; hoặc cài wheel đúng index CUDA. Chẩn đoán: `python -m backend.utils.env_check` |
+| `OSError: [WinError -1073741795] Windows Error 0xc000001d` khi **nạp model** llama.cpp | `STATUS_ILLEGAL_INSTRUCTION` = wheel llama.cpp build kèm **AVX-512** mà CPU không có (Zen 3 / Intel phổ thông). Đã đo: wheel 0.3.35-cu130 có 7.177 lệnh `zmm`, wheel 0.3.22-cu124 có 0 ⇒ `pip install --force-reinstall --no-deps "llama-cpp-python==0.3.22" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124`, hoặc build từ source với `-DGGML_NATIVE=OFF`. Kiểm wheel: `dumpbin /disasm …\llama_cpp\lib\ggml-cpu.dll \| findstr zmm` (0 dòng = an toàn) |
+| CUDA backend "biến mất" (`available_backends` chỉ còn vulkan/cpu) dù `bin\ggml-cuda.dll` vẫn còn | Thiếu runtime CUDA 13 (`cudart64_13.dll`, `cublas64_13.dll`, `cublasLt64_13.dll`). Thường gặp khi `torch` bị đổi sang bản **CPU-only** (ví dụ `2.12.0+cu130` → `2.9.1`). `backend/utils/cuda.py` đã đăng ký toolkit trong repo (`external/cuda-toolkit/nvidia/cu13/bin/x86_64`) nên bundle vẫn chạy; nếu vẫn thiếu, cài lại torch CUDA hoặc giữ toolkit đó trong repo |
 | Đổi model dịch báo *Chưa có file GGUF cục bộ* | File chưa tải và `auto_download` đang tắt. Bật lại (mặc định bật) để backend tự tải, hoặc copy `.gguf` vào `backend/models/` |
 | Đang tải model dịch, API trả **409** | Một lượt tải/nạp khác đang chạy. Xem `GET /api/config → translation.download`, đợi xong rồi thử lại |
 | Backend đứng im, **Ctrl+C không tắt được** | Xem log có `[STALL WATCHDOG]` (dump stack mọi thread). Gửi kèm dump khi báo lỗi; đây là dạng treo event loop mà watchdog được thiết kế để bắt |

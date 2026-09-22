@@ -50,22 +50,6 @@ _TAG = "ASR"
 #: `bindings/python/src/transcribe_cpp/_library.py`).
 _LIBRARY_ENV = "TRANSCRIBE_LIBRARY"
 
-#: Env var mà tầng native đọc để TỪ CHỐI mọi graph có op bị gán cho backend CPU.
-#: Xem `external/transcribe.cpp/patches/ggml/0002-require-gpu-no-cpu-fallback.patch`.
-#: Trạng thái mặc định là BẬT (xem `ASRConfig.require_gpu`).
-_REQUIRE_GPU_ENV = "GGML_SCHED_REQUIRE_GPU"
-
-#: Env var cho phép hạ cờ `config.asr.require_gpu` mà không sửa code.
-_REQUIRE_GPU_OVERRIDE_ENV = "TRANSCRIBE_REQUIRE_GPU"
-
-
-class GpuRequiredError(RuntimeError):
-    """Không có backend GPU khả dụng nhưng `config.asr.require_gpu` đang bật.
-
-    Cố ý là lỗi cứng: chạy ASR trên CPU ở RTF ~2,5 nghĩa là phụ đề không bao giờ đuổi kịp
-    video, và trước đây tình huống đó chỉ tạo ra một dòng WARNING nên rất dễ bị bỏ qua.
-    """
-
 _bootstrap_lock = threading.RLock()
 _bootstrapped = False
 _bundle_dir: Optional[Path] = None
@@ -151,9 +135,6 @@ def bootstrap() -> None:
             logger.debug(f"Bỏ qua setup_cuda_dll_paths: {exc}", extra={"module_tag": _TAG})
 
         bundle, source = _resolve_bundle_dir()
-        # Bắt buộc GPU: đặt env cho tầng native TRƯỚC khi nạp DLL, để mọi scheduler tạo sau
-        # đó đều bị từ chối nếu có op rơi về CPU (xem patch ggml 0002).
-        apply_require_gpu_env()
         if bundle is not None:
             lib = bundle / "transcribe.dll"
             os.environ[_LIBRARY_ENV] = str(lib)
@@ -180,27 +161,6 @@ def bootstrap() -> None:
                 )
 
         _bootstrapped = True
-
-
-def require_gpu_enabled() -> bool:
-    """`config.asr.require_gpu`, có thể bị hạ bởi env `TRANSCRIBE_REQUIRE_GPU=0`."""
-    from backend.config import config
-
-    env = os.environ.get(_REQUIRE_GPU_OVERRIDE_ENV)
-    if env is not None and env.strip() != "":
-        return env.strip().lower() not in ("0", "false", "no", "off")
-    return bool(getattr(config.asr, "require_gpu", True))
-
-
-def apply_require_gpu_env() -> bool:
-    """Đặt `GGML_SCHED_REQUIRE_GPU` cho tầng native. Trả về trạng thái hiệu lực.
-
-    Gọi TRƯỚC `import transcribe_cpp` là tốt nhất (ggml đọc env lúc tạo scheduler), nhưng
-    vì ggml đọc lại env ở mỗi `ggml_backend_sched_alloc_graph` nên đặt muộn vẫn có tác dụng.
-    """
-    on = require_gpu_enabled()
-    os.environ[_REQUIRE_GPU_ENV] = "1" if on else "0"
-    return on
 
 
 # --------------------------------------------------------------------------- backend
@@ -305,30 +265,6 @@ def resolve_backend(requested: Optional[str], *, force_log: bool = False) -> str
 
     avail = _available_kinds()
     prefs = _PREFERENCE[key]
-
-    # ── BẮT BUỘC GPU: không bao giờ im lặng chạy tiếp mà không có GPU ────────────────
-    # Đây là hành vi MỚI (2026-09-20). Trước đây khi thiếu backend, hàm vẫn trả về
-    # `prefs[0]` kèm WARNING; native sau đó tự rơi xuống CPU (RTF ~2,5) và không có lỗi nào
-    # nổi lên ⇒ phụ đề lặng lẽ không đuổi kịp video.
-    if require_gpu_enabled() and not avail:
-        raise GpuRequiredError(
-            "Không có backend GPU nào khả dụng cho ASR (cần ít nhất một trong "
-            f"{list(_SELECTABLE)}), nhưng `config.asr.require_gpu` đang BẬT. "
-            f"Backend yêu cầu='{key}', devices thấy được: {backend_devices()}. "
-            "ASR trên CPU có RTF ~2,5 (chậm hơn thời gian thực) nên bị chặn thay vì "
-            "fallback im lặng. Cách xử lý: (a) cài/khôi phục bundle CUDA trong bin/ "
-            "(xem docs/.../KE_HOACH_FIX_LOI_Hy3.md §4.1.1), hoặc (b) nếu CHỦ ĐÍCH chấp nhận "
-            "chạy CPU thì đặt `config.asr.require_gpu = False` hoặc env "
-            f"`{_REQUIRE_GPU_OVERRIDE_ENV}=0`."
-        )
-    if require_gpu_enabled() and key != "auto" and prefs[0] not in avail:
-        raise GpuRequiredError(
-            f"Backend '{prefs[0]}' được chỉ định nhưng KHÔNG khả dụng "
-            f"(hiện có: {sorted(avail)}, devices: {backend_devices()}). Không tự chuyển sang "
-            f"'{prefs[1]}' vì `config.asr.require_gpu` đang BẬT. Muốn cho phép đổi giữa các "
-            "backend GPU, đặt `config.asr.require_gpu = False`; muốn bỏ hẳn fallback, đặt "
-            "`config.asr.backend_fallback = False`."
-        )
 
     if not getattr(config.asr, "backend_fallback", True):
         chosen = prefs[0]

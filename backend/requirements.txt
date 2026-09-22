@@ -24,6 +24,18 @@
 # ============================================================================
 
 --extra-index-url https://download.pytorch.org/whl/cu130
+# ⚠️ llama.cpp: GHIM 0.3.22 + index **cu124** (đã đo trên máy tham chiếu, Ryzen 5 5600X).
+#   * Wheel MỚI (kiểm 0.3.35-cu130) build kèm **AVX-512**: `ggml-cpu.dll` chứa **7.177 lệnh
+#     `zmm`** ⇒ `llama_init_from_model` nổ `OSError: [WinError -1073741795] 0xc000001d`
+#     (STATUS_ILLEGAL_INSTRUCTION) trên CPU KHÔNG có AVX-512 (Zen 3, phần lớn Intel phổ thông).
+#     Wheel 0.3.22-cu124 đo được **0** lệnh `zmm` ⇒ chạy tốt.
+#   * cu124 cần runtime CUDA 12 (`cudart64_12`/`cublas64_12`) nên phải cài thêm
+#     `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12` (torch cu130 không có bản 12).
+#   * Muốn một major CUDA duy nhất (cu130): build từ source —
+#       $env:CMAKE_ARGS="-DGGML_CUDA=on -DGGML_NATIVE=OFF"; $env:FORCE_CMAKE="1"
+#       pip install llama-cpp-python --no-binary llama-cpp-python
+#   * Kiểm tra BẤT KỲ wheel nào trước khi dùng (0 dòng = an toàn):
+#       dumpbin /disasm <venv>\Lib\site-packages\llama_cpp\lib\ggml-cpu.dll | findstr zmm
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 
 # ---------------------------------------------------------------- Web framework
@@ -52,12 +64,16 @@ orjson>=3.9                 # TUỲ CHỌN — thiếu thì backend tự fallbac
 #     wheel 1380 byte). Muốn có phải tự build — xem README mục "Bật ASR CUDA (tuỳ chọn)".
 # Bản `transcribe-cpp-native` là provider native mà `transcribe-cpp` (binding) tìm qua
 # entry point `transcribe_cpp.native`.
+# ⚠️ PHẢI cài CẢ HAI: `-native` chỉ là thư viện; thiếu binding `transcribe-cpp` thì backend
+# báo `transcribe_cpp package chưa được cài đặt!` và **không có backend ASR nào** (devices=n/a).
+transcribe-cpp>=0.2.3
 transcribe-cpp-native>=0.2.3
 
 # ------------------------------------------------------------------ Dịch (llama.cpp GGUF)
 # Bản CUDA dựng sẵn cho Windows; index ở đầu file lo việc chọn đúng wheel.
-# Bản 0.3.22 là bản đã đo; các bản 0.3.25–0.3.35 cũng có wheel cu124/cu130.
-llama-cpp-python>=0.3.22,<0.4
+# ⚠️ PIN 0.3.22: các bản 0.3.25–0.3.35 build kèm AVX-512 ⇒ crash `0xC000001D` trên CPU không có
+#    AVX-512 (xem ghi chú chi tiết ở đầu file). Kiểm wheel mới: `dumpbin /disasm … | findstr zmm`.
+llama-cpp-python==0.3.22
 
 # ------------------------------------------------------------------- TTS (OmniVoice)
 # kéo theo torch/torchaudio (>=2.4) + transformers + librosa + pydub
@@ -68,6 +84,11 @@ omnivoice>=0.2.1
 # ------------------------------------------------------------------------- VAD engine
 fireredvad>=0.0.2           # mặc định (FireRed Stream-VAD)
 silero-vad>=5.1             # tuỳ chọn
+# ⚠️ silero-vad 6.2.2 `import onnxruntime` NGAY Ở CẤP MODULE (`silero_vad/utils_vad.py`) dù ta
+# chỉ dùng đường JIT ⇒ thiếu gói này thì engine Silero không nạp được:
+#     [VAD] Engine 'silero-vad' nạp nền thất bại: ModuleNotFoundError: No module named 'onnxruntime'
+# (metadata của silero-vad KHÔNG khai báo onnxruntime — đây là thiếu sót của gói.)
+onnxruntime>=1.17
 funasr>=1.1                 # tuỳ chọn (FSMN-VAD) — khá nặng, kéo modelscope/omegaconf
 
 # ------------------------------------------------------------------ Tải model / giọng

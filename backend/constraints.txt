@@ -1,0 +1,44 @@
+# ============================================================================
+# Ràng buộc phiên bản CUDA cho môi trường của dự án (constraints, KHÔNG phải requirements)
+#
+# Dùng:
+#   pip install -r backend/requirements.txt -c backend/constraints.txt
+#   pip install -U <gói> -c backend/constraints.txt \
+#       --extra-index-url https://download.pytorch.org/whl/cu130
+#
+# VÌ SAO CẦN:
+#   Interpreter Python này dùng CHUNG với nhiều gói khác, và các ràng buộc torch của chúng
+#   xung đột nhau:
+#     * whisperx 3.8.6          -> torch~=2.8.0,  torchvision~=0.23.0
+#     * compressed-tensors 0.18 -> torch>=2.10.0
+#     * torchvision 0.27.0+cu130-> torch==2.12.0
+#   Khi pip cài một gói chỉ phụ thuộc "torch" KHÔNG giới hạn (silero-vad 6.2.2 ghi
+#   `Requires: packaging, torch, torchaudio`), resolver có thể chọn bản torch **CPU-only
+#   trên PyPI** ⇒ CUDA biến mất (đã xảy ra 2026-09-22: 2.12.0+cu130 -> 2.9.1+cpu, kéo
+#   theo torchaudio 2.9.1, để lại torchvision 0.27.0+cu130 mồ côi).
+#
+#   Có file này, pip sẽ **BÁO LỖI** (ResolutionImpossible) thay vì âm thầm hạ torch.
+#   Đó là hành vi mong muốn: hỏng to và rõ còn hơn mất GPU im lặng.
+#
+# ⚠️ LƯU Ý PHIÊN BẢN (đã kiểm bằng `pip index versions … --index-url .../whl/cu130`):
+#    index cu130 có torchaudio TỚI 2.11.0+cu130 (KHÔNG có 2.12.x) — torchaudio đi sau torch
+#    một bậc. Bộ đúng đang dùng: torch 2.12.0 + torchaudio 2.11.0 + torchvision 0.27.0.
+#    Đừng "sửa cho khớp số" — torchaudio 2.12.0+cu130 KHÔNG tồn tại và pip sẽ báo
+#    "Could not find a version that satisfies the requirement".
+#
+#    Muốn nâng lên mới hơn: đối chiếu cả ba bằng
+#      pip index versions <gói> --index-url https://download.pytorch.org/whl/cu130
+#    rồi chọn bộ ba cùng tag CUDA (ví dụ torch 2.11.0 + torchaudio 2.11.0 + torchvision 0.26.0).
+#
+# ⚠️ Khi nâng torch có chủ đích: sửa cả 3 dòng dưới cho khớp bộ CUDA (cùng tag `+cuXXX`),
+#    rồi chạy lại `python -m backend.utils.env_check`.
+# ============================================================================
+torch==2.12.0+cu130
+torchaudio==2.11.0+cu130
+torchvision==0.27.0+cu130
+
+# llama.cpp cũng bị ghim vì lý do riêng (không phải CUDA major): các bản 0.3.25–0.3.35 build
+# kèm AVX-512 (`ggml-cpu.dll` 7.177 lệnh `zmm`) ⇒ `llama_init_from_model` nổ `0xC000001D` trên
+# CPU không có AVX-512 (đo thực: Ryzen 5 5600X). 0.3.22-cu124 đo được 0 lệnh `zmm`.
+# Cần runtime CUDA 12: `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12`.
+llama-cpp-python==0.3.22

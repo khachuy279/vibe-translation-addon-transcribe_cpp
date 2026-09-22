@@ -796,6 +796,13 @@ phải bằng cách bỏ backend CPU:
 
 ### 8.2. Tầng 1 — Python: không còn fallback im lặng
 
+> ⚠️ **ĐÃ GỠ BỎ (2026-09-22)** — toàn bộ §8.2/§8.3 dưới đây là **ghi chép lịch sử**: tính năng
+> `ASRConfig.require_gpu`, lớp `GGML_SCHED_REQUIRE_GPU` và patch ggml `0002-require-gpu-no-cpu-fallback`
+> đã bị **xoá theo yêu cầu** (bundle CUDA cũng được build lại không kèm patch). Hành vi hiện tại:
+> chọn backend theo `_PREFERENCE` + `config.asr.backend_fallback`, ghi **WARNING** rõ ràng khi
+> không có backend GPU nào khả dụng, không ném lỗi cứng. Xem `backend/config.py` (`ASRConfig.backend_fallback`)
+> và `backend/asr/native.py::resolve_backend`.
+
 | File | Thay đổi |
 | --- | --- |
 | `backend/config.py` | Thêm `ASRConfig.require_gpu: bool = True` kèm chú thích đầy đủ số đo |

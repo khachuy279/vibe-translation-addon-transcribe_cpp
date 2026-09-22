@@ -7,7 +7,7 @@ models:
   tencent-1.8b:
     name: Hunyuan-MT2 1.8B (Tencent)
     model: unsloth/Hy-MT2-1.8B-GGUF
-    gguf_file: Hy-MT2-1.8B-UD-Q8_K_XL.gguf
+    gguf_file: Hy-MT2-1.8B-UD-Q4_K_XL.gguf
     temperature: 0.7
     top_p: 0.6
     top_k: 20

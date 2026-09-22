@@ -1,8 +1,9 @@
 # ============================================================================
 # Vibe Translation Addon — Backend DEV/TEST dependencies
 #
-# Cài đặt:
-#     pip install -r backend/requirements-dev.txt
+# Cài đặt (kèm ràng buộc CUDA để pip không hạ torch — xem README mục
+# "Nâng cấp gói phụ thuộc mà không phá torch CUDA"):
+#     pip install -r backend/requirements-dev.txt -c backend/constraints.txt
 #
 # Bộ test tầng A (mặc định) KHÔNG nạp model thật, chạy ~10-15 s:
 #     python -m pytest

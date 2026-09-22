@@ -202,37 +202,14 @@ class ASRConfig(BaseModel):
     backend: str = "cuda"
     # Khi backend yêu cầu không khả dụng thì tự fallback theo thứ tự ưu tiên và ghi log
     # WARNING nêu rõ lý do. Đặt False để lỗi nổi lên thay vì âm thầm đổi backend.
-    # ⚠️ Từ khi có `require_gpu` (bên dưới), cờ này CHỈ còn điều khiển việc đổi giữa các
-    # backend GPU (cuda <-> vulkan). Nó KHÔNG bao giờ cho phép rơi xuống CPU.
+    # Cờ này CHỈ điều khiển việc đổi giữa các backend GPU (cuda <-> vulkan); nó không bao
+    # giờ tự chọn CPU — CPU không nằm trong danh sách ưu tiên (xem `backend/asr/native.py`).
+    #
+    # [2026-09-22] `ASRConfig.require_gpu` (và lớp native `GGML_SCHED_REQUIRE_GPU`) đã được
+    # GỠ BỎ theo yêu cầu: không còn lỗi cứng khi thiếu GPU, không còn env chặn graph có op
+    # rơi về CPU. Hành vi nay đúng như tài liệu `transcribe.cpp`: chọn backend GPU theo
+    # `_PREFERENCE` + `backend_fallback`, và ghi WARNING rõ ràng nếu không backend nào khả dụng.
     backend_fallback: bool = True
-    # --- BẮT BUỘC GPU (đo thực 2026-09-20) ---------------------------------------
-    # `backend` ở trên chỉ là *yêu cầu*. Trước đây khi nó không khả dụng,
-    # `native.resolve_backend()` âm thầm fallback và chỉ ghi WARNING ⇒ một máy không có GPU
-    # vẫn "chạy được", nhưng ASR rơi xuống CPU ở RTF ~2,55 (đo thật: `cohere-transcribe`
-    # 71,9 s cho 28,2 s audio, tức chậm hơn thời gian thực 2,5 lần) ⇒ phụ đề không bao giờ
-    # đuổi kịp video mà không có lỗi nào nổi lên.
-    #
-    # Nguy hiểm hơn: NGAY CẢ khi model nạp ra `backend=CUDA0`, ggml vẫn có thể gán một phần
-    # graph cho backend CPU dự phòng. Đo bằng `GGML_SCHED_DEBUG=2` trên RTX 5060 Ti:
-    #   * `qwen3-asr-1.7b`   : 4052/4052 node trên CUDA0 ⇒ **0 op trên CPU**
-    #   * `cohere-transcribe`: 7398 CUDA0 + **192 CPU** (48× `FLASH_ATTN` + 48× `SIGMOID`,
-    #     đúng 1 cặp mỗi encoder block) ⇒ RTF 0,104 (so với 0,020 của qwen) và ăn ~3,4 nhân CPU.
-    # Vì vậy chỉ nhìn log "backend=CUDA0" là KHÔNG đủ để kết luận đang chạy GPU.
-    #
-    # `require_gpu = True` (mặc định) thực thi hai tầng:
-    #   1. Python: `native.resolve_backend()` **NÉM LỖI** (`GpuRequiredError`) khi không có
-    #      backend GPU nào khả dụng, thay vì fallback im lặng.
-    #   2. Native: đặt `GGML_SCHED_REQUIRE_GPU=1` để tầng native **từ chối** mọi graph có op
-    #      bị gán cho backend CPU, kèm tên op trong log (xem
-    #      `external/transcribe.cpp/patches/ggml/0002-require-gpu-no-cpu-fallback.patch`).
-    #      LƯU Ý: cần bundle native đã build lại mới có hiệu lực; bundle cũ bỏ qua env này.
-    #
-    # ⚠️ HỆ QUẢ ĐÃ ĐO: với tầng (2) bật, `cohere-transcribe` **sẽ lỗi** vì nó cần 48×
-    # `FLASH_ATTN` + 48× `SIGMOID` trên CPU — tức nó KHÔNG thể chạy GPU-only trên bản port
-    # hiện tại. `qwen3-asr-1.7b` không bị ảnh hưởng (đã 100% GPU).
-    # Đặt False chỉ khi CHỦ ĐÍCH chấp nhận chạy CPU (chậm hơn thời gian thực) hoặc khi cần
-    # chẩn đoán. Biến môi trường `TRANSCRIBE_REQUIRE_GPU=0` cũng hạ được cờ này.
-    require_gpu: bool = False
     # --- Bundle native cục bộ (`bin/`) ------------------------------------------
     # Ưu tiên bundle trong `bin/` (bản dựng cục bộ, có thể gồm ggml-cuda.dll) hơn provider
     # `transcribe-cpp-native` đã cài trong site-packages. Xem backend/asr/native.py.

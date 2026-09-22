@@ -106,6 +106,54 @@ def _log_asr_backend_at_startup() -> None:
         logger.debug(f"Bỏ qua ghi log backend ASR lúc khởi động: {exc}", extra={"module_tag": "MAIN"})
 
 
+def _log_torch_status_at_startup() -> None:
+    """Cảnh báo NGAY lúc khởi động nếu torch đã bị đổi sang bản CPU-only.
+
+    VÌ SAO CẦN: interpreter Python dùng chung với nhiều gói khác có ràng buộc torch xung đột
+    (whisperx → `torch~=2.8.0`, compressed-tensors → `torch>=2.10.0`, torchvision cu130 →
+    `torch==2.12.0`). Một lệnh `pip install -U <gói chỉ phụ thuộc torch>` có thể khiến pip
+    chọn bản **CPU-only trên PyPI** và CUDA biến mất im lặng (đã xảy ra 2026-09-22 với
+    silero-vad 6.2.2). Log này biến sự cố im lặng thành cảnh báo đọc được ngay.
+    """
+    try:
+        from backend.utils.env_check import torch_status
+
+        status = torch_status()
+        if status["problems"]:
+            logger.warning(
+                f"[STARTUP] Môi trường torch có vấn đề: {' | '.join(status['problems'])} "
+                f"→ chạy `python -m backend.utils.env_check` để xem chi tiết.",
+                extra={"module_tag": "MAIN"},
+            )
+        else:
+            logger.info(
+                f"[STARTUP] torch {status['version']} (CUDA {status['cuda_build']}, "
+                f"{status['cuda_device_count']} GPU)",
+                extra={"module_tag": "MAIN"},
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Bỏ qua kiểm tra môi trường torch: {exc}", extra={"module_tag": "MAIN"})
+
+
+def _torch_health_info() -> Dict[str, Any]:
+    """Khối `torch` cho `/health` — phát hiện sớm pip hạ torch xuống bản CPU-only."""
+    try:
+        from backend.utils.env_check import torch_status
+
+        st = torch_status()
+        return {
+            "version": st["version"],
+            "cuda_build": st["cuda_build"],
+            "cuda_available": st["cuda_available"],
+            "cuda_device_count": st["cuda_device_count"],
+            "torchaudio": st["torchaudio"],
+            "torchvision": st["torchvision"],
+            "problems": st["problems"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def _asr_runtime_info() -> Dict[str, Any]:
     """Thông tin backend ASR thực tế đang dùng (để /health xác nhận bằng mắt).
 
@@ -346,6 +394,7 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] Pre-warming pipeline: ASR, Translation, VAD...", extra={"module_tag": "MAIN"})
 
     _log_asr_backend_at_startup()
+    _log_torch_status_at_startup()
 
     prewarm_jobs = [
         asyncio.to_thread(_prewarm_asr),
@@ -463,6 +512,9 @@ async def health_check():
         "protocol_version": config.ws.protocol_version,
         "asr_model": ModelRegistry.get_instance().get_active_model_key(),
         "asr_runtime": _asr_runtime_info(),
+        # Trạng thái torch (bản CUDA hay CPU-only) — để phát hiện sớm việc pip hạ torch,
+        # vì TTS/dịch cần torch CUDA còn ASR CUDA thì lấy runtime từ toolkit trong repo.
+        "torch": _torch_health_info(),
         "vad_engine": config.vad.vad_engine,
         "translation_model": config.translation.base,
         "tts_model": config.tts.model,

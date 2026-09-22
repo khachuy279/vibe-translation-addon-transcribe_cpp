@@ -48,25 +48,37 @@ def tmp_asr_models(monkeypatch, tmp_path):
 
 # ─────────────────────────────────────────────── catalog / cờ đã tải
 def test_asr_list_models_marks_is_downloaded(tmp_asr_models):
-    """Popup cần biết model nào đã có file để hiển thị icon thích hợp."""
+    """Popup cần biết model nào đã có file để hiển thị icon thích hợp.
+
+    ⚠️ KHÔNG hard-code tên file/quant: catalog `models.yaml` đổi quant (Q8_0 ⇄ Q4_K_M…) là
+    chuyện bình thường; test phải hỏi chính registry.
+    """
     from backend.asr.registry import ModelRegistry
 
-    # Tạo giả file cho qwen3-asr-0.6b
-    (tmp_asr_models / "Qwen3-ASR-0.6B-Q8_0.gguf").write_bytes(b"gguf")
+    reg = ModelRegistry.get_instance()
+    present_key, absent_key = "qwen3-asr-0.6b", "whisper-large-v3-turbo"
 
-    models = {m["id"]: m for m in ModelRegistry.get_instance().list_models()}
-    assert models["qwen3-asr-0.6b"]["is_downloaded"] is True
-    assert models["whisper-large-v3-turbo"]["is_downloaded"] is False
+    # Tạo giả file cho model đầu tiên, đúng TÊN trong catalog; model còn lại để trống.
+    (tmp_asr_models / reg.file_name(present_key)).write_bytes(b"gguf")
+    assert not (tmp_asr_models / reg.file_name(absent_key)).exists()
+
+    models = {m["id"]: m for m in reg.list_models()}
+    assert models[present_key]["is_downloaded"] is True
+    assert models[absent_key]["is_downloaded"] is False
     assert all("is_downloaded" in m for m in models.values())
 
 
 def test_asr_registry_helpers():
-    """Kiểm tra các helper: repo_id, file_name, needs_download."""
+    """Helper phải trả ĐÚNG giá trị trong catalog (repo + tên file)."""
     from backend.asr.registry import ModelRegistry
 
     reg = ModelRegistry.get_instance()
-    assert reg.repo_id("whisper-large-v3-turbo") == "handy-computer/whisper-large-v3-turbo-gguf"
-    assert reg.file_name("whisper-large-v3-turbo") == "whisper-large-v3-turbo-Q8_0.gguf"
+    key = "whisper-large-v3-turbo"
+    info = reg.get_model_info(key) or {}
+    assert reg.repo_id(key) == info["hf_repo"] == "handy-computer/whisper-large-v3-turbo-gguf"
+    assert reg.file_name(key) == info["file"]
+    assert reg.file_name(key).startswith("whisper-large-v3-turbo-")
+    assert reg.file_name(key).endswith(".gguf")
 
 
 # ─────────────────────────────────────────────── ensure_model_file
@@ -75,7 +87,7 @@ def test_ensure_asr_model_file_existing_never_touches_network(monkeypatch, tmp_a
     from backend.asr.registry import ModelRegistry
     from backend.utils import model_download
 
-    target = tmp_asr_models / "whisper-large-v3-turbo-Q8_0.gguf"
+    target = tmp_asr_models / ModelRegistry.get_instance().file_name("whisper-large-v3-turbo")
     target.write_bytes(b"gguf-data")
 
     def _boom(**kwargs):
@@ -100,7 +112,7 @@ def test_ensure_asr_model_file_missing_and_download_disabled(monkeypatch, tmp_as
     with pytest.raises(model_download.ModelFileMissing) as excinfo:
         reg.ensure_model_file("whisper-large-v3-turbo", allow_download=False)
     message = str(excinfo.value)
-    assert "whisper-large-v3-turbo-Q8_0.gguf" in message
+    assert reg.file_name("whisper-large-v3-turbo") in message
     assert "huggingface.co" in message
 
 
@@ -110,7 +122,7 @@ def test_ensure_asr_model_file_downloads_when_missing(monkeypatch, tmp_asr_model
     from backend.utils import model_download
 
     def _fake_list_repo_files(repo_id):
-        return ["README.md", "whisper-large-v3-turbo-Q8_0.gguf"]
+        return ["README.md", ModelRegistry.get_instance().file_name("whisper-large-v3-turbo")]
 
     def _fake_download(repo_id, filename, local_dir):
         path = tmp_asr_models / "downloaded_raw.gguf"
@@ -123,7 +135,7 @@ def test_ensure_asr_model_file_downloads_when_missing(monkeypatch, tmp_asr_model
 
     reg = ModelRegistry.get_instance()
     out = reg.ensure_model_file("whisper-large-v3-turbo", allow_download=True)
-    expected_path = tmp_asr_models / "whisper-large-v3-turbo-Q8_0.gguf"
+    expected_path = tmp_asr_models / reg.file_name("whisper-large-v3-turbo")
     assert out == str(expected_path)
     assert expected_path.is_file()
     assert expected_path.stat().st_size == 1024

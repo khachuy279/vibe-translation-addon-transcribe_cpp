@@ -1,7 +1,7 @@
 default_model: qwen3-asr-1.7b
 models:
   qwen3-asr-1.7b:
-    name: Qwen3 ASR 1.7B (GGUF)
+    name: Qwen3 ASR 1.7B (Q8_0)
     family: qwen3_asr
     architecture_type: offline_llm
     hf_repo: handy-computer/Qwen3-ASR-1.7B-gguf
@@ -13,7 +13,7 @@ models:
     context_window_sec: 30
     description: Alibaba Audio-LLM model ported to transcribe.cpp, 1.61% WER, auto-detect 30 languages
   qwen3-asr-0.6b:
-    name: Qwen3 ASR 0.6B (GGUF)
+    name: Qwen3 ASR 0.6B (Q8_0)
     family: qwen3_asr
     architecture_type: offline_llm
     hf_repo: handy-computer/Qwen3-ASR-0.6B-gguf
@@ -25,12 +25,12 @@ models:
     context_window_sec: 30
     description: Alibaba Audio-LLM model ported to transcribe.cpp, 1.61% WER, auto-detect 30 languages
   sensevoice-small:
-    name: SenseVoice Small (GGUF)
+    name: SenseVoice Small (Q8_0)
     family: sensevoice
     architecture_type: non_autoregressive
     hf_repo: handy-computer/SenseVoiceSmall-gguf
-    default_quant: F32
-    file: SenseVoiceSmall-F32.gguf
+    default_quant: Q8_0
+    file: SenseVoiceSmall-Q8_0.gguf
     sample_rate: 16000
     languages:
     - zh
@@ -41,13 +41,13 @@ models:
     vram_estimate_mb: 500
     description: Non-autoregressive speech model via transcribe.cpp, latency ~20ms
   nemotron-3.5-streaming:
-    name: Nemotron 3.5 ASR Streaming (GGUF)
+    name: Nemotron 3.5 ASR Streaming (Q8_0)
     family: nemotron
     att_context_right: 1 # lookahead 80ms
     architecture_type: streaming
     hf_repo: handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf
-    default_quant: F16
-    file: nemotron-3.5-asr-streaming-0.6b-F16.gguf
+    default_quant: Q8_0
+    file: nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf
     sample_rate: 16000
     languages: auto
     vram_estimate_mb: 750
@@ -65,14 +65,14 @@ models:
     context_window_sec: 30
     description: CohereLabs multilingual ASR model ported to transcribe.cpp, 1.27% WER
   voxtral-mini-4b-realtime:
-    name: Voxtral Mini 4B Realtime (Q5_K_M)
+    name: Voxtral Mini 4B Realtime (Q8_0)
     family: voxtral
     num_delay_tokens: 2          # --stream-voxtral-delay 2 = 160ms delay
     min_decode_interval_ms: 100
     architecture_type: streaming
     hf_repo: handy-computer/Voxtral-Mini-4B-Realtime-2602-gguf
-    default_quant: Q5_K_M
-    file: Voxtral-Mini-4B-Realtime-2602-Q5_K_M.gguf
+    default_quant: Q8_0
+    file: Voxtral-Mini-4B-Realtime-2602-Q8_0.gguf
     sample_rate: 16000
     languages: auto
     vram_estimate_mb: 3200
