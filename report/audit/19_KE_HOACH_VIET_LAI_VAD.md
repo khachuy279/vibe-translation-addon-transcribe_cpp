@@ -526,3 +526,58 @@ Test chốt hành vi: `test_42` (tier A, không model) — `silence=0` để eng
 thể đã phát `END` sớm và bị hoãn; nếu ta quên quyết định đó thì câu treo vĩnh viễn. Nay
 `VADStreamState.engine_end_pending` ghi nhớ "engine đã muốn đóng", và ở chế độ docs frame kế
 tiếp tôn trọng ngay (`test_42::test_gat_silence_ve_0_giua_cau_khong_treo_cau`).
+
+### 10.7 Đối chiếu với bảng công bố của nhà cung cấp (AVA-Speech vs FLEURS-VAD-102)
+
+Bảng FireRedVAD (F1 97,57 · Silero 95,95 · FunASR 90,91) đo **non-streaming trên FLEURS-VAD-102**
+(clip speech ĐỌC ~10 s, nhãn nhị phân — `external/FireRedVAD/README.md`), còn `test_43` đo trên
+**audio phim**. Bốn phép kiểm chứng đã loại trừ lỗi cấu hình / tích hợp / thước đo:
+
+1. `backend/models/silero_vad.jit` **byte-identical** với JIT của gói `silero-vad` (v6) và model chỉ
+   nhận cửa sổ **512** mẫu (1024/1536 lỗi) ⇒ đúng model, đúng cửa sổ.
+2. Đường streaming của ta vs **API offline chính chủ** `get_speech_timestamps()` trên cùng audio:
+   F1 **0,257 vs 0,243** (3 phút đầu) ⇒ không phải lỗi tích hợp; quét ngưỡng 0,25 → 0,5 không cải thiện
+   ⇒ cũng không phải lỗi ngưỡng (AUC-ROC của Silero trên 10 phút AVA chỉ 0,633).
+3. Config khớp docs (`test_41::test_config_3_engine_khop_docs`) và ngữ nghĩa `VAD Silence` đã đo ở §10.6.
+4. **Benchmark in-domain mới** `test_44_vad_clean_speech_benchmark.py` (5 clip speech đọc sạch 16 kHz
+   có sẵn trong repo, ghép với khoảng lặng 3 s): cả 3 engine **phát hiện 100 % clip**; F1 so tham chiếu
+   năng lượng — FireRed **0,897** · Silero **0,893** · FSMN **0,976** ⇒ Silero ≈ FireRed trên đúng
+   loại dữ liệu của bảng nhà cung cấp.
+
+Nguyên nhân khoảng cách nằm ở **lớp `SPEECH_WITH_NOISE`** của AVA-Speech (thoại phim có nhạc/nhiễu nền):
+FireRed 0,947 · FSMN 0,657 · Silero 0,432 (trên `CLEAN_SPEECH` cả ba đều 0,94–1,00).
+Phân tích đầy đủ + cách tái lập: `report/02_vad/ava_vs_vendor_benchmarks.md`.
+`test_43` nay cũng in/ghi `recall_by_class` vào báo cáo MD/JSON.
+
+### 10.8 `🎯 Threshold` (popup) ↔ config riêng của từng engine
+
+Chuỗi đã kiểm bằng `scratch/vad_threshold_trace.py` và khoá bằng
+`test_41::test_threshold_tu_popup_toi_field_native_qua_session` (3 engine thật):
+
+```
+popup slider → {vadThreshold, threshold}  (popup.js / content-script.js)
+  → SessionState.apply_config()           → self.config["vad_threshold"]
+  → VADProcessor.update_config(threshold) → VADProcessor.threshold
+  → engine.is_speech(threshold=…)         → _resolve_effective() → _sync_runtime_config()
+  → FIELD NATIVE: FireRed postprocessor.speech_threshold
+                 Silero  VADIterator.threshold
+                 FSMN    stats.speech_noise_thres
+```
+
+Kết quả đo (`vadThreshold = 0,77`):
+
+| Đường | FireRed | Silero | FSMN |
+|---|---|---|---|
+| `create_initial_state(threshold=0.77)` | 0,77 | 0,77 | 0,77 |
+| `update_config(threshold=0.55)` (đang chạy) | 0,55 | 0,55 | 0,55 |
+| `apply_config({"vadThreshold": 0.77})` (**đường popup**) | **0,77** | **0,77** | **0,77** |
+| Đổi engine SAU khi đã đặt 0,61 | 0,61 | 0,61 | 0,61 |
+
+**Quan trọng — "đồng bộ" theo nghĩa nào:** popup KHÔNG ghi vào `SileroVADConfig.threshold`
+(field này giữ nguyên mặc định docs **0,5**); giá trị của popup sống ở `VADConfig.threshold`
+(toàn cục, qua REST) và `vad_threshold` (theo phiên), rồi **ghi đè runtime** lên field native
+của engine đang chạy ở mọi frame. Nhờ vậy:
+* `VADConfig.threshold = None` (mặc định) ⇒ mỗi engine dùng đúng mặc định docs (0,4 / 0,5 / 0,6);
+* popup mở ra sẽ đọc `/api/config → vad_threshold = effective_threshold` để hiển thị đúng giá
+  trị đang có hiệu lực; người dùng kéo slider ⇒ áp dụng NGAY cho phiên đang chạy (không cần restart);
+* đổi engine nóng vẫn giữ nguyên ngưỡng người dùng đã chọn.

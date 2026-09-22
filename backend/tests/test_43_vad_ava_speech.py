@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 import time
 
+import numpy as np
 import pytest
 
 from backend.tests.fixtures import ava_speech as av
@@ -45,6 +46,35 @@ FLOORS = {
 
 #: Kết quả từng engine cho báo cáo cuối (điền trong lúc chạy test).
 _RESULTS: dict = {}
+
+
+def _recall_by_class(pred, labels, n_frames) -> dict:
+    """Recall theo từng lớp nhãn + tỉ lệ báo động giả trên NO_SPEECH.
+
+    VÌ SAO CẦN: AVA-Speech tách `CLEAN_SPEECH` / `SPEECH_WITH_NOISE` / `SPEECH_WITH_MUSIC`.
+    VAD nào chỉ tệ ở hai lớp sau thì đó là ĐỘ KHÓ CỦA DOMAIN (phim có nhạc/nhiễu), không phải
+    lỗi cấu hình — xem `report/02_vad/ava_vs_vendor_benchmarks.md`.
+    """
+    out = {}
+    for cls in ("CLEAN_SPEECH", "SPEECH_WITH_NOISE", "SPEECH_WITH_MUSIC"):
+        mask = av.labels_to_timeline([(s, e, lab) for s, e, lab in labels if lab == cls], n_frames)
+        total = int(mask.sum())
+        out[cls] = round(float((pred & mask).sum()) / total, 4) if total else None
+    silent = np.zeros(n_frames, dtype=bool)
+    for start, end, lab in labels:
+        if lab != "NO_SPEECH":
+            continue
+        # KHÔNG dùng `labels_to_timeline` ở đây: helper đó coi NO_SPEECH là "không phải speech"
+        # nên bỏ qua ⇒ mặt nạ rỗng và cột báo động giả luôn vô nghĩa (lỗi đã gặp).
+        a = max(0, int(round(start * 1000.0 / av.FRAME_MS)))
+        b = min(n_frames, int(round(end * 1000.0 / av.FRAME_MS)))
+        if b > a:
+            silent[a:b] = True
+    total_sil = int(silent.sum())
+    out["false_alarm_on_no_speech"] = (
+        round(float((pred & silent).sum()) / total_sil, 4) if total_sil else None
+    )
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -105,6 +135,8 @@ def test_vad_tren_10_phut_ava_speech(engine_name, ava_segment, report_dir):
         "rtf": round(result["rtf"], 4),
         "integrity": integrity,
         "metrics": metrics,
+        # Recall RIÊNG theo từng lớp nhãn: chỗ phân biệt "domain khó" với "tích hợp sai".
+        "recall_by_class": _recall_by_class(result["pred"], ava_segment.labels, n_frames),
         "floors": {k: v for k, v in floors.items() if k != "measured"},
         "measured_note": floors["measured"],
     }
@@ -116,7 +148,8 @@ def test_vad_tren_10_phut_ava_speech(engine_name, ava_segment, report_dir):
         f"   byte-exact: {integrity['frames']} frame, {integrity['mismatches']} sai lệch\n"
         f"   P={metrics['precision']:.3f} R={metrics['recall']:.3f} F1={metrics['f1']:.3f} "
         f"acc={metrics['accuracy']:.3f} · segment {metrics['pred_segments']} (GT {metrics['gt_segments']}) · "
-        f"onset trung vị {metrics['onset_median_ms']} ms"
+        f"onset trung vị {metrics['onset_median_ms']} ms\n"
+        f"   recall theo lớp: {_RESULTS[engine_name]['recall_by_class']}"
     )
 
 
@@ -204,7 +237,30 @@ def test_xuat_bao_cao_ava_speech(ava_segment, report_dir):
 
     lines += [
         "",
-        "## 2. Ngưỡng hồi quy đã chốt (thấp hơn số đo để tránh dao động nhỏ)",
+        "## 2. Recall theo LỚP NHÃN — chỗ phân biệt \"domain khó\" với \"tích hợp sai\"",
+        "",
+        "`CLEAN_SPEECH` = speech đọc sạch · `SPEECH_WITH_NOISE` / `SPEECH_WITH_MUSIC` = phim có",
+        "nhạc/nhiễu nền. Nếu cả 3 engine đều tốt ở `CLEAN_SPEECH` mà chênh nhau ở hai lớp sau thì",
+        "khác biệt là ĐỘ BỀN VỚI NHIỄU của model, không phải lỗi cấu hình/tích hợp.",
+        "",
+        "| Engine | R clean | R noise | R music | Báo động giả trên NO_SPEECH |",
+        "|---|---|---|---|---|",
+    ]
+    for eng in ("firered-vad", "silero-vad", "fsmn-vad"):
+        rc = _RESULTS[eng]["recall_by_class"]
+        fmt = lambda v: "—" if v is None else f"{v:.3f}"  # noqa: E731
+        lines.append(
+            f"| `{eng}` | {fmt(rc['CLEAN_SPEECH'])} | {fmt(rc['SPEECH_WITH_NOISE'])} | "
+            f"{fmt(rc['SPEECH_WITH_MUSIC'])} | {fmt(rc['false_alarm_on_no_speech'])} |"
+        )
+    lines += [
+        "",
+        "> ⚠️ **Không so trực tiếp với bảng của nhà cung cấp**: bảng FireRedVAD (F1 97,57 · Silero 95,95)",
+        "> được đo **non-streaming trên FLEURS-VAD-102** — speech ĐỌC sạch, clip ~10 s, nhãn nhị phân",
+        "> (`external/FireRedVAD/README.md`). AVA-Speech là audio PHIM (nhạc, hiệu ứng, nói chồng tiếng).",
+        "> Xem `report/02_vad/ava_vs_vendor_benchmarks.md` để có bằng chứng đầy đủ.",
+        "",
+        "## 3. Ngưỡng hồi quy đã chốt (thấp hơn số đo để tránh dao động nhỏ)",
         "",
         "| Engine | F1 ≥ | Recall ≥ | Precision ≥ | Accuracy ≥ | Onset ≤ | RTF ≤ | Số đo lần này |",
         "|---|---|---|---|---|---|---|---|",
@@ -221,7 +277,7 @@ def test_xuat_bao_cao_ava_speech(ava_segment, report_dir):
     if sweep:
         lines += [
             "",
-            "## 3. Quét `speech_threshold` của FireRed (2 phút đầu)",
+            "## 4. Quét `speech_threshold` của FireRed (2 phút đầu)",
             "",
             "| speech_threshold | P | R | F1 | Accuracy |",
             "|---|---|---|---|---|",
@@ -233,7 +289,7 @@ def test_xuat_bao_cao_ava_speech(ava_segment, report_dir):
 
     lines += [
         "",
-        "## 4. Ghi chú diễn giải",
+        "## 5. Ghi chú diễn giải",
         "",
         "- **FireRed** (mặc định của dự án) có F1 cao nhất và độ trễ onset trung vị ~100 ms;",
         "  số segment nhiều hơn GT vì AVA-Speech gộp các khoảng lặng ngắn, còn VAD cắt theo",

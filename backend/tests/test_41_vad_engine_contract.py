@@ -497,6 +497,65 @@ def test_vad_silence_duong_la_dieu_kien_so_1(engine_name, stream):
           f"(mặc định docs: {_DOCS_SILENCE_MS[engine_name]} ms)")
 
 
+# ─────────────────────────────────────────────── 4b. chuỗi popup → session → engine
+
+
+def _native_threshold(proc, engine_name: str):
+    """Ngưỡng ĐANG có hiệu lực trong engine (field native), None nếu state chưa dựng."""
+    state = proc._state
+    if state is None or state.engine_state is None:
+        return None
+    if engine_name == "firered-vad":
+        return state.engine_state.vad.postprocessor.speech_threshold
+    if engine_name == "silero-vad":
+        return state.engine_state.iterator.threshold
+    return state.engine_state.cache["stats"].speech_noise_thres
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("engine_name", ENGINES)
+def test_threshold_tu_popup_toi_field_native_qua_session(engine_name):
+    """🎯 Threshold (popup) phải đi hết chuỗi tới FIELD NATIVE của engine đang chạy.
+
+    Chuỗi: popup `vadThreshold` → `SessionState.apply_config` → `VADProcessor.update_config`
+    → `engine.is_speech(threshold=…)` → field native (`postprocessor.speech_threshold` /
+    `VADIterator.threshold` / FSMN `stats.speech_noise_thres`).
+
+    Trả lời trực tiếp câu hỏi "threshold của `SileroVADConfig` có được popup chỉnh không":
+    CÓ — nhưng qua ĐƯỜNG GHI ĐÈ (`VADConfig.threshold` / `vad_threshold` của phiên); còn
+    `SileroVADConfig.threshold` vẫn giữ mặc định docs (0.5) làm giá trị fallback.
+    """
+    from backend.config import config as app_config
+    from backend.tests.conftest import MockWebSocket
+    from backend.tests.fakes import make_silence_pcm, pcm_to_int16_bytes
+    from backend.vad.engines import VADEngineFactory
+    from backend.ws.connection import SafeWebSocketConnection
+    from backend.ws.session import SessionState
+
+    VADEngineFactory.get_engine(engine_name)          # nạp sẵn (đường prewarm lúc khởi động)
+
+    session = SessionState(SafeWebSocketConnection(MockWebSocket()))
+    session.init_components()
+    applied = session.apply_config({"vadEngine": engine_name, "vadThreshold": 0.77})
+    assert applied.get("vad_threshold") == pytest.approx(0.77)
+    assert session.config.get("vad_threshold") == pytest.approx(0.77)
+
+    proc = session.vad_processor
+    if proc.vad_engine != engine_name:
+        proc.apply_engine_change(engine_name)
+    proc.feed_chunk(pcm_to_int16_bytes(make_silence_pcm(0.2)))   # đồng bộ ngưỡng runtime
+
+    native = _native_threshold(proc, engine_name)
+    assert native == pytest.approx(0.77), (
+        f"{engine_name}: popup gửi 0.77 nhưng field native của engine là {native}"
+    )
+
+    # Config native vẫn giữ mặc định docs (popup KHÔNG ghi vào config, chỉ ghi đè runtime).
+    assert app_config.vad.silero.threshold == 0.5
+    assert app_config.vad.firered.speech_threshold == 0.4
+    assert app_config.vad.fsmn.speech_noise_thres == 0.6
+
+
 # ─────────────────────────────────────────────── 5. đổi engine giữa câu
 
 

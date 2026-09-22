@@ -275,13 +275,27 @@ Trạng thái tải xem ở `GET /api/config → translation.download` (popup hi
 > ⚠️ Lần đầu chọn một VAD engine mới cần mạng để tải model (chạy một lần, sau đó offline).
 > **ASR thì KHÔNG tự tải** — phải copy file `.gguf` vào `backend/models/` (API chỉ báo `is_downloaded`).
 
-**VAD — kiến trúc & toàn vẹn tín hiệu** (chi tiết: `report/audit/19_KE_HOACH_VIET_LAI_VAD.md`):
+**VAD — kiến trúc, toàn vẹn tín hiệu & độ chính xác** (chi tiết:
+`report/audit/19_KE_HOACH_VIET_LAI_VAD.md`, `report/02_vad/ava_vs_vendor_benchmarks.md`):
 
 - Mỗi engine dùng **đúng API công khai trong docs**: `FireRedStreamVad.from_pretrained(...)`,
   `silero_vad.VADIterator(...)`, `funasr.AutoModel.generate(cache=…, is_final=False, chunk_size=…)`.
   Config backend khớp **1-1** với dataclass/tham số của từng thư viện.
 - **VAD là tap thụ động**: audio `plugin → VAD → ASR` là **byte nguyên bản** của client — không
-  resample, không gain, không clip, không lượng tử hoá lại (chốt bằng `test_42_vad_signal_integrity.py`).
+  resample, không gain, không clip, không lượng tử hoá lại (chốt bằng `test_42_vad_signal_integrity.py`
+  và kiểm tra byte-exact trên 10 phút AVA-Speech trong `test_43_vad_ava_speech.py`).
+- **Chọn engine theo domain** (đo thật): trên 10 phút **AVA-Speech** (audio phim) FireRed F1 **0,918** ·
+  FSMN 0,777 · Silero 0,652; nhưng trên **speech đọc sạch** (`test_44`) cả ba đều **0,89–0,98** và
+  **phát hiện 100 % clip**. Bảng F1 của nhà cung cấp (FireRed 97,57 · Silero 95,95) đo trên
+  **FLEURS-VAD-102** — clip đọc sạch, non-streaming — nên **không so trực tiếp** với audio phim.
+  Khoảng cách của Silero đến từ lớp `SPEECH_WITH_NOISE` (0,432 so với 0,947 của FireRed), và đường
+  offline chính chủ `get_speech_timestamps()` cho **cùng** kết quả ⇒ không phải lỗi tích hợp.
+- **`🎯 Threshold` (popup)** ghi đè **runtime** lên field native của engine đang chạy ở mọi frame
+  (FireRed `postprocessor.speech_threshold` · Silero `VADIterator.threshold` · FSMN
+  `stats.speech_noise_thres`), có hiệu lực ngay và giữ nguyên khi đổi engine nóng. Nó **không** ghi
+  vào config riêng của engine: `firered.speech_threshold` / `silero.threshold` / `fsmn.speech_noise_thres`
+  vẫn giữ mặc định docs (0,4 / 0,5 / 0,6) và là giá trị dùng khi `vad.threshold = None`.
+  Chốt bằng `test_41::test_threshold_tu_popup_toi_field_native_qua_session`.
 - **Không còn `hangover_ms` / `pre_speech_buffer_ms`**: hangover và pre-padding nay do chính VAD
   quyết định. Khi VAD phát `START`, processor xả lại đúng số frame mà VAD yêu cầu
   (`VADResult.lookback_frames`) ⇒ không mất phụ âm đầu và không kéo audio cũ vào.

@@ -294,7 +294,14 @@ def _prewarm_vad_default() -> None:
     nền song song với `prewarm()` (tránh nạp 2 lần).
     """
     try:
-        vad = VADProcessor(vad_engine=config.vad.vad_engine, auto_load=False)
+        # Truyền đúng cấu hình VAD đang có hiệu lực để state prewarm giống state thật
+        # (`threshold=None` ⇒ engine dùng mặc định docs; xem report/audit/19_…, §10.8).
+        vad = VADProcessor(
+            vad_engine=config.vad.vad_engine,
+            threshold=config.vad.threshold,
+            silence_duration_ms=config.vad.effective_silence_ms,
+            auto_load=False,
+        )
         vad.prewarm()
         vad.feed_chunk(bytes(800))
         logger.info(
