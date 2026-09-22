@@ -290,6 +290,15 @@ class SwitchModelRequest(BaseModel):
     target_lang: Optional[str] = None
     translation_model: Optional[str] = None
     min_words_to_commit: Optional[int] = None
+    # Tầng SEG (VAD > ASR > SEG) — chốt câu theo dấu câu + timer lấy mốc cắt.
+    seg_enabled: Optional[bool] = None
+    seg_max_chars: Optional[int] = None
+    seg_tail_min_chars: Optional[int] = None
+    seg_tail_scans: Optional[int] = None
+    seg_use_whisper_timer: Optional[bool] = None
+    seg_debug_trace: Optional[bool] = None
+    seg_stable_cut: Optional[bool] = None
+    seg_stable_ms: Optional[float] = None
     tts_enabled: Optional[bool] = None
     tts_voice: Optional[str] = None
     tts_speed: Optional[float] = None
@@ -564,6 +573,25 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
         "silence_duration_ms": config.vad.effective_silence_ms or 0,
         "vad_threshold": config.vad.effective_threshold,
         "min_words_to_commit": config.sentence.min_words_to_commit,
+        # Tầng SEG: popup đọc để hiển thị/công tắc A/B.
+        "seg": {
+            "enabled": config.segmentation.enabled,
+            "replace_stable_prefix": config.segmentation.replace_stable_prefix,
+            "max_chars": config.segmentation.max_chars,
+            "min_chars": config.segmentation.min_chars,
+            "tail_min_chars": config.segmentation.tail_min_chars,
+            "tail_scans": config.segmentation.tail_scans,
+            "tail_stable_ms": config.segmentation.tail_stable_ms,
+            "stable_ms": config.segmentation.stable_ms,
+            "stable_scans": config.segmentation.stable_scans,
+            "fallback_overlap_ms": config.segmentation.fallback_overlap_ms,
+            "use_whisper_timer": config.segmentation.use_whisper_timer,
+            "debug_trace": config.segmentation.debug_trace,
+            "stable_cut": config.segmentation.stable_cut,
+            "stable_ms": config.segmentation.stable_ms,
+            "whisper_model_key": config.segmentation.whisper_model_key,
+            "timer_min_confidence": config.segmentation.timer_min_confidence,
+        },
         "source_lang": config.asr.language,
         "supported_languages": SUPPORTED_LANGUAGES,
         # Config RIÊNG của từng engine VAD (khớp 1-1 docs) để client/quản trị xem được.
@@ -723,6 +751,23 @@ async def update_backend_config(req: SwitchModelRequest):
         config.vad.silence_duration_ms = raw_ms if raw_ms > 0 else None
     if req.min_words_to_commit is not None:
         config.sentence.min_words_to_commit = max(0, req.min_words_to_commit)
+    # ---- Tầng SEG ----
+    if req.seg_enabled is not None:
+        config.segmentation.enabled = bool(req.seg_enabled)
+    if req.seg_max_chars is not None:
+        config.segmentation.max_chars = max(10, int(req.seg_max_chars))
+    if req.seg_tail_min_chars is not None:
+        config.segmentation.tail_min_chars = max(0, int(req.seg_tail_min_chars))
+    if req.seg_tail_scans is not None:
+        config.segmentation.tail_scans = max(1, int(req.seg_tail_scans))
+    if req.seg_use_whisper_timer is not None:
+        config.segmentation.use_whisper_timer = bool(req.seg_use_whisper_timer)
+    if req.seg_debug_trace is not None:
+        config.segmentation.debug_trace = bool(req.seg_debug_trace)
+    if req.seg_stable_cut is not None:
+        config.segmentation.stable_cut = bool(req.seg_stable_cut)
+    if req.seg_stable_ms is not None:
+        config.segmentation.stable_ms = max(50.0, float(req.seg_stable_ms))
     if req.target_lang is not None:
         config.translation.target_lang = req.target_lang
     if req.source_lang is not None:
@@ -824,6 +869,22 @@ async def update_backend_config(req: SwitchModelRequest):
         session_payload["silence_duration_ms"] = int(req.silence_duration_ms)
     if req.min_words_to_commit is not None:
         session_payload["min_words_to_commit"] = req.min_words_to_commit
+    if req.seg_enabled is not None:
+        session_payload["seg_enabled"] = bool(req.seg_enabled)
+    if req.seg_max_chars is not None:
+        session_payload["seg_max_chars"] = int(req.seg_max_chars)
+    if req.seg_tail_min_chars is not None:
+        session_payload["seg_tail_min_chars"] = int(req.seg_tail_min_chars)
+    if req.seg_tail_scans is not None:
+        session_payload["seg_tail_scans"] = int(req.seg_tail_scans)
+    if req.seg_use_whisper_timer is not None:
+        session_payload["seg_use_whisper_timer"] = bool(req.seg_use_whisper_timer)
+    if req.seg_debug_trace is not None:
+        session_payload["seg_debug_trace"] = bool(req.seg_debug_trace)
+    if req.seg_stable_cut is not None:
+        session_payload["seg_stable_cut"] = bool(req.seg_stable_cut)
+    if req.seg_stable_ms is not None:
+        session_payload["seg_stable_ms"] = float(req.seg_stable_ms)
     if req.target_lang is not None:
         session_payload["target_lang"] = req.target_lang
     if req.source_lang is not None:
@@ -867,6 +928,22 @@ async def update_backend_config(req: SwitchModelRequest):
         updated_items.append(f"silence={req.silence_duration_ms}ms")
     if req.min_words_to_commit is not None:
         updated_items.append(f"min_words={req.min_words_to_commit}")
+    if req.seg_enabled is not None:
+        updated_items.append(f"seg={req.seg_enabled}")
+    if req.seg_max_chars is not None:
+        updated_items.append(f"seg_max_chars={req.seg_max_chars}")
+    if req.seg_tail_min_chars is not None:
+        updated_items.append(f"seg_tail_min_chars={req.seg_tail_min_chars}")
+    if req.seg_tail_scans is not None:
+        updated_items.append(f"seg_tail_scans={req.seg_tail_scans}")
+    if req.seg_use_whisper_timer is not None:
+        updated_items.append(f"seg_timer={req.seg_use_whisper_timer}")
+    if req.seg_debug_trace is not None:
+        updated_items.append(f"seg_trace={req.seg_debug_trace}")
+    if req.seg_stable_cut is not None:
+        updated_items.append(f"seg_stable_cut={req.seg_stable_cut}")
+    if req.seg_stable_ms is not None:
+        updated_items.append(f"seg_stable_ms={req.seg_stable_ms}")
     if req.source_lang is not None:
         updated_items.append(f"src='{req.source_lang}'")
     if req.target_lang is not None:

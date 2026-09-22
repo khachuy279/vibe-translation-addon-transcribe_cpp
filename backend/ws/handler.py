@@ -488,6 +488,9 @@ async def _stream_asr_tokens(session: SessionState) -> None:
         return
     # F-30: client khai báo protocol >= 3 thì nhận payload GỌN (không field trùng lặp).
     compact = bool(getattr(session, "supports_compact_payload", False))
+    # FIX-05b: chỉ đặt placeholder "..." khi CHẮC CHẮN có đường dịch. Nếu không có hàng đợi
+    # dịch thì dấu "..." sẽ treo vĩnh viễn trên phụ đề (client coi là "đang dịch").
+    will_translate = bool(getattr(session, "translation_queue", None))
 
     try:
         async for msg in engine.stream_tokens():
@@ -523,7 +526,7 @@ async def _stream_asr_tokens(session: SessionState) -> None:
                 out_msg = make_utterance_update_msg(
                     utt_id=utt_id,
                     text=text,
-                    translated="..." if is_final else "",
+                    translated="..." if (is_final and will_translate) else "",
                     is_final=is_final,
                     stable_text=stable_text,
                     unstable_text=unstable_text,
@@ -602,6 +605,123 @@ async def _reset_session_stream(session: SessionState, reason: str = "seek") -> 
     await session.send_json({"type": "stream_reset", "reason": reason, "status": "ok"})
 
 
+async def _deliver_translation(
+    session: SessionState,
+    *,
+    item: Dict[str, Any],
+    utt_id: str,
+    text: str,
+    translated: str,
+    elapsed_ms: int,
+    target_lang: str,
+    compact: bool,
+    queued_at: float,
+) -> None:
+    """Gửi bản dịch hoàn chỉnh + gói `utterance_update` chốt về client.
+
+    Dùng chung cho câu dịch mới VÀ câu lặp được tái dùng bản dịch (FIX-05), nhờ vậy
+    mọi đường đi đều gỡ được placeholder `translated="..."` mà client đang chờ.
+    """
+    # 1. Gói tin translation chuyên biệt
+    trans_msg = make_translation_msg(
+        utt_id=utt_id,
+        translated=translated,
+        elapsed_ms=elapsed_ms,
+        target_lang=target_lang,
+        compact=compact,
+    )
+
+    # 2. Gói tin utterance_update cập nhật trạng thái chốt kèm bản dịch
+    update_msg = make_utterance_update_msg(
+        utt_id=utt_id,
+        text=text,
+        translated=translated,
+        is_final=True,
+        compact=compact,
+    )
+
+    sent1 = await session.send_json(trans_msg)
+    sent2 = await session.send_json(update_msg)
+    if not sent1 or not sent2:
+        return
+
+    # FIX-02: nếu item này là kết quả của việc GỘP nhiều câu final (hàng đợi đầy), phát
+    # bản dịch cho MỌI câu được phủ. Nếu không, các câu bị gộp sẽ treo vĩnh viễn ở dấu "..."
+    # vì chúng đã được gửi đi với placeholder `translated="..."`.
+    for covered_id in item.get("merged_utterance_ids") or []:
+        if not covered_id or covered_id == utt_id:
+            continue
+        await session.send_json(
+            make_translation_msg(
+                utt_id=covered_id,
+                translated=translated,
+                elapsed_ms=elapsed_ms,
+                target_lang=target_lang,
+                compact=compact,
+            )
+        )
+
+    # Đo đạc End-to-End Latency từ lúc ASR commit đến khi Client nhận phụ đề
+    e2e_sub_ms = (time.perf_counter() - queued_at) * 1000.0
+    metrics_collector.record_metric("pipeline", "e2e_asr_to_sub_ms", e2e_sub_ms)
+    metrics_collector.increment_counter("pipeline.subtitles_delivered")
+
+    # 3. Đưa vào hàng đợi TTS nếu người dùng bật chế độ lồng tiếng
+    if session.config.get("tts_enabled"):
+        if session.tts_queue and translated:
+            _coalesce_enqueue(
+                session.tts_queue,
+                {
+                    "utterance_id": utt_id,
+                    "text": translated,
+                    "voice": session.config.get("tts_voice"),
+                    "speed": float(session.config.get("tts_speed", 1.0)),
+                    "_queued_at": time.perf_counter(),
+                },
+                label="TTS",
+                merged_counter="queue.tts_merged",
+                dropped_counter="queue.tts_dropped",
+            )
+
+
+async def _clear_pending_translation(
+    session: SessionState,
+    *,
+    item: Dict[str, Any],
+    utt_id: str,
+    target_lang: str,
+    compact: bool,
+) -> None:
+    """Gỡ dấu "・・・" cho câu KHÔNG thể có bản dịch (trùng lặp mà không có cache).
+
+    FIX-05: phụ đề GỐC vẫn phải hiển thị — chỉ bỏ trạng thái "đang dịch" đang treo.
+    Gửi `translated=""` với `status="ok"`: client coi là bản dịch rỗng ⇒ đưa câu từ
+    Layer 2 (pendingFocus) xuống danh sách đã xong và tắt chỉ báo "・・・".
+    """
+    await session.send_json(
+        make_translation_msg(
+            utt_id=utt_id,
+            translated="",
+            elapsed_ms=0,
+            target_lang=target_lang,
+            compact=compact,
+        )
+    )
+    for covered_id in item.get("merged_utterance_ids") or []:
+        if not covered_id or covered_id == utt_id:
+            continue
+        await session.send_json(
+            make_translation_msg(
+                utt_id=covered_id,
+                translated="",
+                elapsed_ms=0,
+                target_lang=target_lang,
+                compact=compact,
+            )
+        )
+    metrics_collector.increment_counter("translation.ellipsis_cleared")
+
+
 async def _process_translation_item(
     session: SessionState,
     trans_engine: GGUFTranslationEngine,
@@ -625,9 +745,39 @@ async def _process_translation_item(
     clean_utt = (utt_id or "unknown")[:8]
     # F-30: payload gọn cho client protocol >= 3.
     compact = bool(getattr(session, "supports_compact_payload", False))
+
+    # FIX-05: câu trùng KHÔNG còn bị bỏ trắng. Client đã nhận câu final kèm placeholder
+    # `translated="..."` (xem `_stream_asr_tokens`) ⇒ `return` im lặng làm phụ đề gốc treo
+    # ở dấu "・・・" mãi mãi. Nay: có bản dịch cache ⇒ tái dùng; không có ⇒ gỡ placeholder.
     if dedup.is_duplicate(text):
+        cached = dedup.cached_translation(text)
+        if cached:
+            metrics_collector.increment_counter("translation.dedup_reused")
+            logger.info(
+                f"[utt={clean_utt}] Câu lặp — TÁI DÙNG bản dịch đã có (không dịch lại): '{cached}'",
+                extra={"module_tag": "WS"},
+            )
+            await _deliver_translation(
+                session,
+                item=item,
+                utt_id=utt_id,
+                text=text,
+                translated=cached,
+                elapsed_ms=0,
+                target_lang=tgt_lang,
+                compact=compact,
+                queued_at=queued_at,
+            )
+            return
+
         metrics_collector.increment_counter("translation.dedup_skipped")
-        logger.info(f"[utt={clean_utt}] Bỏ qua câu dịch trùng lặp: '{text}'", extra={"module_tag": "WS"})
+        logger.info(
+            f"[utt={clean_utt}] Bỏ qua câu dịch trùng lặp (chưa có bản dịch cache): '{text}'",
+            extra={"module_tag": "WS"},
+        )
+        await _clear_pending_translation(
+            session, item=item, utt_id=utt_id, target_lang=tgt_lang, compact=compact
+        )
         return
 
     start_t = time.monotonic()
@@ -690,67 +840,20 @@ async def _process_translation_item(
 
     logger.info(f"[utt={clean_utt}] ({src_lang} -> {tgt_lang} in {elapsed_ms}ms): '{translated}'", extra={"module_tag": "TRANSLATE"})
     ctx_tracker.add(text, translated)
+    # FIX-05: nhớ bản dịch để lần trùng sau tái dùng thay vì bỏ trắng phụ đề.
+    dedup.remember_translation(text, translated)
 
-    # 1. Gói tin translation chuyên biệt
-    trans_msg = make_translation_msg(
+    await _deliver_translation(
+        session,
+        item=item,
         utt_id=utt_id,
+        text=text,
         translated=translated,
         elapsed_ms=elapsed_ms,
         target_lang=tgt_lang,
         compact=compact,
+        queued_at=queued_at,
     )
-
-    # 2. Gói tin utterance_update cập nhật trạng thái chốt kèm bản dịch
-    update_msg = make_utterance_update_msg(
-        utt_id=utt_id,
-        text=text,
-        translated=translated,
-        is_final=True,
-        compact=compact,
-    )
-
-    sent1 = await session.send_json(trans_msg)
-    sent2 = await session.send_json(update_msg)
-    if not sent1 or not sent2:
-        return
-
-    # FIX-02: nếu item này là kết quả của việc GỘP nhiều câu final (hàng đợi đầy), phát
-    # bản dịch cho MỌI câu được phủ. Nếu không, các câu bị gộp sẽ treo vĩnh viễn ở dấu "..."
-    # vì chúng đã được gửi đi với placeholder `translated="..."`.
-    for covered_id in item.get("merged_utterance_ids") or []:
-        if not covered_id or covered_id == utt_id:
-            continue
-        await session.send_json(
-            make_translation_msg(
-                utt_id=covered_id,
-                translated=translated,
-                elapsed_ms=elapsed_ms,
-                target_lang=tgt_lang,
-                compact=compact,
-            )
-        )
-
-    # Đo đạc End-to-End Latency từ lúc ASR commit đến khi Client nhận phụ đề
-    e2e_sub_ms = (time.perf_counter() - queued_at) * 1000.0
-    metrics_collector.record_metric("pipeline", "e2e_asr_to_sub_ms", e2e_sub_ms)
-    metrics_collector.increment_counter("pipeline.subtitles_delivered")
-
-    # 3. Đưa vào hàng đợi TTS nếu người dùng bật chế độ lồng tiếng
-    if session.config.get("tts_enabled"):
-        if session.tts_queue and translated:
-            _coalesce_enqueue(
-                session.tts_queue,
-                {
-                    "utterance_id": utt_id,
-                    "text": translated,
-                    "voice": session.config.get("tts_voice"),
-                    "speed": float(session.config.get("tts_speed", 1.0)),
-                    "_queued_at": time.perf_counter(),
-                },
-                label="TTS",
-                merged_counter="queue.tts_merged",
-                dropped_counter="queue.tts_dropped",
-            )
 
 
 async def _translation_worker(session: SessionState) -> None:

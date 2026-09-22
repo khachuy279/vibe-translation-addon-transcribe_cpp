@@ -230,7 +230,12 @@ def test_tier2_max_chars_fires(session_factory, restore_config):
 
 
 def test_tier3_stable_prefix_fires_after_stable_polls(session_factory, restore_config):
-    """P2.1 BẬC 3: text preview bất biến đủ lâu => cắt ở ranh giới từ (P3)."""
+    """P2.1 BẬC 3: text preview bất biến đủ lâu => cắt ở ranh giới từ (P3).
+
+    LƯU Ý: tầng SEG (VAD > ASR > SEG) mặc định THAY THẾ BẬC 3, nên bài này tắt SEG để
+    kiểm tra riêng cơ chế cũ. Hành vi của SEG được test ở `test_48_seg_timer.py`.
+    """
+    config.segmentation.enabled = False
     config.sentence.enable_tier234 = True
     session = session_factory()
     engine = session.asr_engine
@@ -251,7 +256,10 @@ def test_tier3_respects_min_duration_guard(session_factory, restore_config):
 
     Kịch bản thật: 1 giây đầu model chỉ nhận được vài từ và text không đổi; nếu không
     có sàn thời lượng thì câu bị cắt ngay giữa lúc đang nói.
+
+    Tắt SEG để kiểm tra riêng BẬC 3 (SEG mặc định thay thế BẬC 3).
     """
+    config.segmentation.enabled = False
     config.sentence.enable_tier234 = True
     session = session_factory()
     engine = session.asr_engine

@@ -97,7 +97,10 @@ def build_family_options(
             return opt
 
         elif fam == "whisper":
-            opt = transcribe_cpp.WhisperOptions()
+            # FIX: tên lớp THẬT trong binding là `WhisperRunOptions` (không phải
+            # `WhisperOptions`). Trước đây `AttributeError` bị `except` nuốt nên luôn trả
+            # None ⇒ mọi tuỳ chọn whisper (initial_prompt, temperature…) âm thầm bị bỏ.
+            opt = transcribe_cpp.WhisperRunOptions()
             return opt
 
     except Exception as e:

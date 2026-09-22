@@ -328,6 +328,47 @@ class SentenceConfig(BaseModel):
     carry_over_short_fragment: bool = True
 
 
+class SegmentationConfig(BaseModel):
+    """Tầng SEG (VAD > ASR > SEG): chốt câu theo DẤU CÂU của ASR.
+
+    Vì sao cần: VAD cắt theo im lặng, nhưng trong phim tiếng Nhật người nói có thể ngắt
+    rất ngắn ở `、` (⇒ câu vụn, dịch sai) hoặc nói liền > 10 s (⇒ câu dài, khó đọc).
+    ASR đã tự sinh dấu câu nên dùng nó làm tín hiệu thứ hai. Xem
+    `report/audit/21_SEG_VA_FIX_DEDUP_PHU_DE.md`.
+    """
+    enabled: bool = True
+    #: True = tầng SEG thay BẬC 3 STABLE_PREFIX (tránh hai cơ chế cắt chồng nhau).
+    replace_stable_prefix: bool = True
+    max_chars: int = 100          # trần ký tự 1 câu trước khi cắt cưỡng bức
+    min_chars: int = 2           # câu ngắn hơn sẽ gộp với câu sau
+    # (Ngưỡng "từ" tối thiểu để được cắt KHÔNG có field riêng: SEG dùng chung
+    #  `SentenceConfig.min_words_to_commit` để hai tầng không lệch nhau.)
+    # Chống CẮT SỚM (đo từ log phim thật): ASR có lúc thả dấu `.` sai giữa câu rồi tự sửa
+    # ở nhịp sau (`Don't try and trick.` / `Me into buying…`). Phải thấy đủ chữ của câu mới
+    # VÀ ranh giới đứng yên vài nhịp mới chốt.
+    tail_min_chars: int = 4      # số ký tự nội dung tối thiểu của câu MỚI
+    tail_scans: int = 2          # ...qua bao nhiêu lần quét
+    tail_stable_ms: float = 280.0  # ...và đứng yên bao lâu
+    stable_ms: float = 350.0     # dấu kết câu ở cuối preview phải đứng yên bao lâu
+    stable_scans: int = 2        # ...và qua bao nhiêu lần quét
+    #: Cho phép chốt khi dấu kết câu đứng yên đủ lâu mà CHƯA thấy câu mới (`punct_stable`).
+    #: MẶC ĐỊNH TẮT: tiếng Nhật (và cả tiếng Anh) ASR hay thả `。`/`.` sớm giữa câu
+    #: (`営業回りを終え。`, `夕食を済ませ。`) ⇒ chờ câu mới hoặc im lặng VAD an toàn hơn.
+    stable_cut: bool = False
+    fallback_overlap_ms: float = 600.0   # không neo được khoảng lặng ⇒ lùi lại chồng lấn
+    #: Dùng model CÓ timestamp (whisper) để lấy mốc cắt chính xác (Qwen3 không có timestamp).
+    use_whisper_timer: bool = True
+    whisper_model_key: str = "whisper-large-v3-turbo"
+    timer_min_confidence: float = 0.35
+    timer_max_audio_sec: float = 30.0    # không chạy timer cho mảnh dài hơn (trần chi phí)
+    #: Ghi log TỪNG NHỊP ASR preview (vì sao chốt / vì sao còn chờ) để tinh chỉnh mốc ngắt
+    #: câu bằng mắt người. Bật mặc định trong giai đoạn tinh chỉnh.
+    debug_trace: bool = True
+    #: Khi SEG TẮT: vẫn chạy một máy trạng thái SEG "bóng" và log nó SẼ cắt ở đâu — nhờ vậy
+    #: MỘT lần chạy video vẫn so sánh được "có SEG" với "không SEG".
+    shadow_when_disabled: bool = True
+
+
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
     base: str = "tencent"  # tencent, tencent-1.8b, xiaomi, gemmax
@@ -447,6 +488,7 @@ class AppConfig(BaseModel):
     vad: VADConfig = Field(default_factory=VADConfig)
     asr: ASRConfig = Field(default_factory=ASRConfig)
     sentence: SentenceConfig = Field(default_factory=SentenceConfig)
+    segmentation: SegmentationConfig = Field(default_factory=SegmentationConfig)
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     audio_buffer: AudioBufferConfig = Field(default_factory=AudioBufferConfig)

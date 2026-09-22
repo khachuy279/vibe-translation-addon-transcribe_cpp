@@ -125,12 +125,9 @@ def test_write_error_before_any_output_is_silent():
 def test_identical_records_within_window_are_printed_once():
     """Hai record giống hệt nhau trong cùng khoảng ngắn ⇒ chỉ in 1 lần.
 
-    PHẢI ghim `LOG_DEDUP_MS` tường minh. Bản trước dựa vào mặc định `_DEDUP_WINDOW_SEC = 0.05`
-    (50 ms) nên test chỉ xanh khi máy đủ nhanh: hai lần `emit()` liên tiếp phải cách nhau
-    < 50 ms. Chạy cả bộ test (tải nặng, nhiều I/O) thì khoảng cách đó vượt 50 ms ⇒ record thứ
-    hai KHÔNG bị chặn ⇒ `suppressed_records == 0` ⇒ đổ dù handler hoàn toàn đúng. Đây là test
-    flaky theo thiết kế, không phải lỗi sản phẩm. Ghim 1000 ms giữ nguyên ngữ nghĩa cần kiểm
-    ("trong cửa sổ thì chặn") mà bỏ phụ thuộc vào tốc độ máy.
+    Ghim `LOG_DEDUP_MS` tường minh để không phụ thuộc tốc độ máy. Từ F-41b (2026-09-22)
+    khoá chống trùng KHÔNG còn chứa mốc thời gian (xem test ngay dưới), nên bài này xanh
+    ổn định kể cả khi hai lần `emit()` rơi vào hai mili-giây khác nhau.
     """
     os.environ["LOG_DEDUP_MS"] = "1000"
     stream = _FlakyStream()
@@ -140,6 +137,35 @@ def test_identical_records_within_window_are_printed_once():
 
     text = "".join(stream.chunks)
     assert text.count("Loaded FireRed") == 1, f"in trùng: {text!r}"
+    assert SafeStreamHandler.suppressed_records == 1
+
+
+def test_chong_trung_khong_phu_thuoc_moc_thoi_gian_trong_dong_log():
+    """F-41b: cùng nội dung nhưng KHÁC mốc ms vẫn phải bị chặn.
+
+    Bug gốc: khoá chống trùng là `self.format(record)` — chuỗi này chứa `%(asctime)s` tới
+    mili-giây, nên hai dòng "trùng" luôn khác nhau ⇒ cơ chế chống trùng **không bao giờ
+    chạy** trên thực tế (và test cũ chỉ xanh khi cả hai rơi vào cùng một ms).
+    """
+    os.environ["LOG_DEDUP_MS"] = "1000"
+    stream = _FlakyStream()
+    handler = _make_handler(stream)
+
+    class _TickingFormatter(ColoredFormatter):
+        """Mỗi lần format trả về một mốc thời gian KHÁC NHAU (mô phỏng emit cách >1 ms)."""
+
+        ticks = 0
+
+        def formatTime(self, record, datefmt=None):  # noqa: N802 — API của logging
+            _TickingFormatter.ticks += 1
+            return f"2026-09-22 21:00:00.{_TickingFormatter.ticks:03d}"
+
+    handler.setFormatter(_TickingFormatter(use_color=False))
+    handler.emit(_record())
+    handler.emit(_record())
+
+    text = "".join(stream.chunks)
+    assert text.count("Loaded FireRed") == 1, f"in trùng dù khác mốc ms: {text!r}"
     assert SafeStreamHandler.suppressed_records == 1
 
 

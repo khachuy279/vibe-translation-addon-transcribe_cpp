@@ -305,6 +305,66 @@ def test_silence_duong_ghi_de_end_som_cua_engine():
     assert silent_ms <= silence_ms + 2 * hop / 16000 * 1000
 
 
+class _EndWithSpeechEvidenceEngine(FakeVADEngine):
+    """Engine phát END trên frame VẪN CÒN bằng chứng nói — ca thật của FireRed.
+
+    Log phim thật 2026-09-22 22:15: `[VAD] END [engine_end, im lặng 0ms >= 1500ms] (p=1.00)`
+    xảy ra GIỮA CÂU "Don't try and trick me into buying something I don't want." ⇒ câu bị
+    chẻ đôi. Nguyên nhân: processor cũ coi `END + is_speech=True` là "cắt cưỡng bức".
+    """
+
+    def is_speech(self, frame_int16, state, threshold=None, silence_ms=None):
+        res = super().is_speech(frame_int16, state, threshold=threshold, silence_ms=silence_ms)
+        session = state.engine_state
+        # Ép phát END ở frame có tiếng nói thứ 3 (SAU frame START) và VẪN giữ is_speech=True.
+        if res.is_speech and res.event is None and state.is_speech:
+            session._speech_frames = getattr(session, "_speech_frames", 0) + 1
+            if session._speech_frames >= 3:
+                res.event = "END"
+                res.probability = 1.0
+                res.is_speech = True     # frame chuyển tiếp: VẪN còn bằng chứng nói
+        return res
+
+
+def test_end_kem_bang_chung_noi_KHONG_duoc_cat_giua_cau():
+    """FIX-13: `END` + `is_speech=True` KHÔNG phải cắt cưỡng bức ⇒ phải chờ đủ silence.
+
+    Đây chính là lỗi đã chẻ đôi câu trong log phim thật (`im lặng 0ms >= 1500ms`).
+    """
+    silence_ms = 700
+    hop = _EndWithSpeechEvidenceEngine.frame_samples
+    rec = _do_override(_EndWithSpeechEvidenceEngine(), silence_ms=silence_ms)
+    assert rec["reason"] == "silence_override", (
+        f"phải chốt bằng đồng hồ im lặng, nhận được: {rec['reason']}"
+    )
+    silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+    assert silent_ms >= silence_ms, (
+        f"câu bị chốt sau {silent_ms:.0f} ms im lặng — sớm hơn yêu cầu {silence_ms} ms"
+    )
+    assert silent_ms <= silence_ms + 2 * hop / 16000 * 1000
+
+
+def test_end_kem_bang_chung_noi_o_che_do_docs_van_ton_trong_engine():
+    """Chế độ docs (`silence_duration_ms=None`): END của engine vẫn là nguồn sự thật."""
+    rec = _do_override(_EndWithSpeechEvidenceEngine(), silence_ms=None)
+    assert rec["reason"] == "engine_end"
+
+
+def test_forced_flag_moi_duoc_cat_cuong_buc():
+    """Chỉ khi engine đánh dấu `forced=True` processor mới cắt ngay giữa lúc đang nói."""
+    class _ForcedEngine(_EndWithSpeechEvidenceEngine):
+        def is_speech(self, frame_int16, state, threshold=None, silence_ms=None):
+            res = super().is_speech(frame_int16, state, threshold=threshold, silence_ms=silence_ms)
+            if res.event == "END":
+                res.forced = True
+            return res
+
+    rec = _do_override(_ForcedEngine(), silence_ms=700)
+    assert rec["reason"] == "engine_end"
+    silent_ms = (rec["end_sample"] - rec["last_evidence"]) / 16000 * 1000
+    assert silent_ms < 700, "cắt cưỡng bức phải xảy ra NGAY, không chờ đủ im lặng"
+
+
 def test_silence_bang_0_thi_engine_quyet_dinh():
     """`silence_duration_ms = None` ⇒ tôn trọng END của engine (mặc định docs của nó)."""
     rec = _do_override(_EarlyEndVADEngine(), silence_ms=None)

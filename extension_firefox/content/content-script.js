@@ -36,6 +36,10 @@
       threshold: cfg.vadThreshold !== undefined ? cfg.vadThreshold : (cfg.vad_threshold !== undefined ? cfg.vad_threshold : (cfg.threshold !== undefined ? cfg.threshold : 0.5)),
       silenceDurationMs: silence,
       minWordsToCommit: cfg.minWordsToCommit !== undefined && !isNaN(parseInt(cfg.minWordsToCommit, 10)) ? Math.max(0, parseInt(cfg.minWordsToCommit, 10)) : 2,
+      // Tầng SEG (VAD > ASR > SEG): chốt câu theo dấu câu của ASR.
+      segEnabled: cfg.segEnabled === undefined ? true : !!cfg.segEnabled,
+      segUseWhisperTimer: cfg.segUseWhisperTimer === undefined ? true : !!cfg.segUseWhisperTimer,
+      segDebugTrace: cfg.segDebugTrace === undefined ? true : !!cfg.segDebugTrace,
       ttsEnabled: !!cfg.ttsEnabled,
       ttsVoice: cfg.ttsVoice || "speaker_01_0039.wav",
       ttsSpeed: parseFloat(cfg.ttsSpeed || 1.0),
@@ -45,6 +49,25 @@
     };
     if (cfg.translationModel) out.translationModel = cfg.translationModel;
     if (cfg.vadEngine) out.vadEngine = cfg.vadEngine;
+    // Tầng SEG: nhận cả camelCase (getSettings) lẫn snake_case (settings cũ đã lưu).
+    const segMax = cfg.segMaxChars !== undefined ? cfg.segMaxChars : cfg.seg_max_chars;
+    if (segMax !== undefined && !isNaN(parseInt(segMax, 10))) {
+      out.segMaxChars = Math.max(10, parseInt(segMax, 10));
+    }
+    const segTailChars = cfg.segTailMinChars !== undefined ? cfg.segTailMinChars : cfg.seg_tail_min_chars;
+    if (segTailChars !== undefined && !isNaN(parseInt(segTailChars, 10))) {
+      out.segTailMinChars = Math.max(0, parseInt(segTailChars, 10));
+    }
+    const segTailScans = cfg.segTailScans !== undefined ? cfg.segTailScans : cfg.seg_tail_scans;
+    if (segTailScans !== undefined && !isNaN(parseInt(segTailScans, 10))) {
+      out.segTailScans = Math.max(1, parseInt(segTailScans, 10));
+    }
+    const segStableMs = cfg.segStableMs !== undefined ? cfg.segStableMs : cfg.seg_stable_ms;
+    if (segStableMs !== undefined && !isNaN(parseInt(segStableMs, 10))) {
+      out.segStableMs = Math.max(50, parseInt(segStableMs, 10));
+    }
+    const segTrace = cfg.segDebugTrace !== undefined ? cfg.segDebugTrace : cfg.seg_debug_trace;
+    if (segTrace !== undefined) out.segDebugTrace = !!segTrace;
     return out;
   }
 

@@ -108,6 +108,92 @@
         <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="2">
       </div>
 
+      <!-- Section: SEG (tách câu hậu-ASR) -->
+      <div class="section-title">
+        <span>Segmentation</span>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="segToggleRow">
+          <span class="toggle-label">
+            ✂️ SEG theo dấu câu
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkSegEnabled" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="segTimerToggleRow">
+          <span class="toggle-label">
+            ⏱️ Mốc cắt bằng Whisper
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkSegTimer" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="segStableToggleRow">
+          <span class="toggle-label">
+            ⚡ Cắt khi dấu câu ổn định
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkSegStable">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="label-with-value">
+          <label>⏱️ Dấu câu ổn định (ms)</label>
+          <span class="val-badge"><span id="valSegStableMs">350</span> ms</span>
+        </div>
+        <input type="range" id="rangeSegStableMs" min="100" max="1500" step="50" value="350">
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="segTraceToggleRow">
+          <span class="toggle-label">
+            🔍 Log từng nhịp SEG
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkSegTrace" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="label-with-value">
+          <label>📏 Max chars / câu</label>
+          <span class="val-badge"><span id="valSegMaxChars">60</span></span>
+        </div>
+        <input type="range" id="rangeSegMaxChars" min="20" max="140" step="10" value="60">
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>⏳ Tail (ký tự)</label>
+            <span class="val-badge"><span id="valSegTailChars">4</span></span>
+          </div>
+          <input type="range" id="rangeSegTailChars" min="1" max="12" step="1" value="4">
+        </div>
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>🔁 Nhịp chờ</label>
+            <span class="val-badge"><span id="valSegTailScans">2</span></span>
+          </div>
+          <input type="range" id="rangeSegTailScans" min="1" max="5" step="1" value="2">
+        </div>
+      </div>
+
       <!-- Section: Translation -->
       <div class="section-title">
         <span>Translation</span>

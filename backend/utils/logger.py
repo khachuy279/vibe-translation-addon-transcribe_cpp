@@ -88,6 +88,8 @@ MODULE_COLORS = {
     "TTS": LogColors.YELLOW,
     "WS": LogColors.CYAN,
     "METRICS": LogColors.GREEN,
+    # Tầng SEG: trace từng nhịp preview để tinh chỉnh mốc ngắt câu.
+    "SEG": LogColors.BOLD + LogColors.MAGENTA,
 }
 
 
@@ -176,11 +178,23 @@ class SafeStreamHandler(logging.StreamHandler):
             return cls._DEDUP_WINDOW_SEC
 
     def _is_immediate_duplicate(self, record: logging.LogRecord, msg: str) -> bool:
-        """True nếu vừa in y hệt dòng này trong một khoảng rất ngắn (chống in 2 lần)."""
+        """True nếu vừa in y hệt dòng này trong một khoảng rất ngắn (chống in 2 lần).
+
+        F-41b (2026-09-22): khoá chống trùng PHẢI không phụ thuộc mốc thời gian. Bản trước
+        dùng `msg` = `self.format(record)` — chuỗi này chứa `%(asctime)s` tới **mili-giây**,
+        nên hai bản ghi "giống hệt nhau" luôn khác nhau ở phần ms và cơ chế chống trùng
+        **thực tế không bao giờ chạy** (test `test_19` chỉ xanh khi cả hai rơi vào cùng một
+        ms — đỏ ngay khi máy bận). Nay khoá = (logger, level, nội dung KHÔNG thời gian,
+        module_tag). Cửa sổ thời gian `_dedup_window_sec()` vẫn giới hạn phạm vi chặn.
+        """
         window = self._dedup_window_sec()
         if window <= 0:
             return False
-        key = (record.name, record.levelno, msg)
+        try:
+            content = record.getMessage()
+        except Exception:  # noqa: BLE001 — record hỏng thì đành so theo chuỗi đã format
+            content = msg
+        key = (record.name, record.levelno, content, getattr(record, "module_tag", ""))
         now = time.monotonic()
         if key == SafeStreamHandler._last_key and (now - SafeStreamHandler._last_key_at) <= window:
             SafeStreamHandler.suppressed_records += 1

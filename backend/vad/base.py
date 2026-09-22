@@ -45,11 +45,18 @@ class VADResult:
             ngưỡng), KHÔNG phải trạng thái máy trạng thái của engine. Processor dùng nó
             cho chế độ `silence_duration_ms > 0` (đếm im lặng để chốt câu); ở chế độ mặc
             định docs thì event `START`/`END` mới là nguồn sự thật.
+        forced: engine đánh dấu ĐÂY LÀ CẮT CƯỠNG BỨC vì trần cứng của chính nó (ví dụ
+            `max_speech_frame`), không phải vì đã hết im lặng. Chỉ khi đó chế độ ghi đè
+            mới được phép đóng câu ngay giữa lúc còn bằng chứng nói.
+            LƯU Ý: `is_speech=True` trên một frame END **không** có nghĩa là cắt cưỡng
+            bức — đó thường chỉ là frame chuyển tiếp (đã gặp thật: FireRed phát END kèm
+            `p=1.00` ⇒ processor cũ đóng câu sai giữa câu, xem report/audit/21 §13).
     """
     probability: float = 0.0
     event: Optional[str] = None
     lookback_frames: int = 0
     is_speech: bool = False
+    forced: bool = False
 
     def __iter__(self):
         yield self.probability
@@ -103,6 +110,9 @@ class VADStreamState:
     #: thay vì để câu treo.
     engine_end_pending: bool = False
 
+    #: Đã ghi log "END của engine bị hoãn" cho đoạn nói hiện tại chưa (tránh spam mỗi frame).
+    engine_end_logged: bool = False
+
     #: Mốc thời gian (giây, theo đồng hồ client) của BYTE ĐẦU TIÊN đang nằm trong
     #: `raw_buffer`. Cần thiết vì một frame có thể vắt qua nhiều chunk client gửi (ví dụ
     #: hop 60 ms của FSMN với chunk 20 ms) — nếu lấy `capture_timestamp` của chunk hiện
@@ -118,6 +128,7 @@ class VADStreamState:
         self.total_samples_processed = 0
         self.last_speech_sample = 0
         self.engine_end_pending = False
+        self.engine_end_logged = False
         self.stream_ts = 0.0
 
 

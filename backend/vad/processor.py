@@ -470,6 +470,7 @@ class VADStreamProcessor:
             if not state.is_speech:
                 state.is_speech = True
                 state.engine_end_pending = False
+                state.engine_end_logged = False
                 # Mốc đếm im lặng bắt đầu từ chính frame mở đoạn.
                 state.last_speech_sample = max(state.last_speech_sample, state.total_samples_processed)
                 logger.info(f"START (p={prob:.2f})", extra={"module_tag": "VAD"})
@@ -495,23 +496,38 @@ class VADStreamProcessor:
         if state.is_speech and self.silence_duration_ms is not None:
             # ── CHẾ ĐỘ GHI ĐÈ: `silence_duration_ms` là điều kiện số 1 ────────────────
             silent_ms = (state.total_samples_processed - state.last_speech_sample) / self.sample_rate * 1000.0
-            # END "cưỡng bức" của engine (vd trần `max_speech_frame`) đến khi frame hiện
-            # tại VẪN còn bằng chứng tiếng nói ⇒ tôn trọng ngay, không chờ đủ im lặng.
-            forced_split = res.event == "END" and bool(res.is_speech)
+            # FIX-13: chỉ tôn trọng END "cắt cưỡng bức" khi ENGINE NÓI RÕ đó là trần cứng
+            # của nó (`res.forced`). Bản cũ suy ra từ `res.is_speech` — SAI: frame END
+            # thường là frame CHUYỂN TIẾP nên vẫn có bằng chứng nói (log phim thật
+            # 2026-09-22 22:15: `END [engine_end, im lặng 0ms >= 1500ms] (p=1.00)` cắt đôi
+            # câu "Don't try and trick me into buying something I don't want.").
+            forced_split = bool(res.event == "END" and getattr(res, "forced", False))
             if forced_split or silent_ms >= float(self.silence_duration_ms):
                 self._close_utterance(
                     state,
                     callbacks_to_fire,
-                    reason=("engine_end" if res.event == "END" else "silence_override"),
-                    detail=f"im lặng {silent_ms:.0f}ms >= {self.silence_duration_ms}ms",
+                    reason=("engine_end" if forced_split else "silence_override"),
+                    detail=(
+                        f"cắt cưỡng bức bởi engine (im lặng {silent_ms:.0f}ms)"
+                        if forced_split
+                        else f"im lặng {silent_ms:.0f}ms >= {self.silence_duration_ms}ms"
+                    ),
                     prob=prob,
                 )
                 state.pre_roll.append((frame_bytes, frame_ts))
                 return
             if res.event == "END":
-                # Engine muốn đóng nhưng chưa đủ im lặng theo yêu cầu ⇒ HOÃN. Ghi nhớ để nếu
+                # Engine muốn đóng nhưng CHƯA đủ im lặng theo yêu cầu ⇒ HOÃN. Ghi nhớ để nếu
                 # người dùng gạt VAD Silence về 0 thì frame sau tôn trọng ngay (không treo câu).
                 state.engine_end_pending = True
+                if not state.engine_end_logged:
+                    state.engine_end_logged = True
+                    logger.info(
+                        f"END của engine bị HOÃN: mới im lặng {silent_ms:.0f}ms "
+                        f"< {self.silence_duration_ms}ms (p={prob:.2f}, is_speech={bool(res.is_speech)}) "
+                        f"— giữ câu mở để không cắt giữa câu.",
+                        extra={"module_tag": "VAD"},
+                    )
             # Chưa đủ im lặng: giữ câu mở và tiếp tục chuyển tiếp audio.
             if self.on_speech_chunk:
                 callbacks_to_fire.append(

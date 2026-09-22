@@ -15,6 +15,19 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   const rangeVadThreshold = document.getElementById("rangeVadThreshold");
   const valVadThreshold = document.getElementById("valVadThreshold");
   const rangeMinWords = document.getElementById("rangeMinWords");
+  // Tầng SEG (tách câu hậu-ASR)
+  const chkSegEnabled = document.getElementById("chkSegEnabled");
+  const chkSegTimer = document.getElementById("chkSegTimer");
+  const chkSegTrace = document.getElementById("chkSegTrace");
+  const chkSegStable = document.getElementById("chkSegStable");
+  const rangeSegStableMs = document.getElementById("rangeSegStableMs");
+  const valSegStableMs = document.getElementById("valSegStableMs");
+  const rangeSegMaxChars = document.getElementById("rangeSegMaxChars");
+  const rangeSegTailChars = document.getElementById("rangeSegTailChars");
+  const rangeSegTailScans = document.getElementById("rangeSegTailScans");
+  const valSegMaxChars = document.getElementById("valSegMaxChars");
+  const valSegTailChars = document.getElementById("valSegTailChars");
+  const valSegTailScans = document.getElementById("valSegTailScans");
   const valMinWords = document.getElementById("valMinWords");
   const lblActiveModel = document.getElementById("lblActiveModel");
   const selSourceLang = document.getElementById("selSourceLang");
@@ -101,6 +114,18 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       threshold: vadThresholdVal,
       minWordsToCommit: minWords,
       min_words_to_commit: minWords,
+      // Tầng SEG: chốt câu theo dấu câu của ASR + mốc cắt từ model có timestamp.
+      segEnabled: chkSegEnabled ? chkSegEnabled.checked : true,
+      segUseWhisperTimer: chkSegTimer ? chkSegTimer.checked : true,
+      segDebugTrace: chkSegTrace ? chkSegTrace.checked : true,
+      segStableCut: chkSegStable ? chkSegStable.checked : false,
+      segStableMs: parseInt(rangeSegStableMs ? rangeSegStableMs.value : 350, 10) || 350,
+      segMaxChars: parseInt(rangeSegMaxChars ? rangeSegMaxChars.value : 60, 10) || 60,
+      segTailMinChars: parseInt(rangeSegTailChars ? rangeSegTailChars.value : 4, 10) || 4,
+      segTailScans: parseInt(rangeSegTailScans ? rangeSegTailScans.value : 2, 10) || 2,
+      seg_max_chars: parseInt(rangeSegMaxChars ? rangeSegMaxChars.value : 60, 10) || 60,
+      seg_tail_min_chars: parseInt(rangeSegTailChars ? rangeSegTailChars.value : 4, 10) || 4,
+      seg_tail_scans: parseInt(rangeSegTailScans ? rangeSegTailScans.value : 2, 10) || 2,
       sourceLanguage: selSourceLang ? selSourceLang.value : "auto",
       targetLang: selTargetLang ? selTargetLang.value : "vi",
       translationModel: selTranslationModel ? selTranslationModel.value : "xiaomi",
@@ -165,6 +190,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (valMaxLines && rangeMaxLines) valMaxLines.textContent = rangeMaxLines.value;
     if (valTtsSpeed && selTtsSpeed) valTtsSpeed.textContent = selTtsSpeed.value || "1.0";
     if (valDuckingLevel && rangeDuckingLevel) valDuckingLevel.textContent = rangeDuckingLevel.value;
+    // Tầng SEG
+    if (valSegMaxChars && rangeSegMaxChars) valSegMaxChars.textContent = rangeSegMaxChars.value;
+    if (valSegTailChars && rangeSegTailChars) valSegTailChars.textContent = rangeSegTailChars.value;
+    if (valSegTailScans && rangeSegTailScans) valSegTailScans.textContent = rangeSegTailScans.value;
+    if (valSegStableMs && rangeSegStableMs) valSegStableMs.textContent = rangeSegStableMs.value;
   }
 
   async function fetchActiveTab() {
@@ -355,6 +385,32 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       rangeMinWords.value = data.min_words_to_commit;
       updateRangeLabels();
     }
+    // Tầng SEG: backend là nguồn sự thật (trừ khi người dùng vừa kéo tay).
+    if (data.seg) {
+      if (chkSegEnabled && data.seg.enabled !== undefined) chkSegEnabled.checked = !!data.seg.enabled;
+      if (chkSegTimer && data.seg.use_whisper_timer !== undefined) {
+        chkSegTimer.checked = !!data.seg.use_whisper_timer;
+      }
+      if (chkSegTrace && data.seg.debug_trace !== undefined) {
+        chkSegTrace.checked = !!data.seg.debug_trace;
+      }
+      if (chkSegStable && data.seg.stable_cut !== undefined) {
+        chkSegStable.checked = !!data.seg.stable_cut;
+      }
+      if (rangeSegStableMs && data.seg.stable_ms !== undefined && !rangeSegStableMs.dataset.userEdited) {
+        rangeSegStableMs.value = data.seg.stable_ms;
+      }
+      if (rangeSegMaxChars && data.seg.max_chars !== undefined && !rangeSegMaxChars.dataset.userEdited) {
+        rangeSegMaxChars.value = data.seg.max_chars;
+      }
+      if (rangeSegTailChars && data.seg.tail_min_chars !== undefined && !rangeSegTailChars.dataset.userEdited) {
+        rangeSegTailChars.value = data.seg.tail_min_chars;
+      }
+      if (rangeSegTailScans && data.seg.tail_scans !== undefined && !rangeSegTailScans.dataset.userEdited) {
+        rangeSegTailScans.value = data.seg.tail_scans;
+      }
+      updateRangeLabels();
+    }
 
     if (!isCapturingNow) {
       statusBadge.textContent = `${activeAsr.toUpperCase()}`;
@@ -441,6 +497,14 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         })(),
         vad_threshold: !isNaN(parseFloat(rangeVadThreshold?.value)) ? parseFloat(rangeVadThreshold.value) : 0.5,
         min_words_to_commit: !isNaN(parseInt(rangeMinWords?.value, 10)) ? Math.max(0, parseInt(rangeMinWords.value, 10)) : 2,
+        seg_enabled: chkSegEnabled ? chkSegEnabled.checked : true,
+        seg_use_whisper_timer: chkSegTimer ? chkSegTimer.checked : true,
+        seg_debug_trace: chkSegTrace ? chkSegTrace.checked : true,
+        seg_stable_cut: chkSegStable ? chkSegStable.checked : false,
+        seg_stable_ms: !isNaN(parseInt(rangeSegStableMs?.value, 10)) ? Math.max(50, parseInt(rangeSegStableMs.value, 10)) : 350,
+        seg_max_chars: !isNaN(parseInt(rangeSegMaxChars?.value, 10)) ? Math.max(10, parseInt(rangeSegMaxChars.value, 10)) : 60,
+        seg_tail_min_chars: !isNaN(parseInt(rangeSegTailChars?.value, 10)) ? Math.max(0, parseInt(rangeSegTailChars.value, 10)) : 4,
+        seg_tail_scans: !isNaN(parseInt(rangeSegTailScans?.value, 10)) ? Math.max(1, parseInt(rangeSegTailScans.value, 10)) : 2,
         source_lang: newLang,
         tts_enabled: chkEnableTts ? chkEnableTts.checked : false,
         tts_voice: selTtsVoice ? selTtsVoice.value : undefined,
@@ -747,6 +811,27 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         rangeMinWords.value = isNaN(mw) ? 2 : Math.max(0, mw);
         rangeMinWords.dataset.userEdited = "true";
       }
+      // Tầng SEG (đã lưu ở lần dùng trước)
+      if (s.segEnabled !== undefined && chkSegEnabled) chkSegEnabled.checked = !!s.segEnabled;
+      if (s.segUseWhisperTimer !== undefined && chkSegTimer) chkSegTimer.checked = !!s.segUseWhisperTimer;
+      if (s.seg_max_chars !== undefined && rangeSegMaxChars) {
+        rangeSegMaxChars.value = s.seg_max_chars;
+        rangeSegMaxChars.dataset.userEdited = "true";
+      }
+      if (s.seg_tail_min_chars !== undefined && rangeSegTailChars) {
+        rangeSegTailChars.value = s.seg_tail_min_chars;
+        rangeSegTailChars.dataset.userEdited = "true";
+      }
+      if (s.seg_tail_scans !== undefined && rangeSegTailScans) {
+        rangeSegTailScans.value = s.seg_tail_scans;
+        rangeSegTailScans.dataset.userEdited = "true";
+      }
+      if (s.segStableCut !== undefined && chkSegStable) chkSegStable.checked = !!s.segStableCut;
+      if (s.segStableMs !== undefined && rangeSegStableMs) {
+        rangeSegStableMs.value = s.segStableMs;
+        rangeSegStableMs.dataset.userEdited = "true";
+      }
+      if (s.segDebugTrace !== undefined && chkSegTrace) chkSegTrace.checked = !!s.segDebugTrace;
       if (s.sourceLanguage || s.sourceLang) {
         savedPreferredLang = s.sourceLanguage || s.sourceLang;
         if (selSourceLang) selSourceLang.value = savedPreferredLang;
@@ -886,6 +971,15 @@ const api = typeof browser !== "undefined" ? browser : chrome;
           min_words_to_commit: cfg.minWordsToCommit,
           silence_duration_ms: cfg.silenceDurationMs,
           vad_threshold: cfg.vadThreshold,
+          // Tầng SEG: đẩy sang REST để áp cho MỌI phiên đang chạy (giống VAD/threshold).
+          seg_enabled: cfg.segEnabled,
+          seg_max_chars: cfg.seg_max_chars,
+          seg_tail_min_chars: cfg.seg_tail_min_chars,
+          seg_tail_scans: cfg.seg_tail_scans,
+          seg_use_whisper_timer: cfg.segUseWhisperTimer,
+          seg_debug_trace: cfg.segDebugTrace,
+          seg_stable_cut: cfg.segStableCut,
+          seg_stable_ms: cfg.segStableMs,
         }),
       }).catch(() => { });
     };
@@ -921,6 +1015,25 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       onSettingChange();
     };
   }
+  // Tầng SEG: đổi là gửi ngay (công tắc A/B cần thấy hiệu quả tức thì).
+  if (chkSegEnabled) chkSegEnabled.onchange = () => onSettingChange(true);
+  if (chkSegTimer) chkSegTimer.onchange = () => onSettingChange(true);
+  if (chkSegTrace) chkSegTrace.onchange = () => onSettingChange(true);
+  if (chkSegStable) chkSegStable.onchange = () => onSettingChange(true);
+  if (rangeSegStableMs) {
+    rangeSegStableMs.oninput = () => {
+      rangeSegStableMs.dataset.userEdited = "true";
+      onSettingChange();
+    };
+  }
+  [rangeSegMaxChars, rangeSegTailChars, rangeSegTailScans].forEach((el) => {
+    if (el) {
+      el.oninput = () => {
+        el.dataset.userEdited = "true";
+        onSettingChange();
+      };
+    }
+  });
 
   if (selSourceLang) {
     selSourceLang.onchange = () => {

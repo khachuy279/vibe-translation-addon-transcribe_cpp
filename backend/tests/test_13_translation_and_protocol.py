@@ -118,8 +118,12 @@ def test_translation_streaming_can_be_disabled(session_factory, restore_config):
     assert finals and finals[0]["translated"] == "[vi] abc"
 
 
-def test_translation_dedup_skips_repeat(session_factory, restore_config):
-    """Câu dịch trùng phải bị bỏ qua (không gửi message nào)."""
+def test_translation_dedup_reuses_cached_translation(session_factory, restore_config):
+    """FIX-05: câu dịch trùng KHÔNG được dịch lại, NHƯNG phải có gói `translation` để gỡ "...".
+
+    Bug gốc: nhánh dedup `return` im lặng. Client đã nhận câu final với placeholder
+    `translated="..."` nên phụ đề gốc treo vĩnh viễn ở chỉ báo "đang dịch".
+    """
     from backend.core.metrics import metrics_collector
     from backend.translation.context import TranslationContextTracker
     from backend.translation.dedup import TranslationDeduplicator
@@ -129,7 +133,7 @@ def test_translation_dedup_skips_repeat(session_factory, restore_config):
     session = session_factory()
     translator = FakeTranslator()
     dedup = TranslationDeduplicator()
-    before = metrics_collector.get_counter("translation.dedup_skipped")
+    before_reused = metrics_collector.get_counter("translation.dedup_reused")
 
     async def _run():
         for _ in range(2):
@@ -141,8 +145,62 @@ def test_translation_dedup_skips_repeat(session_factory, restore_config):
             )
 
     asyncio.run(_run())
-    assert metrics_collector.get_counter("translation.dedup_skipped") > before
     assert len(translator.calls) == 1, "câu trùng không được dịch lại"
+
+    msgs = getattr(session.mock_ws, "sent_messages", [])
+    finals = [m for m in msgs if m.get("type") == "translation" and not m.get("partial")]
+    assert len(finals) == 2, "câu lặp vẫn phải gửi gói translation (nếu không dấu '...' treo)"
+    assert finals[0]["translated"] == finals[1]["translated"] == "[vi] same text"
+    assert metrics_collector.get_counter("translation.dedup_reused") == before_reused + 1
+
+
+def test_translation_dedup_without_cache_clears_ellipsis(session_factory, restore_config):
+    """FIX-05: trùng mà chưa có bản dịch cache ⇒ vẫn phải gỡ "...", phụ đề gốc giữ nguyên."""
+    from backend.core.metrics import metrics_collector
+    from backend.translation.context import TranslationContextTracker
+    from backend.translation.dedup import TranslationDeduplicator
+    from backend.tests.fakes import FakeTranslator
+    from backend.ws import handler as handler_mod
+
+    session = session_factory()
+    dedup = TranslationDeduplicator()
+    before = metrics_collector.get_counter("translation.ellipsis_cleared")
+
+    class _FailingTranslator(FakeTranslator):
+        async def translate(self, *a, **kw):
+            raise RuntimeError("model lỗi")
+
+        async def translate_stream(self, *a, **kw):  # type: ignore[override]
+            raise RuntimeError("model lỗi")
+            yield ""  # pragma: no cover
+
+    translator = _FailingTranslator()
+
+    async def _run():
+        # Lần 1: dịch lỗi ⇒ KHÔNG có bản dịch nào được ghi nhớ.
+        with pytest.raises(RuntimeError):
+            await handler_mod._process_translation_item(
+                session, translator, TranslationContextTracker(window_size=3),
+                {"utterance_id": "u1", "text": "lặp", "source_lang": "ja",
+                 "target_lang": "vi", "_queued_at": 0.0},
+                dedup,
+            )
+        session.mock_ws.sent_messages.clear()
+        # Lần 2: cùng câu ⇒ dedup trúng nhưng cache rỗng.
+        await handler_mod._process_translation_item(
+            session, translator, TranslationContextTracker(window_size=3),
+            {"utterance_id": "u2", "text": "lặp", "source_lang": "ja",
+             "target_lang": "vi", "_queued_at": 0.0},
+            dedup,
+        )
+
+    asyncio.run(_run())
+    msgs = getattr(session.mock_ws, "sent_messages", [])
+    finals = [m for m in msgs if m.get("type") == "translation"]
+    assert finals, "phải gửi translation rỗng để client tắt chỉ báo 'đang dịch'"
+    assert finals[0]["translated"] == ""
+    assert finals[0]["status"] == "ok", "status phải 'ok' để renderer coi là bản dịch hoàn chỉnh"
+    assert metrics_collector.get_counter("translation.ellipsis_cleared") == before + 1
 
 
 # ---------------------------------------------------------------------- protocol

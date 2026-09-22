@@ -22,6 +22,9 @@ class CommitReason(str, Enum):
     MANUAL = "MANUAL"
     # P4.5: hàng đợi commit đầy -> câu cũ nhất được GỘP thay vì bị vứt bỏ.
     MERGED_BACKLOG = "MERGED_BACKLOG"
+    # SEG (VAD > ASR > SEG): chốt vì DẤU CÂU của ASR đã trọn câu (xem
+    # `backend/segmentation/`). Mốc cắt lấy từ timer có timestamp (Whisper) nếu bật.
+    SEG_PUNCT = "SEG_PUNCT"
 
 
 @dataclass
