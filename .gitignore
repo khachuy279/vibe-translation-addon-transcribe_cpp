@@ -75,20 +75,20 @@ metrics_report.json
 # Bản đã đổi tên để so A/B (metrics_sched_ON.json / metrics_sched_OFF.json)
 metrics_sched_*.json
 
-# 9. G2/G3 — bản dựng CUDA ASR & toolchain cục bộ (không commit)
-# bin/                  : bundle native lúc chạy (transcribe.dll + ggml*.dll, gồm
-#                         ggml-cuda.dll, tổng ~121 MB). Ứng dụng nạp từ đây qua
-#                         TRANSCRIBE_LIBRARY (backend/asr/native.py).
-#                         QUYẾT ĐỊNH §4.2: đã `git rm --cached bin/*.dll` — DLL không
-#                         còn được theo dõi git (mỗi lần build lại CUDA tạo diff nhị
-#                         phân 68 MB). Chặn tường minh ở đây để `git status` sạch;
-#                         bundle phân phối lại bằng script build trong external/.
-#                         LƯU Ý: git KHÔNG còn backup cho bin/ nữa.
+# 9. G2/G3 — bản dựng CUDA ASR & toolchain cục bộ
+# backend/bin/          : bundle native lúc chạy (transcribe.dll + ggml*.dll, gồm
+#                         ggml-cuda.dll + ggml-vulkan.dll, tổng ~121 MB). Ứng dụng nạp từ
+#                         đây qua TRANSCRIBE_LIBRARY (backend/asr/native.py), và
+#                         backend/utils/cuda.py cũng đăng ký thư mục này cho engine dịch.
+#                         TRẠNG THÁI: 6 DLL này ĐANG được git theo dõi (cố ý) để bản
+#                         `git clone` mới có sẵn CUDA cho ASR — không cần build lại.
+#                         Dòng `# bin/` ngay dưới chỉ là tài liệu đã chú thích, KHÔNG chặn gì.
+#                         LƯU Ý: mỗi lần build lại CUDA sẽ tạo diff nhị phân ~68 MB.
 # external/cuda-toolkit : CUDA toolkit dựng từ wheel pip (nvcc/cublas/headers) ~1,4 GB
 # external/build-cuda   : cây build CMake của transcribe.cpp với backend CUDA
 # external/build-tmp    : log/script/JSON tạm của quá trình đo G2/G3
 # (external/ đã bị chặn ở mục 1; các mục con dưới đây chỉ để tài liệu hoá.)
-# bin/
+# bin/                  (vị trí CŨ của bundle native — đã chuyển sang backend/bin/)
 external/cuda-toolkit/
 external/build-cuda/
 external/build-tmp/

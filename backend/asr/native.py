@@ -9,21 +9,26 @@ Tách riêng khỏi `engine.py` vì hai lý do về **THỨ TỰ NẠP**:
 2. `backend/asr/adapters.py` cũng import `transcribe_cpp`, nên việc chuẩn bị phải chạy
    trước cả module đó ⇒ hàm `bootstrap()` được gọi ở dòng đầu `backend/asr/__init__.py`.
 
-## Bundle native cục bộ (`bin/`)
+## Bundle native cục bộ (`backend/bin/`)
 
 Bản dựng CUDA cho Windows **chưa được phát hành** trên PyPI: gói `transcribe-cpp-native-cu12`
 chỉ là name-reservation (wheel 1380 byte, không có native code) — xem
 `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.1. Vì vậy dự án tự dựng lấy và đặt bundle tại
-`<project_root>/bin/`:
+`<project_root>/backend/bin/`:
 
-    bin/transcribe.dll      libtranscribe (bản dựng cục bộ)
-    bin/ggml.dll            ggml dispatcher
-    bin/ggml-base.dll       ggml core
-    bin/ggml-cpu.dll        backend CPU
-    bin/ggml-cuda.dll       backend CUDA   (nếu có)
-    bin/ggml-vulkan.dll     backend Vulkan (nếu có)
+    backend/bin/transcribe.dll      libtranscribe (bản dựng cục bộ)
+    backend/bin/ggml.dll            ggml dispatcher
+    backend/bin/ggml-base.dll       ggml core
+    backend/bin/ggml-cpu.dll        backend CPU
+    backend/bin/ggml-cuda.dll       backend CUDA   (nếu có)
+    backend/bin/ggml-vulkan.dll     backend Vulkan (nếu có)
 
-Khi bundle tồn tại, ta đặt `TRANSCRIBE_LIBRARY` trỏ vào `bin/transcribe.dll` **trước khi**
+Bundle nằm trong `backend/` (không phải thư mục gốc repo) để **toàn bộ tài nguyên native của
+backend nằm chung một cây** — `backend/` trở thành đơn vị duy nhất cần sao chép khi triển khai,
+và DLL của ASR không còn lẫn với các thư mục build ở gốc repo. Vị trí CŨ `<project_root>/bin/`
+vẫn được chấp nhận như **fallback** (xem `_resolve_bundle_dir`) để bản cài cũ không mất CUDA.
+
+Khi bundle tồn tại, ta đặt `TRANSCRIBE_LIBRARY` trỏ vào `transcribe.dll` **trước khi**
 import `transcribe_cpp` ⇒ binding đi theo "dev-tree / explicit path" và nạp đúng bundle này,
 thay vì provider `transcribe-cpp-native` đã cài trong site-packages.
 
@@ -65,6 +70,11 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def _backend_dir() -> Path:
+    # backend/asr/native.py -> backend/asr -> backend
+    return Path(__file__).resolve().parent.parent
+
+
 def native_bundle_dir() -> Optional[Path]:
     """Thư mục bundle native đang dùng, hoặc None nếu dùng provider đã cài."""
     return _bundle_dir
@@ -91,11 +101,15 @@ def _resolve_bundle_dir() -> Tuple[Optional[Path], str]:
     if not getattr(config.asr, "use_local_native", True):
         return None, "installed"
 
-    # 2. Đường dẫn cấu hình; 3. mặc định <project_root>/bin.
+    # 2. Đường dẫn cấu hình; 3. mặc định `backend/bin`; 4. vị trí cũ `<root>/bin`.
     configured = (getattr(config.asr, "native_dir", "") or "").strip()
     candidates = []
     if configured:
         candidates.append((Path(configured), "config"))
+    candidates.append((_backend_dir() / "bin", "default"))
+    # Vị trí CŨ trước khi bundle được gom vào `backend/bin`. Giữ làm fallback để bản cài đã có
+    # sẵn `<root>/bin` không mất CUDA sau khi nâng cấp. Vẫn báo nguồn là "default" — tập giá
+    # trị của `native_bundle_source()` giữ nguyên: config | default | env | installed.
     candidates.append((_project_root() / "bin", "default"))
 
     for cand, source in candidates:
@@ -115,13 +129,13 @@ def bootstrap() -> None:
 
         # Nếu `transcribe_cpp` đã nằm trong sys.modules thì native ĐÃ được dlopen từ nguồn
         # khác, và mọi thứ ta đặt dưới đây sẽ KHÔNG có tác dụng (DLL đã nạp vào tiến trình).
-        # Ghi cảnh báo rõ ràng thay vì log "đang dùng bin/" gây hiểu sai — đây là lỗi thứ tự
-        # nạp, thường do import `transcribe_cpp` trực tiếp trước `backend.asr`.
+        # Ghi cảnh báo rõ ràng thay vì log "đang dùng backend/bin" gây hiểu sai — đây là lỗi
+        # thứ tự nạp, thường do import `transcribe_cpp` trực tiếp trước `backend.asr`.
         too_late = "transcribe_cpp" in sys.modules
         if too_late:
             logger.warning(
                 "ASR native: `transcribe_cpp` đã được import TRƯỚC khi bootstrap chạy — "
-                "bundle trong bin/ KHÔNG được áp dụng (native đã dlopen từ nguồn khác). "
+                "bundle trong backend/bin KHÔNG được áp dụng (native đã dlopen từ nguồn khác). "
                 "Hãy import `backend.asr` (hoặc để backend/asr/__init__.py chạy) trước.",
                 extra={"module_tag": _TAG},
             )
@@ -156,7 +170,7 @@ def bootstrap() -> None:
             _bundle_dir, _bundle_source = None, "installed"
             if not too_late:
                 logger.info(
-                    "Native bundle: không tìm thấy trong bin/ (dùng provider cài đặt)",
+                    "Native bundle: không tìm thấy trong backend/bin (dùng provider cài đặt)",
                     extra={"module_tag": _TAG},
                 )
 
@@ -178,8 +192,8 @@ def bootstrap() -> None:
 #:  * "vulkan" -> Vulkan trước (chỉ định rõ thì không tự chuyển sang CUDA trừ khi Vulkan không có).
 #:
 #: KHÔNG có "cpu" trong danh sách. Backend CPU vẫn tồn tại trong thư viện native
-#: (`bin/ggml-cpu.dll`) và **phải giữ lại** vì ggml dùng nó làm backend mặc định cho các
-#: op không offload được lên GPU (`ggml_backend_sched` cần một CPU backend cho graph) —
+#: (`backend/bin/ggml-cpu.dll`) và **phải giữ lại** vì ggml dùng nó làm backend mặc định cho
+#: các op không offload được lên GPU (`ggml_backend_sched` cần một CPU backend cho graph) —
 #: nhưng nó KHÔNG phải lựa chọn hợp lệ cho ASR.
 #:
 #: Đo thật (external/build-tmp/probe_cpu_backend.py, qwen3-asr-0.6b, clip 5,08 s):

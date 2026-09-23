@@ -7,7 +7,7 @@ nhân logic + chế độ spin. Đo trên máy 12 luồng: harness WER (wheel/Vu
 ⇒ mọi `import backend.*` đều có.
 
 **Harness `test_09_wer_ab.py`:** bản cũ `import transcribe_cpp` TRỰC TIẾP trước khi
-`backend.asr` kịp bootstrap ⇒ nạp native của WHEEL (Vulkan) và bỏ qua bundle `bin/` (CUDA).
+`backend.asr` kịp bootstrap ⇒ nạp native của WHEEL (Vulkan) và bỏ qua bundle `backend/bin/` (CUDA).
 Hệ quả kép: (a) mọi số `infer_ms` không đại diện bản phát hành; (b) chính đường Vulkan của
 wheel đốt ~11 core CPU. Đo sau khi sửa: **~0,5 core**.
 """
@@ -134,15 +134,15 @@ def test_harness_bootstrap_bin_truoc_khi_cham_transcribe_cpp():
     """`test_09_wer_ab.py` phải để `backend.asr` bootstrap TRƯỚC `import transcribe_cpp`.
 
     Bản cũ import thẳng `transcribe_cpp` ⇒ native của WHEEL (Vulkan) vào `sys.modules`,
-    bundle `bin/` (CUDA) không áp được. Hệ quả ĐO ĐƯỢC: harness chạy Vulkan của wheel và
-    đốt **~11 core CPU** liên tục (so với ~0,5 core khi chạy `bin/`+CUDA).
+    bundle `backend/bin/` (CUDA) không áp được. Hệ quả ĐO ĐƯỢC: harness chạy Vulkan của wheel và
+    đốt **~11 core CPU** liên tục (so với ~0,5 core khi chạy `backend/bin/`+CUDA).
     """
     boot, plain = _boot_before_plain_import(HARNESS)
     assert boot is not None, "harness không bootstrap `backend.asr`"
     if plain is not None:
         assert boot < plain, (
             f"`import transcribe_cpp` (dòng {plain}) chạy TRƯỚC bootstrap (dòng {boot}) "
-            f"⇒ bundle bin/ bị bỏ qua"
+            f"⇒ bundle backend/bin/ bị bỏ qua"
         )
 
 
@@ -163,5 +163,5 @@ def test_moi_harness_ngoai_package_asr_phai_bootstrap_truoc():
         if boot is None or boot > plain:
             offenders.append(f"{rel} (import dòng {plain}, bootstrap dòng {boot})")
     assert not offenders, (
-        "các file này nạp native của WHEEL trước khi bootstrap bin/: " + "; ".join(offenders)
+        "các file này nạp native của WHEEL trước khi bootstrap backend/bin/: " + "; ".join(offenders)
     )

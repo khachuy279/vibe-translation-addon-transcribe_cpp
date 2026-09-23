@@ -192,8 +192,8 @@ class ASRConfig(BaseModel):
     #   "auto"   — CUDA nếu có, không thì Vulkan (mặc định).
     #   "cuda"   — ưu tiên CUDA; KHÔNG có thì fallback về Vulkan (xem `backend_fallback`).
     #   "vulkan" — chỉ Vulkan. Chỉ định rõ thì KHÔNG tự chuyển sang CUDA.
-    # KHÔNG có "cpu": backend CPU vẫn nằm trong thư viện native (`bin/ggml-cpu.dll`) và phải
-    # giữ vì ggml cần nó cho các op không offload được lên GPU, nhưng model ASR (audio-LLM)
+    # KHÔNG có "cpu": backend CPU vẫn nằm trong thư viện native (`backend/bin/ggml-cpu.dll`) và
+    # phải giữ vì ggml cần nó cho các op không offload được lên GPU, nhưng model ASR (audio-LLM)
     # chạy CPU ở RTF 1,6 (chậm hơn thời gian thực) — đo thật, xem backend/asr/native.py —
     # nên không phải lựa chọn hợp lệ cho phụ đề realtime.
     # Đo thật trên RTX 5060 Ti (report/audit/KE_HOACH_FIX_LOI_Hy3.md §4.1.3): CUDA nhanh hơn
@@ -210,11 +210,11 @@ class ASRConfig(BaseModel):
     # rơi về CPU. Hành vi nay đúng như tài liệu `transcribe.cpp`: chọn backend GPU theo
     # `_PREFERENCE` + `backend_fallback`, và ghi WARNING rõ ràng nếu không backend nào khả dụng.
     backend_fallback: bool = True
-    # --- Bundle native cục bộ (`bin/`) ------------------------------------------
-    # Ưu tiên bundle trong `bin/` (bản dựng cục bộ, có thể gồm ggml-cuda.dll) hơn provider
-    # `transcribe-cpp-native` đã cài trong site-packages. Xem backend/asr/native.py.
+    # --- Bundle native cục bộ (`backend/bin/`) ----------------------------------
+    # Ưu tiên bundle trong `backend/bin/` (bản dựng cục bộ, có thể gồm ggml-cuda.dll) hơn
+    # provider `transcribe-cpp-native` đã cài trong site-packages. Xem backend/asr/native.py.
     use_local_native: bool = True
-    # Thư mục chứa bundle. Để trống = "<project_root>/bin".
+    # Thư mục chứa bundle. Để trống = "<project_root>/backend/bin" (fallback: "<root>/bin").
     native_dir: str = ""
     language: str = "auto"
     threads: int = _AUTO_THREADS  # A1-1 (Hy3): tự động theo số nhân CPU

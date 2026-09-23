@@ -37,7 +37,7 @@ import numpy as np
 
 # `backend/asr/__init__.py` đã gọi `backend.asr.native.bootstrap()` TRƯỚC khi module này
 # được nạp (mọi đường vào đều đi qua package `backend.asr`). Lúc này `TRANSCRIBE_LIBRARY`
-# đã trỏ đúng bundle trong `bin/` (nếu có) và các thư mục DLL phụ thuộc đã được đăng ký,
+# đã trỏ đúng bundle trong `backend/bin/` (nếu có) và các thư mục DLL phụ thuộc đã được đăng ký,
 # nên `import transcribe_cpp` bên dưới dlopen đúng thư viện mong muốn.
 try:
     import transcribe_cpp

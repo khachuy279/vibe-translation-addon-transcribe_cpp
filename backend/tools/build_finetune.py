@@ -32,7 +32,7 @@ RIÊNG ``transcribe-quantize`` là binary C++ phải build trước::
     cmake -S external/transcribe.cpp -B <build-dir> -DTRANSCRIBE_BUILD_TOOLS=ON
     cmake --build <build-dir> --target transcribe-quantize
 
-Script tự dò binary trong ``bin/``, ``external/build-cuda/bin/``,
+Script tự dò binary trong ``backend/bin/``, ``bin/``, ``external/build-cuda/bin/``,
 ``.build-cuda/bin/`` và ``external/transcribe.cpp/build/bin/``.
 """
 
@@ -64,6 +64,7 @@ REFERENCE_TIERS = ("F32", "F16", "BF16")
 
 #: Các vị trí có thể có binary quantizer (đường dẫn junction trùng nhau sẽ bị lọc).
 QUANTIZE_BIN_CANDIDATES = (
+    PROJECT_ROOT / "backend" / "bin" / "transcribe-quantize.exe",
     PROJECT_ROOT / "bin" / "transcribe-quantize.exe",
     PROJECT_ROOT / "external" / "build-cuda" / "bin" / "transcribe-quantize.exe",
     PROJECT_ROOT / ".build-cuda" / "bin" / "transcribe-quantize.exe",
@@ -370,7 +371,7 @@ def verify_registry(model_key: str) -> Dict[str, Any]:
 
 def validate_gguf(gguf_path: Path, family: str, wav: Path, language: str) -> Dict[str, Any]:
     """Nạp GGUF qua binding + chạy 1 câu audio, giống hệt đường đi của engine."""
-    import backend.asr  # noqa: F401  (bootstrap bin/ TRƯỚC khi import transcribe_cpp)
+    import backend.asr  # noqa: F401  (bootstrap backend/bin/ TRƯỚC khi import transcribe_cpp)
     import transcribe_cpp
     from backend.asr.adapters import build_family_options
     from backend.asr.native import resolve_backend

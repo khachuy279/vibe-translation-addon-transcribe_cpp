@@ -5,38 +5,47 @@
 #     pip install -r backend/requirements.txt
 #
 # File này cài được MỘT LẦN cho toàn bộ backend (ASR + VAD + dịch + TTS + WebSocket).
-# Hai gói dưới đây KHÔNG có trên PyPI ở bản CUDA nên phải trỏ đúng index — hai dòng
-# --extra-index-url ngay dưới lo việc đó:
-#   * torch / torchaudio : PyPI chỉ có bản CPU. Index chính thức của PyTorch có bản CUDA.
-#   * llama-cpp-python   : PyPI chỉ có sdist (phải tự build, cần nvcc). Index của tác giả
-#                          abetlen có wheel Windows dựng sẵn với CUDA.
+#   * torch / torchaudio : PyPI chỉ có bản CPU ⇒ cần `--extra-index-url` của PyTorch.
+#   * llama-cpp-python   : PyPI **chỉ có sdist** (pip sẽ tự build ~10 phút, cần MSVC + nvcc và
+#                          ra bản CPU-only nếu thiếu CMAKE_ARGS). Wheel Windows dựng sẵn nằm ở
+#                          index `whl/cpu` của tác giả abetlen — file này cài bản **CPU ~7 MB**
+#                          để lấy **BINDING** (thuần ctypes, không có native code). Còn DLL CUDA
+#                          thật nằm trong repo tại `backend/bin/llama/` và engine dịch trỏ tới
+#                          bằng env `LLAMA_CPP_LIB_PATH`. ⇒ KHÔNG cần build gì cả.
 #
 # PHIÊN BẢN ĐÃ ĐO THỰC TẾ trên máy tham chiếu (RTX 5060 Ti, Windows 11, Python 3.13):
 #     fastapi 0.141.1 · uvicorn 0.52.0 · pydantic 2.13.4 · numpy 2.4.4 · scipy 1.18.0
-#     torch 2.12.0+cu130 · llama-cpp-python 0.3.22 · transcribe-cpp-native 0.2.3
+#     torch 2.12.0+cu130 · llama-cpp-python 0.3.35 (binding CPU) + DLL CUDA 13.4 trong repo · transcribe-cpp-native 0.2.3
 #     omnivoice 0.2.1 · fireredvad 0.0.2 · silero-vad 6.2.1 · funasr 1.4.15
 #     huggingface-hub 1.31.0 · soundfile 0.14.0 · cryptography 42.0.5 · psutil 7.2.2
 #
 # Ghi chú về CUDA: torch ở đây dùng CUDA 13.0 (cu130) để khớp driver mới. Nếu driver của
-# bạn chỉ hỗ trợ CUDA 12.x, đổi cả hai dòng index/phiên bản bên dưới sang cu124 (xem README
-# mục "Cài đặt chi tiết"). Đừng trộn: torch cu124 + llama-cpp cu130 sẽ nạp 2 bộ DLL CUDA
-# khác nhau trong cùng tiến trình.
+# bạn chỉ hỗ trợ CUDA 12.x, đổi index/phiên bản torch bên dưới sang cu124 (xem README mục
+# "Cài đặt chi tiết"). Riêng llama.cpp KHÔNG bị ảnh hưởng: DLL của nó nằm sẵn trong
+# `backend/bin/llama/` nên không còn cảnh 2 bộ DLL CUDA cùng nằm trong một tiến trình.
 # ============================================================================
 
 --extra-index-url https://download.pytorch.org/whl/cu130
-# ⚠️ llama.cpp: GHIM 0.3.22 + index **cu124** (đã đo trên máy tham chiếu, Ryzen 5 5600X).
-#   * Wheel MỚI (kiểm 0.3.35-cu130) build kèm **AVX-512**: `ggml-cpu.dll` chứa **7.177 lệnh
-#     `zmm`** ⇒ `llama_init_from_model` nổ `OSError: [WinError -1073741795] 0xc000001d`
-#     (STATUS_ILLEGAL_INSTRUCTION) trên CPU KHÔNG có AVX-512 (Zen 3, phần lớn Intel phổ thông).
-#     Wheel 0.3.22-cu124 đo được **0** lệnh `zmm` ⇒ chạy tốt.
-#   * cu124 cần runtime CUDA 12 (`cudart64_12`/`cublas64_12`) nên phải cài thêm
-#     `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12` (torch cu130 không có bản 12).
-#   * Muốn một major CUDA duy nhất (cu130): build từ source —
-#       $env:CMAKE_ARGS="-DGGML_CUDA=on -DGGML_NATIVE=OFF"; $env:FORCE_CMAKE="1"
-#       pip install llama-cpp-python --no-binary llama-cpp-python
-#   * Kiểm tra BẤT KỲ wheel nào trước khi dùng (0 dòng = an toàn):
-#       dumpbin /disasm <venv>\Lib\site-packages\llama_cpp\lib\ggml-cpu.dll | findstr zmm
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# Wheel binding của llama.cpp (xem ghi chú đầu file); chỉ chứa binding + DLL CPU không dùng tới.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# ---------------------------------------------------------------- llama.cpp (dịch GGUF)
+# PHÂN TÁCH BINDING ↔ DLL — lý do KHÔNG phải build từ source nữa:
+#   * Wheel CUDA dựng sẵn của abetlen chỉ chứa kernel tới `sm_90` ⇒ GPU Blackwell (sm_120) phải
+#     chạy qua **PTX JIT** (đo được: decode 48,3 tok/s, nạp model 4,33 s), và nhiều bản
+#     0.3.25–0.3.35 còn build kèm **AVX-512** ⇒ nổ `0xc000001d` trên CPU không có AVX-512.
+#   * Binding Python (ctypes) thì giống nhau giữa mọi wheel cùng phiên bản, nên ta chỉ cần LẤY
+#     BINDING từ wheel CPU 7 MB, rồi trỏ DLL sang bản CUDA trong repo:
+#         LLAMA_CPP_LIB_PATH=<repo>/backend/bin/llama
+#     (`backend/utils/cuda.py::setup_llama_cpp_dll_path` đặt env này; `setup_cuda_dll_paths()`
+#      gọi nó tự động nên mọi caller cũ không phải đổi gì.)
+#   * Ưu điểm: DLL CPU trong wheel KHÔNG bao giờ được nạp ⇒ vô hiệu hoàn toàn cả lỗi AVX-512
+#     lẫn PTX JIT. Đo lại qua đúng đường đi của app: decode 67,6 tok/s · prefill 2.710 tok/s ·
+#     nạp model 2,26 s · `offloaded 33/33 layers to GPU` · `ARCHS = 1200`.
+#   * Muốn dựng lại DLL CUDA: `scratch\build_llama_cpp_cuda_blackwell.bat`, rồi chép
+#     `llama.dll` + `ggml*.dll` + `mtmd.dll` từ `llama_cpp\lib\` vào `backend/bin/llama/`.
+#   * ⚠️ DLL llama.cpp PHẢI ở thư mục RIÊNG, không để chung `backend/bin/`: cả hai bên đều có
+#     `ggml.dll`/`ggml-base.dll`/`ggml-cpu.dll`/`ggml-cuda.dll` nhưng là hai bản ggml khác nhau,
+#     Windows phân giải theo tên module nên để chung sẽ chết với `0xc0000139`.
 
 # ---------------------------------------------------------------- Web framework
 fastapi>=0.115,<1.0
@@ -70,10 +79,11 @@ transcribe-cpp>=0.2.3
 transcribe-cpp-native>=0.2.3
 
 # ------------------------------------------------------------------ Dịch (llama.cpp GGUF)
-# Bản CUDA dựng sẵn cho Windows; index ở đầu file lo việc chọn đúng wheel.
-# ⚠️ PIN 0.3.22: các bản 0.3.25–0.3.35 build kèm AVX-512 ⇒ crash `0xC000001D` trên CPU không có
-#    AVX-512 (xem ghi chú chi tiết ở đầu file). Kiểm wheel mới: `dumpbin /disasm … | findstr zmm`.
-llama-cpp-python==0.3.22
+# Lấy BINDING từ wheel CPU 7 MB (index khai ở đầu file). `--only-binary` để pip KHÔNG tự build
+# từ sdist (build ~10 phút và ra bản CPU-only nếu thiếu CMAKE_ARGS) — thiếu wheel thì báo lỗi rõ
+# ràng thay vì âm thầm cài bản chậm. DLL CUDA thật nằm ở `backend/bin/llama/`, xem ghi chú trên.
+--only-binary llama-cpp-python
+llama-cpp-python==0.3.35
 
 # ------------------------------------------------------------------- TTS (OmniVoice)
 # kéo theo torch/torchaudio (>=2.4) + transformers + librosa + pydub

@@ -218,7 +218,7 @@ def test_backend_log_never_suggests_bogus_package(caplog):
     """Log backend ASR KHÔNG được hướng dẫn `pip install transcribe-cpp-native-cu12`.
 
     Gói đó trên PyPI chỉ có `0.0.0` — name reservation, wheel 1380 byte không có native
-    code. CUDA cho ASR nay có được là nhờ **tự dựng** bundle trong `bin/` (xem
+    code. CUDA cho ASR nay có được là nhờ bundle **có sẵn trong `backend/bin/`** (xem
     `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2), không phải nhờ cài gói kia.
     """
     import logging

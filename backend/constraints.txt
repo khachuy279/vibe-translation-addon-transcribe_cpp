@@ -37,8 +37,16 @@ torch==2.12.0+cu130
 torchaudio==2.11.0+cu130
 torchvision==0.27.0+cu130
 
-# llama.cpp cũng bị ghim vì lý do riêng (không phải CUDA major): các bản 0.3.25–0.3.35 build
-# kèm AVX-512 (`ggml-cpu.dll` 7.177 lệnh `zmm`) ⇒ `llama_init_from_model` nổ `0xC000001D` trên
-# CPU không có AVX-512 (đo thực: Ryzen 5 5600X). 0.3.22-cu124 đo được 0 lệnh `zmm`.
-# Cần runtime CUDA 12: `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12`.
-llama-cpp-python==0.3.22
+# llama.cpp: cài BINDING từ wheel CPU 7 MB (`whl/cpu` của abetlen), DLL CUDA nằm trong repo.
+# Lý do ghim 0.3.22 trước đây (wheel 0.3.25–0.3.35 dính AVX-512) đã hết: DLL CPU của wheel
+# KHÔNG bao giờ được nạp vì `backend/utils/cuda.py::setup_llama_cpp_dll_path()` đặt
+# `LLAMA_CPP_LIB_PATH=<repo>/backend/bin/llama` trước khi `import llama_cpp`.
+#   DLL CUDA trong repo: `backend/bin/llama/` (llama.dll + ggml*.dll + mtmd.dll, ~60 MB)
+#   Dựng lại DLL:        scratch\build_llama_cpp_cuda_blackwell.bat → chép vào backend/bin/llama/
+#   Đo qua đúng đường đi của app (RTX 5060 Ti sm_120, Hy-MT2-7B Q4_K_XL, n_ctx=512):
+#       decode 67,6 tok/s · prefill 2.710 tok/s · nạp model 2,26 s · offloaded 33/33 layers
+#       `CUDA : ARCHS = 1200 | BLACKWELL_NATIVE_FP4 = 1`
+#   (wheel cu124 dựng sẵn trước đây: decode 48,3 tok/s · nạp model 4,33 s)
+#   KHÔNG cần `nvidia-cuda-runtime-cu12` / `nvidia-cublas-cu12`: DLL chỉ phụ thuộc
+#   `cublas64_13.dll` / `cudart64_13.dll`, đã có trong `torch/lib` (hoặc chép vào backend/bin/).
+llama-cpp-python==0.3.35

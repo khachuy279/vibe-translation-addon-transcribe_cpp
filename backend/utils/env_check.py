@@ -141,7 +141,8 @@ def check_llama_cpp() -> Optional[str]:
     except Exception:  # noqa: BLE001
         return None
 
-    # BẮT BUỘC: đăng ký đường dẫn DLL CUDA trước khi nạp llama.dll (giống backend thật).
+    # BẮT BUỘC: đăng ký đường dẫn DLL CUDA (và chọn thư mục DLL llama.cpp) trước khi nạp
+    # llama.dll — giống hệt `backend/translation/engine.py`.
     try:
         from backend.utils.cuda import setup_cuda_dll_paths  # noqa: PLC0415
 
@@ -155,12 +156,12 @@ def check_llama_cpp() -> Optional[str]:
         return None
     except Exception as exc:  # noqa: BLE001
         return (
-            f"không import được llama_cpp ({type(exc).__name__}: {exc}). Thường là THIẾU RUNTIME "
-            "CUDA khớp wheel llama.cpp: wheel cu124 cần `cudart64_12.dll`/`cublas64_12.dll`, "
-            "wheel cu130 cần bản 13. Sửa: `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12` "
-            "(cho cu124), hoặc cài wheel đúng index CUDA đang dùng. Nếu lỗi xuất hiện ở bước NẠP "
-            "MODEL với `0xc000001d` thì đó là wheel build bằng AVX-512 (CPU không hỗ trợ) — dùng "
-            "`llama-cpp-python==0.3.22` (cu124) hoặc build từ source với `-DGGML_NATIVE=OFF`."
+            f"llama.cpp: không import được llama_cpp ({type(exc).__name__}: {exc}). Kiểm tra: "
+            "`backend/bin/llama/llama.dll` có tồn tại không (bundle CUDA đi kèm repo), và "
+            "runtime CUDA 13 (`cudart64_13.dll`/`cublas64_13.dll`/`cublasLt64_13.dll`) có "
+            "trong `torch/lib` hoặc `backend/bin/` không. Nếu lỗi xuất hiện ở bước NẠP MODEL "
+            "với `0xc000001d` thì đó là STATUS_ILLEGAL_INSTRUCTION do AVX-512 — bản trong "
+            "`backend/bin/llama/` đã tắt AVX-512 nên không gặp."
         )
 
 
@@ -170,7 +171,7 @@ def check_asr_binding() -> Optional[str]:
     Đã gặp thực tế trong venv sạch: chỉ cài `transcribe-cpp-native` (provider) mà quên binding
     `transcribe-cpp` ⇒ log `transcribe_cpp package chưa được cài đặt!`,
     `/health → asr_runtime.devices = "n/a"`, và cảnh báo "không backend nào trong ('cuda',
-    'vulkan') khả dụng" dù `bin/ggml-cuda.dll` còn nguyên.
+    'vulkan') khả dụng" dù `backend/bin/ggml-cuda.dll` còn nguyên.
     """
     try:
         import importlib.util  # noqa: PLC0415

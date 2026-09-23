@@ -42,8 +42,8 @@ from backend.utils.cuda import setup_cuda_dll_paths
 
 setup_cuda_dll_paths()
 try:
-    # Bootstrap TRƯỚC để `TRANSCRIBE_LIBRARY` trỏ vào bundle `bin/` (CUDA); nếu không,
-    # native của wheel (Vulkan) đã vào sys.modules và bin/ không áp được.
+    # Bootstrap TRƯỚC để `TRANSCRIBE_LIBRARY` trỏ vào bundle `backend/bin/` (CUDA); nếu không,
+    # native của wheel (Vulkan) đã vào sys.modules và backend/bin/ không áp được.
     from backend.asr import native as _asr_native
 
     _asr_native.bootstrap()

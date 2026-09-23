@@ -72,8 +72,8 @@ def _log_asr_backend_at_startup() -> None:
 
     Lịch sử: trước đây hàm này tên `_warn_if_cuda_provider_missing()` và khẳng định
     *"KHÔNG dùng được CUDA cho ASR trên Windows"*. Kết luận đó **đã hết đúng**: dự án tự
-    dựng được bundle CUDA trong `bin/` (xem `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2),
-    và PyPI `transcribe-cpp-native-cu12` vẫn chỉ là name-reservation.
+    dựng được bundle CUDA trong `backend/bin/` (xem `report/audit/KE_HOACH_FIX_LOI_Hy3.md`
+    §4.1.2), và PyPI `transcribe-cpp-native-cu12` vẫn chỉ là name-reservation.
 
     Hàm này KHÔNG quyết định backend — `backend/asr/native.py::resolve_backend()` làm việc đó
     (có fallback + log). Ở đây chỉ tóm tắt trạng thái để người vận hành thấy ngay lúc khởi động.
@@ -87,7 +87,12 @@ def _log_asr_backend_at_startup() -> None:
         effective = asr_native.resolve_backend(config.asr.backend)
 
         bundle = info.get("native_bundle_dir")
-        source_desc = f"bin/ ({info.get('native_bundle_source')})" if bundle else "installed"
+        if bundle:
+            # Hiện cả thư mục cha để phân biệt `backend/bin` (mặc định) với vị trí cũ `<root>/bin`.
+            _bp = Path(bundle)
+            source_desc = f"{_bp.parent.name}/{_bp.name} ({info.get('native_bundle_source')})"
+        else:
+            source_desc = "installed"
         line = (
             f"[STARTUP] Backend={effective} (req={requested}) | "
             f"native={source_desc} | devices={info.get('devices')}"
@@ -158,7 +163,7 @@ def _asr_runtime_info() -> Dict[str, Any]:
     """Thông tin backend ASR thực tế đang dùng (để /health xác nhận bằng mắt).
 
     Lưu ý: `provider` là tên provider PyPI (entry point). Khi chạy bằng bundle cục bộ
-    trong `bin/` (qua `TRANSCRIBE_LIBRARY`), binding đi theo đường "dev-tree" nên
+    trong `backend/bin/` (qua `TRANSCRIBE_LIBRARY`), binding đi theo đường "dev-tree" nên
     `native_provider()` trả `None` — đó KHÔNG phải lỗi. Dùng `native_source`/
     `native_bundle_dir` để biết thư viện native đang nạp thực sự đến từ đâu.
     """

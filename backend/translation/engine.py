@@ -20,7 +20,9 @@ from typing import Any, AsyncIterator, Dict, Optional
 from backend.utils.cuda import setup_cuda_dll_paths
 from backend.utils.logger import logger
 
-# Bắt buộc thiết lập đường dẫn CUDA DLL trước khi nạp llama_cpp
+# Bắt buộc thiết lập đường dẫn DLL trước khi nạp llama_cpp.
+# `setup_cuda_dll_paths()` cũng chọn luôn thư mục DLL llama.cpp (`backend/bin/llama/` qua env
+# `LLAMA_CPP_LIB_PATH`) nên binding CPU từ wheel vẫn chạy CUDA.
 setup_cuda_dll_paths()
 
 try:

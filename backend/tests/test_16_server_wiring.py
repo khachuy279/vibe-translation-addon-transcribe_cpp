@@ -144,7 +144,7 @@ def test_stall_watchdog_dumps_threads_without_raising(capsys):
 def test_asr_backend_log_helper_never_raises():
     """Log backend ASR lúc khởi động phải an toàn kể cả khi không có backend CUDA.
 
-    `provider` có thể là `None` khi chạy bằng bundle cục bộ trong `bin/`
+    `provider` có thể là `None` khi chạy bằng bundle cục bộ trong `backend/bin/`
     (`TRANSCRIBE_LIBRARY`) — binding đi đường "dev-tree" nên không có tên provider PyPI.
     `_asr_runtime_info()` quy đổi trường hợp đó thành "local-bin" và luôn kèm
     `native_source`/`native_bundle_dir` để biết thư viện native đến từ đâu.

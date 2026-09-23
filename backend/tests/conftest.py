@@ -32,8 +32,8 @@ setup_cuda_dll_paths()
 # ở đây ta chốt thứ tự tường minh cho MỌI module test.
 #
 # ⚠️ NHƯNG phải để `backend.asr` BOOTSTRAP trước: `bootstrap()` đặt `TRANSCRIBE_LIBRARY`
-# trỏ vào bundle `bin/` (nếu có). Nếu `import transcribe_cpp` chạy trước, native của WHEEL
-# (chỉ Vulkan) đã vào `sys.modules` và bundle `bin/` (CUDA) KHÔNG áp được — cả suite test
+# trỏ vào bundle `backend/bin/` (nếu có). Nếu `import transcribe_cpp` chạy trước, native của WHEEL
+# (chỉ Vulkan) đã vào `sys.modules` và bundle `backend/bin/` (CUDA) KHÔNG áp được — cả suite test
 # sẽ chạy sai backend so với bản phát hành. Thứ tự đúng vẫn bảo toàn yêu cầu nạp DLL ở
 # trên, vì `transcribe_cpp` vẫn được nạp TRƯỚC `llama_cpp`.
 try:  # pragma: no cover - phụ thuộc môi trường

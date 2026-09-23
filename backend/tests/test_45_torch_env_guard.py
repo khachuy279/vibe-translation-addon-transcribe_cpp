@@ -202,7 +202,11 @@ def test_lifespan_goi_canh_bao_moi_truong():
 
 
 def test_check_llama_cpp_bao_loi_kem_goi_y(monkeypatch):
-    """Đúng lỗi đã gặp: llama.cpp wheel cu124 + torch cu130 ⇒ import nổ, phải kèm cách sửa."""
+    """Import `llama_cpp` nổ ⇒ thông báo phải chỉ đúng kho DLL và runtime CUDA cần có.
+
+    Bối cảnh mới: binding lấy từ wheel CPU ~7 MB, còn `llama.dll` + `ggml*.dll` do repo cung cấp
+    trong `backend/bin/llama/` (trỏ qua `LLAMA_CPP_LIB_PATH`). Nên gợi ý phải nói về hai thứ đó.
+    """
     import builtins
 
     real_import = builtins.__import__
@@ -217,8 +221,9 @@ def test_check_llama_cpp_bao_loi_kem_goi_y(monkeypatch):
 
     msg = env_check.check_llama_cpp()
     assert msg is not None
-    assert "llama.cpp" in msg and "cudart64_12" in msg
-    assert "0xc000001d" in msg and "AVX-512" in msg and "0.3.22" in msg
+    assert "llama.cpp" in msg and "llama.dll" in msg
+    assert "backend/bin/llama" in msg
+    assert "0xc000001d" in msg and "AVX-512" in msg
 
 
 def test_check_llama_cpp_chua_cai_thi_bo_qua(monkeypatch):

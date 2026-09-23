@@ -47,13 +47,13 @@ setup_cuda_dll_paths()
 #
 # Bản cũ `import transcribe_cpp` TRỰC TIẾP tại chỗ này, tức là nạp native của **wheel PyPI**
 # vào `sys.modules` TRƯỚC khi `backend.asr` kịp chạy `bootstrap()`. Hệ quả: bootstrap không
-# áp được bundle trong `bin/`, và cả harness đo trên **Vulkan của wheel** trong khi bản
-# chạy thật dùng **CUDA trong `bin/`** (log cảnh báo:
-# "transcribe_cpp đã được import TRƯỚC khi bootstrap ... bundle trong bin/ KHÔNG được áp dụng").
+# áp được bundle trong `backend/bin/`, và cả harness đo trên **Vulkan của wheel** trong khi bản
+# chạy thật dùng **CUDA trong `backend/bin/`** (log cảnh báo:
+# "transcribe_cpp đã được import TRƯỚC khi bootstrap ... bundle trong backend/bin KHÔNG được áp dụng").
 # Điều đó làm mọi số `infer_ms` của A/B không đại diện cho cấu hình phát hành.
 #
 # Nay: để `backend.asr` (→ `native.bootstrap()`) chạy TRƯỚC, rồi mới chạm `transcribe_cpp`.
-from backend.asr import native as _asr_native  # noqa: E402  (bootstrap bin/ ngay tại đây)
+from backend.asr import native as _asr_native  # noqa: E402  (bootstrap backend/bin/ ngay tại đây)
 
 _asr_native.bootstrap()
 try:

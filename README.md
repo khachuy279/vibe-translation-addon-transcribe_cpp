@@ -80,7 +80,7 @@ Repository: [github.com/khachuy279/vibe-translation-addon-transcribe_cpp](https:
 
 | Backend | Nguồn | Trạng thái |
 | :--- | :--- | :--- |
-| **CUDA** *(mặc định)* | `bin/` — do dự án **tự build** | ⚙️ Nhanh nhất — đo được **nhanh hơn Vulkan ~1,53×**, +243 MB VRAM |
+| **CUDA** *(mặc định)* | `backend/bin/` — bundle tự build, **có sẵn ngay sau khi clone** | ⚙️ Nhanh nhất — đo được **nhanh hơn Vulkan ~1,53×**, +243 MB VRAM |
 | **Vulkan** *(fallback)* | Wheel `transcribe-cpp-native` trên PyPI | ✅ **Được transcribe.cpp hỗ trợ CHÍNH THỨC** ⇒ **chắc chắn chạy trên mọi máy** |
 | CPU | Wheel `transcribe-cpp-native` | ❌ Chạy được nhưng **RTF ~1,6** (chậm hơn thời gian thực) ⇒ backend từ chối chọn |
 
@@ -89,7 +89,7 @@ Repository: [github.com/khachuy279/vibe-translation-addon-transcribe_cpp](https:
 > (`transcribe-cpp-native-cu12` chỉ là *name reservation* — wheel `0.0.0` ~1,4 KB, không có native
 > code), nên nó là bản **dự án tự build** và **không đảm bảo có mặt trên mọi máy**. Vulkan thì
 > `transcribe.cpp` hỗ trợ **chính thức** qua wheel ⇒ đó là đường **chắc chắn chạy**. Vì vậy Vulkan
-> luôn là **đích fallback**: nếu `bin/ggml-cuda.dll` không có, backend **tự chuyển về Vulkan** và
+> luôn là **đích fallback**: nếu `backend/bin/ggml-cuda.dll` không có, backend **tự chuyển về Vulkan** và
 > ghi log WARNING nêu rõ — không cần cấu hình gì thêm.
 >
 > Kiểm tra thực tế: `GET /health → asr_runtime`, hoặc log lúc khởi động
@@ -114,13 +114,13 @@ python -m venv .venv
 pip install -r backend\requirements.txt -c backend\constraints.txt
 ```
 
-`backend/requirements.txt` đã khai báo sẵn `--extra-index-url` cho hai gói **không có bản CUDA trên
-PyPI**, nên một lệnh là đủ:
+`backend/requirements.txt` đã khai báo sẵn `--extra-index-url` của PyTorch cho `torch`/`torchaudio`
+(PyPI chỉ có bản **CPU**), nên một lệnh là đủ cho hai gói đó.
 
-| Gói | Vì sao cần index riêng |
+| Gói | Vì sao phải xử lý riêng |
 | :--- | :--- |
-| `torch` / `torchaudio` | PyPI chỉ có bản **CPU**; index chính thức của PyTorch có bản CUDA |
-| `llama-cpp-python` | PyPI chỉ có **sdist** (phải tự build, cần `nvcc`); index của tác giả `abetlen` có wheel Windows dựng sẵn với CUDA |
+| `torch` / `torchaudio` | PyPI chỉ có bản **CPU**; index chính thức của PyTorch có bản CUDA ⇒ khai báo bằng `--extra-index-url` |
+| `llama-cpp-python` | Cài **binding** từ wheel CPU ~7 MB (`whl/cpu` của abetlen) rồi trỏ sang **DLL CUDA có sẵn trong repo** (`backend/bin/llama/`) ⇒ **không phải build** — xem [Bước 3](#-cài-đặt) |
 
 > [!NOTE]
 > **Chưa có file `requirements.txt` ở thư mục gốc** — file nằm trong `backend/` vì đây là phụ thuộc
@@ -149,16 +149,17 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 # Nếu driver của bạn CHỈ hỗ trợ CUDA 12.x, dùng cu124 thay thế:
 # pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
-# ⚠️ Đổi torch sang cu124 thì phải đổi CẢ llama.cpp sang whl/cu124 (Bước 3) và thêm
-#    `pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12`, nếu không `import llama_cpp` sẽ nổ.
+# (llama.cpp dùng DLL CUDA có sẵn trong repo nên KHÔNG bị ràng buộc theo major CUDA của torch —
+#  nó dùng toolkit CUDA 13 trong repo.)
 ```
 
-`backend/utils/cuda.py` tự đăng ký đường tìm DLL theo thứ tự: `torch/lib` → **CUDA 13 toolkit
-trong repo** (`external/cuda-toolkit/nvidia/cu13/bin/x86_64`, hoặc `.cuda-toolkit/…`) → `CUDA_PATH`
-→ Program Files. Nhờ vậy bundle ASR CUDA trong `bin/` **không phụ thuộc bản torch nào**: chỉ cần
-`cudart64_13.dll` / `cublas64_13.dll` / `cublasLt64_13.dll` có trong toolkit đã dùng để build.
+`backend/utils/cuda.py` tự đăng ký đường tìm DLL: **`backend/bin/`** (kho DLL cục bộ của dự án) →
+`torch/lib` → **CUDA 13 toolkit trong repo** (`external/cuda-toolkit/nvidia/cu13/bin/x86_64`, hoặc
+`.cuda-toolkit/…`) → `CUDA_PATH` → Program Files. Nhờ vậy bundle ASR CUDA trong `backend/bin/`
+**không phụ thuộc bản torch nào**: chỉ cần `cudart64_13.dll` / `cublas64_13.dll` / `cublasLt64_13.dll`
+có trong toolkit đã dùng để build — hoặc chép thẳng 3 DLL đó vào `backend/bin/` nếu muốn tự đủ.
 (Đã gặp thực tế: torch bị đổi sang bản CPU-only ⇒ `torch/lib` hết CUDA runtime ⇒ CUDA backend
-không nạp được dù `bin/ggml-cuda.dll` còn nguyên; nay lấy từ toolkit nên vẫn chạy.)
+không nạp được dù `backend/bin/ggml-cuda.dll` còn nguyên; nay lấy từ toolkit nên vẫn chạy.)
 
 **Kiểm tra:**
 ```powershell
@@ -168,39 +169,81 @@ python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.
 </details>
 
 <details>
-<summary><b>Bước 3 — llama.cpp cho dịch GGUF (bắt buộc có CUDA)</b></summary>
+<summary><b>Bước 3 — llama.cpp cho dịch GGUF (binding từ wheel + DLL CUDA trong repo)</b></summary>
 
-```powershell
-pip install "llama-cpp-python==0.3.22" `
-  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-# wheel cu124 cần runtime CUDA 12 (torch cu130 không có bản 12):
-pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12
+Engine dịch dùng `llama-cpp-python`. **Bạn không phải build gì cả** — `pip install -r
+backend\requirements.txt` là đủ (ba dòng này đã nằm sẵn trong file đó):
+
+```text
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+--only-binary llama-cpp-python
+llama-cpp-python==0.3.35
 ```
 
-**Kiểm tra GPU offload đã bật chưa** (phải in `True`):
+**Cơ chế: tách BINDING khỏi DLL.** Wheel Windows của `llama-cpp-python` trên PyPI **chỉ có sdist**
+(pip sẽ tự build ~10 phút, cần MSVC + nvcc, và ra bản **CPU-only** nếu thiếu `CMAKE_ARGS`), còn
+wheel CUDA dựng sẵn thì chỉ chứa kernel tới `sm_90` (GPU Blackwell phải chạy qua PTX JIT — chậm hơn
+~43%) và nhiều bản còn dính AVX-512. Vì vậy dự án lấy **binding** (lớp ctypes ~7 MB, không có native
+code) từ wheel CPU của abetlen, rồi để **DLL CUDA thật** nằm trong repo:
+
+```text
+backend/bin/llama/                    # ~60 MB, CÓ trong git — clone là có ngay
+├── llama.dll                         #   bản dựng CUDA 13.4, SASS native sm_120, AVX-512 OFF
+├── ggml-cuda.dll                     #   50,8 MB  (wheel dựng sẵn cũ: 795 MB)
+├── ggml.dll · ggml-base.dll · ggml-cpu.dll
+└── mtmd.dll
+```
+
+`backend/utils/cuda.py::setup_llama_cpp_dll_path()` đặt env `LLAMA_CPP_LIB_PATH` trỏ vào thư mục đó
+**trước khi** `import llama_cpp` (`llama_cpp/llama_cpp.py` đọc env này để chọn thư mục thư viện), và
+được gọi tự động bên trong `setup_cuda_dll_paths()` nên mọi đường vào đều đúng — kể cả script đo
+đạc chỉ gọi mỗi `setup_cuda_dll_paths()`.
+
+> [!IMPORTANT]
+> `backend/bin/llama/` **phải là thư mục RIÊNG**, không để chung với `backend/bin/` (bundle ASR):
+> cả hai đều chứa `ggml.dll` / `ggml-base.dll` / `ggml-cpu.dll` / `ggml-cuda.dll` nhưng là **hai
+> bản ggml KHÁC NHAU**. Windows phân giải DLL phụ thuộc theo **tên module**, nên để chung một thư
+> mục thì `transcribe.dll` sẽ bind nhầm `ggml-base.dll` của llama.cpp và cả tiến trình chết với
+> `0xc0000139` (STATUS_ENTRYPOINT_NOT_FOUND).
+
+**Kiểm tra** — phải in `True`, và log nạp model phải ghi `assigned to device CUDA0`:
 ```powershell
+python -m backend.utils.env_check
 python -c "import sys;sys.path.insert(0,'.');from backend.utils.cuda import setup_cuda_dll_paths;setup_cuda_dll_paths();from llama_cpp import llama_cpp as L;print('GPU offload:',L.llama_supports_gpu_offload())"
 ```
 
-> ⚠️ **Vì sao GHIM 0.3.22 (đã đo trên Ryzen 5 5600X)**
-> * Các wheel llama.cpp MỚI (0.3.25–0.3.35, kể cả cu130) được build kèm **AVX-512**:
->   `ggml-cpu.dll` chứa **7.177 lệnh `zmm`**. CPU không có AVX-512 (Zen 3, phần lớn Intel phổ
->   thông) sẽ nổ ngay khi nạp model: `OSError: [WinError -1073741795] … 0xc000001d`
->   (STATUS_ILLEGAL_INSTRUCTION) — **kể cả khi chạy CPU-only**.
-> * Wheel `0.3.22` (cu124) đo được **0** lệnh `zmm` ⇒ chạy tốt cả CPU lẫn GPU.
-> * Kiểm tra một wheel bất kỳ trước khi dùng (0 dòng = an toàn):
->   ```powershell
->   dumpbin /disasm .venv\Lib\site-packages\llama_cpp\lib\ggml-cpu.dll | findstr zmm
->   ```
-> * Muốn dùng CUDA 13 (một major duy nhất với torch/bundle ASR): build từ source, tắt
->   `GGML_NATIVE` để ggml tự chọn tập lệnh theo CPU:
->   ```powershell
->   $env:CMAKE_ARGS="-DGGML_CUDA=on -DGGML_NATIVE=OFF"; $env:FORCE_CMAKE="1"
->   pip install llama-cpp-python --no-binary llama-cpp-python
->   ```
+> **Số đo qua đúng đường đi của app** (RTX 5060 Ti, Hy-MT2-7B `Q4_K_XL`, `n_ctx=512`,
+> `n_gpu_layers=-1`): `offloaded 33/33 layers to GPU` · `CUDA0 model buffer = 4553 MiB` ·
+> decode **67,6 tok/s** · prefill **2.710 tok/s** · nạp model **2,26 s** · `ARCHS = 1200`.
+> (Wheel cu124 dựng sẵn trước đây: decode 48,3 tok/s · nạp model 4,33 s.)
 
-> ⚠️ Nếu `GPU offload` in `False`, bạn đang có bản **CPU** (vẫn dịch được nhưng rất chậm).
-> Cách xử lý: cài lại bằng index ở trên, hoặc build từ source.
+<details>
+<summary>Dựng lại DLL CUDA (chỉ khi muốn bản llama.cpp mới hơn)</summary>
+
+Cần MSVC 2022/2026 + toolkit CUDA 13 trong repo (`.cuda-toolkit\nvidia\cu13`):
+
+```powershell
+.\scratch\build_llama_cpp_cuda_blackwell.bat
+# rồi chép DLL vào kho của repo:
+copy .venv\Lib\site-packages\llama_cpp\lib\*.dll backend\bin\llama\
+```
+
+Các cờ quan trọng mà script truyền cho CMake:
+
+| Cờ | Vì sao |
+| :--- | :--- |
+| `-DGGML_CUDA=on` | Bật backend CUDA. Thiếu cờ này ⇒ bản **CPU** và `llama_supports_gpu_offload()` trả `False` |
+| `-DCMAKE_CUDA_ARCHITECTURES=120` | Sinh SASS **native**. RTX 50 → `120`, RTX 40 → `89`, RTX 30 → `86`, RTX 20 → `75` |
+| `-DGGML_NATIVE=OFF` | Không dùng `-march=native` ⇒ DLL chạy được cả trên CPU khác |
+| `-DGGML_AVX512*=OFF` | Tắt hẳn AVX-512 — nguyên nhân lỗi `0xc000001d` |
+
+> [!NOTE]
+> `scratch/` **không được git theo dõi** (xem `.gitignore`), giống `scratch\build_cuda.bat` dùng cho
+> bundle ASR. Nếu clone mới mà thiếu script: đặt `CUDAToolkit_ROOT` về `.cuda-toolkit\nvidia\cu13`,
+> thêm `ninja` + đường dẫn `bin` của toolkit vào `PATH`, rồi chạy
+> `pip wheel llama-cpp-python==0.3.35 --no-binary llama-cpp-python --no-deps -w <thư-mục-ra>`.
+
+</details>
 </details>
 
 <details>
@@ -211,7 +254,7 @@ pip install transcribe-cpp transcribe-cpp-native
 ```
 ⚠️ **Phải cài CẢ HAI**: `transcribe-cpp-native` là thư viện native, `transcribe-cpp` là binding
 Python. Thiếu binding ⇒ log `transcribe_cpp package chưa được cài đặt!`,
-`/health → asr_runtime.devices = "n/a"` và **không có backend ASR nào** (dù `bin/ggml-cuda.dll`
+`/health → asr_runtime.devices = "n/a"` và **không có backend ASR nào** (dù `backend/bin/ggml-cuda.dll`
 còn nguyên). `transcribe-cpp-native` là provider **được hỗ trợ chính thức** (Vulkan + CPU) và là
 mặc định của backend.
 </details>
@@ -238,7 +281,7 @@ python -m backend.utils.env_check          # torch có phải bản CUDA không?
 python -c "import sys;sys.path.insert(0,'.');from backend.asr import native;print('backends:', sorted(native._available_kinds()));print('devices :', native.backend_devices())"
 ```
 Kỳ vọng tối thiểu (chỉ wheel Vulkan): `backends: ['vulkan']`, `devices: vulkan=Vulkan0, cpu=CPU`.
-Nếu bạn cài torch CUDA và/hoặc có bundle trong `bin/`: `backends: ['cuda', 'vulkan', 'cpu']`.
+Nếu bạn cài torch CUDA và/hoặc có bundle trong `backend/bin/`: `backends: ['cuda', 'vulkan', 'cpu']`.
 </details>
 
 ### ⚠️ Nâng cấp gói phụ thuộc mà không phá torch CUDA
@@ -305,19 +348,23 @@ python -m backend.utils.env_check
 
 ### Bundle ASR CUDA (backend mặc định)
 
-`asr.backend` mặc định là `"cuda"`. Để nó chạy được, cần **bundle native trong `bin/`**:
-`bin/transcribe.dll` + `bin/ggml-*.dll` (gồm `ggml-cuda.dll`). Đo được: **nhanh hơn Vulkan ~1,53×**,
-độ chính xác tương đương, tốn thêm ~243 MB VRAM.
+`asr.backend` mặc định là `"cuda"`. Để nó chạy được, cần **bundle native trong `backend/bin/`**:
+`backend/bin/transcribe.dll` + `backend/bin/ggml-*.dll` (gồm `ggml-cuda.dll`). Đo được: **nhanh hơn
+Vulkan ~1,53×**, độ chính xác tương đương, tốn thêm ~243 MB VRAM.
+
+> Bundle này **đã có sẵn trong repo** (6 DLL, ~121 MB, được git theo dõi) ⇒ `git clone` là có luôn
+> ASR CUDA, **không phải build lại**. Chỉ cần dựng lại nếu bạn muốn bản `transcribe.cpp` mới hơn.
 
 1. **Kiểm tra bạn đã có bundle chưa:**
    ```powershell
    python -c "import sys;sys.path.insert(0,'.');from backend.asr import native as N;print('có sẵn:', sorted(N._available_kinds()))"
    ```
    Ra `['cuda', 'vulkan']` ⇒ đã có CUDA. Ra `['vulkan']` ⇒ **chưa có**, xem bước 2.
-2. **Lấy bundle.** Cách dựng lại: `external/build-tmp/build_cuda.bat`, hướng dẫn đầy đủ ở
-   `report/audit/KE_HOACH_FIX_LOI_Hy3.md` §4.1.2 (dựng CUDA toolkit **không cần quyền admin**).
-   Nếu không muốn tự build, cứ để nguyên: backend **tự fallback về Vulkan**.
-3. **Kiểm tra.** Log khởi động phải ghi `Backend: CUDA0 ... native: bin/`. Nếu không, nó ghi
+2. **Lấy bundle.** Đã có sẵn trong `backend/bin/` ngay sau khi clone. Nếu muốn dựng lại bản mới hơn:
+   `external/build-tmp/build_cuda.bat`, hướng dẫn đầy đủ ở `report/audit/KE_HOACH_FIX_LOI_Hy3.md`
+   §4.1.2 (dựng CUDA toolkit **không cần quyền admin**), rồi chép DLL vào `backend/bin/`.
+   Nếu thiếu bundle, backend **tự fallback về Vulkan**.
+3. **Kiểm tra.** Log khởi động phải ghi `Backend: CUDA0 ... native: backend/bin`. Nếu không, nó ghi
    `[WARNING] ... KHÔNG khả dụng ⇒ FALLBACK sang 'vulkan'` — đây là hành vi đúng, không phải lỗi.
 
 > **Không đổi backend lúc chạy.** Backend ASR được chốt **lúc nạp model** (thư viện native `dlopen`
@@ -420,9 +467,9 @@ inference — giữ nguyên vì nếu không warm thì câu dịch **đầu tiê
 
 ```text
 [STARTUP] Đang nạp và pre-warm song song ASR, Translation & VAD...
-[ASR] ASR native: dùng bundle cục bộ '...\bin\transcribe.dll' (nguồn: default).   # chỉ khi có bin/
-[ASR] [STARTUP] Backend=cuda (req=cuda) | native=bin/ (default) | devices=cuda=CUDA0, vulkan=Vulkan0, cpu=CPU
-[ASR] Nạp thành công ASR Model 'qwen3-asr-1.7b'(Arch: qwen3_asr, Backend: CUDA0, yêu cầu: 'cuda', Streaming: False, max_audio=..., native: bin/)
+[ASR] Native bundle: backend/bin/ (nguồn: default)   # chỉ in khi tìm thấy bundle
+[ASR] [STARTUP] Backend=cuda (req=cuda) | native=backend/bin (default) | devices=cuda=CUDA0, vulkan=Vulkan0, cpu=CPU
+[ASR] Nạp thành công ASR Model 'qwen3-asr-1.7b'(Arch: qwen3_asr, Backend: CUDA0, yêu cầu: 'cuda', Streaming: False, max_audio=..., native: backend/bin/)
 [TRANSLATE] Nạp thành công mô hình dịch 'tencent' trên GPU (n_ctx=512, n_batch=256, n_threads=4)
 [VAD] Model FireRed Stream sẵn sàng
 [VAD] [STARTUP] Engine 'firered-vad' sẵn sàng
@@ -432,7 +479,7 @@ INFO:  Uvicorn running on https://0.0.0.0:8765 (Press CTRL+C to quit)
 
 **Đọc log backend ASR:** dòng `[STARTUP] ASR backend:` là nơi khẳng định backend thực tế. Nếu bạn
 yêu cầu `cuda` mà thấy `→ thực tế='vulkan'` kèm `[WARNING] ... KHÔNG khả dụng ⇒ FALLBACK`, nghĩa là
-thư viện native đang nạp **không có** `ggml-cuda.dll` (thiếu `bin/`) — Vulkan vẫn chạy bình thường.
+thư viện native đang nạp **không có** `ggml-cuda.dll` (thiếu `backend/bin/`) — Vulkan vẫn chạy bình thường.
 
 - Chứng chỉ WSS **tự ký** được sinh tự động vào `backend/cert.pem` + `backend/key.pem`.
 - Mở `https://localhost:8765` một lần và chọn **Nâng cao → Tiếp tục** để trình duyệt chấp nhận
@@ -555,8 +602,8 @@ Toàn bộ cấu hình tập trung ở `backend/config.py` (Pydantic v2). Các c
 | `ws.port` / `ws.protocol_version` | `8765` / `3` | Cổng WSS và phiên bản giao thức |
 | **`asr.backend`** | `"cuda"` | `cuda` (mặc định) · `auto` (cuda → vulkan) · `vulkan`. **Không có `cpu`** — CPU chạy ở RTF ~1,6 nên vô dụng cho phụ đề |
 | **`asr.backend_fallback`** | `True` | Tự fallback + ghi WARNING khi backend yêu cầu không khả dụng |
-| **`asr.use_local_native`** | `True` | Ưu tiên bundle trong `bin/` hơn provider đã cài |
-| **`asr.native_dir`** | `""` | Thư mục bundle; trống = `<project_root>/bin` |
+| **`asr.use_local_native`** | `True` | Ưu tiên bundle trong `backend/bin/` hơn provider đã cài |
+| **`asr.native_dir`** | `""` | Thư mục bundle; trống = `<project_root>/backend/bin` (fallback: `<root>/bin`) |
 | `vad.vad_engine` | `firered-vad` | Engine VAD: `firered-vad` · `silero-vad` · `fsmn-vad` (mỗi engine có config riêng, xem §VAD bên dưới) |
 | `vad.threshold` | `None` | `None` = dùng **đúng mặc định trong docs** của engine đang chọn (FireRed 0.4 · Silero 0.5 · FSMN 0.6). Đặt số ⇒ ghi đè |
 | `vad.silence_duration_ms` | `None` | **0/off (popup) = `None`** ⇒ để chính VAD quyết định theo mặc định docs của nó. **> 0 ⇒ ĐIỀU KIỆN SỐ 1 để chốt câu**: processor chốt `Speech END` sau ĐÚNG ngần ấy ms im lặng, ghi đè `min_silence_frame` / `min_silence_duration_ms` / `max_end_silence_time`. Đo được (engine thật): đặt 700 → FireRed 700 ms · Silero 704 ms · FSMN 720 ms |
@@ -632,7 +679,7 @@ trực tiếp được với số trên **pipeline streaming** — hãy dùng `/
 | K5 | Không mất câu; mọi drop/merge có counter | `commit_carried_over`, `pending_commits`, `commit_slice_clamped`, `commit_dropped_stale`… | ✅ |
 | K6 | WER không xấu đi | `reuse_preview_for_commit` bật ⇒ xấu hơn (+9,5 / +14,8 điểm ở 2 file đo ổn định) ⇒ giữ TẮT | ✅ |
 | K7 | VRAM đỉnh < 14 GB | **9,5 GB** (ASR + dịch 7B + TTS) | ✅ |
-| K8 | ASR dùng CUDA | **Đã làm được** bằng bundle tự build trong `bin/` — nhanh hơn Vulkan **1,53×**, WER tương đương (chênh 0,82 điểm % < sàn nhiễu 2,28–4,12), +243 MB VRAM. **Mặc định là CUDA**; Vulkan là đường transcribe.cpp hỗ trợ chính thức nên được giữ làm **fallback tự động** khi thiếu `bin/ggml-cuda.dll` (có WARNING) | ⚙️ mặc định |
+| K8 | ASR dùng CUDA | **Đã làm được** bằng bundle tự build trong `backend/bin/` — nhanh hơn Vulkan **1,53×**, WER tương đương (chênh 0,82 điểm % < sàn nhiễu 2,28–4,12), +243 MB VRAM. **Mặc định là CUDA**; Vulkan là đường transcribe.cpp hỗ trợ chính thức nên được giữ làm **fallback tự động** khi thiếu `backend/bin/ggml-cuda.dll` (có WARNING) | ⚙️ mặc định |
 | K9 | Mọi control trong popup có tác dụng | 11/11 nhóm control có test | ✅ |
 | K10 | 0 crash khi đổi model lúc đang stream | soak **200 vòng** | ✅ |
 | K11 | Độ trễ capture phía client < 70 ms | **64 ms** (worklet gom 1024 mẫu @16 kHz) | ✅ (chờ xác nhận trên Firefox thật) |
@@ -660,12 +707,12 @@ transcript tham chiếu):
 | Log `transcribe_cpp package chưa được cài đặt!` + `/health → asr_runtime.devices = "n/a"` | Thiếu **binding** `transcribe-cpp` (chỉ cài `-native`). Cài `pip install "transcribe-cpp>=0.2.3"` rồi khởi động lại. Kiểm nhanh: `python -m backend.utils.env_check` |
 | `ModuleNotFoundError: No module named 'onnxruntime'` ở engine Silero | `silero-vad` ≥ 6.2 import onnxruntime ở cấp module (không khai báo trong metadata) ⇒ `pip install onnxruntime` |
 | Lỗi `[Errno 10048] error while attempting to bind on address ('0.0.0.0', 8765)` | Đã có một backend khác đang giữ cổng 8765 (instance cũ chưa tắt). Tắt instance cũ (Ctrl+C) hoặc tìm tiến trình đang nghe cổng: `Get-NetTCPConnection -LocalPort 8765 -State Listen` |
-| `pip install transcribe-cpp-native-cu12` rồi vẫn không có CUDA | Gói này chỉ là *name reservation* (wheel `0.0.0` ~1,4 KB, không có native code). CUDA cho ASR **không phát hành qua PyPI** — phải tự build bundle vào `bin/` (xem [Bật ASR CUDA](#bật-asr-cuda-tuỳ-chọn)). Không có `bin/` thì ASR chạy **Vulkan**, đúng như thiết kế |
+| `pip install transcribe-cpp-native-cu12` rồi vẫn không có CUDA | Gói này chỉ là *name reservation* (wheel `0.0.0` ~1,4 KB, không có native code). CUDA cho ASR **không phát hành qua PyPI** — bundle nằm sẵn trong `backend/bin/` của repo (xem [Bật ASR CUDA](#bật-asr-cuda-tuỳ-chọn)). Thiếu `backend/bin/` thì ASR chạy **Vulkan**, đúng như thiết kế |
 | Log ghi `ASR backend: 'cuda' KHÔNG khả dụng ⇒ FALLBACK sang 'vulkan'` | Thư viện native đang nạp không có `ggml-cuda.dll`. Đây là **hành vi đúng** (fallback + log rõ). Kiểm tra `GET /health → asr_runtime.available_backends` |
-| Dịch rất chậm, `llama_supports_gpu_offload()` trả `False` | Bạn đang cài bản llama.cpp **CPU**. Cài lại bằng index CUDA (xem [Bước 3](#-cài-đặt)) |
-| Lỗi `Failed to load shared library ... llama.dll (or one of its dependencies)` | **Thiếu runtime CUDA khớp wheel**: llama.dll → ggml.dll → ggml-cuda.dll cần `cudart64_1x`/`cublas64_1x` (cu124 → bản 12, cu130 → bản 13). Cài `nvidia-cuda-runtime-cu12 nvidia-cublas-cu12` nếu dùng wheel cu124; hoặc cài wheel đúng index CUDA. Chẩn đoán: `python -m backend.utils.env_check` |
-| `OSError: [WinError -1073741795] Windows Error 0xc000001d` khi **nạp model** llama.cpp | `STATUS_ILLEGAL_INSTRUCTION` = wheel llama.cpp build kèm **AVX-512** mà CPU không có (Zen 3 / Intel phổ thông). Đã đo: wheel 0.3.35-cu130 có 7.177 lệnh `zmm`, wheel 0.3.22-cu124 có 0 ⇒ `pip install --force-reinstall --no-deps "llama-cpp-python==0.3.22" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124`, hoặc build từ source với `-DGGML_NATIVE=OFF`. Kiểm wheel: `dumpbin /disasm …\llama_cpp\lib\ggml-cpu.dll \| findstr zmm` (0 dòng = an toàn) |
-| CUDA backend "biến mất" (`available_backends` chỉ còn vulkan/cpu) dù `bin\ggml-cuda.dll` vẫn còn | Thiếu runtime CUDA 13 (`cudart64_13.dll`, `cublas64_13.dll`, `cublasLt64_13.dll`). Thường gặp khi `torch` bị đổi sang bản **CPU-only** (ví dụ `2.12.0+cu130` → `2.9.1`). `backend/utils/cuda.py` đã đăng ký toolkit trong repo (`external/cuda-toolkit/nvidia/cu13/bin/x86_64`) nên bundle vẫn chạy; nếu vẫn thiếu, cài lại torch CUDA hoặc giữ toolkit đó trong repo |
+| Dịch rất chậm, `llama_supports_gpu_offload()` trả `False` | `backend/bin/llama/` thiếu hoặc không nạp được ⇒ `llama_cpp` rơi về DLL **CPU** trong `site-packages/llama_cpp/lib`. Kiểm tra: env `LLAMA_CPP_LIB_PATH` phải trỏ tới `<repo>\backend\bin\llama`, và thư mục đó phải có `llama.dll` + `ggml-cuda.dll`. Xem [Bước 3](#-cài-đặt) |
+| Lỗi `Failed to load shared library ... llama.dll (or one of its dependencies)` | **Thiếu runtime CUDA 13**: `llama.dll` → `ggml.dll` → `ggml-cuda.dll` cần `cublas64_13.dll` (bản build từ source chỉ phụ thuộc DLL này; `nvcuda.dll` do driver NVIDIA cung cấp). `backend/utils/cuda.py` đã đăng ký `.cuda-toolkit\nvidia\cu13\bin\x86_64` và `torch/lib`. Chẩn đoán: `python -m backend.utils.env_check` |
+| `OSError: [WinError -1073741795] Windows Error 0xc000001d` khi **nạp model** llama.cpp | `STATUS_ILLEGAL_INSTRUCTION` = binary llama.cpp build kèm **AVX-512** mà CPU không có (Zen 3 / Intel phổ thông). Bản trong `backend/bin/llama/` đã tắt hẳn AVX-512, nên gặp lỗi này nghĩa là env `LLAMA_CPP_LIB_PATH` KHÔNG được áp và `llama_cpp` đang nạp DLL CPU của wheel (0.3.25–0.3.35 có 7.177 lệnh `zmm`). Kiểm tra `echo $env:LLAMA_CPP_LIB_PATH` — xem [Bước 3](#-cài-đặt) |
+| CUDA backend "biến mất" (`available_backends` chỉ còn vulkan/cpu) dù `backend\bin\ggml-cuda.dll` vẫn còn | Thiếu runtime CUDA 13 (`cudart64_13.dll`, `cublas64_13.dll`, `cublasLt64_13.dll`). Thường gặp khi `torch` bị đổi sang bản **CPU-only** (ví dụ `2.12.0+cu130` → `2.9.1`). `backend/utils/cuda.py` đã đăng ký `backend/bin/` + toolkit trong repo (`external/cuda-toolkit/nvidia/cu13/bin/x86_64`) nên bundle vẫn chạy; cách chắc ăn nhất là chép thẳng 3 DLL đó vào `backend/bin/` |
 | Đổi model dịch báo *Chưa có file GGUF cục bộ* | File chưa tải và `auto_download` đang tắt. Bật lại (mặc định bật) để backend tự tải, hoặc copy `.gguf` vào `backend/models/` |
 | Đang tải model dịch, API trả **409** | Một lượt tải/nạp khác đang chạy. Xem `GET /api/config → translation.download`, đợi xong rồi thử lại |
 | Backend đứng im, **Ctrl+C không tắt được** | Xem log có `[STALL WATCHDOG]` (dump stack mọi thread). Gửi kèm dump khi báo lỗi; đây là dạng treo event loop mà watchdog được thiết kế để bắt |
@@ -680,12 +727,12 @@ transcript tham chiếu):
 
 1. **1 phiên / 1 video** — xem khối cảnh báo ở đầu tài liệu. Không có model pool.
 2. **ASR không tự tải model** — phải copy `.gguf` vào `backend/models/` (khác với model dịch và VAD).
-3. **ASR cần bundle CUDA trong `bin/` để chạy nhanh nhất.** Bản CUDA **không có trên PyPI** (phải
-   tự build), nên nếu `bin/ggml-cuda.dll` thiếu, backend **tự fallback về Vulkan** — đường
-   `transcribe.cpp` hỗ trợ chính thức, chắc chắn chạy, nhưng chậm hơn ~1,53×. Việc fallback được
-   ghi log WARNING rõ ràng; xem [Bundle ASR CUDA](#bundle-asr-cuda-backend-mặc-định).
-   **Lưu ý:** `bin/` **không** nằm trong git (đã `git rm --cached` — xem §9 của `.gitignore`), nên
-   bản `git clone` mới **không có** DLL nào; phải tự build bundle theo hướng dẫn trên.
+3. **ASR cần bundle CUDA trong `backend/bin/` để chạy nhanh nhất.** Bản CUDA **không có trên PyPI**
+   (phải tự build), nên nếu `backend/bin/ggml-cuda.dll` thiếu, backend **tự fallback về Vulkan** —
+   đường `transcribe.cpp` hỗ trợ chính thức, chắc chắn chạy, nhưng chậm hơn ~1,53×. Việc fallback
+   được ghi log WARNING rõ ràng; xem [Bundle ASR CUDA](#bundle-asr-cuda-backend-mặc-định).
+   **Lưu ý:** `backend/bin/` **có** nằm trong git (6 DLL ~121 MB — xem §9 của `.gitignore`), nên bản
+   `git clone` mới **có sẵn** bundle ⇒ ASR CUDA chạy ngay, không phải build lại.
 4. **Cửa sổ preview có đuôi độ trễ lẻ**: p50 ≈ 87 ms nhưng thỉnh thoảng spike ~2,5 s do tầng native
    dựng lại scheduler/compute context mỗi `run()`. Nhịp preview **bỏ nhịp** (không trôi) và commit
    được ưu tiên nên phụ đề chốt không bị chặn.
@@ -704,12 +751,12 @@ vibe-translation-addon-transcribe_cpp/
 ├── backend/
 │   ├── main.py                   # FastAPI app: lifespan pre-warm, REST API, WSS endpoint
 │   ├── config.py                 # Cấu hình tập trung (Pydantic v2) — gồm asr.backend, gpu.*
-│   ├── requirements.txt          # Phụ thuộc runtime (torch cu130 + llama.cpp CUDA qua extra-index)
+│   ├── requirements.txt          # Phụ thuộc runtime (torch cu130 + binding llama.cpp; DLL CUDA ở bin/)
 │   ├── requirements-dev.txt      # + pytest / pytest-asyncio
 │   ├── models.yaml               # Catalog model ASR (GGUF)
 │   ├── translation_models.yaml   # Catalog model dịch (GGUF + repo HuggingFace)
 │   ├── asr/                      # transcribe.cpp engine, registry, adapter, text cleaner
-│   │   └── native.py             #   nạp bundle bin/ + chọn backend có fallback (Vulkan/CUDA)
+│   │   └── native.py             #   nạp bundle backend/bin/ + chọn backend có fallback (Vulkan/CUDA)
 │   ├── core/                     # Ring buffer, SpeechNormalizer, CommitManager, dedup, metrics
 │   │   └── gpu_scheduler.py      #   GpuArbiter (A2-1) — điều phối tranh chấp GPU, mặc định TẮT
 │   ├── vad/                      # VADProcessor + engine FireRed / Silero / FSMN
@@ -719,10 +766,13 @@ vibe-translation-addon-transcribe_cpp/
 │   ├── utils/                    # logger (quy ước tag), CUDA DLL, SSL tự ký, mem_guard, stall_watchdog
 │   ├── voices/                   # Giọng mẫu (.wav/.txt), voices.json, wav_downloader.py
 │   ├── models/                   # Model cục bộ (.gguf, .jit, firered_stream/, fsmn_vad/) — gitignore
+│   ├── bin/                      # Kho DLL native — CÓ trong git (clone là có, không phải build)
+│   │   ├── transcribe.dll …      #   Bundle ASR CUDA/Vulkan: transcribe.dll + ggml(-base|-cpu|-cuda|-vulkan).dll (~121 MB)
+│   │   │                         #   Có ⇒ nạp từ đây; thiếu ⇒ dùng wheel đã cài (Vulkan)
+│   │   └── llama/                #   DLL llama.cpp CUDA cho engine dịch (~60 MB): llama.dll + ggml*.dll + mtmd.dll
+│   │                             #   Trỏ tới qua LLAMA_CPP_LIB_PATH (backend/utils/cuda.py). PHẢI để riêng
+│   │                             #   vì trùng tên ggml*.dll với bundle ASR ở trên.
 │   └── tests/                    # test_01…test_29 + harness JS (Node) + harness WER
-├── bin/                          # Bundle native ASR lúc chạy — gitignore, TÙY CHỌN
-│                                 #   transcribe.dll + ggml(-base|-cpu|-cuda|-vulkan).dll
-│                                 #   Có bin/ ⇒ nạp từ đây; không có ⇒ dùng wheel đã cài (Vulkan)
 ├── external/                     # gitignore: transcribe.cpp, omnivoice.cpp, FireRedVAD
 │   ├── transcribe.cpp/           #   Mã nguồn ASR (Vulkan chính thức; CUDA tự build)
 │   ├── cuda-toolkit/             #   CUDA toolkit dựng từ wheel pip (chỉ khi tự build CUDA)
@@ -749,7 +799,7 @@ Dự án phát hành theo **MIT License** — dùng, sửa, chia sẻ tự do ch
 - `report/audit/00_BAO_CAO_AUDIT_HIEU_NANG.md` — audit hiệu năng đầy đủ (F-01…F-51).
 - `report/audit/BAO_CAO_AUDIT_HIEU_NANG_Hy3.md` — audit hiệu năng chuyên sâu (A2-1, A2-2, B3-1, …).
 - `report/audit/KE_HOACH_FIX_LOI_Hy3.md` — **kế hoạch fix lỗi + kết quả**: Gate G1–G3 (build ASR
-  CUDA), hạ tầng Nhánh A (`bin/`, chọn backend + fallback), và `GpuArbiter` (A2-1) kèm số đo A/B.
+  CUDA), hạ tầng Nhánh A (`backend/bin/`, chọn backend + fallback), và `GpuArbiter` (A2-1) kèm số đo A/B.
 - `report/audit/03_KE_HOACH_TRIEN_KHAI.md` — kế hoạch triển khai & KPI.
 - `report/audit/05_measurements_and_status.md` — trạng thái, số đo, nghiệm thu K1–K12.
 
