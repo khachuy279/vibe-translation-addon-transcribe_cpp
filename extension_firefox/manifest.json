@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bilingual Subtitle",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Real-time bilingual subtitles for videos using transcribe.cpp (giao thức v3: payload gọn)",
   "browser_specific_settings": {
     "gecko": {

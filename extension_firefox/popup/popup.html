@@ -81,7 +81,7 @@
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>⏱️ VAD Silence</label>
-            <span class="val-badge"><span id="valVadSilence">0</span><span id="valVadSilenceUnit"></span></span>
+            <span class="val-badge"><span id="valVadSilence">600</span><span id="valVadSilenceUnit"></span></span>
           </div>
           <!-- 0 = OFF: để chính VAD dùng mặc định trong docs của nó (FireRed 200 ms,
                Silero 100 ms, FSMN 800 ms).
@@ -89,23 +89,23 @@
                Speech END sau ĐÚNG ngần ấy ms im lặng, ghi đè min_silence_frame /
                min_silence_duration_ms / max_end_silence_time của engine.
                Không còn hangover/pre-speech ở tầng processor. -->
-          <input type="range" id="rangeVadSilence" min="0" max="1500" step="50" value="0">
+          <input type="range" id="rangeVadSilence" min="0" max="1500" step="50" value="600">
         </div>
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>🎯 Threshold</label>
-            <span class="val-badge"><span id="valVadThreshold">0.35</span></span>
+            <span class="val-badge"><span id="valVadThreshold">0.50</span></span>
           </div>
-          <input type="range" id="rangeVadThreshold" min="0.10" max="0.90" step="0.05" value="0.35">
+          <input type="range" id="rangeVadThreshold" min="0.10" max="0.90" step="0.05" value="0.50">
         </div>
       </div>
 
       <div class="setting-group">
         <div class="label-with-value">
           <label>📝 Min Words</label>
-          <span class="val-badge"><span id="valMinWords">2</span> words</span>
+          <span class="val-badge"><span id="valMinWords">3</span> words</span>
         </div>
-        <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="2">
+        <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="3">
       </div>
 
       <!-- Section: SEG (tách câu hậu-ASR) -->
@@ -152,9 +152,9 @@
       <div class="setting-group">
         <div class="label-with-value">
           <label>⏱️ Consistent punctuation (ms)</label>
-          <span class="val-badge"><span id="valSegStableMs">350</span> ms</span>
+          <span class="val-badge"><span id="valSegStableMs">800</span> ms</span>
         </div>
-        <input type="range" id="rangeSegStableMs" min="100" max="1500" step="50" value="350">
+        <input type="range" id="rangeSegStableMs" min="100" max="1500" step="50" value="800">
       </div>
 
       <div class="setting-group">
@@ -163,7 +163,7 @@
             🔍 Log each SEG segment
           </span>
           <label class="switch">
-            <input type="checkbox" id="chkSegTrace" checked>
+            <input type="checkbox" id="chkSegTrace">
             <span class="slider"></span>
           </label>
         </div>
@@ -181,9 +181,9 @@
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>⏳ Tail</label>
-            <span class="val-badge"><span id="valSegTailChars">4</span></span>
+            <span class="val-badge"><span id="valSegTailChars">2</span></span>
           </div>
-          <input type="range" id="rangeSegTailChars" min="1" max="12" step="1" value="4">
+          <input type="range" id="rangeSegTailChars" min="1" max="12" step="1" value="2">
         </div>
         <div class="setting-group flex-1">
           <div class="label-with-value">
@@ -280,9 +280,9 @@
       <div class="setting-group" id="duckingSliderRow">
         <div class="label-with-value">
           <label>🔉 Original audio</label>
-          <span class="val-badge"><span id="valDuckingLevel">25</span>%</span>
+          <span class="val-badge"><span id="valDuckingLevel">50</span>%</span>
         </div>
-        <input type="range" id="rangeDuckingLevel" min="0" max="100" step="5" value="25">
+        <input type="range" id="rangeDuckingLevel" min="0" max="100" step="5" value="50">
       </div>
 
       <!-- Section: Subtitle Style -->
