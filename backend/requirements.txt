@@ -13,11 +13,18 @@
 #                          thật nằm trong repo tại `backend/bin/llama/` và engine dịch trỏ tới
 #                          bằng env `LLAMA_CPP_LIB_PATH`. ⇒ KHÔNG cần build gì cả.
 #
-# PHIÊN BẢN ĐÃ ĐO THỰC TẾ trên máy tham chiếu (RTX 5060 Ti, Windows 11, Python 3.13):
-#     fastapi 0.141.1 · uvicorn 0.52.0 · pydantic 2.13.4 · numpy 2.4.4 · scipy 1.18.0
-#     torch 2.12.0+cu130 · llama-cpp-python 0.3.35 (binding CPU) + DLL CUDA 13.4 trong repo · transcribe-cpp-native 0.2.3
-#     omnivoice 0.2.1 · fireredvad 0.0.2 · silero-vad 6.2.1 · funasr 1.4.15
-#     huggingface-hub 1.31.0 · soundfile 0.14.0 · cryptography 42.0.5 · psutil 7.2.2
+# PHIÊN BẢN ĐÃ ĐO THỰC TẾ — lấy từ một **venv trắng + clone sạch** chạy đúng lệnh
+# `pip install -r backend/requirements.txt` (2026-09-23, RTX 5060 Ti, Windows 11, Python 3.13.14):
+#     fastapi 0.141.1 · uvicorn 0.53.0 · pydantic 2.13.5 · numpy 2.5.3 · scipy 1.18.1
+#     torch 2.14.0+cu130 · torchaudio 2.11.0+cu130 · llama-cpp-python 0.3.35 (binding CPU 7 MB)
+#     transcribe-cpp 0.2.3 · transcribe-cpp-native 0.2.3 · onnxruntime 1.30.0
+#     omnivoice 0.2.1 · fireredvad 0.0.2 · silero-vad 6.2.3 · funasr 1.4.16
+#     huggingface-hub 1.32.0 · soundfile 0.14.0 · cryptography 50.0.1 · psutil 7.2.2
+#   (torchvision KHÔNG được cài — không subsystem nào cần; xem `backend/constraints.txt`.)
+#
+# Các dòng dưới là KHOẢNG (`>=`) nên pip luôn lấy bản mới nhất khớp. Muốn GHIM đúng bộ đã đo
+# (chống pip âm thầm hạ torch xuống bản CPU-only), thêm `-c`:
+#     pip install -r backend/requirements.txt -c backend/constraints.txt
 #
 # Ghi chú về CUDA: torch ở đây dùng CUDA 13.0 (cu130) để khớp driver mới. Nếu driver của
 # bạn chỉ hỗ trợ CUDA 12.x, đổi index/phiên bản torch bên dưới sang cu124 (xem README mục

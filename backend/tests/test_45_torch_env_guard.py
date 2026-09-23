@@ -11,6 +11,7 @@ ràng buộc torch xung đột. Test này khoá lại 3 lớp phòng ngừa:
 4. `backend/constraints.txt` tồn tại và ghim đúng bộ CUDA (để pip báo lỗi thay vì hạ torch).
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -316,3 +317,48 @@ def test_constraints_ghim_dung_bo_cuda():
         assert expected in text, f"constraints thiếu {expected}"
     for name in ("torch", "torchaudio", "torchvision"):
         assert f"{name}==" in text, f"constraints thiếu ghim cho {name}"
+
+
+# ─────────────────────────────── 9. DLL llama.cpp: chống bẫy "âm thầm chạy CPU"
+#
+# Binding `llama-cpp-python` giờ lấy từ wheel **CPU ~7 MB** (xem `backend/requirements.txt`),
+# còn DLL CUDA thật nằm ở `backend/bin/llama/`. `llama_cpp/llama_cpp.py` chọn thư mục DLL từ env
+# `LLAMA_CPP_LIB_PATH` NGAY LÚC IMPORT, nên nếu env chưa được đặt thì nó nạp bản CPU — mọi thứ
+# vẫn "chạy", chỉ chậm ~10× và KHÔNG có cảnh báo nào (log cũ còn ghi cứng "(GPU, …)").
+# Đo được cùng một câu EN→VI: 589 ms khi đúng, 6027 ms khi sai thứ tự import.
+
+
+def test_backend_dat_llama_cpp_lib_path_khi_import():
+    """`import backend` phải trỏ `LLAMA_CPP_LIB_PATH` vào `backend/bin/llama/`.
+
+    Đặt trong `backend/__init__.py` (cùng chỗ với `apply_thread_limits`) để không phụ thuộc thứ
+    tự import: `backend/__init__.py` chạy trước mọi submodule của mọi đường vào.
+    """
+    import backend  # noqa: F401,PLC0415  — đảm bảo package đã được nạp
+
+    lib_dir = os.environ.get("LLAMA_CPP_LIB_PATH")
+    assert lib_dir, "backend/__init__.py chưa đặt LLAMA_CPP_LIB_PATH"
+    path = Path(lib_dir)
+    assert path.name == "llama" and path.parent.name == "bin", f"trỏ sai chỗ: {path}"
+    for dll in ("llama.dll", "ggml-cuda.dll"):
+        assert (path / dll).is_file(), f"thiếu {dll} trong {path} (bundle llama.cpp chưa có?)"
+
+
+def test_setup_llama_cpp_dll_path_idempotent_va_khong_ghi_de(monkeypatch):
+    """Hàm setup phải tôn trọng env người dùng đã đặt (không ghi đè)."""
+    from backend.utils import cuda
+
+    monkeypatch.setenv("LLAMA_CPP_LIB_PATH", r"X:\ep-buoc\khac")
+    assert cuda.setup_llama_cpp_dll_path() == cuda.llama_cpp_lib_dir()
+    assert os.environ["LLAMA_CPP_LIB_PATH"] == r"X:\ep-buoc\khac", "đã ghi đè lựa chọn của người dùng"
+
+
+@pytest.mark.gpu
+def test_duong_di_that_cua_app_thay_backend_gpu():
+    """Đường đi THẬT của app (qua `backend`) phải thấy backend GPU, không rơi về CPU."""
+    from backend.translation.engine import _llama_supports_gpu_offload  # noqa: PLC0415
+
+    assert _llama_supports_gpu_offload() is True, (
+        "llama.cpp không thấy backend GPU — binding đang nạp DLL CPU của wheel. "
+        "Kiểm tra LLAMA_CPP_LIB_PATH và backend/bin/llama/."
+    )

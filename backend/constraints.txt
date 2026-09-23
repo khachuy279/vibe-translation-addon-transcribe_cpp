@@ -21,21 +21,26 @@
 #   Đó là hành vi mong muốn: hỏng to và rõ còn hơn mất GPU im lặng.
 #
 # ⚠️ LƯU Ý PHIÊN BẢN (đã kiểm bằng `pip index versions … --index-url .../whl/cu130`):
-#    index cu130 có torchaudio TỚI 2.11.0+cu130 (KHÔNG có 2.12.x) — torchaudio đi sau torch
-#    một bậc. Bộ đúng đang dùng: torch 2.12.0 + torchaudio 2.11.0 + torchvision 0.27.0.
-#    Đừng "sửa cho khớp số" — torchaudio 2.12.0+cu130 KHÔNG tồn tại và pip sẽ báo
+#    index cu130 có torchaudio TỚI 2.11.0+cu130 (KHÔNG có 2.12.x trở lên) — torchaudio đi sau
+#    torch. Bộ đúng đang dùng: torch 2.14.0 + torchaudio 2.11.0 + torchvision 0.29.0
+#    (torch 2.14 ↔ torchvision 0.29; torch 2.12 ↔ torchvision 0.27).
+#    Đừng "sửa cho khớp số": torchaudio 2.14.0+cu130 KHÔNG tồn tại và pip sẽ báo
 #    "Could not find a version that satisfies the requirement".
+#
+#    ⚠️ torchvision KHÔNG được `backend/requirements.txt` cài (không subsystem nào cần);
+#    dòng ghim bên dưới chỉ để nếu có gói khác kéo nó vào thì pip chọn đúng bản CUDA khớp torch.
 #
 #    Muốn nâng lên mới hơn: đối chiếu cả ba bằng
 #      pip index versions <gói> --index-url https://download.pytorch.org/whl/cu130
-#    rồi chọn bộ ba cùng tag CUDA (ví dụ torch 2.11.0 + torchaudio 2.11.0 + torchvision 0.26.0).
+#    rồi chọn bộ ba cùng tag CUDA.
 #
 # ⚠️ Khi nâng torch có chủ đích: sửa cả 3 dòng dưới cho khớp bộ CUDA (cùng tag `+cuXXX`),
-#    rồi chạy lại `python -m backend.utils.env_check`.
+#    sửa `EXPECTED_CUDA_TRIO` trong `backend/utils/env_check.py`, rồi chạy lại
+#    `python -m backend.utils.env_check`.
 # ============================================================================
-torch==2.12.0+cu130
+torch==2.14.0+cu130
 torchaudio==2.11.0+cu130
-torchvision==0.27.0+cu130
+torchvision==0.29.0+cu130
 
 # llama.cpp: cài BINDING từ wheel CPU 7 MB (`whl/cpu` của abetlen), DLL CUDA nằm trong repo.
 # Lý do ghim 0.3.22 trước đây (wheel 0.3.25–0.3.35 dính AVX-512) đã hết: DLL CPU của wheel

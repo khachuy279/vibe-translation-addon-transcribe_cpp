@@ -164,7 +164,7 @@ không nạp được dù `backend/bin/ggml-cuda.dll` còn nguyên; nay lấy t�
 **Kiểm tra:**
 ```powershell
 python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
-# kỳ vọng: 2.12.0+cu130 13.0 True
+# kỳ vọng: 2.14.0+cu130 13.0 True   (bộ ba đã đo: torch 2.14.0 · torchaudio 2.11.0 · torchvision 0.29.0)
 ```
 </details>
 
@@ -194,10 +194,19 @@ backend/bin/llama/                    # ~60 MB, CÓ trong git — clone là có 
 └── mtmd.dll
 ```
 
-`backend/utils/cuda.py::setup_llama_cpp_dll_path()` đặt env `LLAMA_CPP_LIB_PATH` trỏ vào thư mục đó
-**trước khi** `import llama_cpp` (`llama_cpp/llama_cpp.py` đọc env này để chọn thư mục thư viện), và
-được gọi tự động bên trong `setup_cuda_dll_paths()` nên mọi đường vào đều đúng — kể cả script đo
-đạc chỉ gọi mỗi `setup_cuda_dll_paths()`.
+`llama_cpp/llama_cpp.py` đọc env `LLAMA_CPP_LIB_PATH` **ngay lúc import** để chọn thư mục thư viện.
+Dự án đặt env này ở **hai** chỗ để không thể sai thứ tự import:
+
+1. `backend/__init__.py` — chạy trước mọi submodule của mọi đường vào (cùng chỗ với
+   `apply_thread_limits()`), nên `import backend.anything` là env đã đúng.
+2. `backend/utils/cuda.py::setup_llama_cpp_dll_path()` — đặt lại (idempotent, tôn trọng env người
+   dùng đã set) cho đường vào **không** qua package, ví dụ script gọi thẳng `import llama_cpp`.
+
+> [!WARNING]
+> Nếu vì lý do nào đó `llama.cpp` vẫn nạp `llama.dll` bản **CPU** của wheel, mọi thứ trông vẫn
+> "chạy" — chỉ chậm **~10×**. Đo cùng một câu EN→VI: **589 ms** khi đúng, **6027 ms** khi sai.
+> Từ bản này engine **không còn ghi cứng "(GPU, …)"**: nó kiểm tra `llama_supports_gpu_offload()`
+> và ghi `ERROR` kèm cách sửa nếu thiếu backend GPU.
 
 > [!IMPORTANT]
 > `backend/bin/llama/` **phải là thư mục RIÊNG**, không để chung với `backend/bin/` (bundle ASR):
@@ -338,12 +347,12 @@ index cu130 chỉ có tới `2.11.0+cu130`, KHÔNG có `2.12.x` — đừng "s�
 
 ```powershell
 pip index versions torchaudio --index-url https://download.pytorch.org/whl/cu130   # xem bản có thật
-pip install torch==2.12.0+cu130 torchaudio==2.11.0+cu130 torchvision==0.27.0+cu130 `
+pip install torch==2.14.0+cu130 torchaudio==2.11.0+cu130 torchvision==0.29.0+cu130 `
   --index-url https://download.pytorch.org/whl/cu130
 python -m backend.utils.env_check
 ```
 `env_check` so theo **tag CUDA** (`+cu130`) chứ không so số phiên bản, nên bộ
-`2.12.0 + 2.11.0 + 0.27.0` được coi là hợp lệ.
+`2.14.0 + 2.11.0 + 0.29.0` được coi là hợp lệ (`torch 2.14 ↔ torchvision 0.29`).
 
 
 ### Bundle ASR CUDA (backend mặc định)

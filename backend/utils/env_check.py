@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 #: Bộ ba torch/torchaudio/torchvision mà dự án đã đo và khoá trong `backend/constraints.txt`.
 #: ⚠️ Số phiên bản KHÔNG bằng nhau: index cu130 chỉ có torchaudio tới 2.11.x (torchaudio đi sau
 #: torch một bậc) ⇒ torch 2.12.0 + torchaudio 2.11.0 + torchvision 0.27.0 là bộ hợp lệ.
-EXPECTED_CUDA_TRIO = ("2.12.0+cu130", "2.11.0+cu130", "0.27.0+cu130")
+EXPECTED_CUDA_TRIO = ("2.14.0+cu130", "2.11.0+cu130", "0.29.0+cu130")
 
 
 def cuda_tag(version: Optional[str]) -> Optional[str]:

@@ -30,6 +30,21 @@ try:
 except ImportError:
     Llama = None
 
+
+def _llama_supports_gpu_offload() -> bool:
+    """`llama_supports_gpu_offload()` của llama.cpp — an toàn nếu binding thiếu API.
+
+    Dùng để bắt BẪY IM LẶNG: nếu `llama_cpp` được nạp TRƯỚC khi `LLAMA_CPP_LIB_PATH` trỏ vào
+    `backend/bin/llama/` thì nó dùng `llama.dll` **bản CPU** của wheel ⇒ mọi thứ vẫn chạy,
+    chỉ chậm ~10× và không có cảnh báo nào. Xem `backend/__init__.py`.
+    """
+    try:
+        import llama_cpp.llama_cpp as _lc  # noqa: PLC0415
+
+        return bool(_lc.llama_supports_gpu_offload())
+    except Exception:  # noqa: BLE001
+        return False
+
 from backend.config import config, TranslationConfig
 from backend.translation.base import BaseTranslator
 from backend.translation.registry import TranslationModelRegistry
@@ -115,8 +130,22 @@ class GGUFTranslator(BaseTranslator):
             verbose=False,
         )
 
+        # Chống bẫy IM LẶNG: log cũ ghi cứng "(GPU, …)" kể cả khi đang chạy CPU.
+        wants_gpu = int(n_gpu_layers) != 0
+        if wants_gpu and not _llama_supports_gpu_offload():
+            logger.error(
+                "llama.cpp KHÔNG có backend GPU ⇒ dịch đang chạy bằng CPU (chậm ~10×). "
+                "Thường do `llama_cpp` bị import trước khi `LLAMA_CPP_LIB_PATH` được đặt: env phải "
+                "trỏ tới `<repo>\\backend\\bin\\llama` và thư mục đó phải có `llama.dll` + "
+                "`ggml-cuda.dll`. Chẩn đoán: `python -m backend.utils.env_check`.",
+                extra={"module_tag": "TRANSLATE"},
+            )
+            device_note = "CPU — THIẾU backend GPU!"
+        else:
+            device_note = "GPU" if wants_gpu else "CPU (n_gpu_layers=0, theo cấu hình)"
+
         logger.info(
-            f"Model '{key}' sẵn sàng (GPU, ctx={n_ctx}, batch={n_batch}, threads={n_threads})",
+            f"Model '{key}' sẵn sàng ({device_note}, ctx={n_ctx}, batch={n_batch}, threads={n_threads})",
             extra={"module_tag": "TRANSLATE"},
         )
         return llm, get_prompt_strategy(info.get("prompt_style", "tencent"))

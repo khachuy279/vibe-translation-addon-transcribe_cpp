@@ -40,6 +40,21 @@ def apply_thread_limits() -> None:
 
 apply_thread_limits()
 
+# ── DLL llama.cpp: chọn thư mục DLL NGAY khi import package ─────────────────────────
+# `llama_cpp/llama_cpp.py` đọc env `LLAMA_CPP_LIB_PATH` NGAY LÚC IMPORT để quyết định nạp
+# `llama.dll` từ đâu. Binding ta cài là wheel **CPU ~7 MB** (xem `backend/requirements.txt`);
+# nếu env chưa được đặt thì nó nạp bản CPU trong `site-packages/llama_cpp/lib` — và mọi thứ
+# vẫn "chạy", chỉ chậm **~10×**, còn log thì vẫn ghi "(GPU, …)". Đo được: dịch EN→VI 589 ms
+# (đúng) so với 6027 ms (sai thứ tự import).
+#
+# Đặt Ở ĐÂY, cùng lý do như `apply_thread_limits` ở trên: `backend/__init__.py` chạy TRƯỚC mọi
+# submodule của MỌI đường vào, nên KHÔNG phụ thuộc thứ tự `import`. `setdefault` để người dùng
+# vẫn ép được thư mục khác. `backend/utils/cuda.py::setup_llama_cpp_dll_path` vẫn đặt lại
+# (idempotent) cho đường vào không qua package — ví dụ script gọi thẳng `import llama_cpp`.
+_LLAMA_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "llama")
+if os.path.isfile(os.path.join(_LLAMA_LIB_DIR, "llama.dll")):
+    os.environ.setdefault("LLAMA_CPP_LIB_PATH", _LLAMA_LIB_DIR)
+
 from backend.config import config, load_config
 from backend.utils.logger import logger, get_logger
 
