@@ -237,7 +237,7 @@ def test_khong_cat_cau_qua_it_tu_tranh_lap():
     clk = _Clock()
     for _ in range(4):
         assert c.observe("Laughter.", now=clk()) == [], "câu 1 từ không được cắt"
-    assert "chờ gộp" in c.trace_state()["hold"]
+    assert "hold=min_words" in c.trace_state()["hold"]
 
     # Khi câu sau tới, hai mảnh được GỘP thành một câu đủ từ.
     out = []
@@ -288,7 +288,7 @@ def test_mac_dinh_KHONG_cat_khi_chua_co_cau_moi():
     clk = _Clock()
     for _ in range(4):
         assert c.observe("あ、そうじゃん。", now=clk()) == [], "chưa có câu mới ⇒ chưa được cắt"
-    assert "CHƯA có câu mới" in c.trace_state()["hold"]
+    assert "hold=stable_off" in c.trace_state()["hold"]
 
     # Khi câu mới xuất hiện (đủ nhịp) ⇒ cắt như thường.
     out = []

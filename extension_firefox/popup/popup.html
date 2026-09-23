@@ -116,7 +116,7 @@
       <div class="setting-group">
         <div class="toggle-row" id="segToggleRow">
           <span class="toggle-label">
-            ✂️ SEG theo dấu câu
+            ✂️ SEG follows the punctuation marks.
           </span>
           <label class="switch">
             <input type="checkbox" id="chkSegEnabled" checked>
@@ -128,7 +128,7 @@
       <div class="setting-group">
         <div class="toggle-row" id="segTimerToggleRow">
           <span class="toggle-label">
-            ⏱️ Mốc cắt bằng Whisper
+            ⏱️ Whisper-cut mark
           </span>
           <label class="switch">
             <input type="checkbox" id="chkSegTimer" checked>
@@ -140,7 +140,7 @@
       <div class="setting-group">
         <div class="toggle-row" id="segStableToggleRow">
           <span class="toggle-label">
-            ⚡ Cắt khi dấu câu ổn định
+            ⚡ Cut when stabilizes.
           </span>
           <label class="switch">
             <input type="checkbox" id="chkSegStable">
@@ -151,7 +151,7 @@
 
       <div class="setting-group">
         <div class="label-with-value">
-          <label>⏱️ Dấu câu ổn định (ms)</label>
+          <label>⏱️ Consistent punctuation (ms)</label>
           <span class="val-badge"><span id="valSegStableMs">350</span> ms</span>
         </div>
         <input type="range" id="rangeSegStableMs" min="100" max="1500" step="50" value="350">
@@ -160,7 +160,7 @@
       <div class="setting-group">
         <div class="toggle-row" id="segTraceToggleRow">
           <span class="toggle-label">
-            🔍 Log từng nhịp SEG
+            🔍 Log each SEG segment
           </span>
           <label class="switch">
             <input type="checkbox" id="chkSegTrace" checked>
@@ -171,7 +171,7 @@
 
       <div class="setting-group">
         <div class="label-with-value">
-          <label>📏 Max chars / câu</label>
+          <label>📏 Max chars</label>
           <span class="val-badge"><span id="valSegMaxChars">60</span></span>
         </div>
         <input type="range" id="rangeSegMaxChars" min="20" max="140" step="10" value="60">
@@ -180,14 +180,14 @@
       <div class="setting-row">
         <div class="setting-group flex-1">
           <div class="label-with-value">
-            <label>⏳ Tail (ký tự)</label>
+            <label>⏳ Tail</label>
             <span class="val-badge"><span id="valSegTailChars">4</span></span>
           </div>
           <input type="range" id="rangeSegTailChars" min="1" max="12" step="1" value="4">
         </div>
         <div class="setting-group flex-1">
           <div class="label-with-value">
-            <label>🔁 Nhịp chờ</label>
+            <label>🔁 Rhythm</label>
             <span class="val-badge"><span id="valSegTailScans">2</span></span>
           </div>
           <input type="range" id="rangeSegTailScans" min="1" max="5" step="1" value="2">
@@ -234,7 +234,7 @@
         <span>TTS</span>
       </div>
 
-      <div class="setting-group toggle-box">
+      <div class="setting-group">
         <div class="toggle-row" id="ttsToggleRow">
           <span class="toggle-label">
             <span class="toggle-icon">🔊</span>
@@ -290,11 +290,11 @@
         <span>Subtitle</span>
       </div>
 
-      <div class="setting-group toggle-box">
+      <div class="setting-group">
         <div class="toggle-row" id="translationOnceToggleRow">
           <span class="toggle-label">
             <span class="toggle-icon">📝</span>
-            Hiện bản dịch 1 lần (tắt chạy chữ)
+            Show translation once
           </span>
           <label class="switch">
             <input type="checkbox" id="chkTranslationOnce" checked>

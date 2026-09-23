@@ -1041,17 +1041,15 @@ class TranscribeEngine(BaseASREngine):
         shown = preview_text if len(preview_text) <= 90 else "…" + preview_text[-90:]
         if decision is None:
             logger.info(
-                f"[{tag}] [utt={self._active_utterance_id}] +{elapsed:.1f}s | "
-                f"CHỜ: {state.get('hold', '')} | đã chốt {state.get('committed_len', 0)} ký tự | "
-                f"'{shown}'",
+                f"[{tag}] [utt={self._active_utterance_id}] t=+{elapsed:.1f}s "
+                f"{state.get('hold', '')} c={state.get('committed_len', 0)} | '{shown}'",
                 extra={"module_tag": "SEG"},
             )
             return
         logger.info(
-            f"[{tag}] [utt={self._active_utterance_id}] +{elapsed:.1f}s | "
-            f"CHỐT ({decision.reason}): '{decision.text}' | ranh giới@{decision.end_index} "
-            f"tail='{state.get('tail', '')}' | phần chưa chốt: "
-            f"'{preview_text[decision.end_index:][:40]}'",
+            f"[{tag}] [utt={self._active_utterance_id}] t=+{elapsed:.1f}s "
+            f"cut={decision.reason} b={decision.end_index} tail='{state.get('tail', '')}' "
+            f"rest='{preview_text[decision.end_index:][:40]}' | '{decision.text}'",
             extra={"module_tag": "SEG"},
         )
 

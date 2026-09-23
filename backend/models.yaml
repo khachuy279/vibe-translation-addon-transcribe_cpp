@@ -89,3 +89,15 @@ models:
     vram_estimate_mb: 1500
     context_window_sec: 30
     description: Whisper large v3 turbo ASR model ported to transcribe.cpp
+  kotoba-whisper-v2.2:
+    name: 'kotoba-whisper-v2.2 (Q8_0)'
+    family: whisper
+    architecture_type: offline_llm
+    hf_repo: kotoba-tech/kotoba-whisper-v2.2
+    default_quant: Q8_0
+    file: kotoba-whisper-v2.2-Q8_0.gguf
+    sample_rate: 16000
+    languages: auto
+    vram_estimate_mb: 1500
+    context_window_sec: 30
+    description: 'kotoba-whisper-v2.2: finetune kotoba-tech/kotoba-whisper-v2.2 chuyển sang GGUF (Q8_0) bằng backend/tools/build_finetune.py'

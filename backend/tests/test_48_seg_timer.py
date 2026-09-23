@@ -483,7 +483,7 @@ def test_trace_tung_nhip_ghi_ly_do_cho(restore_config, caplog):
 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "[SEG_TRACE]" in text, text
-    assert "CHỜ:" in text
+    assert "hold=" in text
     assert "tail" in text
 
 
@@ -501,7 +501,7 @@ def test_trace_ghi_ca_khi_chot(restore_config, caplog):
     with caplog.at_level(_logging.INFO, logger="backend.utils.logger"):
         assert eng._evaluate_seg("Hello world. Super man", 16_000, 0) is not None
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "[SEG_CUT]" in text and "CHỐT" in text
+    assert "[SEG_CUT]" in text and "cut=" in text
 
 
 def test_shadow_log_khi_seg_tat(restore_config, caplog):
@@ -531,7 +531,7 @@ def test_may_trang_thai_mo_ta_duoc_ly_do_cho():
     c.observe("Hello world. Hi", now=1.0)
     st = c.trace_state()
     assert st["hold"], "phải có lý do chờ"
-    assert "2/4" in st["hold"] or "tail" in st["hold"]
+    assert "hold=tail_short" in st["hold"]
     assert st["boundary_index"] > 0 and st["tail"] == "Hi"
 
 

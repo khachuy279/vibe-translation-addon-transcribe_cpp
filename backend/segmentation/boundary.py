@@ -292,14 +292,13 @@ class SentenceCompleter:
         while True:
             tail = text[self._cursor:]
             if not tail.strip():
-                self.last_hold = "không còn chữ chưa chốt"
+                self.last_hold = "hold=empty"
                 break
 
             cand = first_boundary(tail)
             if cand is None:
                 self.last_hold = (
-                    f"chưa có dấu kết câu (dài {content_len(text[self._sentence_start:])}"
-                    f"/{self.max_chars} ký tự nội dung)"
+                    f"hold=no_punct n={content_len(text[self._sentence_start:])}/{self.max_chars}"
                 )
                 if content_len(text[self._sentence_start:]) >= self.max_chars:
                     cut = self._forced_cut(tail)
@@ -319,8 +318,9 @@ class SentenceCompleter:
                     self._mark_pending(idx, now)
                     self._mark_tail(idx, now, False)
                     self.last_hold = (
-                        f"câu mới {count_tokens(piece_so_far)}/{self.min_words} từ "
-                        f"(hoặc < {self.min_chars} ký tự) — chờ gộp"
+                        f"hold=min_words n={count_tokens(piece_so_far)}/{self.min_words}"
+                        if self.min_words > 0
+                        else f"hold=min_chars n={content_len(piece_so_far)}/{self.min_chars}"
                     )
                     break
                 idx, end = end + nxt[0], end + nxt[1]
@@ -351,28 +351,30 @@ class SentenceCompleter:
         return out
 
     def _hold_reason(self, after: str, now: float) -> str:
-        """Mô tả ngắn vì sao CHƯA chốt (dùng cho log trace từng nhịp)."""
+        """Vì sao CHƯA chốt — token gọn, thiên kỹ thuật (dùng cho trace từng nhịp).
+
+        Định dạng: `hold=<lý do> [k=v ...]`, mỗi khoá đủ ngắn để `grep`/thống kê:
+          * `punct_eof s=<nhịp>/<cần> t=<ms>/<cần>ms` — dấu kết câu ở cuối preview, chờ đủ ổn định
+          * `stable_off`            — như trên nhưng cắt-theo-độ-ổn-định đang TẮT (chờ câu mới/VAD)
+          * `tail_short n=<có>/<cần>` — tail chưa đủ ký tự nội dung
+          * `tail_midword`          — tail dính giữa từ Latin (ASR đang viết dở)
+          * `tail_wait s=<nhịp>/<cần> t=<ms>/<cần>ms` — tail đủ chữ nhưng chưa đủ nhịp/thời gian
+        """
         tail_n = content_len(after)
-        elapsed_ms = (now - self._tail_since) * 1000.0 if self._tail_scans else 0.0
         if tail_n == 0:
             if not self.allow_stable_cut:
-                return (
-                    f"dấu ở cuối preview, CHƯA có câu mới (đang tắt cắt-theo-độ-ổn-định; "
-                    f"chờ câu mới hoặc im lặng VAD)"
-                )
+                return "hold=stable_off"
             return (
-                f"dấu ở cuối preview, chưa có tail (nhịp {self._pending_scans}/{self.stable_scans}, "
-                f"{(now - self._pending_since) * 1000.0:.0f}/{self.stable_ms:.0f}ms)"
+                f"hold=punct_eof s={self._pending_scans}/{self.stable_scans} "
+                f"t={(now - self._pending_since) * 1000.0:.0f}/{self.stable_ms:.0f}ms"
             )
         if tail_n < self.tail_min_chars:
-            return (
-                f"tail '{after.strip()}' = {tail_n}/{self.tail_min_chars} ký tự nội dung"
-            )
+            return f"hold=tail_short n={tail_n}/{self.tail_min_chars}"
         if not self._tail_ready(after):
-            return f"tail '{after.strip()}' dính giữa từ (Latin chưa có khoảng trắng)"
+            return "hold=tail_midword"
         return (
-            f"tail '{after.strip()}' đủ chữ nhưng mới {self._tail_scans}/{self.tail_scans} nhịp "
-            f"({elapsed_ms:.0f}/{self.tail_stable_ms:.0f}ms)"
+            f"hold=tail_wait s={self._tail_scans}/{self.tail_scans} "
+            f"t={(now - self._tail_since) * 1000.0:.0f}/{self.tail_stable_ms:.0f}ms"
         )
 
     def trace_state(self) -> dict:

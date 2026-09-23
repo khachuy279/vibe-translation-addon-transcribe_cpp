@@ -559,5 +559,106 @@ CÒN LẠI:
 7. **Nghe thử/đối chiếu thủ công trên phim thật** — người dùng đang làm; file ghép FLEURS:
    `wav_test/google_fleurs/ja_jp/ja_concat_1min.wav` (`python scratch/seg_trace_demo.py`).
 
-**→ Kết thúc hạng mục SEG tại đây.** Còn lại (KHÔNG làm tiếp theo yêu cầu): Namo/hayamimi turn
-detector, chế độ tách hiển thị cho câu dài, test end-to-end tự động trên audio, dashboard metric SEG.
+### 19. Qwen3-ForcedAligner: khả thi port + kế hoạch test hiệu quả (2026-09-22 23:30)
+
+**(a) Trạng thái port — kiểm tra tại chỗ:**
+* checkout `external/transcribe.cpp` = `v0.2.3-7-gbe7a8b35`: KHÔNG có thư mục arch `*align*`, catalog không có entry aligner.
+* **upstream `main`** (GitHub API `contents/src/arch`, 19 thư mục) **cũng KHÔNG có** `qwen3_forced_aligner` ⇒ port KHÔNG phải chuyện cập nhật checkout.
+* `bin/transcribe.dll` (bundle đang dùng) KHÔNG chứa chuỗi `aligner`/`forced_align` nào.
+
+⇒ Muốn có mốc theo chính văn bản Qwen3 phải **viết một family C++ MỚI** (encoder + head
+token-classification, format GGUF, catalog/CMake, test) — việc lớn. Đúng như docs upstream nói:
+aligner là *family anh em*, không phải tuỳ chọn của `qwen3_asr` (`max_timestamp_kind = NONE`).
+
+**(b) Model CÓ tồn tại (nguồn web):** `Qwen3-ForcedAligner-0.6B` (Qwen chính thức; repo
+[QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) quảng cáo "timestamp prediction"), kèm
+bản cộng đồng: [CoreML INT8](https://huggingface.co/aufklarer/Qwen3-ForcedAligner-0.6B-CoreML-INT8),
+[Transformers-native](https://huggingface.co/bezzam/Qwen3-ForcedAligner-0.6B-hf),
+[112 ngôn ngữ](https://huggingface.co/AMAImedia/NOESIS-Qwen3-Forced-Aligner-0.6B-112LANG-BF16).
+
+**(c) Chặn ở môi trường hiện tại:** package `qwen_asr` **crash khi import** với `transformers 5.17.0`
+(`TypeError: check_model_inputs() missing 1 required positional argument`). Hai đường: (1) **venv
+riêng** cho thí nghiệm (an toàn, tải lại torch ~2.5 GB); (2) thử **transformers-native** — 5.17.0
+đã có lớp `Qwen3ASRForTokenClassification` nên có thể load trực tiếp checkpoint aligner.
+
+**(d) Số đo đã có (CUDA, clip tiếng Nhật 34.4 s):**
+
+| Nguồn mốc | Chi phí | Ghi chú |
+|---|---|---|
+| whisper-large-v3-turbo (transcribe.cpp, `segment`) | **0.45 s** (RTF 0.013) | segment 4-6 s, có lúc để "lỗ" 20.74→24.84 s |
+| faster-whisper base (`word_timestamps`) | 1.03 s (RTF 0.030) | mốc từng từ |
+| faster-whisper small | 1.33 s (RTF 0.039) | |
+
+**Phát hiện quan trọng:** hai nguồn độc lập (segment whisper-large vs word faster-whisper) đặt
+cùng một biên câu lệch nhau chỉ **~0.4 s** (24.84 vs 25.24 s) ⇒ các timer khá nhất quán; **sai số
+tuyệt đối CHƯA đo được** vì "mốc thật" tổng hợp của tôi (mép ghép FLEURS, kể cả sau khi cắt im
+lặng) rơi vào vùng nền nhiễu ~4 s (`scratch/align_benefit_probe.py`). Muốn quyết định đúng phải
+có **mốc thật do VAD hoặc gán tay**.
+
+**(e) Đề xuất test trước khi port:**
+1. Clip tiếng Nhật 1-2 phút; lấy **mốc thật bằng VAD** (silero/firered trên chính clip) hoặc gán tay ~20-30 biên.
+2. Ba đường so sánh: (i) whisper segment + nội suy ký tự (hiện tại), (ii) word-level (faster-whisper), (iii) **Qwen3-ForcedAligner** căn trên **chính văn bản Qwen3**.
+3. Tiêu chí chấp nhận: trung vị sai số **< ~150 ms**, p95 **< ~300 ms**, độ trễ **< ~300 ms/câu** trên RTX 5060 Ti. Không đạt ⇒ không port.
+4. Chỉ khi (iii) thắng rõ mới tính viết family C++ (hoặc dùng aligner ngoài pipeline realtime).
+
+### 20. KẾT QUẢ TEST mốc mịn (Tier 1) — vì sao KHÔNG nên port aligner
+
+**Phép đo lần này có MỐC THẬT đúng**: cắt mỗi file FLEURS đúng phần tiếng nói bằng **Silero VAD**
+(biên ±1 frame ~30 ms) rồi ghép liền ⇒ mối ghép CHÍNH LÀ biên câu thật (khắc phục lỗi đo lần
+trước khi mép file rơi vào vùng nền nhiễu 4 s). Script: `scratch/ja_align_test.py`.
+
+| Đường định vị cùng một biên câu | Sai số | Chi phí |
+|---|---|---|
+| **whisper-large-v3-turbo `segment` + nội suy ký tự (ĐANG DÙNG)** | **184 ms** | **372 ms** |
+| faster-whisper base, word-level | 156 ms | 988 ms |
+| Reazon JA CTC forced-align (prototype Tier 1) | ~5.8 s (hỏng) | ~1 s |
+
+**Hai kết luận:**
+
+1. **Timer hiện tại tốt hơn nhiều so với báo cáo trước đó.** Sai số thật ở biên câu là **~184 ms**,
+   không phải "±1-2 s" (con số cũ là hệ quả phép đo sai: mép file FLEURS nằm giữa vùng nền nhiễu).
+   ⇒ **Trần lợi ích của mọi giải pháp mốc mịn chỉ còn ~40-150 ms.**
+2. **Word-level đắt gấp ~2.7× mà chỉ hơn 28 ms** (156 vs 184 ms) ⇒ không đáng. Prototype Reazon
+   CTC (96.7M, Apache-2.0) **hỏng trong harness này (5.8 s)** — khả năng do bất khớp giữa văn bản
+   tham chiếu và đơn vị token của model (125 token cho 162 ký tự), chưa kết luận model kém; nhưng
+   dù sửa được thì mức cải thiện tối đa vẫn ~150 ms.
+
+**⇒ KHUYẾN NGHỊ: KHÔNG PORT Qwen3-ForcedAligner**, vì:
+* lợi ích thực tế tối đa ~150 ms (đo ở biên VAD), trong khi AAS 42 ms của aligner là **trung bình
+  trên MỌI mốc từ**, không phải sai số tại biên câu, và chưa có số độc lập cho tiếng Nhật;
+* chi phí port rất lớn: head 5000 lớp không tie, forward non-AR, placeholder `<timestamp>` id
+  151705, **đường tokenizer văn bản chưa tồn tại** (JA cần `nagisa`), hậu xử lý LIS, API mới
+  `(audio, text, lang) → spans`; encoder aligner 24L/1024 nên **không tái dùng** trọng số encoder
+  ASR-0.6B (18L/896);
+* mọi phương án mốc mịn đều ~1 s/câu — đúng loại chi phí đã bị gỡ ở #2.
+
+**Nếu sau này vẫn muốn theo:** đo trên ≥20-30 biên câu thật (n=1 chưa đủ kết luận) và ưu tiên
+đường **không cần port**: Qwen3-ForcedAligner như sidecar Python hoặc `CrispASR --align-only`
+(đã có C++/ggml, MIT) — nhưng phải vá tokenizer JA trước.
+
+### 21. Định dạng log trace gọn (2026-09-23)
+
+_hold_reason() đổi sang token kỹ thuật, dễ grep/thống kê: hold=<lý do> [k=v ...]
+
+| Token | Nghĩa |
+|---|---|
+| hold=empty | không còn chữ chưa chốt |
+| hold=no_punct n=51/100 | chưa có dấu kết câu (N/M ký tự nội dung tới trần max_chars) |
+| hold=min_words n=1/3 | câu mới chưa đủ từ (min_chars nếu min_words=0) |
+| hold=tail_short n=2/4 | tail chưa đủ ký tự nội dung |
+| hold=tail_midword | tail dính giữa từ Latin (ASR đang viết dở) |
+| hold=tail_wait s=1/2 t=0/280ms | tail đủ chữ nhưng chưa đủ nhịp/thời gian |
+| hold=punct_eof s=1/2 t=0/350ms | dấu kết câu ở cuối preview, chờ đủ ổn định |
+| hold=stable_off | như trên nhưng đang TẮT cắt-theo-độ-ổn-định |
+
+Dòng log cũng gọn lại:
+`
+[SEG] [SEG_TRACE] [utt=…] t=+1.2s hold=tail_wait s=1/2 t=0/280ms c=0 | '<preview>'
+[SEG] [SEG_CUT]   [utt=…] t=+2.1s cut=punct_tail b=11 tail='…' rest='…' | '<câu đã chốt>'
+`
+
+### 22. Kế hoạch đang chạy (2026-09-23)
+* **Script build finetune → GGUF** cho các family transcribe.cpp hỗ trợ, thử đầu tiên với kotoba-tech/kotoba-whisper-v2.2 (family whisper), tự lưu vào backend/models + cập nhật backend/models.yaml.
+* **Nghiên cứu khả thi intercept MSE** (hook SourceBuffer.appendBuffer ở MAIN world) để xử lý trước khi phát, mục tiêu gần 0 ms → report/audit/22_MSE_INTERCEPT_FEASIBILITY.md.
+
+**→ Kết thúc hạng mục SEG tại đây.**
