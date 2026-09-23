@@ -117,6 +117,21 @@ pip install -r backend\requirements.txt -c backend\constraints.txt
 `backend/requirements.txt` đã khai báo sẵn `--extra-index-url` của PyTorch cho `torch`/`torchaudio`
 (PyPI chỉ có bản **CPU**), nên một lệnh là đủ cho hai gói đó.
 
+> [!IMPORTANT]
+> **Điều kiện duy nhất ngoài `pip`:** Microsoft **Visual C++ Redistributable 2015-2022 (x64)** —
+> `transcribe.dll` và `llama.dll` phụ thuộc `VCRUNTIME140.dll` / `VCRUNTIME140_1.dll` /
+> `MSVCP140.dll`. Bản Python 3.13 chính thức **cũng** cần runtime này, nên máy chạy được Python
+> là máy đã có; nếu thiếu thì cài
+> [vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe). Ngoài thứ này, **không cần**
+> MSVC, CMake, ninja hay CUDA toolkit — mọi thứ native đều nằm trong repo hoặc đến từ `pip`.
+
+Hai lệnh sau **cho ra cùng một bộ phiên bản** (`-c` chỉ ghim lại đúng những gì pip tự chọn):
+
+```powershell
+pip install -r backend\requirements.txt                                 # đơn giản nhất
+pip install -r backend\requirements.txt -c backend\constraints.txt      # có ghim, chống pip hạ torch
+```
+
 | Gói | Vì sao phải xử lý riêng |
 | :--- | :--- |
 | `torch` / `torchaudio` | PyPI chỉ có bản **CPU**; index chính thức của PyTorch có bản CUDA ⇒ khai báo bằng `--extra-index-url` |
