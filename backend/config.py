@@ -354,7 +354,7 @@ class SegmentationConfig(BaseModel):
     #: Cho phép chốt khi dấu kết câu đứng yên đủ lâu mà CHƯA thấy câu mới (`punct_stable`).
     #: MẶC ĐỊNH TẮT: tiếng Nhật (và cả tiếng Anh) ASR hay thả `。`/`.` sớm giữa câu
     #: (`営業回りを終え。`, `夕食を済ませ。`) ⇒ chờ câu mới hoặc im lặng VAD an toàn hơn.
-    stable_cut: bool = True
+    stable_cut: bool = False
     fallback_overlap_ms: float = 800.0   # không neo được khoảng lặng ⇒ lùi lại chồng lấn
     #: Bật tầng "timer" lấy mốc cắt chính xác (Qwen3-ASR không có timestamp).
     #: Tên trường giữ nguyên vì popup/extension đã gửi `segUseWhisperTimer`; từ 2026-09-28

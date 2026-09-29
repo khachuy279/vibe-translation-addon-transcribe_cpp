@@ -221,9 +221,11 @@ class SentenceCompleter:
         self._emitted_text = ""     # tiền tố đã chốt (ĐÓNG BĂNG, không bao giờ lùi)
         self._last_span: Optional[Tuple[int, int]] = None
         self._pending_punct: Optional[int] = None   # tương đối so với `_cursor`
+        self._pending_anchor: Optional[str] = None
         self._pending_since = 0.0
         self._pending_scans = 0
         self._tail_punct: Optional[int] = None      # bộ đếm riêng cho tail (punct_tail)
+        self._tail_anchor: Optional[str] = None
         self._tail_since = 0.0
         self._tail_scans = 0
         self.stale_text = False     # ASR đã viết lại phần ĐÃ chốt ⇒ engine phải chạy lại
@@ -260,7 +262,11 @@ class SentenceCompleter:
             self.stale_text = True
         self._cursor = self._sentence_start
         self._pending_punct = None
+        self._pending_anchor = None
         self._pending_scans = 0
+        self._tail_punct = None
+        self._tail_anchor = None
+        self._tail_scans = 0
         self.resync_count += 1
 
     def _forced_cut(self, tail: str) -> int:
@@ -315,8 +321,8 @@ class SentenceCompleter:
                 # không tiến ⇒ nhịp sau cắt đúng chỗ đó (đã gặp 4 lần liên tiếp trong log).
                 nxt = first_boundary(tail[end:])
                 if nxt is None:
-                    self._mark_pending(idx, now)
-                    self._mark_tail(idx, now, False)
+                    self._mark_pending(idx, now, tail)
+                    self._mark_tail(idx, now, False, tail)
                     self.last_hold = (
                         f"hold=min_words n={count_tokens(piece_so_far)}/{self.min_words}"
                         if self.min_words > 0
@@ -328,8 +334,8 @@ class SentenceCompleter:
             after = tail[end:]
             self.last_boundary_index = self._cursor + end
             self.last_tail = after.strip()
-            self._mark_pending(idx, now)
-            self._mark_tail(idx, now, content_len(after) > 0)
+            self._mark_pending(idx, now, tail)
+            self._mark_tail(idx, now, content_len(after) > 0, tail)
             # `punct_tail`: phải thấy ĐỦ chữ của câu mới VÀ tail phải xuất hiện ĐỦ NHỊP.
             # Lý do (đo từ log phim thật 2026-09-22): ASR có lúc thả dấu `.` SAI giữa câu
             # (`Don't try and trick.` / `Me into buying…`) rồi tự sửa ở nhịp sau. Chốt ngay
@@ -346,6 +352,15 @@ class SentenceCompleter:
             ):
                 out.append(self._commit(text, self._cursor + end, "punct_stable", 0.8))
                 continue
+
+            # Chống câu trôi quá dài: nếu dấu kết câu ở cuối preview bị giữ (chưa có tail)
+            # mà độ dài câu đang chờ đã vượt trần max_chars -> cắt cưỡng bức tại dấu ngắt mệnh đề gần nhất
+            if content_len(after) == 0 and content_len(text[self._sentence_start:]) >= self.max_chars:
+                cut = self._forced_cut(tail)
+                if cut > 0 and (self._cursor + cut) > self._sentence_start:
+                    out.append(self._commit(text, self._cursor + cut, "max_chars", 0.5))
+                    continue
+
             self.last_hold = self._hold_reason(after, now)
             break
         return out
@@ -401,12 +416,21 @@ class SentenceCompleter:
         return [self._commit(text, len(text), "flush", 0.7)]
 
     # ------------------------------------------------------------------ helpers
-    def _mark_pending(self, idx: int, now: float) -> None:
-        if idx != self._pending_punct:
+    def _mark_pending(self, idx: int, now: float, tail_text: str = "") -> None:
+        anchor = tail_text[max(0, idx - 2):idx + 1] if tail_text else ""
+        is_same_punct = (
+            self._pending_punct is not None
+            and abs(idx - self._pending_punct) <= 4
+            and (not anchor or anchor == self._pending_anchor)
+        )
+        if not is_same_punct:
             self._pending_punct = idx
+            self._pending_anchor = anchor
             self._pending_since = now
             self._pending_scans = 1
         else:
+            self._pending_punct = idx
+            self._pending_anchor = anchor
             self._pending_scans += 1
 
     def _too_few_words(self, piece: str) -> bool:
@@ -435,28 +459,47 @@ class SentenceCompleter:
                 return False
         return True
 
-    def _mark_tail(self, idx: int, now: float, has_tail: bool) -> None:
+    def _mark_tail(self, idx: int, now: float, has_tail: bool, tail_text: str = "") -> None:
         """Đếm số NHỊP LIÊN TIẾP đã thấy tail của cùng một ranh giới.
 
         Chỉ đếm nhịp CÓ tail: nhịp mà dấu kết câu còn nằm ở cuối preview không được tính,
         nếu không "chờ 2 nhịp" sẽ thành "chờ 1 nhịp" (bug đã gặp khi viết test).
         """
-        if not has_tail or idx != self._tail_punct:
-            self._tail_punct = idx if has_tail else None
+        if not has_tail:
+            self._tail_punct = None
+            self._tail_anchor = None
             self._tail_since = now
-            self._tail_scans = 1 if has_tail else 0
+            self._tail_scans = 0
             return
+
+        anchor = tail_text[max(0, idx - 2):idx + 1] if tail_text else ""
+        is_same_punct = (
+            self._tail_punct is not None
+            and abs(idx - self._tail_punct) <= 4
+            and (not anchor or anchor == self._tail_anchor)
+        )
+        if not is_same_punct:
+            self._tail_punct = idx
+            self._tail_anchor = anchor
+            self._tail_since = now
+            self._tail_scans = 1
+            return
+
+        self._tail_punct = idx
+        self._tail_anchor = anchor
         self._tail_scans += 1
 
     def _is_tail_stable(self, now: float) -> bool:
         """Tail đã xuất hiện đủ số nhịp và đủ thời gian chưa?"""
+        if self.tail_scans <= 1:
+            return self._tail_scans >= 1
         return (
             self._tail_scans >= self.tail_scans
             and (now - self._tail_since) * 1000.0 >= self.tail_stable_ms
         )
 
     def _is_stable(self, idx: int, now: float) -> bool:
-        if idx != self._pending_punct:
+        if self._pending_punct is None or abs(idx - self._pending_punct) > 4:
             return False
         return (
             self._pending_scans >= self.stable_scans
@@ -472,6 +515,10 @@ class SentenceCompleter:
         self._cursor = end_index
         self._emitted_text = text[:end_index]
         self._pending_punct = None
+        self._pending_anchor = None
         self._pending_scans = 0
+        self._tail_punct = None
+        self._tail_anchor = None
+        self._tail_scans = 0
         return SegmentDecision(text=piece, end_index=end_index, reason=reason,
                                confidence=confidence, stale_text=self.stale_text)

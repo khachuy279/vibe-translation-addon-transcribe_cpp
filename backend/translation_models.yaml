@@ -22,7 +22,7 @@ models:
     name: Hunyuan-MT2 7B (Tencent)
     model: tencent/Hy-MT2-7B-GGUF
     gguf_file: HY-MT2-7B-Q6_K.gguf
-    temperature: 0.2
+    temperature: 0.7
     top_p: 0.6
     top_k: 20
     repetition_penalty: 1.05
@@ -59,3 +59,18 @@ models:
       - gemmax2
       - gemmax-9b
     description: Chất lượng cao 28 ngôn ngữ (~5.8GB)
+
+  index-translate:
+    name: Index-Translate-2B (Bilibili IndexTeam)
+    model: mradermacher/Index-Translate-2B-GGUF
+    gguf_file: Index-Translate-2B.Q8_0.gguf
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 1
+    repetition_penalty: 1.0
+    prompt_style: index
+    aliases:
+      - index
+      - index-mt-2b
+      - index2b
+    description: Siêu nhẹ 2B (en/ja/zh互译, ~2.2GB Q8_0)

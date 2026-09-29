@@ -108,6 +108,42 @@
         <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="3">
       </div>
 
+      <!-- Section: Translation -->
+      <div class="section-title">
+        <span>Translation</span>
+      </div>
+
+      <div class="setting-group">
+        <label for="selTranslationModel">🌐 Translation Model</label>
+        <select id="selTranslationModel">
+          <option value="tencent-1.8b">Hunyuan-MT2 1.8B (Tencent) ⚡ Siêu nhanh (~2.0GB)</option>
+          <option value="tencent" selected>Hunyuan-MT2 7B (Tencent) 🎯 Chuẩn (~4.6GB)</option>
+          <option value="xiaomi">MiLM-MT 4.6B (Xiaomi) ⚡ Nhanh (~2.5GB)</option>
+          <option value="gemmax">GemmaX2 28-9B v0.2 (Xiaomi) 🌟 Cao cấp (~5.8GB)</option>
+          <option value="index-translate">Index-Translate-2B (IndexTeam) 🎌 2B nhẹ (~2.2GB)</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <label for="selSourceLang">🌍 SourceLang</label>
+          <select id="selSourceLang">
+            <option value="auto" selected>Auto-detect</option>
+            <option value="en">English (en)</option>
+            <option value="ja">Japanese (ja)</option>
+            <option value="zh">Chinese (zh)</option>
+            <option value="ko">Korean (ko)</option>
+            <option value="ru">Russian (ru)</option>
+          </select>
+        </div>
+        <div class="setting-group flex-1">
+          <label for="selTargetLang">🎯 TargetLang</label>
+          <select id="selTargetLang">
+            <option value="vi" selected>Vietnamese</option>
+          </select>
+        </div>
+      </div>
+      
       <!-- Section: SEG (tách câu hậu-ASR) -->
       <div class="section-title">
         <span>Segmentation</span>
@@ -191,41 +227,6 @@
             <span class="val-badge"><span id="valSegTailScans">2</span></span>
           </div>
           <input type="range" id="rangeSegTailScans" min="1" max="5" step="1" value="2">
-        </div>
-      </div>
-
-      <!-- Section: Translation -->
-      <div class="section-title">
-        <span>Translation</span>
-      </div>
-
-      <div class="setting-group">
-        <label for="selTranslationModel">🌐 Translation Model</label>
-        <select id="selTranslationModel">
-          <option value="tencent-1.8b">Hunyuan-MT2 1.8B (Tencent) ⚡ Siêu nhanh (~2.0GB)</option>
-          <option value="tencent" selected>Hunyuan-MT2 7B (Tencent) 🎯 Chuẩn (~4.6GB)</option>
-          <option value="xiaomi">MiLM-MT 4.6B (Xiaomi) ⚡ Nhanh (~2.5GB)</option>
-          <option value="gemmax">GemmaX2 28-9B v0.2 (Xiaomi) 🌟 Cao cấp (~5.8GB)</option>
-        </select>
-      </div>
-
-      <div class="setting-row">
-        <div class="setting-group flex-1">
-          <label for="selSourceLang">🌍 SourceLang</label>
-          <select id="selSourceLang">
-            <option value="auto" selected>Auto-detect</option>
-            <option value="en">English (en)</option>
-            <option value="ja">Japanese (ja)</option>
-            <option value="zh">Chinese (zh)</option>
-            <option value="ko">Korean (ko)</option>
-            <option value="ru">Russian (ru)</option>
-          </select>
-        </div>
-        <div class="setting-group flex-1">
-          <label for="selTargetLang">🎯 TargetLang</label>
-          <select id="selTargetLang">
-            <option value="vi" selected>Vietnamese</option>
-          </select>
         </div>
       </div>
 

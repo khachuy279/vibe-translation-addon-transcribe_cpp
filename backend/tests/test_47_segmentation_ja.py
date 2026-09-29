@@ -409,3 +409,38 @@ def test_turn_scorer_duoc_dung_khi_khong_co_dau_cau():
 
     seg2 = StreamingSegmenter(turn_scorer=lambda t: 0.1, turn_threshold=0.5, turn_min_chars=4)
     assert seg2.observe("今日はいい天気ですねます", 32_000, now=1.0) == []
+
+
+def test_rhythm_1_tach_ngay_khi_thay_tail():
+    """Rhythm=1 (tail_scans=1): ngay nhịp đầu tiên thấy tail đủ chữ là cắt ngay, không chờ 280ms."""
+    c = SentenceCompleter(tail_min_chars=2, tail_scans=1)
+    text = "こっちの方がリフレッシュしてちょっと綺麗になっているんですけど、確かに結構周りも広いので、うんうん、なんか使いやすそうですね。そうですね。"
+    out = c.observe(text, now=1.0)
+    assert len(out) == 1
+    assert out[0].reason == "punct_tail"
+    assert out[0].text == "こっちの方がリフレッシュしてちょっと綺麗になっているんですけど、確かに結構周りも広いので、うんうん、なんか使いやすそうですね。"
+
+
+def test_asr_prefix_jitter_khong_reset_tail_stability():
+    """ASR sửa từ ở đầu câu (lệch vài ký tự) nhưng cùng câu kết thúc thì không reset nhịp tail."""
+    c = SentenceCompleter(tail_min_chars=2, tail_scans=2, tail_stable_ms=100.0)
+    # Nhịp 1: 'こっちの方が' (6 ký tự)
+    text1 = "こっちの方がリフレッシュしてちょっと綺麗になっているんですけど、確かに結構周りも広いので、うんうん、なんか使いやすそうですね。そうですね。"
+    assert c.observe(text1, now=1.0) == []
+    # Nhịp 2 (sau 150ms): ASR đổi đầu câu thành 'こちらは' (4 ký tự, lệch 2 ký tự)
+    text2 = "こちらはリフレッシュしてちょっと綺麗になっているんですけど、確かに結構丸みも広いので、うんうん、なんか使いやすそうですね。そうですね。"
+    out = c.observe(text2, now=1.15)
+    assert len(out) == 1
+    assert out[0].reason == "punct_tail"
+
+
+def test_max_chars_cat_cuong_buc_du_co_dau_cuoi_preview():
+    """Câu quá dài vượt max_chars dù có dấu `。` ở cuối preview (chưa có tail) vẫn phải cắt cưỡng bức."""
+    c = SentenceCompleter(max_chars=40)
+    # Câu có content_len > 40, có dấu `、` ở giữa và `。` ở cuối preview (không có tail)
+    text = "こちらはリフレッシュをしてちょっと綺麗になっているんですけど、うんうん使いやすさですね。"
+    out = c.observe(text, now=1.0)
+    assert len(out) == 1
+    assert out[0].reason == "max_chars"
+    assert out[0].text.endswith("、")
+

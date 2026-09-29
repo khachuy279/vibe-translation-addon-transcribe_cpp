@@ -1,4 +1,4 @@
-"""Bộ mẫu Prompt chuyên biệt cho từng mô hình dịch (Hunyuan-MT2, Xiaomi MiLM, GemmaX2)."""
+"""Bộ mẫu Prompt chuyên biệt cho từng mô hình dịch (Hunyuan-MT2, Xiaomi MiLM, GemmaX2, Index-Translate-2B)."""
 
 from typing import Dict, List, Optional
 
@@ -58,14 +58,11 @@ class TencentPromptStrategy(PromptStrategy):
 
         if context and use_context:
             user_content = (
-                f"Context: {context.strip()}\n\n"
-                f"Translate the following text to {tgt}:\n{text.strip()}"
+                f"Reference the following translations: {context.strip()}\n\n"
+                f"Translate the following text into Vietnamese. Note that you must ONLY output the translated result without any additional explanation:\n{text.strip()}"
             )
         else:
-            if src != "auto":
-                user_content = f"Translate the following {src} text to {tgt}:\n{text.strip()}"
-            else:
-                user_content = f"Translate the following text to {tgt}:\n{text.strip()}"
+            user_content = f"Translate the following text into Vietnamese. Note that you must ONLY output the translated result without any additional explanation:\n{text.strip()}"
 
         return f"<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
 
@@ -135,6 +132,63 @@ class GemmaXPromptStrategy(PromptStrategy):
         return ["<end_of_turn>", "<eos>", "<|endoftext|>", "</s>", "<|im_end|>", "\n"]
 
 
+class IndexTranslatePromptStrategy(PromptStrategy):
+    """Prompt chuyên dụng cho IndexTeam/Index-Translate-2B (Qwen3.5-base, ChatML).
+
+    Model dùng Qwen3.5 làm base — có thinking token `<think>`. Để dịch nhanh (no-think mode)
+    ta ép output bắt đầu bằng `<think>\n\n</think>\n\n` ngay trong prefix assistant,
+    tương đương với việc truyền `enable_thinking=False` trong chat template chính thức.
+
+    Prompt reference: https://huggingface.co/IndexTeam/Index-Translate-2B
+    (通用翻译模型 — en/ja/zh互译, Qwen3.5系列)
+    """
+
+    # Prefix cố định để tắt thinking mode và bắt đầu output thẳng.
+    _NO_THINK_PREFIX = "<think>\n\n</think>\n\n"
+
+    def build_prompt(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        context: str = "",
+        use_context: bool = False,
+    ) -> str:
+        src = resolve_lang_name(source_lang) if source_lang != "auto" else "auto"
+        tgt = resolve_lang_name(target_lang)
+
+        # System prompt mô tả nhiệm vụ dịch thuật.
+        if src == "auto":
+            system = (
+                f"You are a professional translator. "
+                f"Translate the user's text into {tgt}. "
+                f"Output ONLY the translation, no explanations."
+            )
+        else:
+            system = (
+                f"You are a professional translator. "
+                f"Translate the user's text from {src} into {tgt}. "
+                f"Output ONLY the translation, no explanations."
+            )
+
+        if context and use_context:
+            user_content = (
+                f"Reference translations for context: {context.strip()}\n\n"
+                f"{text.strip()}"
+            )
+        else:
+            user_content = text.strip()
+
+        return (
+            f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{user_content}<|im_end|>\n"
+            f"<|im_start|>assistant\n{self._NO_THINK_PREFIX}"
+        )
+
+    def get_stop_tokens(self) -> List[str]:
+        return ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "</s>", "\n\n"]
+
+
 def get_prompt_strategy(style: Optional[str]) -> PromptStrategy:
     """Lấy Prompt Strategy phù hợp với kiểu mô hình."""
     st = (style or "tencent").lower().strip()
@@ -142,4 +196,6 @@ def get_prompt_strategy(style: Optional[str]) -> PromptStrategy:
         return MiLMMPromptStrategy()
     elif st in ("gemmax", "gemmax2", "gemma"):
         return GemmaXPromptStrategy()
+    elif st in ("index", "index-translate", "index_translate"):
+        return IndexTranslatePromptStrategy()
     return TencentPromptStrategy()
