@@ -538,7 +538,7 @@ flowchart TD
     EXT["Extension MV3<br/>AudioWorklet 48k→16k PCM16"] -->|WSS binary frame| WS["FastAPI /ws<br/>protocol v3"]
     WS --> BUF["CircularAudioBuffer 60s"]
     WS --> VAD["VAD: FireRed / Silero / FSMN<br/>CPU, pre-warm"]
-    VAD -->|speech start/end| SEG["Segmenter + CommitManager 4 bậc"]
+    VAD -->|speech start/end| COMMIT["CommitManager 4 bậc<br/>stable_cut = text đứng im ⇒ chốt"]
     BUF --> NORM["Speech Normalizer<br/>RMS auto-gain + limiter"]
     NORM --> ASR["transcribe.cpp<br/>Vulkan (mặc định) / CUDA (tuỳ chọn)"]
     ASR -->|preview tokens| WS
@@ -558,7 +558,7 @@ flowchart TD
 | VAD | FireRed-VAD / Silero / FSMN, CPU, cả 3 pre-warm | `~3,2 ms` / chunk 25 ms (~13 % 1 nhân) |
 | Chuẩn hoá | RMS auto-gain + soft-knee + peak limiter | `< 0,2 ms` / chunk |
 | ASR | `transcribe.cpp` (Vulkan mặc định; CUDA tuỳ chọn nhanh hơn 1,53×), preview cửa sổ ≤ 6 s | commit p50 **~107 ms** (câu 4,5 s, RTF ≈ 0,024) |
-| Cắt câu | CommitManager 4 bậc + dedup 3 lớp | cả 3 loại lý do cắt đều xuất hiện trong log |
+| Cắt câu | CommitManager 4 bậc + dedup 3 lớp (cắt giữa câu = `stable_cut`: text đứng im đủ lâu; KHÔNG xét dấu câu) | cả 3 loại lý do cắt đều xuất hiện trong log |
 | Dịch | llama.cpp GPU, streaming token | **~67 token/s**, token đầu **26 ms** |
 | TTS | OmniVoice PyTorch 24 kHz, cache prompt giọng | `~420 ms` / câu 3 s (RTF 0,077) |
 | WebSocket | framing nhị phân, version hoá giao thức | cleanup phiên `~0,4 ms` |
@@ -637,7 +637,11 @@ Toàn bộ cấu hình tập trung ở `backend/config.py` (Pydantic v2). Các c
 | `asr.min_transcribe_sec` | `0,35` | Audio tối thiểu để có preview đầu tiên |
 | `asr.preview_window_sec` | `6,0` | Cửa sổ preview ⇒ chi phí preview bị chặn trên |
 | `asr.max_inflight_infer` | `1` | Số suy luận song song (chống phình hàng đợi) |
-| `asr.preview_reuse_for_commit` | `False` | **Giữ TẮT** (đo WER cho thấy bật thì xấu hơn) |
+| `asr.preview_reuse_for_commit` | `False` | **Giữ TẮT** (đo WER cho thấy bật thì xấu hơn). Bật ⇒ commit KHÔNG chạy lại ASR mà chép lại preview cuối ⇒ dễ chốt đúng giả thuyết đã trôi của model |
+| **`sentence.split_on_stability`** | `True` | Bật `stable_cut` — cơ chế cắt GIỮA CÂU DUY NHẤT (từ 2026-09-29, sau khi gỡ tầng SEG theo dấu câu + timer). Chốt khi preview text KHÔNG ĐỔI trong `stability_duration_sec` |
+| `sentence.stability_duration_sec` | `0,6` | Text phải đứng im bao lâu (giây) + `stability_threshold_polls` nhịp poll thì chốt câu |
+| `sentence.stability_min_duration_sec` / `stability_min_words` | `2,5` / `4` | Hai SÀN chống cắt sớm: câu phải đã dài ≥ ngần này giây và đủ số từ |
+| `sentence.trace_stability` | `False` | **Giữ TẮT**: bật ⇒ log `[SEG] [SEG_TRACE]` mỗi nhịp preview (kèm `hold=` lý do còn chờ, `n=<nhịp>/<cần>`, `t=<ms>/<cần>ms`, `nw=<số từ>`) và `[SEG_CUT]` ở nhịp chốt câu. Công tắc popup: **"🔍 Log each poll (SEG_TRACE)"** — chỉ nên bật khi tinh chỉnh ngưỡng cắt câu |
 | `sentence.max_duration_sec` | `6,0` | Chốt an toàn cho câu nói liên tục |
 | `sentence.min_words_to_commit` | `2` | Lọc tiếng ậm ừ / mảnh vụn |
 | `translation.base` / `auto_download` | `tencent` / `True` | Model dịch đang dùng / tự tải khi thiếu file |

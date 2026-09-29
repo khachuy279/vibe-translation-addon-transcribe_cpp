@@ -173,6 +173,9 @@ def test_config_response_exposes_streaming_and_protocol():
         "stability_duration_sec",
         "enable_tier234",
         "reuse_preview_for_commit",
+        # stable_cut: cắt câu theo độ ổn định (cơ chế cắt giữa câu duy nhất).
+        "stability_min_duration_sec",
+        "stability_min_words",
         "stream_translation",
         "native_backend",
     ):

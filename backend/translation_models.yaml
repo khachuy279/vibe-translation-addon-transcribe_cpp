@@ -33,9 +33,9 @@ models:
     description: Chất lượng cao (~4.6GB, Q4_K_XL)
 
   xiaomi:
-    name: MiLM-MT 4.6B (Xiaomi)
-    model: mradermacher/MiLMMT-46-4B-v1.0-GGUF
-    gguf_file: MiLMMT-46-4B-v1.0.Q4_K_M.gguf
+    name: MiLMMT 46 12B (Xiaomi)
+    model: mradermacher/MiLMMT-46-12B-v1.0-GGUF
+    gguf_file: MiLMMT-46-12B-v1.0.Q4_K_M.gguf
     temperature: 0.0
     top_p: 1.0
     top_k: 1
@@ -43,7 +43,7 @@ models:
     prompt_style: milmmt
     aliases:
       - milmmt
-    description: Nhanh & Nhẹ (~2.5GB)
+    description: Chất lượng cao
 
   gemmax:
     name: GemmaX2 28-9B v0.2 (Xiaomi)

@@ -250,7 +250,15 @@ class ASRConfig(BaseModel):
     preview_max_interval_ms: int = 1000   # trần nhịp preview
     # P2.5: tái sử dụng kết quả preview cho commit. MẶC ĐỊNH TẮT vì có thể mất từ
     # cuối câu (trái ưu tiên C4). Chỉ bật sau khi đo WER đạt chênh <= 0.3%.
-    preview_reuse_for_commit: bool = True
+    # ⚠️ ĐÃ TỪNG BỊ ĐẶT NHẦM THÀNH `True` (commit 2026-09-29) và gây lỗi phụ đề ngay trong
+    # log thật cùng ngày: `[ASR_COMMIT] [VAD_SILENCE] (infer=0.0ms): '泳いてくるね。'` —
+    # commit KHÔNG chạy lại ASR trên mảnh đã đóng mà chỉ CHÉP LẠI preview cuối, tức là chép
+    # lại đúng giả thuyết đã trôi của model (câu đúng `寄り行ってくる。` chỉ xuất hiện ở nhịp
+    # +0,7 s rồi bị các nhịp sau ghi đè). Đây cũng trái kết luận đo WER đã ghi ở
+    # `report/audit/XAC_NHAN_QWEN_VA_DINH_CHINH.md` (Q7a: bật ⇒ chất lượng XẤU HƠN sàn nhiễu)
+    # và ở `README.md` (bảng cấu hình: "Giữ TẮT"). Muốn bật thì phải chạy lại
+    # `test_09_wer_ab.py` theo TỪNG family model rồi mới đổi.
+    preview_reuse_for_commit: bool = False
     preview_reuse_max_delta_sec: float = 0.4
 
     # --- F-39: chống nghẽn executor ------------------------------------------
@@ -315,6 +323,13 @@ class SentenceConfig(BaseModel):
     # C4: số từ tối thiểu của preview trước khi cho phép BẬC 3 cắt câu.
     stability_min_words: int = 4
     inactivity_timeout_sec: float = 1.2    # Timeout ép chốt câu nếu không có frame mới
+    #: Ghi log CHẨN ĐOÁN từng nhịp preview của cơ chế cắt theo ĐỘ ỔN ĐỊNH: token
+    #: `[SEG_TRACE]` (mỗi nhịp — vì sao CHƯA chốt câu) và `[SEG_CUT]` (nhịp chốt câu).
+    #: Giữ nguyên token `SEG_*` như bản cũ để grep/so log không phải đổi thói quen.
+    #: MẶC ĐỊNH TẮT: mỗi nhịp một dòng (≈4 dòng/giây với nhịp poll 250 ms) — chỉ nên bật khi
+    #: đang tinh chỉnh `stability_duration_sec` / `stability_min_duration_sec` /
+    #: `stability_min_words`. Bật/tắt từ popup ("Log each poll").
+    trace_stability: bool = False
     # P2.1: feature flag cho 3 bậc commit không phải VAD (MAX_DURATION/STABLE_PREFIX/TIMEOUT_FORCE).
     # Đặt False để quay lại hành vi cũ (chỉ chốt theo VAD silence).
     enable_tier234: bool = True
@@ -328,81 +343,9 @@ class SentenceConfig(BaseModel):
     carry_over_short_fragment: bool = True
 
 
-class SegmentationConfig(BaseModel):
-    """Tầng SEG (VAD > ASR > SEG): chốt câu theo DẤU CÂU của ASR.
-
-    Vì sao cần: VAD cắt theo im lặng, nhưng trong phim tiếng Nhật người nói có thể ngắt
-    rất ngắn ở `、` (⇒ câu vụn, dịch sai) hoặc nói liền > 10 s (⇒ câu dài, khó đọc).
-    ASR đã tự sinh dấu câu nên dùng nó làm tín hiệu thứ hai. Xem
-    `report/audit/21_SEG_VA_FIX_DEDUP_PHU_DE.md`.
-    """
-    enabled: bool = True
-    #: True = tầng SEG thay BẬC 3 STABLE_PREFIX (tránh hai cơ chế cắt chồng nhau).
-    replace_stable_prefix: bool = True
-    max_chars: int = 100          # trần ký tự 1 câu trước khi cắt cưỡng bức
-    min_chars: int = 2           # câu ngắn hơn sẽ gộp với câu sau
-    # (Ngưỡng "từ" tối thiểu để được cắt KHÔNG có field riêng: SEG dùng chung
-    #  `SentenceConfig.min_words_to_commit` để hai tầng không lệch nhau.)
-    # Chống CẮT SỚM (đo từ log phim thật): ASR có lúc thả dấu `.` sai giữa câu rồi tự sửa
-    # ở nhịp sau (`Don't try and trick.` / `Me into buying…`). Phải thấy đủ chữ của câu mới
-    # VÀ ranh giới đứng yên vài nhịp mới chốt.
-    tail_min_chars: int = 4      # số ký tự nội dung tối thiểu của câu MỚI
-    tail_scans: int = 2          # ...qua bao nhiêu lần quét
-    tail_stable_ms: float = 280.0  # ...và đứng yên bao lâu
-    stable_ms: float = 350.0     # dấu kết câu ở cuối preview phải đứng yên bao lâu
-    stable_scans: int = 2        # ...và qua bao nhiêu lần quét
-    #: Cho phép chốt khi dấu kết câu đứng yên đủ lâu mà CHƯA thấy câu mới (`punct_stable`).
-    #: MẶC ĐỊNH TẮT: tiếng Nhật (và cả tiếng Anh) ASR hay thả `。`/`.` sớm giữa câu
-    #: (`営業回りを終え。`, `夕食を済ませ。`) ⇒ chờ câu mới hoặc im lặng VAD an toàn hơn.
-    stable_cut: bool = False
-    fallback_overlap_ms: float = 800.0   # không neo được khoảng lặng ⇒ lùi lại chồng lấn
-    #: Bật tầng "timer" lấy mốc cắt chính xác (Qwen3-ASR không có timestamp).
-    #: Tên trường giữ nguyên vì popup/extension đã gửi `segUseWhisperTimer`; từ 2026-09-28
-    #: nó là công tắc CHUNG, còn engine cụ thể do `timer_engine` chọn.
-    use_whisper_timer: bool = True
-    whisper_model_key: str = "whisper-large-v3-turbo"
-    #: Engine timer: "qwen3-aligner" (mặc định — Qwen3-ForcedAligner-0.6B qua transformers) hoặc
-    #: "whisper" (transcribe.cpp; mốc segment + nội suy ký tự, dùng làm đường dự phòng).
-    #: Đo A/B trên FLEURS ja: aligner p50 20 ms / p90 36 ms / 94 ms-lần vs whisper p50 32 ms /
-    #: p90 204 ms / 202 ms-lần (whisper còn có mẫu lệch tới ~12-20 s vì phải căn chéo văn bản
-    #: của 2 model). Xem `report/audit/26_...md` + `27_SEG_AB_ALIGNER_VS_WHISPER.md`.
-    timer_engine: str = "qwen3-aligner"
-    timer_min_confidence: float = 0.35
-    timer_max_audio_sec: float = 30.0    # không chạy timer cho mảnh dài hơn (trần chi phí)
-    #: --- Qwen3-ForcedAligner (chỉ dùng khi `timer_engine="qwen3-aligner"`) ---
-    #: Checkpoint `-hf` (định dạng native của transformers, KHÔNG phải bản gốc của gói
-    #: `qwen-asr`): chỉ bản `-hf` có `chat_template.jinja` chạy được `language=None`.
-    aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
-    #: Thư mục model CỤC BỘ. RỖNG ⇒ `backend/models/Qwen__Qwen3-ForcedAligner-0.6B-hf`
-    #: (cùng quy ước `backend/models/_hf/<org>__<name>`). Model **luôn** được nạp từ đây —
-    #: KHÔNG bao giờ nạp thẳng từ cache HuggingFace; nếu chưa có thì tải MỘT LẦN về đây khi
-    #: `aligner_auto_download=True`. Nhờ vậy chạy được offline và không phát sinh request HF
-    #: mỗi lần nạp.
-    aligner_local_dir: str = ""
-    aligner_device: str = "cuda:0"
-    aligner_dtype: str = "bfloat16"
-    aligner_auto_download: bool = True
-    #: Aligner chỉ phủ 11/30 ngôn ngữ của ASR ⇒ khi phiên dùng ngôn ngữ NGOÀI danh sách
-    #: (vd `vi`), timer tự chuyển sang `WhisperTimer` (whisper chỉ được nạp khi thật cần)
-    #: thay vì để mốc cắt rơi về chồng lấn. Đặt False để timer trả None (engine dùng mốc
-    #: chồng lấn) — chỉ nên dùng khi muốn đo riêng chất lượng aligner.
-    aligner_whisper_fallback: bool = False
-    #: Aligner chỉ hỗ trợ 11 ngôn ngữ (zh, en, yue, fr, de, it, ja, ko, pt, ru, es). Phiên ở
-    #: chế độ `auto` được suy theo CHỮ VIẾT (kana/hangul/CJK/Cyrillic); chữ Latin không phân
-    #: biệt được nên mặc định KHÔNG align (rơi về đường dự phòng). Đặt tên ngôn ngữ ở đây
-    #: (vd "English") nếu muốn ép align cho phiên auto dùng chữ Latin.
-    aligner_language_fallback: str = ""
-    #: Ghi log TỪNG NHỊP ASR preview (vì sao chốt / vì sao còn chờ) để tinh chỉnh mốc ngắt
-    #: câu bằng mắt người. Bật mặc định trong giai đoạn tinh chỉnh.
-    debug_trace: bool = True
-    #: Khi SEG TẮT: vẫn chạy một máy trạng thái SEG "bóng" và log nó SẼ cắt ở đâu — nhờ vậy
-    #: MỘT lần chạy video vẫn so sánh được "có SEG" với "không SEG".
-    shadow_when_disabled: bool = True
-
-
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "tencent"  # tencent, tencent-1.8b, xiaomi, gemmax
+    base: str = "xiaomi"  # tencent, tencent-1.8b, xiaomi, gemmax
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None
@@ -519,7 +462,6 @@ class AppConfig(BaseModel):
     vad: VADConfig = Field(default_factory=VADConfig)
     asr: ASRConfig = Field(default_factory=ASRConfig)
     sentence: SentenceConfig = Field(default_factory=SentenceConfig)
-    segmentation: SegmentationConfig = Field(default_factory=SegmentationConfig)
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     audio_buffer: AudioBufferConfig = Field(default_factory=AudioBufferConfig)

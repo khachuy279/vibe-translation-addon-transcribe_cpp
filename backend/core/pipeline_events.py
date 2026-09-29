@@ -14,7 +14,13 @@ class VADState(str, Enum):
 
 
 class CommitReason(str, Enum):
-    """Lý do chốt câu (Commit Reason) để phân tích và logging."""
+    """Lý do chốt câu (Commit Reason) để phân tích và logging.
+
+    Hệ chỉ còn 4 cửa chốt: VAD báo hết tiếng (BẬC 1), quá dài (BẬC 2), TEXT ĐỨNG IM đủ lâu
+    (BẬC 3 — "stable_cut", cơ chế cắt giữa câu DUY NHẤT, không xét dấu câu) và hết kiên nhẫn
+    (BẬC 4). Tầng SEG (chốt theo dấu câu ASR) và timer timestamp (Whisper/Qwen3-Aligner) đã
+    bị gỡ bỏ hoàn toàn (2026-09-29).
+    """
     VAD_SILENCE = "VAD_SILENCE"
     MAX_DURATION = "MAX_DURATION"
     STABLE_PREFIX = "STABLE_PREFIX"
@@ -22,9 +28,6 @@ class CommitReason(str, Enum):
     MANUAL = "MANUAL"
     # P4.5: hàng đợi commit đầy -> câu cũ nhất được GỘP thay vì bị vứt bỏ.
     MERGED_BACKLOG = "MERGED_BACKLOG"
-    # SEG (VAD > ASR > SEG): chốt vì DẤU CÂU của ASR đã trọn câu (xem
-    # `backend/segmentation/`). Mốc cắt lấy từ timer có timestamp (Whisper) nếu bật.
-    SEG_PUNCT = "SEG_PUNCT"
 
 
 @dataclass

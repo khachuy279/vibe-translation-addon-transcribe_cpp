@@ -132,6 +132,23 @@ class CommitManager:
 
         return False
 
+    def stability_state(self) -> dict:
+        """Trạng thái bộ đếm ổn định (cho log trace từng nhịp — xem `[SEG_TRACE]`).
+
+        Trả các khoá dùng để giải thích VÌ SAO chưa chốt câu: số nhịp đã thấy text đứng im,
+        số nhịp cần, thời gian đã đứng im (ms) và thời gian cần (ms). Thuần đọc — không đổi
+        trạng thái, nên gọi ở đâu cũng an toàn.
+        """
+        start = self._stability_start_time
+        stable_ms = (time.time() - start) * 1000.0 if start else 0.0
+        return {
+            "polls": int(self._stable_poll_count),
+            "required_polls": int(self.cfg.stability_threshold_polls),
+            "stable_ms": stable_ms,
+            "required_ms": float(self.cfg.stability_duration_sec) * 1000.0,
+            "text": self._last_preview_text,
+        }
+
     def evaluate_inactivity_timeout(self, is_speech_active: bool) -> bool:
         """Đánh giá BẬC 4: Inactivity Timeout Force-Commit nếu session đứng yên quá 1.2s.
         

@@ -157,7 +157,7 @@ def restore_config():
     saved_top = {k: v for k, v in config.__dict__.items()}
     saved_sub = {name: _snapshot(getattr(config, name)) for name in
                  ("ws", "vad", "asr", "sentence", "translation", "tts", "audio_buffer",
-                  "metrics", "segmentation", "gpu")}
+                  "metrics", "gpu")}
     try:
         yield config
     finally:
@@ -175,14 +175,6 @@ def restore_config():
                     setattr(sub, k, v)
                 except Exception:
                     pass
-        # Timer SEG là singleton theo `segmentation.timer_engine` ⇒ phải quên nó sau mỗi
-        # test, nếu không test sau có thể dùng lại engine/model của test trước.
-        try:
-            from backend.asr import timer as _timer_mod
-
-            _timer_mod.reset_seg_timer()
-        except Exception:
-            pass
 
 
 @pytest.fixture(autouse=True)
@@ -203,7 +195,6 @@ def _forbid_heavy_model_loads(request, monkeypatch):
         return
 
     from backend.asr import engine as asr_mod
-    from backend.asr import aligner_timer as aligner_mod
     from backend.translation import engine as trans_mod
     from backend.tts import engine as tts_mod
 
@@ -220,11 +211,6 @@ def _forbid_heavy_model_loads(request, monkeypatch):
     monkeypatch.setattr(trans_mod.GGUFTranslator, "reconfigure", _make_boom("translation"), raising=False)
     monkeypatch.setattr(tts_mod.OmniVoiceTTS, "load_model", _make_boom("tts"), raising=False)
     monkeypatch.setattr(asr_mod.TranscribeEngine, "_load_model_locked", _make_boom("asr"), raising=False)
-    # Aligner SEG (Qwen3-ForcedAligner-0.6B, ~1,8 GB VRAM) cũng là model thật: chặn nạp ở
-    # tầng A để một test lỡ đặt `segmentation.timer_engine="qwen3-aligner"` không ngốn VRAM.
-    monkeypatch.setattr(
-        aligner_mod.Qwen3AlignerTimer, "ensure_loaded", _make_boom("qwen3-aligner"), raising=False
-    )
     yield
 
 

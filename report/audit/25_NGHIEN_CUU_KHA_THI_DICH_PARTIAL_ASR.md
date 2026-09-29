@@ -1,5 +1,13 @@
 # 25 — NGHIÊN CỨU KHẢ THI: DỊCH PARTIAL ASR VÀ XUẤT BẢN DỊCH DẦN (hướng thay thế mirror-MSE)
 
+> ⚠️ **TÀI LIỆU LỊCH SỬ (ghi chú 2026-09-29).** Bản nghiên cứu này dựa trên tầng SEG
+> (`backend/segmentation/`, chốt câu theo DẤU CÂU + timer timestamp) và trên việc "đóng băng tiền tố
+> đã chốt". **Tầng SEG và timer đã bị GỠ BỎ hoàn toàn** khỏi `backend/` và `extension_firefox/`
+> (chỉ còn `stable_cut`: text đứng im đủ lâu thì chốt câu — xem `README.md` §Cấu hình quan trọng).
+> Vì vậy mọi tham chiếu `backend/segmentation/boundary.py`, `SEG_PUNCT`, `_emitted_text`… dưới đây
+> **không còn tồn tại trong mã nguồn**; phần còn giá trị là các số đo về độ bất ổn định của ASR
+> streaming và luận điểm về dịch partial.
+
 > **Loại tài liệu:** nghiên cứu khả thi (feasibility study) + thiết kế + kế hoạch đo.
 > **KHÔNG** sửa `backend/` hay `extension_firefox/`; chỉ đọc và ghi chính file này.
 > **Ngày:** 2026-09 · **Tiền đề:** `22_MSE_INTERCEPT_FEASIBILITY.md`, `23_M1_KET_QUA_KHAO_SAT_MSE.md`,

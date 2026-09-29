@@ -25,14 +25,13 @@ Ghi chú an toàn luồng (P1.8b):
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-import difflib
 import logging
 import os
 from pathlib import Path
 import threading
 import time
 import uuid
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
 import numpy as np
 
 # `backend/asr/__init__.py` đã gọi `backend.asr.native.bootstrap()` TRƯỚC khi module này
@@ -47,11 +46,7 @@ except ImportError:
 from backend.config import config, SentenceConfig
 from backend.core.audio_buffer import CircularAudioBuffer
 from backend.core.commit_manager import CommitManager, count_content_tokens
-from backend.segmentation import (
-    SentenceCompleter,
-    StreamingSegmenter,
-    split_complete_sentences,
-)
+from backend.core.hypothesis import HypothesisConsensus
 from backend.core.metrics import metrics_collector
 from backend.core.normalizer import SpeechNormalizer
 from backend.core.pipeline_events import CommitReason
@@ -75,28 +70,6 @@ _EXECUTOR = ThreadPoolExecutor(
 
 # Trần số commit chờ xử lý trước khi gộp (P4.5). Không còn `maxlen` vứt câu âm thầm.
 _MAX_PENDING_COMMITS = 6
-
-
-def _best_matching_sentence(parts: List[str], target: str) -> Optional[str]:
-    """Chọn câu trong `parts` khớp nhất với `target` (câu mà SEG đã chốt).
-
-    Dùng khi văn bản chạy lại trên mảnh đã cắt chứa NHIỀU câu: ta muốn giữ ĐÚNG câu đã
-    quyết định, không phải "câu đầu tiên" (câu đầu có thể chỉ là mảnh ngắn như `Okay.`,
-    và giữ nó sẽ làm câu bị coi là quá ngắn ⇒ gộp lại ⇒ LẶP).
-    """
-    if not parts:
-        return None
-    if not target:
-        return max(parts, key=len)
-    from backend.asr.timer import normalize_for_align as _norm
-
-    want = _norm(target)
-    best, best_score = parts[0], -1.0
-    for part in parts:
-        score = difflib.SequenceMatcher(None, _norm(part), want, autojunk=False).ratio()
-        if score > best_score:
-            best, best_score = part, score
-    return best
 
 
 class TranscribeEngine(BaseASREngine):
@@ -284,6 +257,9 @@ class TranscribeEngine(BaseASREngine):
         # P2.5: kết quả preview gần nhất để có thể tái sử dụng cho commit.
         self._last_preview_end_sample: int = -1
         self._last_preview_text: str = ""
+        # Chẩn đoán "ASR viết lại cả câu": đếm số NHỊP preview ủng hộ mỗi câu
+        # (xem `backend/core/hypothesis.py` + `_warn_unseen_commit_text`).
+        self._hypothesis_consensus = HypothesisConsensus()
         # K2: mốc đo thời gian tới preview đầu tiên (đặt lại mỗi khi VAD báo bắt đầu nói).
         self._speech_started_at: float = 0.0
         self._first_preview_reported: bool = True
@@ -299,22 +275,13 @@ class TranscribeEngine(BaseASREngine):
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None  # set khi stream_tokens bắt đầu
         self._is_running: bool = True
         self._lock = threading.RLock()
-        # SEG (VAD > ASR > SEG): chốt câu theo dấu câu của ASR + mốc cắt từ timer.
-        seg_cfg = getattr(config, "segmentation", None)
-        self._seg_cfg = seg_cfg
-        self._seg: Optional[StreamingSegmenter] = None
-        if seg_cfg is not None and bool(getattr(seg_cfg, "enabled", False)):
-            self._seg = self._build_seg(seg_cfg)
-        self._seg_decision: Optional[Any] = None
-        self._seg_commits: int = 0
-        self._seg_timer_ms_total: float = 0.0
-        self._seg_timer_prewarmed: bool = False
-        #: Mảnh SEG vừa bị "gộp vào câu kế tiếp" — dùng để phát hiện VÒNG LẶP (FIX-12b).
+        #: Mảnh ngắn vừa bị "gộp vào câu kế tiếp" — dùng để phát hiện VÒNG LẶP (FIX-12b).
         self._last_carried_text: str = ""
-        self._seg_trace: bool = bool(getattr(seg_cfg, "debug_trace", False)) if seg_cfg else False
-        # SEG "bóng": khi SEG TẮT vẫn cho biết nó SẼ cắt ở đâu (so sánh A/B trong 1 lần chạy).
-        self._seg_shadow: Optional[StreamingSegmenter] = None
-        self._refresh_seg_shadow()
+        #: Trace chẩn đoán `[SEG_TRACE]`/`[SEG_CUT]` cho cơ chế cắt theo độ ổn định
+        #: (`sentence.trace_stability`, popup "Log each poll", MẶC ĐỊNH TẮT).
+        self._trace_stability: bool = bool(getattr(config.sentence, "trace_stability", False))
+        #: Lý do còn chờ của nhịp gần nhất (do `_evaluate_tier234` ghi).
+        self._stability_hold: str = ""
         # P1.5: trần audio hợp lệ của session (samples). 0 = không biết.
         self._max_audio_samples: int = 0
         self._window_warned: bool = False
@@ -337,84 +304,6 @@ class TranscribeEngine(BaseASREngine):
         self.on_model_status: Optional[Callable[[Dict[str, Any]], None]] = None
 
     # ------------------------------------------------------------------ cấu hình
-    def _build_seg(self, seg_cfg: Any) -> StreamingSegmenter:
-        """Tạo một máy trạng thái SEG từ cấu hình (dùng cho cả SEG thật và SEG 'bóng')."""
-        # SEG không được cắt câu ngắn hơn ngưỡng lọc của tầng trên: cắt ra rồi bị gộp lại
-        # làm vùng audio không tiến ⇒ LẶP (xem log phim thật 2026-09-22). Ngưỡng này ĐI
-        # CHUNG với "Min Words" ở popup (`min_words_to_commit`) để hai tầng không lệch nhau.
-        min_words = int(getattr(config.sentence, "min_words_to_commit", 2) or 0)
-        min_words = max(0, min_words)
-        return StreamingSegmenter(
-            SentenceCompleter(
-                min_chars=int(getattr(seg_cfg, "min_chars", 2)),
-                min_words=min_words,
-                max_chars=int(getattr(seg_cfg, "max_chars", 60)),
-                tail_min_chars=int(getattr(seg_cfg, "tail_min_chars", 4)),
-                tail_scans=int(getattr(seg_cfg, "tail_scans", 2)),
-                tail_stable_ms=float(getattr(seg_cfg, "tail_stable_ms", 280.0)),
-                stable_ms=float(getattr(seg_cfg, "stable_ms", 350.0)),
-                stable_scans=int(getattr(seg_cfg, "stable_scans", 2)),
-                # Mặc định TẮT cắt-theo-độ-ổn-định: ASR hay thả dấu kết câu sớm giữa câu
-                # (tiếng Nhật: `営業回りを終え。`, `夕食を済ませ。`) ⇒ chờ câu mới / im lặng VAD.
-                allow_stable_cut=bool(getattr(seg_cfg, "stable_cut", False)),
-            ),
-            fallback_overlap_ms=float(getattr(seg_cfg, "fallback_overlap_ms", 600.0)),
-        )
-
-    def _refresh_seg_shadow(self) -> None:
-        cfg = self._seg_cfg
-        want = bool(
-            cfg is not None
-            and self._seg is None
-            and self._seg_trace
-            and bool(getattr(cfg, "shadow_when_disabled", True))
-        )
-        self._seg_shadow = self._build_seg(cfg) if want else None
-
-    def update_seg_config(self, **kwargs: Any) -> None:
-        """Cập nhật cấu hình tầng SEG runtime (từ popup/REST) và DỰNG LẠI máy trạng thái.
-
-        Không dựng lại `_seg` thì mọi thay đổi `max_chars`/`tail_*` chỉ nằm trong config mà
-        không có tác dụng (đúng loại bug "cấu hình vô hiệu" đã gặp ở BẬC 3 trước đây).
-        """
-        seg_cfg = getattr(config, "segmentation", None)
-        if seg_cfg is None:
-            return
-        from backend.asr.timer import normalize_timer_engine  # noqa: PLC0415
-
-        # ⚠️ CHỈ reset timer khi ENGINE THỰC SỰ ĐỔI. Popup đồng bộ cấu hình ở MỖI lần kết nối
-        # và luôn gửi kèm `use_whisper_timer`; nếu reset theo sự CÓ MẶT của khoá thì mỗi lần
-        # đồng bộ sẽ đóng model aligner (1,8 GB) rồi nạp lại từ đầu — đo thật trong log:
-        # 5 lần nạp × ~9-12 s cho 2 phiên.
-        prev_engine = normalize_timer_engine(getattr(seg_cfg, "timer_engine", "whisper"))
-        for key, value in kwargs.items():
-            if value is None or not hasattr(seg_cfg, key):
-                continue
-            setattr(seg_cfg, key, value)
-        self._seg_cfg = seg_cfg
-        self._seg_trace = bool(getattr(seg_cfg, "debug_trace", False))
-        new_engine = normalize_timer_engine(getattr(seg_cfg, "timer_engine", "whisper"))
-        if new_engine != prev_engine:
-            # Đổi engine timer (whisper ↔ qwen3-aligner) phải ĐÓNG model cũ và cho phép nạp
-            # lại: nếu không, `_seg_timer_prewarmed` giữ True và model mới không bao giờ nạp.
-            self._reset_seg_timer(prewarm=False)
-        if bool(getattr(seg_cfg, "enabled", False)):
-            self._seg = self._build_seg(seg_cfg)
-            self.prewarm_seg_timer()
-        else:
-            self._seg = None
-        self._refresh_seg_shadow()
-        self._seg_decision = None
-        logger.info(
-            f"SEG cấu hình lại: enabled={bool(getattr(seg_cfg, 'enabled', False))}, "
-            f"max_chars={getattr(seg_cfg, 'max_chars', None)}, "
-            f"tail_min_chars={getattr(seg_cfg, 'tail_min_chars', None)}, "
-            f"tail_scans={getattr(seg_cfg, 'tail_scans', None)}, "
-            f"timer={bool(getattr(seg_cfg, 'use_whisper_timer', False))}, "
-            f"timer_engine={getattr(seg_cfg, 'timer_engine', 'whisper')}",
-            extra={"module_tag": "ASR"},
-        )
-
     def update_sentence_config(self, **kwargs) -> None:
         """Cập nhật cấu hình phân câu và ngắt đoạn runtime (P2.1 / G4).
 
@@ -424,9 +313,9 @@ class TranscribeEngine(BaseASREngine):
         for k, v in kwargs.items():
             if hasattr(self.commit_manager.cfg, k):
                 setattr(self.commit_manager.cfg, k, v)
-        # `min_words_to_commit` cũng là ngưỡng lọc của tầng SEG (dùng chung) ⇒ dựng lại SEG.
-        if "min_words_to_commit" in kwargs and self._seg is not None:
-            self.update_seg_config()
+        # Cờ trace đọc lại NGAY để công tắc popup có hiệu lực tức thì.
+        if "trace_stability" in kwargs:
+            self._trace_stability = bool(getattr(config.sentence, "trace_stability", False))
 
     @property
     def preview_window_sec(self) -> float:
@@ -633,84 +522,6 @@ class TranscribeEngine(BaseASREngine):
             self._preload_model(force_warm=True)
         except Exception as e:
             logger.warning(f"Pre-warm ASR warning: {e}", extra={"module_tag": "ASR"})
-        self.prewarm_seg_timer()
-
-    def _reset_seg_timer(self, *, prewarm: bool = False) -> None:
-        """Quên timer SEG đang cache (dùng khi đổi engine timer) rồi (tuỳ chọn) nạp lại.
-
-        Vì sao cần: `get_seg_timer()` là singleton theo `config.segmentation.timer_engine`.
-        Không reset thì đổi engine từ popup/WS chỉ đổi CONFIG còn model đang chạy vẫn là
-        engine cũ (đúng loại bug "cấu hình vô hiệu").
-        """
-        try:
-            from backend.asr.timer import reset_seg_timer  # noqa: PLC0415
-
-            reset_seg_timer()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Không reset được SEG timer: {exc}", extra={"module_tag": "ASR"})
-        self._seg_timer_prewarmed = False
-        if prewarm:
-            self.prewarm_seg_timer()
-
-    def prewarm_seg_timer(self) -> None:
-        """Nạp trước model TIMER của tầng SEG (whisper hoặc Qwen3-ForcedAligner) trong luồng nền.
-
-        Vì sao: timer chỉ được gọi ở lần CHỐT CÂU đầu tiên; nếu nạp lúc đó thì câu đầu
-        tiên bị trễ thêm ~1 s (nạp model 845 MB) — với aligner là ~1,3 s / 1,8 GB VRAM —
-        đúng lúc người dùng đang chờ phụ đề. Nạp nền nên không chặn khởi động phiên; nếu
-        chưa kịp thì `_seg_cut_sample()` vẫn có đường dự phòng (chồng lấn) nên không mất chữ.
-        """
-        cfg = self._seg_cfg
-        if self._seg is None or cfg is None:
-            return
-        if not bool(getattr(cfg, "use_whisper_timer", False)):
-            return
-        if getattr(self, "_seg_timer_prewarmed", False):
-            return
-        self._seg_timer_prewarmed = True
-        engine_name = str(getattr(cfg, "timer_engine", "whisper") or "whisper")
-        try:
-            from backend.asr.timer import get_seg_timer
-
-            timer = get_seg_timer()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Không lấy được SEG timer để prewarm: {exc}", extra={"module_tag": "ASR"})
-            return
-        if timer is None or not timer.available():
-            metrics_collector.increment_counter("seg.timer_unavailable")
-            logger.info(
-                f"SEG timer ({engine_name}): chưa có model cục bộ ⇒ dùng chồng lấn dự phòng.",
-                extra={"module_tag": "ASR"},
-            )
-            return
-
-        def _load() -> None:
-            t0 = time.perf_counter()
-            try:
-                # `Qwen3AlignerTimer.prewarm()` tự quyết định nạp aligner hay whisper dự phòng
-                # (theo ngôn ngữ phiên); `WhisperTimer` không có `prewarm()` ⇒ dùng như cũ.
-                loader = getattr(timer, "prewarm", None)
-                session = loader() if callable(loader) else timer._ensure_session()  # noqa: SLF001
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"Prewarm SEG timer lỗi: {exc}", extra={"module_tag": "ASR"})
-                return
-            elapsed = time.perf_counter() - t0
-            if session is None:
-                metrics_collector.increment_counter("seg.timer_prewarm_failed")
-                logger.warning(
-                    f"Prewarm SEG timer thất bại: {timer.last_error or 'không rõ lý do'}",
-                    extra={"module_tag": "ASR"},
-                )
-                return
-            metrics_collector.record_metric("seg", "timer_load_ms", elapsed * 1000.0)
-            metrics_collector.increment_counter("seg.timer_prewarmed")
-            logger.info(
-                f"SEG timer sẵn sàng ({engine_name}: {timer.model_key}, {elapsed:.2f}s) — mốc cắt "
-                f"theo timestamp thật.",
-                extra={"module_tag": "ASR"},
-            )
-
-        threading.Thread(target=_load, name="seg-timer-prewarm", daemon=True).start()
 
     # ------------------------------------------------------------------ ingress
     def feed_audio(self, audio_data: Any, timestamp: float = 0.0, vad_state: str = "") -> None:
@@ -781,9 +592,8 @@ class TranscribeEngine(BaseASREngine):
             self._preview_sec_processed = 0.0
             self._preview_sec_unique_peak = 0.0
         self.commit_manager.reset_stability()
-        if self._seg is not None:
-            self._seg.reset()
-            self._seg_decision = None
+        # Câu mới ⇒ lịch sử giả thuyết của câu trước không được dùng để chẩn đoán câu này.
+        self._hypothesis_consensus.reset()
         # K2: ĐÁNH THỨC generator ngay. Trước đây nhánh idle ngủ tới `poll_interval_ms`
         # (mặc định 300 ms) nên preview đầu tiên của câu bị trễ thêm tới ~300 ms chỉ vì
         # generator chưa biết là đã có tiếng nói (đo thật: K2 1,29 s -> 0,62 s).
@@ -994,180 +804,94 @@ class TranscribeEngine(BaseASREngine):
         ngay giữa câu => mất chữ.
         """
         if not bool(getattr(config.sentence, "enable_tier234", True)):
+            self._stability_hold = "tier234_off"
             return None
 
         cfg = self.commit_manager.cfg
+        self._stability_hold = ""
 
         # BẬC 2 — chốt an toàn chống câu phình (bảo vệ chi phí preview, P2.3)
         if self.commit_manager.check_max_duration(duration_sec, len(preview_text)):
             return CommitReason.MAX_DURATION
 
-        # BẬC 3 — cắt ở ranh giới từ (P3). Khi tầng SEG bật và được phép THAY THẾ thì bỏ
-        # qua bậc này: SEG đã bao trùm trường hợp "text đứng yên" (`punct_stable`) và cắt
-        # đúng ở dấu câu thay vì cắt mò giữa câu.
-        seg_replaces = bool(
-            self._seg is not None
-            and getattr(self._seg_cfg, "replace_stable_prefix", True)
-        )
-        if self.commit_manager.cfg.split_on_stability and not seg_replaces:
+        # BẬC 3 — CẮT THEO ĐỘ ỔN ĐỊNH (stable_cut): preview text KHÔNG ĐỔI trong
+        # `stability_duration_sec` (và đủ số nhịp poll) ⇒ chốt câu. KHÔNG xét dấu câu: ASR
+        # thả dấu `.`/`。` sai giữa câu rất thường xuyên (log phim thật: `営業回りを終え。`,
+        # `夕食を済ませ。`), nên chỉ "text đứng im" mới là bằng chứng dùng được.
+        if self.commit_manager.cfg.split_on_stability:
             min_dur = float(getattr(cfg, "stability_min_duration_sec", 0.0) or 0.0)
             min_words = int(getattr(cfg, "stability_min_words", 0) or 0)
-            if duration_sec >= min_dur and count_content_tokens(preview_text) >= min_words:
+            tokens = count_content_tokens(preview_text)
+            if duration_sec >= min_dur and tokens >= min_words:
                 if self.commit_manager.evaluate_preview_stability(preview_text):
                     return CommitReason.STABLE_PREFIX
+                # LÝ DO còn chờ (cho `[SEG_TRACE]`) — bộ đếm vừa được cập nhật ở trên.
+                st = self.commit_manager.stability_state()
+                self._stability_hold = (
+                    f"stability n={st['polls']}/{st['required_polls']} "
+                    f"t={st['stable_ms']:.0f}/{st['required_ms']:.0f}ms"
+                )
             else:
                 # Chưa đủ điều kiện: reset để bộ đếm ổn định không tích luỹ sai.
                 self.commit_manager.reset_stability()
+                self._stability_hold = (
+                    f"floor_duration {duration_sec:.1f}/{min_dur:.1f}s"
+                    if duration_sec < min_dur
+                    else f"floor_words {tokens}/{min_words}"
+                )
+        else:
+            self._stability_hold = "stability_off"
 
         # BẬC 4 — không có audio mới (lưới an toàn chống treo)
         if self.commit_manager.evaluate_inactivity_timeout(True):
             return CommitReason.TIMEOUT_FORCE
 
+        if not self._stability_hold:
+            self._stability_hold = "waiting"
         return None
 
-    def _evaluate_seg(self, preview_text: str, end_sample: int,
-                      region_start: int = 0) -> Optional[CommitReason]:
-        """Tầng SEG: chốt câu khi DẤU CÂU của ASR đã trọn câu (xem `backend/segmentation/`).
+    def _trace_stability_poll(self, reason: Optional[CommitReason], preview_text: str,
+                              duration_sec: float, end_sample: int, region_start: int) -> None:
+        """Ghi `[SEG_TRACE]` (chưa chốt — kèm lý do còn chờ) hoặc `[SEG_CUT]` (nhịp chốt).
 
-        Khác BẬC 3 (STABLE_PREFIX) ở chỗ: bằng chứng là *cấu trúc câu* (đã có chữ của câu
-        kế tiếp sau dấu kết câu, hoặc dấu kết câu đứng yên đủ lâu), không phải "text không
-        đổi". Nhờ vậy câu không bị cắt vụn ở `、` mà cũng không phình tới `max_duration_sec`.
+        CHỈ chạy khi `sentence.trace_stability` bật (popup: "Log each poll", mặc định TẮT):
+        mỗi nhịp preview một dòng, ≈4 dòng/giây với nhịp poll 250 ms — đủ để tinh chỉnh
+        `stability_duration_sec` / `stability_min_duration_sec` / `stability_min_words` bằng
+        mắt người, nhưng quá ồn để bật thường trực.
 
-        Khi `config.segmentation.debug_trace` bật: ghi `[SEG_TRACE]` cho TỪNG nhịp preview
-        (kèm lý do còn chờ) để người dùng tự chọn mốc ngắt câu; nếu SEG đang TẮT thì ghi
-        `[SEG_SHADOW]` cho biết SEG *sẽ* cắt ở đâu (so sánh A/B trong cùng một lần chạy).
+        Định dạng::
+
+            [SEG_TRACE] [utt=ab12cd34] t=+1.2s hold=stability n=2/3 t=340/600ms nw=4 | 'text'
+            [SEG_CUT]   [utt=ab12cd34] t=+4.8s cut=STABLE_PREFIX dur=4.8s n=3 | 'text'
+
+        `nw=` = số "từ" theo đúng thước đo của `stability_min_words` (CJK: ký tự, Latin: từ) —
+        nhìn `nw=` và `hold=floor_words a/b` là biết ngay còn thiếu bao nhiêu.
+
+        Giữ nguyên token `SEG_TRACE` / `SEG_CUT` và các khoá `t=+`, `hold=`, `cut=`, `n=` như bản
+        SEG cũ (đã gỡ 2026-09-29) để log cũ/mới còn grep và so sánh được. Khoá `c=` (số ký tự
+        ĐÃ CHỐT của tầng SEG) không còn vì tầng đó không tồn tại.
         """
-        if self._seg is None:
-            self._trace_seg_shadow(preview_text, end_sample)
-            return None
-        if not preview_text:
-            return None
-        try:
-            decisions = self._seg.observe(preview_text, end_sample)
-        except Exception as exc:  # noqa: BLE001 — SEG lỗi không được làm chết pipeline
-            logger.warning(f"SEG lỗi, bỏ qua vòng này: {exc}", extra={"module_tag": "ASR"})
-            return None
-
-        if not decisions:
-            self._log_seg_trace("SEG_TRACE", preview_text, end_sample, region_start,
-                                self._seg.completer.trace_state())
-            return None
-
-        self._seg_decision = decisions[0]
-        if getattr(decisions[0], "stale_text", False):
-            metrics_collector.increment_counter("seg.stale_text")
-        metrics_collector.increment_counter(f"seg.reason.{decisions[0].reason}")
-        self._log_seg_trace("SEG_CUT", preview_text, end_sample, region_start,
-                            self._seg.completer.trace_state(), decision=decisions[0])
-        return CommitReason.SEG_PUNCT
-
-    @staticmethod
-    def _elapsed_sec(end_sample: int, region_start: int) -> float:
-        return max(0.0, (end_sample - region_start) / 16000.0)
-
-    def _log_seg_trace(self, tag: str, preview_text: str, end_sample: int,
-                       region_start: int, state: Dict[str, Any],
-                       decision: Optional[Any] = None) -> None:
-        """Ghi MỘT dòng trace cho mỗi nhịp ASR — đủ để chỉnh mốc ngắt câu bằng mắt."""
-        if not self._seg_trace:
+        if not self._trace_stability or not preview_text:
             return
-        elapsed = self._elapsed_sec(end_sample, region_start)
+        elapsed = max(0.0, (end_sample - region_start) / 16000.0)
         shown = preview_text if len(preview_text) <= 90 else "…" + preview_text[-90:]
-        if decision is None:
+        state = self.commit_manager.stability_state()
+        if reason is None:
             logger.info(
-                f"[{tag}] [utt={self._active_utterance_id}] t=+{elapsed:.1f}s "
-                f"{state.get('hold', '')} c={state.get('committed_len', 0)} | '{shown}'",
+                f"[SEG_TRACE] [utt={self._active_utterance_id}] t=+{elapsed:.1f}s "
+                f"hold={self._stability_hold or 'waiting'} "
+                f"n={state['polls']}/{state['required_polls']} "
+                f"t={state['stable_ms']:.0f}/{state['required_ms']:.0f}ms "
+                f"nw={count_content_tokens(preview_text)} | '{shown}'",
                 extra={"module_tag": "SEG"},
             )
             return
         logger.info(
-            f"[{tag}] [utt={self._active_utterance_id}] t=+{elapsed:.1f}s "
-            f"cut={decision.reason} b={decision.end_index} tail='{state.get('tail', '')}' "
-            f"rest='{preview_text[decision.end_index:][:40]}' | '{decision.text}'",
+            f"[SEG_CUT] [utt={self._active_utterance_id}] t=+{elapsed:.1f}s "
+            f"cut={getattr(reason, 'value', reason)} dur={duration_sec:.1f}s "
+            f"n={state['polls']} | '{shown[:60]}'",
             extra={"module_tag": "SEG"},
         )
-
-    def _trace_seg_shadow(self, preview_text: str, end_sample: int) -> None:
-        """SEG đang TẮT: vẫn chạy máy trạng thái 'bóng' để log nó SẼ cắt ở đâu."""
-        shadow = self._seg_shadow
-        if shadow is None or not preview_text:
-            return
-        try:
-            decisions = shadow.observe(preview_text, end_sample)
-        except Exception:  # noqa: BLE001
-            return
-        if decisions:
-            d = decisions[0]
-            logger.info(
-                f"[SEG_SHADOW] [utt={self._active_utterance_id}] SEG đang TẮT — nếu BẬT thì "
-                f"đã cắt ({d.reason}) tại đây: '{d.text}'",
-                extra={"module_tag": "SEG"},
-            )
-
-    def _seg_cut_sample(self, region_start: int, current_total: int, preview_text: str) -> int:
-        """Mốc cắt cho commit SEG: mốc ms của timer (Whisper) nếu được, nếu không thì lùi chồng lấn.
-
-        LƯU Ý: đã BỎ tính năng "tinh chỉnh mốc cắt bằng decode lại cửa sổ con" (2026-09-22)
-        vì đo thật tốn ~1.25 s GPU cho mỗi câu được cắt — quá đắt so với lợi ích.
-        """
-        return self._seg_base_cut_sample(region_start, current_total, preview_text)
-
-    def _seg_base_cut_sample(self, region_start: int, current_total: int,
-                             preview_text: str) -> int:
-        """Mốc cắt GỐC (trước tinh chỉnh): mốc ms của timer (Whisper) nếu được,
-        nếu không thì lùi `fallback_overlap_ms` so với cuối vùng nói.
-
-        """
-        fallback = getattr(self._seg_decision, "cut_sample", None)
-        if fallback is None:
-            fallback = max(region_start, current_total)
-        cfg = self._seg_cfg
-        if not bool(getattr(cfg, "use_whisper_timer", False)) or self._seg_decision is None:
-            return int(fallback)
-        duration_sec = (current_total - region_start) / 16000.0
-        if duration_sec <= 0 or duration_sec > float(getattr(cfg, "timer_max_audio_sec", 30.0)):
-            return int(fallback)
-        try:
-            from backend.asr.timer import get_seg_timer
-
-            timer = get_seg_timer()
-        except Exception:  # noqa: BLE001
-            return int(fallback)
-        if timer is None or not timer.available():
-            metrics_collector.increment_counter("seg.timer_unavailable")
-            return int(fallback)
-        try:
-            audio = self.audio_buffer.get_slice(region_start, current_total)
-            res = timer.locate_boundary(
-                audio,
-                int(self._seg_decision.end_index),
-                preview_text,
-                min_confidence=float(getattr(cfg, "timer_min_confidence", 0.35)),
-                language=self.language,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Timer SEG lỗi: {exc}", extra={"module_tag": "ASR"})
-            res = None
-        if res is None:
-            metrics_collector.increment_counter("seg.timer_miss")
-            return int(fallback)
-        cut = region_start + res.cut_sample
-        # Chốt an toàn: mốc cắt phải nằm TRONG vùng nói, không được vượt hiện tại.
-        margin = int(0.1 * 16000)
-        if cut <= region_start + margin or cut >= current_total:
-            metrics_collector.increment_counter("seg.timer_out_of_range")
-            return int(fallback)
-        self._seg_timer_ms_total += res.elapsed_ms
-        metrics_collector.record_metric("seg", "timer_ms", res.elapsed_ms)
-        metrics_collector.record_metric("seg", "timer_confidence", res.confidence)
-        metrics_collector.increment_counter("seg.timer_used")
-        logger.info(
-            f"[utt={self._active_utterance_id}] SEG timer: cắt tại "
-            f"{(cut - region_start) / 16000.0:.2f}s trong vùng (tin cậy {res.confidence:.2f}, "
-            f"{res.elapsed_ms:.0f}ms) — '{self._seg_decision.text[:40]}'",
-            extra={"module_tag": "ASR"},
-        )
-        return int(cut)
 
     def has_pending_work(self) -> bool:
         """True nếu pipeline còn việc: đang nói, còn commit chờ, hoặc inference đang chạy.
@@ -1434,6 +1158,38 @@ class TranscribeEngine(BaseASREngine):
         metrics_collector.record_gauge("asr", "preview_median_ms", median)
         return self._eff_poll_interval
 
+    def _warn_unseen_commit_text(self, final_text: str, utt_id: str) -> None:
+        """Chẩn đoán "ASR viết lại cả câu" ⇒ WARNING `[DRIFT]` (KHÔNG đổi văn bản phát đi).
+
+        Vì sao cần (log thật 2026-09-29 21:29, phim tiếng Nhật): Qwen3-ASR streaming KHÔNG ổn
+        định theo tiền tố — cùng một đoạn audio, khi đuôi audio dài thêm thì model viết lại cả
+        phần ĐẦU của câu::
+
+            t=+0.4s  '焼いて。'
+            t=+0.7s  '寄り行ってくる。'   ← câu đúng (theo người dùng đối chiếu video)
+            t=+0.9s  '泳いてくるね。'     ← trôi, rồi lặp lại 6 nhịp
+            [ASR_COMMIT] [VAD_SILENCE]: '泳いてくるね。'
+
+        Không tầng nào phát hiện ra vì commit chỉ phát văn bản mới nhất. Hàm này ghi lại ca đó
+        (kèm bảng đếm "nhịp nào đọc ra câu gì") để ĐO tần suất, còn quyết định phát câu nào vẫn
+        thuộc về bản chạy lại trên mảnh audio đã đóng — nguồn đáng tin nhất hiện có.
+        """
+        if not final_text:
+            return
+        support = self._hypothesis_consensus.support(final_text)
+        if support > 0:
+            return
+        top = self._hypothesis_consensus.tally(3)
+        if not top or top[0][1] < 2:
+            return
+        metrics_collector.increment_counter("asr.commit_text_unseen_in_preview")
+        logger.warning(
+            f"[utt={utt_id}] [DRIFT] câu chốt CHƯA TỪNG xuất hiện trong "
+            f"{self._hypothesis_consensus.scans} nhịp preview: '{final_text}' | "
+            f"preview đã đọc: " + " · ".join(f"'{t}'×{c}" for t, c in top),
+            extra={"module_tag": "ASR_COMMIT"},
+        )
+
     async def _emit_commit(self, commit_req: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """Chạy inference cho một commit và phát ra message `utterance_update` final."""
         self._commit_event.clear()
@@ -1446,6 +1202,9 @@ class TranscribeEngine(BaseASREngine):
             # F-48: không phát gì thì PHẢI xoá cờ đánh thức, nếu không nhánh idle sẽ
             # `wait_for(event.wait())` trả về tức thì ⇒ quay nóng (xem chú thích ở nhánh idle).
             self._commit_event.clear()
+            # Vùng nói đã tiến (engine đặt `_speech_start_sample` lúc enqueue) ⇒ lịch sử
+            # giả thuyết của vùng cũ không còn giá trị.
+            self._hypothesis_consensus.reset()
             return
 
         # F-44: commit này thuộc đoạn TRƯỚC khi tua ⇒ bỏ (tránh phụ đề lệch vị trí).
@@ -1514,24 +1273,11 @@ class TranscribeEngine(BaseASREngine):
                 )
                 final_text = trimmed
 
-        # FIX-12 (bản 2 — sửa lỗi LẶP do bản 1): mốc cắt có thể hơi lệch nên văn bản chạy lại
-        # trên mảnh đã cắt thường chứa NHIỀU câu (log thật: `'Okay. Well, … Aquaman statue.
-        # Aquaman. This isn't a gag gift, Stewart.'`). Bản 1 luôn lấy CÂU ĐẦU ⇒ phần lớn
-        # trường hợp câu đầu chỉ là mảnh ngắn (`'Okay.'`) ⇒ bị coi là "quá ngắn" ⇒ gộp lại ⇒
-        # VÙNG KHÔNG TIẾN ⇒ lặp tới `MAX_DURATION` (câu siêu dài).
-        # Bản 2: chọn câu KHỚP NHẤT với câu mà SEG đã chốt (`self._seg_decision.text`).
-        if final_text and reason == CommitReason.SEG_PUNCT.value and self._seg_decision is not None:
-            parts = split_complete_sentences(final_text)
-            if len(parts) > 1:
-                chosen = _best_matching_sentence(parts, getattr(self._seg_decision, "text", ""))
-                if chosen and chosen != final_text.strip():
-                    logger.info(
-                        f"[utt={utt_id}] SEG: chọn lại câu khớp với câu đã chốt: "
-                        f"{len(parts)} câu -> '{chosen}'",
-                        extra={"module_tag": "ASR_COMMIT"},
-                    )
-                    metrics_collector.increment_counter("asr.commit_tail_trimmed")
-                    final_text = chosen
+        # CHỐNG "ASR VIẾT LẠI CẢ CÂU": câu phát đi mà CHƯA TỪNG xuất hiện trong lịch sử
+        # preview trong khi có câu khác được preview lặp nhiều nhịp ⇒ ghi WARNING `[DRIFT]`
+        # kèm bảng đếm (xem `backend/core/hypothesis.py`). Đây thuần chẩn đoán — KHÔNG đổi
+        # văn bản phát đi (bản chạy lại trên mảnh đã đóng vẫn là nguồn đáng tin nhất).
+        self._warn_unseen_commit_text(final_text, utt_id)
 
         min_words = int(config.sentence.min_words_to_commit)
         carry_over = bool(getattr(config.sentence, "carry_over_short_fragment", True))
@@ -1543,10 +1289,10 @@ class TranscribeEngine(BaseASREngine):
         ):
             # FIX-11 (đo từ log phim thật 2026-09-22): mảnh cắt ra CHỈ CÒN DẤU CÂU (ví dụ
             # `'.'` sau khi trim chồng lấn) mà vẫn "gộp vào câu kế tiếp" thì vùng audio
-            # KHÔNG tiến ⇒ nhịp sau lại đọc đúng mảnh đó, lại gọi timer (~105 ms) rồi lại gộp:
-            # log thật cho thấy `'Aquaman.' -> '.'` lặp 4 lần liên tiếp.
+            # KHÔNG tiến ⇒ nhịp sau lại đọc đúng mảnh đó rồi lại gộp: log thật cho thấy
+            # `'Aquaman.' -> '.'` lặp 4 lần liên tiếp.
             # Mảnh không còn ký tự nội dung thì BỎ HẲN và đẩy mốc bắt đầu vùng lên `end_s`.
-            if reason == CommitReason.SEG_PUNCT.value and count_content_tokens(final_text) == 0:
+            if count_content_tokens(final_text) == 0:
                 with self._lock:
                     self._speech_start_sample = end_s
                     self._awaiting_pre_roll = False
@@ -1556,11 +1302,12 @@ class TranscribeEngine(BaseASREngine):
                     f"đẩy vùng đọc lên {end_s / 16000.0:.2f}s để không lặp lại.",
                     extra={"module_tag": "ASR_COMMIT"},
                 )
+                self._hypothesis_consensus.reset()
                 return
             # FIX-12b: CHỐT AN TOÀN CHỐNG LẶP. Nếu cùng một mảnh ngắn bị gộp HAI lần liên
             # tiếp thì vùng audio rõ ràng không tiến (đã gặp: `'Okay.'` lặp 6 lần tới
             # MAX_DURATION, câu phình 15 s). Lần thứ hai thì BỎ mảnh và đẩy vùng lên `end_s`.
-            if reason == CommitReason.SEG_PUNCT.value and final_text == self._last_carried_text:
+            if final_text == self._last_carried_text:
                 with self._lock:
                     self._speech_start_sample = end_s
                     self._awaiting_pre_roll = False
@@ -1570,9 +1317,9 @@ class TranscribeEngine(BaseASREngine):
                     f"vùng đọc lên {end_s / 16000.0:.2f}s.",
                     extra={"module_tag": "ASR_COMMIT"},
                 )
+                self._hypothesis_consensus.reset()
                 return
-            if reason == CommitReason.SEG_PUNCT.value:
-                self._last_carried_text = final_text
+            self._last_carried_text = final_text
             with self._lock:
                 self._speech_start_sample = start_s
                 self._awaiting_pre_roll = False
@@ -1597,6 +1344,8 @@ class TranscribeEngine(BaseASREngine):
         self._last_committed_sample = end_s
         self.commit_manager.record_commit(final_text)
         self._last_carried_text = ""
+        # Vùng nói đã tiến qua câu vừa chốt ⇒ lịch sử giả thuyết bắt đầu lại từ câu kế tiếp.
+        self._hypothesis_consensus.reset()
         metrics_collector.increment_counter(f"asr.commit_reason.{reason}")
         # FIX-10: chốt số liệu lãng phí preview của câu này (đo trước khi tối ưu).
         self._finalize_recompute_metrics()
@@ -1753,6 +1502,8 @@ class TranscribeEngine(BaseASREngine):
                         if preview_text and self._speech_active:
                             self._last_preview_end_sample = current_total
                             self._last_preview_text = preview_text
+                            # FIX-13: ghi nhịp này vào bộ đếm đồng thuận giả thuyết.
+                            self._hypothesis_consensus.observe(preview_text)
                             # K2: đo thời gian từ lúc VAD báo bắt đầu nói tới preview đầu tiên.
                             if not self._first_preview_reported and self._speech_started_at > 0:
                                 self._first_preview_reported = True
@@ -1781,22 +1532,19 @@ class TranscribeEngine(BaseASREngine):
                     # dài ~45 s (infer 1294 ms) dù `max_duration_sec` chỉ 6 s.
                     if self._speech_active:
                         duration_sec = (current_total - seg_start) / 16000.0
-                        reason = self._evaluate_seg(self._last_preview_text, current_total, seg_start)
-                        if reason is None:
-                            reason = self._evaluate_tier234(self._last_preview_text, duration_sec)
+                        reason = self._evaluate_tier234(self._last_preview_text, duration_sec)
+                        # Chẩn đoán (`sentence.trace_stability`, mặc định TẮT).
+                        self._trace_stability_poll(
+                            reason, self._last_preview_text, duration_sec, current_total, seg_start
+                        )
                         if reason is not None:
                             overlap = int(
                                 float(getattr(config.sentence, "boundary_overlap_ms", 0)) / 1000.0 * 16000
                             )
-                            # SEG: mốc cắt có thể nằm TRONG vùng (nhờ timer có timestamp);
-                            # phần audio giữa mốc cắt và hiện tại sẽ được nhận dạng lại ở
-                            # câu kế tiếp nên KHÔNG mất chữ.
+                            # KHÔNG còn mốc cắt "giữa vùng" (SEG + timer đã bị gỡ): mọi cửa
+                            # chốt ở giữa câu đều cắt ở CUỐI vùng nói hiện tại
+                            # (`current_total`), nên phần audio đã đọc không bao giờ bị bỏ.
                             effective_end = current_total
-                            if reason is CommitReason.SEG_PUNCT:
-                                effective_end = self._seg_cut_sample(
-                                    seg_start, current_total, self._last_preview_text
-                                )
-                                self._seg_commits += 1
                             with self._lock:
                                 self._enqueue_commit_locked(
                                     utterance_id=self._active_utterance_id,
@@ -1815,9 +1563,6 @@ class TranscribeEngine(BaseASREngine):
                                 self._speech_start_sample = max(0, effective_end - overlap)
                                 self._last_preview_text = ""
                                 self._last_preview_end_sample = -1
-                                self._seg_decision = None
-                                if self._seg is not None:
-                                    self._seg.reset()
                             self.commit_manager.reset_stability()
                             self._wake_stream()
 
@@ -1898,9 +1643,7 @@ class TranscribeEngine(BaseASREngine):
             self._first_preview_reported = True
         self.audio_buffer.clear()
         self.commit_manager.reset_stability()
-        if self._seg is not None:
-            self._seg.reset()
-            self._seg_decision = None
+        self._hypothesis_consensus.reset()
         self._preview_durations.clear()
         self._eff_poll_interval = max(0.05, self.poll_interval_ms / 1000.0)
         self._wake_stream()

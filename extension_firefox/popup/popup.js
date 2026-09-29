@@ -15,19 +15,16 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   const rangeVadThreshold = document.getElementById("rangeVadThreshold");
   const valVadThreshold = document.getElementById("valVadThreshold");
   const rangeMinWords = document.getElementById("rangeMinWords");
-  // Tầng SEG (tách câu hậu-ASR)
-  const chkSegEnabled = document.getElementById("chkSegEnabled");
-  const chkSegTimer = document.getElementById("chkSegTimer");
-  const chkSegTrace = document.getElementById("chkSegTrace");
-  const chkSegStable = document.getElementById("chkSegStable");
-  const rangeSegStableMs = document.getElementById("rangeSegStableMs");
-  const valSegStableMs = document.getElementById("valSegStableMs");
-  const rangeSegMaxChars = document.getElementById("rangeSegMaxChars");
-  const rangeSegTailChars = document.getElementById("rangeSegTailChars");
-  const rangeSegTailScans = document.getElementById("rangeSegTailScans");
-  const valSegMaxChars = document.getElementById("valSegMaxChars");
-  const valSegTailChars = document.getElementById("valSegTailChars");
-  const valSegTailScans = document.getElementById("valSegTailScans");
+  // Cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut): text đứng im đủ lâu thì chốt câu.
+  const chkStableCut = document.getElementById("chkStableCut");
+  const rangeStableMs = document.getElementById("rangeStableMs");
+  const valStableMs = document.getElementById("valStableMs");
+  const rangeStableMinSec = document.getElementById("rangeStableMinSec");
+  const valStableMinSec = document.getElementById("valStableMinSec");
+  const rangeStableMinWords = document.getElementById("rangeStableMinWords");
+  const valStableMinWords = document.getElementById("valStableMinWords");
+  // Chẩn đoán: log mỗi nhịp preview ([SEG_TRACE]) — mặc định TẮT.
+  const chkStableTrace = document.getElementById("chkStableTrace");
   const valMinWords = document.getElementById("valMinWords");
   const lblActiveModel = document.getElementById("lblActiveModel");
   const selSourceLang = document.getElementById("selSourceLang");
@@ -127,18 +124,17 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       threshold: vadThresholdVal,
       minWordsToCommit: minWords,
       min_words_to_commit: minWords,
-      // Tầng SEG: chốt câu theo dấu câu của ASR + mốc cắt từ model có timestamp.
-      segEnabled: chkSegEnabled ? chkSegEnabled.checked : true,
-      segUseWhisperTimer: chkSegTimer ? chkSegTimer.checked : true,
-      segDebugTrace: chkSegTrace ? chkSegTrace.checked : true,
-      segStableCut: chkSegStable ? chkSegStable.checked : false,
-      segStableMs: parseInt(rangeSegStableMs ? rangeSegStableMs.value : 350, 10) || 350,
-      segMaxChars: parseInt(rangeSegMaxChars ? rangeSegMaxChars.value : 60, 10) || 60,
-      segTailMinChars: parseInt(rangeSegTailChars ? rangeSegTailChars.value : 4, 10) || 4,
-      segTailScans: parseInt(rangeSegTailScans ? rangeSegTailScans.value : 2, 10) || 2,
-      seg_max_chars: parseInt(rangeSegMaxChars ? rangeSegMaxChars.value : 60, 10) || 60,
-      seg_tail_min_chars: parseInt(rangeSegTailChars ? rangeSegTailChars.value : 4, 10) || 4,
-      seg_tail_scans: parseInt(rangeSegTailScans ? rangeSegTailScans.value : 2, 10) || 2,
+      // Cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut): text đứng im đủ lâu ⇒ chốt câu.
+      splitOnStability: chkStableCut ? chkStableCut.checked : true,
+      stabilityDurationSec: parseFloat(rangeStableMs ? rangeStableMs.value : 600) / 1000 || 0.6,
+      stabilityMinDurationSec: rangeStableMinSec ? parseFloat(rangeStableMinSec.value) : 2.5,
+      stabilityMinWords: rangeStableMinWords ? parseInt(rangeStableMinWords.value, 10) : 4,
+      stability_duration_ms: parseFloat(rangeStableMs ? rangeStableMs.value : 600) || 600,
+      stability_min_duration_sec: rangeStableMinSec ? parseFloat(rangeStableMinSec.value) : 2.5,
+      stability_min_words: rangeStableMinWords ? parseInt(rangeStableMinWords.value, 10) : 4,
+      split_on_stability: chkStableCut ? chkStableCut.checked : true,
+      traceStability: chkStableTrace ? chkStableTrace.checked : false,
+      trace_stability: chkStableTrace ? chkStableTrace.checked : false,
       sourceLanguage: selSourceLang ? selSourceLang.value : "auto",
       targetLang: selTargetLang ? selTargetLang.value : "vi",
       translationModel: selTranslationModel ? selTranslationModel.value : "xiaomi",
@@ -203,11 +199,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (valMaxLines && rangeMaxLines) valMaxLines.textContent = rangeMaxLines.value;
     if (valTtsSpeed && selTtsSpeed) valTtsSpeed.textContent = selTtsSpeed.value || "1.0";
     if (valDuckingLevel && rangeDuckingLevel) valDuckingLevel.textContent = rangeDuckingLevel.value;
-    // Tầng SEG
-    if (valSegMaxChars && rangeSegMaxChars) valSegMaxChars.textContent = rangeSegMaxChars.value;
-    if (valSegTailChars && rangeSegTailChars) valSegTailChars.textContent = rangeSegTailChars.value;
-    if (valSegTailScans && rangeSegTailScans) valSegTailScans.textContent = rangeSegTailScans.value;
-    if (valSegStableMs && rangeSegStableMs) valSegStableMs.textContent = rangeSegStableMs.value;
+    // stable_cut
+    if (valStableMs && rangeStableMs) valStableMs.textContent = rangeStableMs.value;
+    if (valStableMinSec && rangeStableMinSec) valStableMinSec.textContent = rangeStableMinSec.value;
+    if (valStableMinWords && rangeStableMinWords) valStableMinWords.textContent = rangeStableMinWords.value;
   }
 
   async function fetchActiveTab() {
@@ -398,29 +393,22 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       rangeMinWords.value = data.min_words_to_commit;
       updateRangeLabels();
     }
-    // Tầng SEG: backend là nguồn sự thật (trừ khi người dùng vừa kéo tay).
-    if (data.seg) {
-      if (chkSegEnabled && data.seg.enabled !== undefined) chkSegEnabled.checked = !!data.seg.enabled;
-      if (chkSegTimer && data.seg.use_whisper_timer !== undefined) {
-        chkSegTimer.checked = !!data.seg.use_whisper_timer;
+    // stable_cut: backend là nguồn sự thật (trừ khi người dùng vừa kéo tay).
+    if (data.stable) {
+      if (chkStableCut && data.stable.split_on_stability !== undefined) {
+        chkStableCut.checked = !!data.stable.split_on_stability;
       }
-      if (chkSegTrace && data.seg.debug_trace !== undefined) {
-        chkSegTrace.checked = !!data.seg.debug_trace;
+      if (rangeStableMs && data.stable.duration_ms !== undefined && !rangeStableMs.dataset.userEdited) {
+        rangeStableMs.value = Math.round(data.stable.duration_ms);
       }
-      if (chkSegStable && data.seg.stable_cut !== undefined) {
-        chkSegStable.checked = !!data.seg.stable_cut;
+      if (rangeStableMinSec && data.stable.min_duration_sec !== undefined && !rangeStableMinSec.dataset.userEdited) {
+        rangeStableMinSec.value = data.stable.min_duration_sec;
       }
-      if (rangeSegStableMs && data.seg.stable_ms !== undefined && !rangeSegStableMs.dataset.userEdited) {
-        rangeSegStableMs.value = data.seg.stable_ms;
+      if (rangeStableMinWords && data.stable.min_words !== undefined && !rangeStableMinWords.dataset.userEdited) {
+        rangeStableMinWords.value = data.stable.min_words;
       }
-      if (rangeSegMaxChars && data.seg.max_chars !== undefined && !rangeSegMaxChars.dataset.userEdited) {
-        rangeSegMaxChars.value = data.seg.max_chars;
-      }
-      if (rangeSegTailChars && data.seg.tail_min_chars !== undefined && !rangeSegTailChars.dataset.userEdited) {
-        rangeSegTailChars.value = data.seg.tail_min_chars;
-      }
-      if (rangeSegTailScans && data.seg.tail_scans !== undefined && !rangeSegTailScans.dataset.userEdited) {
-        rangeSegTailScans.value = data.seg.tail_scans;
+      if (chkStableTrace && data.stable.trace !== undefined) {
+        chkStableTrace.checked = !!data.stable.trace;
       }
       updateRangeLabels();
     }
@@ -510,14 +498,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         })(),
         vad_threshold: !isNaN(parseFloat(rangeVadThreshold?.value)) ? parseFloat(rangeVadThreshold.value) : 0.5,
         min_words_to_commit: !isNaN(parseInt(rangeMinWords?.value, 10)) ? Math.max(0, parseInt(rangeMinWords.value, 10)) : 2,
-        seg_enabled: chkSegEnabled ? chkSegEnabled.checked : true,
-        seg_use_whisper_timer: chkSegTimer ? chkSegTimer.checked : true,
-        seg_debug_trace: chkSegTrace ? chkSegTrace.checked : true,
-        seg_stable_cut: chkSegStable ? chkSegStable.checked : false,
-        seg_stable_ms: !isNaN(parseInt(rangeSegStableMs?.value, 10)) ? Math.max(50, parseInt(rangeSegStableMs.value, 10)) : 350,
-        seg_max_chars: !isNaN(parseInt(rangeSegMaxChars?.value, 10)) ? Math.max(10, parseInt(rangeSegMaxChars.value, 10)) : 60,
-        seg_tail_min_chars: !isNaN(parseInt(rangeSegTailChars?.value, 10)) ? Math.max(0, parseInt(rangeSegTailChars.value, 10)) : 4,
-        seg_tail_scans: !isNaN(parseInt(rangeSegTailScans?.value, 10)) ? Math.max(1, parseInt(rangeSegTailScans.value, 10)) : 2,
+        split_on_stability: chkStableCut ? chkStableCut.checked : true,
+        stability_duration_ms: !isNaN(parseFloat(rangeStableMs?.value)) ? Math.max(100, parseFloat(rangeStableMs.value)) : 600,
+        stability_min_duration_sec: !isNaN(parseFloat(rangeStableMinSec?.value)) ? Math.max(0, parseFloat(rangeStableMinSec.value)) : 2.5,
+        stability_min_words: !isNaN(parseInt(rangeStableMinWords?.value, 10)) ? Math.max(0, parseInt(rangeStableMinWords.value, 10)) : 4,
+        trace_stability: chkStableTrace ? chkStableTrace.checked : false,
         source_lang: newLang,
         tts_enabled: chkEnableTts ? chkEnableTts.checked : false,
         tts_voice: selTtsVoice ? selTtsVoice.value : undefined,
@@ -824,27 +809,30 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         rangeMinWords.value = isNaN(mw) ? 2 : Math.max(0, mw);
         rangeMinWords.dataset.userEdited = "true";
       }
-      // Tầng SEG (đã lưu ở lần dùng trước)
-      if (s.segEnabled !== undefined && chkSegEnabled) chkSegEnabled.checked = !!s.segEnabled;
-      if (s.segUseWhisperTimer !== undefined && chkSegTimer) chkSegTimer.checked = !!s.segUseWhisperTimer;
-      if (s.seg_max_chars !== undefined && rangeSegMaxChars) {
-        rangeSegMaxChars.value = s.seg_max_chars;
-        rangeSegMaxChars.dataset.userEdited = "true";
+      // stable_cut (đã lưu ở lần dùng trước)
+      if (s.splitOnStability !== undefined && chkStableCut) chkStableCut.checked = !!s.splitOnStability;
+      if (s.split_on_stability !== undefined && chkStableCut) chkStableCut.checked = !!s.split_on_stability;
+      const savedStableMs = s.stability_duration_ms !== undefined
+        ? s.stability_duration_ms
+        : (s.stabilityDurationSec !== undefined ? parseFloat(s.stabilityDurationSec) * 1000 : undefined);
+      if (savedStableMs !== undefined && rangeStableMs) {
+        rangeStableMs.value = Math.round(savedStableMs);
+        rangeStableMs.dataset.userEdited = "true";
       }
-      if (s.seg_tail_min_chars !== undefined && rangeSegTailChars) {
-        rangeSegTailChars.value = s.seg_tail_min_chars;
-        rangeSegTailChars.dataset.userEdited = "true";
+      const savedMinSec = s.stability_min_duration_sec !== undefined
+        ? s.stability_min_duration_sec
+        : s.stabilityMinDurationSec;
+      if (savedMinSec !== undefined && rangeStableMinSec) {
+        rangeStableMinSec.value = savedMinSec;
+        rangeStableMinSec.dataset.userEdited = "true";
       }
-      if (s.seg_tail_scans !== undefined && rangeSegTailScans) {
-        rangeSegTailScans.value = s.seg_tail_scans;
-        rangeSegTailScans.dataset.userEdited = "true";
+      const savedMinWords = s.stability_min_words !== undefined ? s.stability_min_words : s.stabilityMinWords;
+      if (savedMinWords !== undefined && rangeStableMinWords) {
+        rangeStableMinWords.value = savedMinWords;
+        rangeStableMinWords.dataset.userEdited = "true";
       }
-      if (s.segStableCut !== undefined && chkSegStable) chkSegStable.checked = !!s.segStableCut;
-      if (s.segStableMs !== undefined && rangeSegStableMs) {
-        rangeSegStableMs.value = s.segStableMs;
-        rangeSegStableMs.dataset.userEdited = "true";
-      }
-      if (s.segDebugTrace !== undefined && chkSegTrace) chkSegTrace.checked = !!s.segDebugTrace;
+      const savedTrace = s.trace_stability !== undefined ? s.trace_stability : s.traceStability;
+      if (savedTrace !== undefined && chkStableTrace) chkStableTrace.checked = !!savedTrace;
       if (s.sourceLanguage || s.sourceLang) {
         savedPreferredLang = s.sourceLanguage || s.sourceLang;
         if (selSourceLang) selSourceLang.value = savedPreferredLang;
@@ -987,15 +975,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
           min_words_to_commit: cfg.minWordsToCommit,
           silence_duration_ms: cfg.silenceDurationMs,
           vad_threshold: cfg.vadThreshold,
-          // Tầng SEG: đẩy sang REST để áp cho MỌI phiên đang chạy (giống VAD/threshold).
-          seg_enabled: cfg.segEnabled,
-          seg_max_chars: cfg.seg_max_chars,
-          seg_tail_min_chars: cfg.seg_tail_min_chars,
-          seg_tail_scans: cfg.seg_tail_scans,
-          seg_use_whisper_timer: cfg.segUseWhisperTimer,
-          seg_debug_trace: cfg.segDebugTrace,
-          seg_stable_cut: cfg.segStableCut,
-          seg_stable_ms: cfg.segStableMs,
+          // stable_cut: đẩy sang REST để áp cho MỌI phiên đang chạy (giống VAD/threshold).
+          split_on_stability: cfg.splitOnStability,
+          stability_duration_ms: cfg.stability_duration_ms,
+          stability_min_duration_sec: cfg.stability_min_duration_sec,
+          stability_min_words: cfg.stability_min_words,
+          trace_stability: cfg.traceStability,
         }),
       }).catch(() => { });
     };
@@ -1031,18 +1016,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       onSettingChange();
     };
   }
-  // Tầng SEG: đổi là gửi ngay (công tắc A/B cần thấy hiệu quả tức thì).
-  if (chkSegEnabled) chkSegEnabled.onchange = () => onSettingChange(true);
-  if (chkSegTimer) chkSegTimer.onchange = () => onSettingChange(true);
-  if (chkSegTrace) chkSegTrace.onchange = () => onSettingChange(true);
-  if (chkSegStable) chkSegStable.onchange = () => onSettingChange(true);
-  if (rangeSegStableMs) {
-    rangeSegStableMs.oninput = () => {
-      rangeSegStableMs.dataset.userEdited = "true";
-      onSettingChange();
-    };
-  }
-  [rangeSegMaxChars, rangeSegTailChars, rangeSegTailScans].forEach((el) => {
+  // stable_cut: đổi là gửi ngay (cần thấy hiệu quả tức thì khi tinh chỉnh thời gian).
+  if (chkStableCut) chkStableCut.onchange = () => onSettingChange(true);
+  // Công tắc chẩn đoán: bật/tắt phải có hiệu lực NGAY (không debounce).
+  if (chkStableTrace) chkStableTrace.onchange = () => onSettingChange(true);
+  [rangeStableMs, rangeStableMinSec, rangeStableMinWords].forEach((el) => {
     if (el) {
       el.oninput = () => {
         el.dataset.userEdited = "true";

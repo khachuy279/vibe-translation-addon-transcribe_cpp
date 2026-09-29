@@ -27,12 +27,13 @@ BACKEND = ROOT / "backend"
 KNOWN_TAGS = {
     "CORE", "VAD", "ASR", "ASR_PREVIEW", "ASR_COMMIT",
     "TRANSLATE", "TTS", "WS", "MAIN", "METRICS",
-    # Tầng SEG (VAD > ASR > SEG): trace từng nhịp preview + mốc cắt của timer.
+    # Chẩn đoán cắt câu theo độ ổn định (bật bằng `sentence.trace_stability`, mặc định TẮT).
     "SEG",
 }
-#: Token trong `[...]` của thông điệp log. `SEG_*` là trace do người dùng bật để tinh
-#: chỉnh mốc ngắt câu: SEG_TRACE (mỗi nhịp), SEG_CUT (lúc chốt), SEG_SHADOW (SEG đang tắt).
-ALLOWED_BRACKETS = ("utt=", "STARTUP", "SHUTDOWN", "SEG_")
+#: Token trong `[...]` của thông điệp log. `SEG_*` là trace từng nhịp preview do người dùng
+#: bật để tinh chỉnh ngưỡng cắt câu: SEG_TRACE (mỗi nhịp), SEG_CUT (nhịp chốt câu).
+#: `DRIFT` là cảnh báo ASR viết lại cả câu.
+ALLOWED_BRACKETS = ("utt=", "STARTUP", "SHUTDOWN", "SEG_", "DRIFT")
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]")
 BRACKET_RE = re.compile(r"\[([^\[\]]{1,40})\]")
 LEVELS = {"debug", "info", "warning", "error", "critical"}

@@ -62,18 +62,11 @@ class SessionConfigPayload(BaseModel):
     max_duration_sec: Optional[float] = Field(default=None, alias="maxDurationSec")
     max_chars: Optional[int] = Field(default=None, alias="maxChars")
     min_words_to_commit: Optional[int] = Field(default=None, alias="minWordsToCommit")
-
-    # Tầng SEG (VAD > ASR > SEG): chốt câu theo dấu câu của ASR.
-    seg_enabled: Optional[bool] = Field(default=None, alias="segEnabled")
-    seg_max_chars: Optional[int] = Field(default=None, alias="segMaxChars")
-    seg_tail_min_chars: Optional[int] = Field(default=None, alias="segTailMinChars")
-    seg_tail_scans: Optional[int] = Field(default=None, alias="segTailScans")
-    seg_use_whisper_timer: Optional[bool] = Field(default=None, alias="segUseWhisperTimer")
-    #: Engine timer của tầng SEG: "whisper" | "qwen3-aligner" (đổi được lúc chạy).
-    seg_timer_engine: Optional[str] = Field(default=None, alias="segTimerEngine")
-    seg_debug_trace: Optional[bool] = Field(default=None, alias="segDebugTrace")
-    seg_stable_cut: Optional[bool] = Field(default=None, alias="segStableCut")
-    seg_stable_ms: Optional[float] = Field(default=None, alias="segStableMs")
+    # Cắt câu theo ĐỘ ỔN ĐỊNH ("stable_cut"): text đứng im đủ lâu thì chốt câu.
+    stability_min_duration_sec: Optional[float] = Field(default=None, alias="stabilityMinDurationSec")
+    stability_min_words: Optional[int] = Field(default=None, alias="stabilityMinWords")
+    #: Chẩn đoán `[SEG_TRACE]`/`[SEG_CUT]` từng nhịp preview (mặc định TẮT).
+    trace_stability: Optional[bool] = Field(default=None, alias="traceStability")
 
     # P2.3/P2.4: cho phép chỉnh từ popup
     preview_window_sec: Optional[float] = Field(default=None, alias="previewWindowSec")
@@ -97,15 +90,11 @@ class SessionConfig:
             "silence_duration_ms": config.vad.effective_silence_ms,
             "vad_enabled": config.vad.enabled,
             "min_words_to_commit": config.sentence.min_words_to_commit,
-            "seg_enabled": config.segmentation.enabled,
-            "seg_max_chars": config.segmentation.max_chars,
-            "seg_tail_min_chars": config.segmentation.tail_min_chars,
-            "seg_tail_scans": config.segmentation.tail_scans,
-            "seg_use_whisper_timer": config.segmentation.use_whisper_timer,
-            "seg_timer_engine": config.segmentation.timer_engine,
-            "seg_debug_trace": config.segmentation.debug_trace,
-            "seg_stable_cut": config.segmentation.stable_cut,
-            "seg_stable_ms": config.segmentation.stable_ms,
+            "stability_duration_sec": config.sentence.stability_duration_sec,
+            "stability_min_duration_sec": config.sentence.stability_min_duration_sec,
+            "stability_min_words": config.sentence.stability_min_words,
+            "split_on_stability": config.sentence.split_on_stability,
+            "trace_stability": config.sentence.trace_stability,
             "tts_enabled": config.tts.enabled,
             "tts_voice": config.tts.default_voice,
             "tts_speed": config.tts.speed,
@@ -494,50 +483,17 @@ class SessionState:
             if parsed.min_words_to_commit is not None:
                 self.config["min_words_to_commit"] = parsed.min_words_to_commit
                 sentence_updates["min_words_to_commit"] = parsed.min_words_to_commit
+            if parsed.stability_min_duration_sec is not None:
+                sentence_updates["stability_min_duration_sec"] = parsed.stability_min_duration_sec
+            if parsed.stability_min_words is not None:
+                sentence_updates["stability_min_words"] = parsed.stability_min_words
+            if parsed.trace_stability is not None:
+                sentence_updates["trace_stability"] = bool(parsed.trace_stability)
+                self.config["trace_stability"] = bool(parsed.trace_stability)
 
             if sentence_updates:
                 self.asr_engine.update_sentence_config(**sentence_updates)
                 applied.update(sentence_updates)
-
-            # ---- Tầng SEG (VAD > ASR > SEG) ----
-            seg_updates: Dict[str, Any] = {}
-            if parsed.seg_enabled is not None:
-                seg_updates["enabled"] = bool(parsed.seg_enabled)
-                self.config["seg_enabled"] = bool(parsed.seg_enabled)
-            if parsed.seg_max_chars is not None:
-                seg_updates["max_chars"] = max(10, int(parsed.seg_max_chars))
-                self.config["seg_max_chars"] = seg_updates["max_chars"]
-            if parsed.seg_tail_min_chars is not None:
-                seg_updates["tail_min_chars"] = max(0, int(parsed.seg_tail_min_chars))
-                self.config["seg_tail_min_chars"] = seg_updates["tail_min_chars"]
-            if parsed.seg_tail_scans is not None:
-                seg_updates["tail_scans"] = max(1, int(parsed.seg_tail_scans))
-                self.config["seg_tail_scans"] = seg_updates["tail_scans"]
-            if parsed.seg_use_whisper_timer is not None:
-                seg_updates["use_whisper_timer"] = bool(parsed.seg_use_whisper_timer)
-                self.config["seg_use_whisper_timer"] = seg_updates["use_whisper_timer"]
-            if parsed.seg_timer_engine is not None:
-                from backend.asr.timer import normalize_timer_engine  # noqa: PLC0415
-
-                engine = normalize_timer_engine(parsed.seg_timer_engine)
-                seg_updates["timer_engine"] = engine
-                self.config["seg_timer_engine"] = engine
-
-            if parsed.seg_debug_trace is not None:
-                seg_updates["debug_trace"] = bool(parsed.seg_debug_trace)
-                self.config["seg_debug_trace"] = seg_updates["debug_trace"]
-
-            if parsed.seg_stable_cut is not None:
-                seg_updates["stable_cut"] = bool(parsed.seg_stable_cut)
-                self.config["seg_stable_cut"] = seg_updates["stable_cut"]
-
-            if parsed.seg_stable_ms is not None:
-                seg_updates["stable_ms"] = max(50.0, float(parsed.seg_stable_ms))
-                self.config["seg_stable_ms"] = seg_updates["stable_ms"]
-
-            if seg_updates and hasattr(self.asr_engine, "update_seg_config"):
-                self.asr_engine.update_seg_config(**seg_updates)
-                applied.update({f"seg_{k}": v for k, v in seg_updates.items()})
 
             # P2.3/P2.4: chỉnh cửa sổ preview và nhịp poll runtime
             if parsed.preview_window_sec is not None:

@@ -1,8 +1,8 @@
-"""Fixture dữ liệu tiếng Nhật cho tầng SEG (Google FLEURS `ja_jp`).
+"""Fixture dữ liệu tiếng Nhật từ Google FLEURS (`ja_jp`).
 
 Mục đích: có một đoạn audio ~60 giây được ghép từ các câu FLEURS (mỗi câu cách nhau
-một khoảng lặng), kèm **bản tham chiếu dấu câu** lấy từ `test.tsv`. Nhờ vậy tầng SEG
-được kiểm tra đúng tiêu chí: "tách câu đúng theo dấu câu trong test.tsv".
+một khoảng lặng), kèm **bản tham chiếu dấu câu** lấy từ `test.tsv` — dùng để đo CER/WER
+của ASR và của cơ chế chốt câu trên dữ liệu thật.
 
 `test.tsv` (không header) gồm 7 cột:
     id, filename, raw_text (CÓ dấu câu), normalized_text, char_phrases, samples, gender
@@ -18,7 +18,7 @@ import numpy as np
 FLEURS_REL = Path("wav_test") / "google_fleurs" / "ja_jp"
 SAMPLE_RATE = 16000
 
-#: Dấu kết câu dùng để dựng BẢN THAM CHIẾU (độc lập với `backend.segmentation`).
+#: Dấu kết câu dùng để dựng BẢN THAM CHIẾU (độc lập với cách hệ thống cắt câu).
 _REF_SPLIT = re.compile(r"(?<=[。！？])")
 
 

@@ -36,10 +36,10 @@
       threshold: cfg.vadThreshold !== undefined ? cfg.vadThreshold : (cfg.vad_threshold !== undefined ? cfg.vad_threshold : (cfg.threshold !== undefined ? cfg.threshold : 0.5)),
       silenceDurationMs: silence,
       minWordsToCommit: cfg.minWordsToCommit !== undefined && !isNaN(parseInt(cfg.minWordsToCommit, 10)) ? Math.max(0, parseInt(cfg.minWordsToCommit, 10)) : 2,
-      // Tầng SEG (VAD > ASR > SEG): chốt câu theo dấu câu của ASR.
-      segEnabled: cfg.segEnabled === undefined ? true : !!cfg.segEnabled,
-      segUseWhisperTimer: cfg.segUseWhisperTimer === undefined ? true : !!cfg.segUseWhisperTimer,
-      segDebugTrace: cfg.segDebugTrace === undefined ? true : !!cfg.segDebugTrace,
+      // Cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut): text đứng im đủ lâu ⇒ chốt câu.
+      splitOnStability: cfg.splitOnStability === undefined ? true : !!cfg.splitOnStability,
+      // Chẩn đoán mỗi nhịp ([SEG_TRACE]) — mặc định TẮT.
+      traceStability: !!cfg.traceStability,
       ttsEnabled: !!cfg.ttsEnabled,
       ttsVoice: cfg.ttsVoice || "speaker_01_0039.wav",
       ttsSpeed: parseFloat(cfg.ttsSpeed || 1.0),
@@ -49,25 +49,26 @@
     };
     if (cfg.translationModel) out.translationModel = cfg.translationModel;
     if (cfg.vadEngine) out.vadEngine = cfg.vadEngine;
-    // Tầng SEG: nhận cả camelCase (getSettings) lẫn snake_case (settings cũ đã lưu).
-    const segMax = cfg.segMaxChars !== undefined ? cfg.segMaxChars : cfg.seg_max_chars;
-    if (segMax !== undefined && !isNaN(parseInt(segMax, 10))) {
-      out.segMaxChars = Math.max(10, parseInt(segMax, 10));
+    // stable_cut: nhận cả camelCase (getSettings) lẫn snake_case (settings cũ đã lưu).
+    const stableMs = cfg.stability_duration_ms !== undefined
+      ? cfg.stability_duration_ms
+      : (cfg.stabilityDurationSec !== undefined ? parseFloat(cfg.stabilityDurationSec) * 1000 : undefined);
+    if (stableMs !== undefined && !isNaN(parseFloat(stableMs))) {
+      out.stabilityDurationSec = Math.max(0.1, parseFloat(stableMs) / 1000);
     }
-    const segTailChars = cfg.segTailMinChars !== undefined ? cfg.segTailMinChars : cfg.seg_tail_min_chars;
-    if (segTailChars !== undefined && !isNaN(parseInt(segTailChars, 10))) {
-      out.segTailMinChars = Math.max(0, parseInt(segTailChars, 10));
+    const stableMinSec = cfg.stability_min_duration_sec !== undefined
+      ? cfg.stability_min_duration_sec
+      : cfg.stabilityMinDurationSec;
+    if (stableMinSec !== undefined && !isNaN(parseFloat(stableMinSec))) {
+      out.stabilityMinDurationSec = Math.max(0, parseFloat(stableMinSec));
     }
-    const segTailScans = cfg.segTailScans !== undefined ? cfg.segTailScans : cfg.seg_tail_scans;
-    if (segTailScans !== undefined && !isNaN(parseInt(segTailScans, 10))) {
-      out.segTailScans = Math.max(1, parseInt(segTailScans, 10));
+    const stableMinWords = cfg.stability_min_words !== undefined ? cfg.stability_min_words : cfg.stabilityMinWords;
+    if (stableMinWords !== undefined && !isNaN(parseInt(stableMinWords, 10))) {
+      out.stabilityMinWords = Math.max(0, parseInt(stableMinWords, 10));
     }
-    const segStableMs = cfg.segStableMs !== undefined ? cfg.segStableMs : cfg.seg_stable_ms;
-    if (segStableMs !== undefined && !isNaN(parseInt(segStableMs, 10))) {
-      out.segStableMs = Math.max(50, parseInt(segStableMs, 10));
-    }
-    const segTrace = cfg.segDebugTrace !== undefined ? cfg.segDebugTrace : cfg.seg_debug_trace;
-    if (segTrace !== undefined) out.segDebugTrace = !!segTrace;
+    // Chẩn đoán `[SEG_TRACE]`: nhận cả camelCase lẫn snake_case (cấu hình cũ đã lưu).
+    const trace = cfg.trace_stability !== undefined ? cfg.trace_stability : cfg.traceStability;
+    if (trace !== undefined) out.traceStability = !!trace;
     return out;
   }
 
