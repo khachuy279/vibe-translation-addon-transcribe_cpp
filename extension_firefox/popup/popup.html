@@ -81,7 +81,7 @@
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>⏱️ VAD Silence</label>
-            <span class="val-badge"><span id="valVadSilence">600</span><span id="valVadSilenceUnit"></span></span>
+            <span class="val-badge"><span id="valVadSilence">1000</span><span id="valVadSilenceUnit"></span></span>
           </div>
           <!-- 0 = OFF: để chính VAD dùng mặc định trong docs của nó (FireRed 200 ms,
                Silero 100 ms, FSMN 800 ms).
@@ -89,7 +89,7 @@
                Speech END sau ĐÚNG ngần ấy ms im lặng, ghi đè min_silence_frame /
                min_silence_duration_ms / max_end_silence_time của engine.
                Không còn hangover/pre-speech ở tầng processor. -->
-          <input type="range" id="rangeVadSilence" min="0" max="1500" step="50" value="600">
+          <input type="range" id="rangeVadSilence" min="0" max="2000" step="50" value="1000">
         </div>
         <div class="setting-group flex-1">
           <div class="label-with-value">

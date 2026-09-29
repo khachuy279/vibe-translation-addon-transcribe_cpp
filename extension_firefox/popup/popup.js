@@ -63,10 +63,23 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
   let activeTab = null;
   let isCapturingNow = false;
+  let currentAudioSampleRate = null;
   let isSwitchingEngine = false;
   let lastActiveAsr = "sensevoice";
   let lastActiveVad = "auto";
   let lastActiveLang = "auto";
+
+  function formatSampleRate(rate) {
+    const numRate = Number(rate);
+    if (!numRate || isNaN(numRate) || numRate <= 0) return "";
+    const khz = +(numRate / 1000).toFixed(1);
+    return `${khz} kHz`;
+  }
+
+  function getCapturingLabel(rate = currentAudioSampleRate) {
+    const rateStr = formatSampleRate(rate);
+    return rateStr ? `Capturing ${rateStr}` : "Capturing";
+  }
 
   function renderVoiceOptions(voicesList, currentVoiceId) {
     if (!selTtsVoice || !voicesList || voicesList.length === 0) return;
@@ -547,7 +560,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const cfg = getSettings();
       api.storage.local.set({ bs_settings: cfg });
 
-      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
       statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
       showMsg(`✅ Đã chuyển sang ASR: ${lastActiveAsr.toUpperCase()} (${lastActiveLang}) | VAD: ${result.resolved_vad || lastActiveVad}`, "success");
 
@@ -561,8 +574,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       // Rollback dropdown selections
       if (selAsrEngine) selAsrEngine.value = lastActiveAsr;
       if (selVadEngine) selVadEngine.value = lastActiveVad;
-      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = "badge badge-ready";
+      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
       showMsg(`❌ Lỗi nạp model: ${err.message || "Không thể chuyển engine"}`, "error");
     } finally {
       isSwitchingEngine = false;
@@ -724,14 +737,14 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       cfg.translationModel = newModel;
       await api.storage.local.set({ bs_settings: cfg });
 
-      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = "badge badge-ready";
+      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
       showMsg(`✅ Đã chuyển sang model dịch: ${modelDesc}`, "success");
     } catch (err) {
       console.error("[Popup] Translation model switch error:", err);
       showMsg(`❌ Lỗi nạp model dịch: ${err.message || "Không thể chuyển model"}`, "error");
-      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = "badge badge-ready";
+      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
     } finally {
       isSwitchingTranslationModel = false;
       if (selTranslationModel) selTranslationModel.disabled = isCapturingNow;
@@ -748,19 +761,19 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       try {
         const results = await api.scripting.executeScript({
           target: { tabId: tab.id, allFrames: true },
-          func: (act, p) => {
+          func: async (act, p) => {
             try {
               if (act === "START_TRANSLATION" && typeof window.__bsStartCapture === "function") {
-                return window.__bsStartCapture(p);
+                return await window.__bsStartCapture(p);
               }
               if (act === "STOP_TRANSLATION" && typeof window.__bsStopCapture === "function") {
-                return window.__bsStopCapture();
+                return await window.__bsStopCapture();
               }
               if (act === "GET_STATUS" && typeof window.__bsGetStatus === "function") {
-                return window.__bsGetStatus();
+                return await window.__bsGetStatus();
               }
               if (act === "update_settings" && typeof window.__bsUpdateSettings === "function") {
-                return window.__bsUpdateSettings(p.settings || p);
+                return await window.__bsUpdateSettings(p.settings || p);
               }
             } catch (e) {
               return { success: false, error: e.message };
@@ -882,11 +895,13 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (!tab) return;
 
     const statuses = await broadcastToFrames("GET_STATUS");
-    if (statuses && statuses.some(s => s?.isCapturing)) {
-      setUI(true);
+    const capturingFrame = statuses?.find(s => s?.isCapturing);
+    if (capturingFrame) {
+      const rate = capturingFrame.sampleRate || statuses.find(s => s?.sampleRate)?.sampleRate;
+      setUI(true, rate);
     } else {
       api.tabs.sendMessage(tab.id, { action: "GET_STATUS", type: "GET_STATUS" }, (r) => {
-        if (!api.runtime.lastError && r?.isCapturing) setUI(true);
+        if (!api.runtime.lastError && r?.isCapturing) setUI(true, r?.sampleRate);
       });
     }
   })();
@@ -911,7 +926,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
           return;
         }
         if (r?.success || r?.isCapturing) {
-          setUI(true);
+          setUI(true, r?.sampleRate);
           showMsg("✅ Đã tìm thấy video và bắt đầu dịch!", "success");
         } else {
           showMsg("❌ " + (r?.error || "Không tìm thấy video nào (Hãy bấm Play video trước)"), "error");
@@ -923,7 +938,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
     const successResult = results.find(r => r && (r.success || r.isCapturing));
     if (successResult) {
-      setUI(true);
+      const rate = successResult.sampleRate || results.find(r => r?.sampleRate)?.sampleRate;
+      setUI(true, rate);
       showMsg("✅ Đã tìm thấy video và bắt đầu dịch!", "success");
     } else {
       const specificError = results.find(r => r?.error && r.error !== "No video found");
@@ -1106,8 +1122,15 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   if (selTtsDucking) selTtsDucking.onchange = onSettingChange;
   if (rangeDuckingLevel) rangeDuckingLevel.oninput = onSettingChange;
 
-  function setUI(active) {
+  function setUI(active, audioRate = null) {
     isCapturingNow = active;
+    if (active) {
+      if (audioRate) {
+        currentAudioSampleRate = audioRate;
+      }
+    } else {
+      currentAudioSampleRate = null;
+    }
     btnStart.disabled = active || isSwitchingEngine || isSwitchingTranslationModel;
     btnStop.disabled = !active;
     if (selTranslationModel) {
@@ -1119,8 +1142,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (selVadEngine) {
       selVadEngine.disabled = active || isSwitchingEngine;
     }
-    statusBadge.textContent = active ? "Capturing" : `${lastActiveAsr.toUpperCase()}`;
+    statusBadge.textContent = active ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
     statusBadge.className = active ? "badge badge-connected" : "badge badge-ready";
+    statusBadge.title = active && currentAudioSampleRate ? `Đang thu âm thanh: ${currentAudioSampleRate} Hz` : "";
   }
 
   function showMsg(t, tp) {

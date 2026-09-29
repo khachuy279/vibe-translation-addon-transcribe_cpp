@@ -5,7 +5,7 @@ models:
     family: qwen3_asr
     architecture_type: offline_llm
     hf_repo: handy-computer/Qwen3-ASR-1.7B-gguf
-    default_quant: Q8_0
+    default_quant: Q4_K_M
     file: Qwen3-ASR-1.7B-Q8_0.gguf
     sample_rate: 16000
     languages: auto
@@ -78,12 +78,12 @@ models:
     vram_estimate_mb: 3200
     description: Mistral Voxtral Mini 4B Realtime Audio-LLM streaming ASR model ported to transcribe.cpp
   whisper-large-v3-turbo:
-    name: whisper-large-v3-turbo (Q8_0)
+    name: whisper-large-v3-turbo (Q4_K_M)
     family: whisper
     architecture_type: offline_llm
     hf_repo: handy-computer/whisper-large-v3-turbo-gguf
-    default_quant: Q8_0
-    file: whisper-large-v3-turbo-Q8_0.gguf
+    default_quant: Q4_K_M
+    file: whisper-large-v3-turbo-Q4_K_M.gguf
     sample_rate: 16000
     languages: auto
     vram_estimate_mb: 1500
@@ -101,3 +101,14 @@ models:
     vram_estimate_mb: 1500
     context_window_sec: 30
     description: 'kotoba-whisper-v2.2: finetune kotoba-tech/kotoba-whisper-v2.2 chuyển sang GGUF (Q8_0) bằng backend/tools/build_finetune.py'
+  qwen3-asr-enhanced-v0.1:
+    name: 'qwen3-asr-enhanced-v0.1 (Q8_0)'
+    family: qwen3_asr
+    architecture_type: offline_llm
+    hf_repo: mrfakename/Qwen3-ASR-Enhanced-v0.1
+    default_quant: Q8_0
+    file: qwen3-asr-enhanced-v0.1-Q8_0.gguf
+    sample_rate: 16000
+    languages: auto
+    vram_estimate_mb: 2100
+    description: 'qwen3-asr-enhanced-v0.1: finetune mrfakename/Qwen3-ASR-Enhanced-v0.1 chuyển sang GGUF (Q8_0) bằng backend/tools/build_finetune.py'

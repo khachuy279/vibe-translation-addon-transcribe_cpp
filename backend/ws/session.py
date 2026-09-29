@@ -69,6 +69,8 @@ class SessionConfigPayload(BaseModel):
     seg_tail_min_chars: Optional[int] = Field(default=None, alias="segTailMinChars")
     seg_tail_scans: Optional[int] = Field(default=None, alias="segTailScans")
     seg_use_whisper_timer: Optional[bool] = Field(default=None, alias="segUseWhisperTimer")
+    #: Engine timer của tầng SEG: "whisper" | "qwen3-aligner" (đổi được lúc chạy).
+    seg_timer_engine: Optional[str] = Field(default=None, alias="segTimerEngine")
     seg_debug_trace: Optional[bool] = Field(default=None, alias="segDebugTrace")
     seg_stable_cut: Optional[bool] = Field(default=None, alias="segStableCut")
     seg_stable_ms: Optional[float] = Field(default=None, alias="segStableMs")
@@ -100,6 +102,7 @@ class SessionConfig:
             "seg_tail_min_chars": config.segmentation.tail_min_chars,
             "seg_tail_scans": config.segmentation.tail_scans,
             "seg_use_whisper_timer": config.segmentation.use_whisper_timer,
+            "seg_timer_engine": config.segmentation.timer_engine,
             "seg_debug_trace": config.segmentation.debug_trace,
             "seg_stable_cut": config.segmentation.stable_cut,
             "seg_stable_ms": config.segmentation.stable_ms,
@@ -513,6 +516,12 @@ class SessionState:
             if parsed.seg_use_whisper_timer is not None:
                 seg_updates["use_whisper_timer"] = bool(parsed.seg_use_whisper_timer)
                 self.config["seg_use_whisper_timer"] = seg_updates["use_whisper_timer"]
+            if parsed.seg_timer_engine is not None:
+                from backend.asr.timer import normalize_timer_engine  # noqa: PLC0415
+
+                engine = normalize_timer_engine(parsed.seg_timer_engine)
+                seg_updates["timer_engine"] = engine
+                self.config["seg_timer_engine"] = engine
 
             if parsed.seg_debug_trace is not None:
                 seg_updates["debug_trace"] = bool(parsed.seg_debug_trace)

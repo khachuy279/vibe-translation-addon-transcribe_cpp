@@ -380,12 +380,24 @@ class TranscribeEngine(BaseASREngine):
         seg_cfg = getattr(config, "segmentation", None)
         if seg_cfg is None:
             return
+        from backend.asr.timer import normalize_timer_engine  # noqa: PLC0415
+
+        # ⚠️ CHỈ reset timer khi ENGINE THỰC SỰ ĐỔI. Popup đồng bộ cấu hình ở MỖI lần kết nối
+        # và luôn gửi kèm `use_whisper_timer`; nếu reset theo sự CÓ MẶT của khoá thì mỗi lần
+        # đồng bộ sẽ đóng model aligner (1,8 GB) rồi nạp lại từ đầu — đo thật trong log:
+        # 5 lần nạp × ~9-12 s cho 2 phiên.
+        prev_engine = normalize_timer_engine(getattr(seg_cfg, "timer_engine", "whisper"))
         for key, value in kwargs.items():
             if value is None or not hasattr(seg_cfg, key):
                 continue
             setattr(seg_cfg, key, value)
         self._seg_cfg = seg_cfg
         self._seg_trace = bool(getattr(seg_cfg, "debug_trace", False))
+        new_engine = normalize_timer_engine(getattr(seg_cfg, "timer_engine", "whisper"))
+        if new_engine != prev_engine:
+            # Đổi engine timer (whisper ↔ qwen3-aligner) phải ĐÓNG model cũ và cho phép nạp
+            # lại: nếu không, `_seg_timer_prewarmed` giữ True và model mới không bao giờ nạp.
+            self._reset_seg_timer(prewarm=False)
         if bool(getattr(seg_cfg, "enabled", False)):
             self._seg = self._build_seg(seg_cfg)
             self.prewarm_seg_timer()
@@ -398,7 +410,8 @@ class TranscribeEngine(BaseASREngine):
             f"max_chars={getattr(seg_cfg, 'max_chars', None)}, "
             f"tail_min_chars={getattr(seg_cfg, 'tail_min_chars', None)}, "
             f"tail_scans={getattr(seg_cfg, 'tail_scans', None)}, "
-            f"timer={bool(getattr(seg_cfg, 'use_whisper_timer', False))}",
+            f"timer={bool(getattr(seg_cfg, 'use_whisper_timer', False))}, "
+            f"timer_engine={getattr(seg_cfg, 'timer_engine', 'whisper')}",
             extra={"module_tag": "ASR"},
         )
 
@@ -622,13 +635,30 @@ class TranscribeEngine(BaseASREngine):
             logger.warning(f"Pre-warm ASR warning: {e}", extra={"module_tag": "ASR"})
         self.prewarm_seg_timer()
 
+    def _reset_seg_timer(self, *, prewarm: bool = False) -> None:
+        """Quên timer SEG đang cache (dùng khi đổi engine timer) rồi (tuỳ chọn) nạp lại.
+
+        Vì sao cần: `get_seg_timer()` là singleton theo `config.segmentation.timer_engine`.
+        Không reset thì đổi engine từ popup/WS chỉ đổi CONFIG còn model đang chạy vẫn là
+        engine cũ (đúng loại bug "cấu hình vô hiệu").
+        """
+        try:
+            from backend.asr.timer import reset_seg_timer  # noqa: PLC0415
+
+            reset_seg_timer()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Không reset được SEG timer: {exc}", extra={"module_tag": "ASR"})
+        self._seg_timer_prewarmed = False
+        if prewarm:
+            self.prewarm_seg_timer()
+
     def prewarm_seg_timer(self) -> None:
-        """Nạp trước model TIMER của tầng SEG (whisper) trong luồng nền.
+        """Nạp trước model TIMER của tầng SEG (whisper hoặc Qwen3-ForcedAligner) trong luồng nền.
 
         Vì sao: timer chỉ được gọi ở lần CHỐT CÂU đầu tiên; nếu nạp lúc đó thì câu đầu
-        tiên bị trễ thêm ~1 s (nạp model 845 MB) đúng lúc người dùng đang chờ phụ đề.
-        Nạp nền nên không chặn khởi động phiên; nếu chưa kịp thì `_seg_cut_sample()` vẫn
-        có đường dự phòng (chồng lấn) nên không mất chữ.
+        tiên bị trễ thêm ~1 s (nạp model 845 MB) — với aligner là ~1,3 s / 1,8 GB VRAM —
+        đúng lúc người dùng đang chờ phụ đề. Nạp nền nên không chặn khởi động phiên; nếu
+        chưa kịp thì `_seg_cut_sample()` vẫn có đường dự phòng (chồng lấn) nên không mất chữ.
         """
         cfg = self._seg_cfg
         if self._seg is None or cfg is None:
@@ -638,6 +668,7 @@ class TranscribeEngine(BaseASREngine):
         if getattr(self, "_seg_timer_prewarmed", False):
             return
         self._seg_timer_prewarmed = True
+        engine_name = str(getattr(cfg, "timer_engine", "whisper") or "whisper")
         try:
             from backend.asr.timer import get_seg_timer
 
@@ -648,7 +679,7 @@ class TranscribeEngine(BaseASREngine):
         if timer is None or not timer.available():
             metrics_collector.increment_counter("seg.timer_unavailable")
             logger.info(
-                "SEG timer: chưa có file model whisper cục bộ ⇒ dùng chồng lấn dự phòng.",
+                f"SEG timer ({engine_name}): chưa có model cục bộ ⇒ dùng chồng lấn dự phòng.",
                 extra={"module_tag": "ASR"},
             )
             return
@@ -656,7 +687,10 @@ class TranscribeEngine(BaseASREngine):
         def _load() -> None:
             t0 = time.perf_counter()
             try:
-                session = timer._ensure_session()  # noqa: SLF001 — cùng package, tránh API thừa
+                # `Qwen3AlignerTimer.prewarm()` tự quyết định nạp aligner hay whisper dự phòng
+                # (theo ngôn ngữ phiên); `WhisperTimer` không có `prewarm()` ⇒ dùng như cũ.
+                loader = getattr(timer, "prewarm", None)
+                session = loader() if callable(loader) else timer._ensure_session()  # noqa: SLF001
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Prewarm SEG timer lỗi: {exc}", extra={"module_tag": "ASR"})
                 return
@@ -671,8 +705,8 @@ class TranscribeEngine(BaseASREngine):
             metrics_collector.record_metric("seg", "timer_load_ms", elapsed * 1000.0)
             metrics_collector.increment_counter("seg.timer_prewarmed")
             logger.info(
-                f"SEG timer sẵn sàng ({timer.model_key}, {elapsed:.2f}s) — mốc cắt theo "
-                f"timestamp thật.",
+                f"SEG timer sẵn sàng ({engine_name}: {timer.model_key}, {elapsed:.2f}s) — mốc cắt "
+                f"theo timestamp thật.",
                 extra={"module_tag": "ASR"},
             )
 

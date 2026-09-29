@@ -267,7 +267,12 @@
         handleSubtitleEvent(msg.eventType, msg.payload);
         break;
       case "GET_STATUS": case "content_status":
-        sendResponse?.({ isCapturing, hasVideo: !!findVideo(), overlayActive: !!overlayManager });
+        sendResponse?.({
+          isCapturing,
+          hasVideo: !!findVideo(),
+          overlayActive: !!overlayManager,
+          sampleRate: audioCapture?.audioContext?.sampleRate || null
+        });
         break;
       case "set_overlay_mode":
         if (msg.payload?.mode) settings.overlayStyle = msg.payload.mode;
@@ -307,7 +312,14 @@
         await cleanup();
       } catch (e) {}
     }
-    if (isCapturing) return { success: false, error: "Already capturing" };
+    if (isCapturing) {
+      return {
+        success: false,
+        error: "Already capturing",
+        isCapturing: true,
+        sampleRate: audioCapture?.audioContext?.sampleRate || null
+      };
+    }
     try {
       if (msg.settings) Object.assign(settings, msg.settings);
       let video = findVideo();
@@ -505,8 +517,9 @@
       }
       checkCaptureAudibility(video);
 
-      console.log("[BS] Capture started");
-      return { success: true };
+      const actualRate = audioCapture?.audioContext?.sampleRate || null;
+      console.log("[BS] Capture started (rate:", actualRate, ")");
+      return { success: true, sampleRate: actualRate };
     } catch (e) {
       console.error("[BS] Start error:", e);
       await cleanup();
@@ -557,7 +570,12 @@
     }
     return { success: true };
   };
-  window.__bsGetStatus = () => ({ isCapturing, hasVideo: !!findVideo(), overlayActive: !!overlayManager });
+  window.__bsGetStatus = () => ({
+    isCapturing,
+    hasVideo: !!findVideo(),
+    overlayActive: !!overlayManager,
+    sampleRate: audioCapture?.audioContext?.sampleRate || null
+  });
   window.__bsUpdateSettings = (s) => {
     if (s) {
       Object.assign(settings, s);

@@ -6,8 +6,8 @@ default_model: tencent
 models:
   tencent-1.8b:
     name: Hunyuan-MT2 1.8B (Tencent)
-    model: unsloth/Hy-MT2-1.8B-GGUF
-    gguf_file: Hy-MT2-1.8B-UD-Q4_K_XL.gguf
+    model: tencent/Hy-MT2-1.8B-GGUF
+    gguf_file: Hy-MT2-1.8B-Q8_0.gguf
     temperature: 0.7
     top_p: 0.6
     top_k: 20
@@ -20,9 +20,9 @@ models:
 
   tencent:
     name: Hunyuan-MT2 7B (Tencent)
-    model: unsloth/Hy-MT2-7B-GGUF
-    gguf_file: Hy-MT2-7B-UD-Q4_K_XL.gguf
-    temperature: 0.7
+    model: tencent/Hy-MT2-7B-GGUF
+    gguf_file: HY-MT2-7B-Q6_K.gguf
+    temperature: 0.2
     top_p: 0.6
     top_k: 20
     repetition_penalty: 1.05

@@ -301,6 +301,8 @@ class SwitchModelRequest(BaseModel):
     seg_tail_min_chars: Optional[int] = None
     seg_tail_scans: Optional[int] = None
     seg_use_whisper_timer: Optional[bool] = None
+    #: Engine timer SEG: "whisper" | "qwen3-aligner".
+    seg_timer_engine: Optional[str] = None
     seg_debug_trace: Optional[bool] = None
     seg_stable_cut: Optional[bool] = None
     seg_stable_ms: Optional[float] = None
@@ -591,6 +593,9 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             "stable_scans": config.segmentation.stable_scans,
             "fallback_overlap_ms": config.segmentation.fallback_overlap_ms,
             "use_whisper_timer": config.segmentation.use_whisper_timer,
+            "timer_engine": config.segmentation.timer_engine,
+            "aligner_model": config.segmentation.aligner_model,
+            "aligner_device": config.segmentation.aligner_device,
             "debug_trace": config.segmentation.debug_trace,
             "stable_cut": config.segmentation.stable_cut,
             "stable_ms": config.segmentation.stable_ms,
@@ -767,6 +772,10 @@ async def update_backend_config(req: SwitchModelRequest):
         config.segmentation.tail_scans = max(1, int(req.seg_tail_scans))
     if req.seg_use_whisper_timer is not None:
         config.segmentation.use_whisper_timer = bool(req.seg_use_whisper_timer)
+    if req.seg_timer_engine is not None:
+        from backend.asr.timer import normalize_timer_engine  # noqa: PLC0415
+
+        config.segmentation.timer_engine = normalize_timer_engine(req.seg_timer_engine)
     if req.seg_debug_trace is not None:
         config.segmentation.debug_trace = bool(req.seg_debug_trace)
     if req.seg_stable_cut is not None:
@@ -884,6 +893,10 @@ async def update_backend_config(req: SwitchModelRequest):
         session_payload["seg_tail_scans"] = int(req.seg_tail_scans)
     if req.seg_use_whisper_timer is not None:
         session_payload["seg_use_whisper_timer"] = bool(req.seg_use_whisper_timer)
+    if req.seg_timer_engine is not None:
+        from backend.asr.timer import normalize_timer_engine  # noqa: PLC0415
+
+        session_payload["seg_timer_engine"] = normalize_timer_engine(req.seg_timer_engine)
     if req.seg_debug_trace is not None:
         session_payload["seg_debug_trace"] = bool(req.seg_debug_trace)
     if req.seg_stable_cut is not None:
@@ -943,6 +956,8 @@ async def update_backend_config(req: SwitchModelRequest):
         updated_items.append(f"seg_tail_scans={req.seg_tail_scans}")
     if req.seg_use_whisper_timer is not None:
         updated_items.append(f"seg_timer={req.seg_use_whisper_timer}")
+    if req.seg_timer_engine is not None:
+        updated_items.append(f"seg_timer_engine={req.seg_timer_engine}")
     if req.seg_debug_trace is not None:
         updated_items.append(f"seg_trace={req.seg_debug_trace}")
     if req.seg_stable_cut is not None:

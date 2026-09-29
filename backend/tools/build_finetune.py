@@ -20,6 +20,8 @@ Ví dụ:
         --hf-repo kotoba-tech/kotoba-whisper-v2.2 --family whisper ^
         --quant Q8_0 --model-key kotoba-whisper-v2.2 --vram-estimate-mb 1500
 
+    .venv\\Scripts\\python.exe -m backend.tools.build_finetune --hf-repo mrfakename/Qwen3-ASR-Enhanced-v0.1 --family qwen3_asr --quant Q8_0 --model-key Qwen3-ASR-Enhanced-v0.1 --vram-estimate-mb 2100
+
 Idempotent: chạy lại cùng tham số không tải lại, không build lại, không sinh entry
 trùng và không sửa `models.yaml`. Entry đã có sẽ được cập nhật tại chỗ; các field
 tuỳ chọn không truyền trên CLI được giữ nguyên từ entry cũ (xem `keep()` trong `main`).
@@ -151,33 +153,49 @@ def read_reference_tier(gguf_path: Path) -> str:
 
 
 def infer_variant(family: str, model_dir: Path) -> Optional[str]:
-    """Suy ra `stt.variant` từ config của model (hiện chỉ Whisper cần).
+    """Suy ra `stt.variant` từ config của model (Whisper, Qwen3-ASR, ...).
 
     Finetune Whisper bắt buộc phải khai một slug có trong VARIANT_DISPLAY_NAMES của
     `convert-whisper.py`; slug này chỉ mang tính mô tả (loader không đổi hành vi theo
     nó) nhưng nó phải tồn tại nên ta suy ra từ hình học encoder + số mel bins.
     """
-    if family != "whisper":
-        return None
     config_path = model_dir / "config.json"
     if not config_path.is_file():
         return None
     with config_path.open(encoding="utf-8") as handle:
-        cfg = json.load(handle)
-    try:
-        key = (int(cfg["d_model"]), int(cfg["encoder_layers"]), int(cfg["num_mel_bins"]))
-        dec_layers = int(cfg.get("decoder_layers", 0))
-    except (KeyError, TypeError, ValueError):
-        return None
-    slug = _WHISPER_GEOMETRY.get(key)
-    if slug is None:
-        return None
-    if slug in ("whisper-large-v2", "whisper-large-v3") and 0 < dec_layers <= 8:
-        slug = "whisper-large-v3-turbo"  # decoder đã distill (large-v3-turbo)
-    gen_path = model_dir / "generation_config.json"
-    if gen_path.is_file() and not json.loads(gen_path.read_text(encoding="utf-8")).get("lang_to_id"):
-        slug += ".en"  # bản English-only (vocab không có token ngôn ngữ)
-    return slug
+        try:
+            cfg = json.load(handle)
+        except Exception:
+            return None
+
+    if family == "whisper":
+        try:
+            key = (int(cfg["d_model"]), int(cfg["encoder_layers"]), int(cfg["num_mel_bins"]))
+            dec_layers = int(cfg.get("decoder_layers", 0))
+        except (KeyError, TypeError, ValueError):
+            return None
+        slug = _WHISPER_GEOMETRY.get(key)
+        if slug is None:
+            return None
+        if slug in ("whisper-large-v2", "whisper-large-v3") and 0 < dec_layers <= 8:
+            slug = "whisper-large-v3-turbo"  # decoder đã distill (large-v3-turbo)
+        gen_path = model_dir / "generation_config.json"
+        if gen_path.is_file() and not json.loads(gen_path.read_text(encoding="utf-8")).get("lang_to_id"):
+            slug += ".en"  # bản English-only (vocab không có token ngôn ngữ)
+        return slug
+
+    if family == "qwen3_asr":
+        try:
+            text_cfg = cfg.get("thinker_config", {}).get("text_config", {})
+            hidden_size = int(text_cfg.get("hidden_size", 0))
+            if hidden_size >= 1536:
+                return "qwen3-asr-1.7b"
+            elif hidden_size > 0:
+                return "qwen3-asr-0.6b"
+        except Exception:
+            return None
+
+    return None
 
 
 def read_wav_16k_mono(path: Path) -> Any:
@@ -384,22 +402,32 @@ def validate_gguf(gguf_path: Path, family: str, wav: Path, language: str) -> Dic
     try:
         session = model.session(n_threads=0)
         try:
-            result = session.run(
-                pcm,
-                language=language,
-                family=build_family_options(family, info, model=model, slot="run"),
-                timestamps="segment",
-            )
+            family_opts = build_family_options(family, info, model=model, slot="run")
+            try:
+                result = session.run(
+                    pcm,
+                    language=language,
+                    family=family_opts,
+                    timestamps="segment",
+                )
+            except transcribe_cpp.errors.UnsupportedRequest:
+                result = session.run(
+                    pcm,
+                    language=language,
+                    family=family_opts,
+                    timestamps="none",
+                )
         finally:
             session.close()
     finally:
         model.close()
 
+    segments = [(s.t0_ms, s.t1_ms, s.text) for s in getattr(result, "segments", [])]
     return {
         "backend": backend_name,
         "text": result.text,
         "language": result.language,
-        "segments": [(s.t0_ms, s.t1_ms, s.text) for s in result.segments],
+        "segments": segments,
     }
 
 

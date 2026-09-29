@@ -300,18 +300,85 @@ class WhisperTimer:
         return res
 
 
-_TIMER: Optional[WhisperTimer] = None
+_TIMER: Optional[Any] = None
+_TIMER_ENGINE: Optional[str] = None
+
+#: Các engine timer được hỗ trợ. Bí danh → tên chuẩn.
+_ENGINE_ALIASES = {
+    "whisper": "whisper",
+    "transcribe_cpp": "whisper",
+    "transcribe-cpp": "whisper",
+    "qwen3-aligner": "qwen3-aligner",
+    "qwen3_aligner": "qwen3-aligner",
+    "qwen3aligner": "qwen3-aligner",
+    "aligner": "qwen3-aligner",
+}
 
 
-def get_seg_timer() -> WhisperTimer:
-    """Singleton timer cho tầng SEG (tạo lười; test có thể monkeypatch hàm này)."""
-    global _TIMER
+def normalize_timer_engine(value: Optional[str]) -> str:
+    """Chuẩn hoá tên engine timer từ cấu hình/popup; mặc định `whisper`."""
+    key = (value or "").strip().lower()
+    return _ENGINE_ALIASES.get(key, "whisper")
+
+
+def reset_seg_timer() -> None:
+    """Đóng và quên timer hiện tại (dùng khi đổi engine timer runtime)."""
+    global _TIMER, _TIMER_ENGINE
+    old, _TIMER, _TIMER_ENGINE = _TIMER, None, None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001 — đóng timer không được làm chết luồng gọi
+            pass
+
+
+def get_seg_timer() -> Any:
+    """Singleton timer cho tầng SEG (tạo lười; test có thể monkeypatch hàm này).
+
+    Engine được chọn bởi `config.segmentation.timer_engine`:
+      * `"whisper"` (mặc định) → `WhisperTimer` (transcribe.cpp, mốc segment + nội suy ký tự);
+      * `"qwen3-aligner"` → `Qwen3AlignerTimer` (Qwen3-ForcedAligner-0.6B qua transformers).
+
+    Đổi engine lúc chạy (popup/WS) sẽ ĐÓNG timer cũ rồi dựng timer mới.
+    """
+    global _TIMER, _TIMER_ENGINE
+    from backend.config import config  # noqa: PLC0415
+
+    seg = config.segmentation
+    want = normalize_timer_engine(getattr(seg, "timer_engine", "whisper"))
+    if _TIMER is not None and _TIMER_ENGINE != want:
+        reset_seg_timer()
+
     if _TIMER is None:
-        from backend.config import config  # noqa: PLC0415
+        if want == "qwen3-aligner":
+            from backend.asr.aligner_timer import Qwen3AlignerTimer  # noqa: PLC0415
 
-        seg = config.segmentation
-        _TIMER = WhisperTimer(
-            model_key=getattr(seg, "whisper_model_key", "whisper-large-v3-turbo"),
-            language=(getattr(config.asr, "language", "") or "auto"),
-        )
+            _TIMER = Qwen3AlignerTimer(
+                model_id=getattr(
+                    seg, "aligner_model", "Qwen/Qwen3-ForcedAligner-0.6B-hf"
+                ),
+                local_dir=getattr(seg, "aligner_local_dir", "") or "",
+                device=getattr(seg, "aligner_device", "cuda:0") or "cuda:0",
+                dtype=getattr(seg, "aligner_dtype", "bfloat16") or "bfloat16",
+                language=(getattr(config.asr, "language", "") or "auto"),
+                language_fallback=getattr(seg, "aligner_language_fallback", "") or "",
+                auto_download=bool(getattr(seg, "aligner_auto_download", True)),
+                whisper_fallback=bool(getattr(seg, "aligner_whisper_fallback", True)),
+                whisper_model_key=getattr(seg, "whisper_model_key", "whisper-large-v3-turbo"),
+            )
+        else:
+            _TIMER = WhisperTimer(
+                model_key=getattr(seg, "whisper_model_key", "whisper-large-v3-turbo"),
+                language=(getattr(config.asr, "language", "") or "auto"),
+            )
+        _TIMER_ENGINE = want
+    else:
+        # Timer là SINGLETON dùng chung nhiều phiên ⇒ ngôn ngữ phiên có thể đã đổi. Làm mới
+        # để `prewarm()` quyết định đúng (ngôn ngữ ngoài 11 ngôn ngữ aligner ⇒ nạp whisper
+        # thay vì nạp aligner 1,8 GB vô ích). Lúc CHỐT CÂU, engine vẫn truyền ngôn ngữ của
+        # chính phiên nên kết quả không phụ thuộc giá trị này.
+        try:
+            _TIMER.language = getattr(config.asr, "language", "") or "auto"
+        except Exception:  # noqa: BLE001 — timer lạ (test/monkeypatch) thì bỏ qua
+            pass
     return _TIMER

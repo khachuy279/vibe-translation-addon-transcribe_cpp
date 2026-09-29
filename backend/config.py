@@ -220,8 +220,8 @@ class ASRConfig(BaseModel):
     threads: int = _AUTO_THREADS  # A1-1 (Hy3): tự động theo số nhân CPU
     # P2.8: hạ từ 0.6 -> 0.35 để preview đầu tiên xuất hiện sớm hơn (C5).
     min_transcribe_sec: float = 0.35
-    # P2.8: hạ từ 350 -> 300 để nhịp cập nhật phụ đề mượt hơn (C5).
-    poll_interval_ms: int = 300
+    # P2.8: hạ từ 350 -> 200 để nhịp cập nhật phụ đề mượt hơn (C5).
+    poll_interval_ms: int = 200
     # K2: đánh thức generator ngay khi VAD báo bắt đầu nói. Không bật thì nhánh idle có
     # thể đang ngủ hết `poll_interval_ms` (300 ms) và preview đầu tiên bị trễ thêm ~300 ms.
     # Đo thật (report §17): K2 giảm từ ~1,29 s xuống ~0,62 s. Đặt False để tắt.
@@ -250,7 +250,7 @@ class ASRConfig(BaseModel):
     preview_max_interval_ms: int = 1000   # trần nhịp preview
     # P2.5: tái sử dụng kết quả preview cho commit. MẶC ĐỊNH TẮT vì có thể mất từ
     # cuối câu (trái ưu tiên C4). Chỉ bật sau khi đo WER đạt chênh <= 0.3%.
-    preview_reuse_for_commit: bool = False
+    preview_reuse_for_commit: bool = True
     preview_reuse_max_delta_sec: float = 0.4
 
     # --- F-39: chống nghẽn executor ------------------------------------------
@@ -354,13 +354,44 @@ class SegmentationConfig(BaseModel):
     #: Cho phép chốt khi dấu kết câu đứng yên đủ lâu mà CHƯA thấy câu mới (`punct_stable`).
     #: MẶC ĐỊNH TẮT: tiếng Nhật (và cả tiếng Anh) ASR hay thả `。`/`.` sớm giữa câu
     #: (`営業回りを終え。`, `夕食を済ませ。`) ⇒ chờ câu mới hoặc im lặng VAD an toàn hơn.
-    stable_cut: bool = False
-    fallback_overlap_ms: float = 600.0   # không neo được khoảng lặng ⇒ lùi lại chồng lấn
-    #: Dùng model CÓ timestamp (whisper) để lấy mốc cắt chính xác (Qwen3 không có timestamp).
+    stable_cut: bool = True
+    fallback_overlap_ms: float = 800.0   # không neo được khoảng lặng ⇒ lùi lại chồng lấn
+    #: Bật tầng "timer" lấy mốc cắt chính xác (Qwen3-ASR không có timestamp).
+    #: Tên trường giữ nguyên vì popup/extension đã gửi `segUseWhisperTimer`; từ 2026-09-28
+    #: nó là công tắc CHUNG, còn engine cụ thể do `timer_engine` chọn.
     use_whisper_timer: bool = True
     whisper_model_key: str = "whisper-large-v3-turbo"
+    #: Engine timer: "qwen3-aligner" (mặc định — Qwen3-ForcedAligner-0.6B qua transformers) hoặc
+    #: "whisper" (transcribe.cpp; mốc segment + nội suy ký tự, dùng làm đường dự phòng).
+    #: Đo A/B trên FLEURS ja: aligner p50 20 ms / p90 36 ms / 94 ms-lần vs whisper p50 32 ms /
+    #: p90 204 ms / 202 ms-lần (whisper còn có mẫu lệch tới ~12-20 s vì phải căn chéo văn bản
+    #: của 2 model). Xem `report/audit/26_...md` + `27_SEG_AB_ALIGNER_VS_WHISPER.md`.
+    timer_engine: str = "qwen3-aligner"
     timer_min_confidence: float = 0.35
     timer_max_audio_sec: float = 30.0    # không chạy timer cho mảnh dài hơn (trần chi phí)
+    #: --- Qwen3-ForcedAligner (chỉ dùng khi `timer_engine="qwen3-aligner"`) ---
+    #: Checkpoint `-hf` (định dạng native của transformers, KHÔNG phải bản gốc của gói
+    #: `qwen-asr`): chỉ bản `-hf` có `chat_template.jinja` chạy được `language=None`.
+    aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
+    #: Thư mục model CỤC BỘ. RỖNG ⇒ `backend/models/Qwen__Qwen3-ForcedAligner-0.6B-hf`
+    #: (cùng quy ước `backend/models/_hf/<org>__<name>`). Model **luôn** được nạp từ đây —
+    #: KHÔNG bao giờ nạp thẳng từ cache HuggingFace; nếu chưa có thì tải MỘT LẦN về đây khi
+    #: `aligner_auto_download=True`. Nhờ vậy chạy được offline và không phát sinh request HF
+    #: mỗi lần nạp.
+    aligner_local_dir: str = ""
+    aligner_device: str = "cuda:0"
+    aligner_dtype: str = "bfloat16"
+    aligner_auto_download: bool = True
+    #: Aligner chỉ phủ 11/30 ngôn ngữ của ASR ⇒ khi phiên dùng ngôn ngữ NGOÀI danh sách
+    #: (vd `vi`), timer tự chuyển sang `WhisperTimer` (whisper chỉ được nạp khi thật cần)
+    #: thay vì để mốc cắt rơi về chồng lấn. Đặt False để timer trả None (engine dùng mốc
+    #: chồng lấn) — chỉ nên dùng khi muốn đo riêng chất lượng aligner.
+    aligner_whisper_fallback: bool = False
+    #: Aligner chỉ hỗ trợ 11 ngôn ngữ (zh, en, yue, fr, de, it, ja, ko, pt, ru, es). Phiên ở
+    #: chế độ `auto` được suy theo CHỮ VIẾT (kana/hangul/CJK/Cyrillic); chữ Latin không phân
+    #: biệt được nên mặc định KHÔNG align (rơi về đường dự phòng). Đặt tên ngôn ngữ ở đây
+    #: (vd "English") nếu muốn ép align cho phiên auto dùng chữ Latin.
+    aligner_language_fallback: str = ""
     #: Ghi log TỪNG NHỊP ASR preview (vì sao chốt / vì sao còn chờ) để tinh chỉnh mốc ngắt
     #: câu bằng mắt người. Bật mặc định trong giai đoạn tinh chỉnh.
     debug_trace: bool = True

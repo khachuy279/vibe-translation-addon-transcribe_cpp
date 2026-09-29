@@ -82,8 +82,8 @@ orjson>=3.9                 # TUỲ CHỌN — thiếu thì backend tự fallbac
 # entry point `transcribe_cpp.native`.
 # ⚠️ PHẢI cài CẢ HAI: `-native` chỉ là thư viện; thiếu binding `transcribe-cpp` thì backend
 # báo `transcribe_cpp package chưa được cài đặt!` và **không có backend ASR nào** (devices=n/a).
-transcribe-cpp>=0.2.3
-transcribe-cpp-native>=0.2.3
+transcribe-cpp=0.2.3
+transcribe-cpp-native=0.2.3
 
 # ------------------------------------------------------------------ Dịch (llama.cpp GGUF)
 # Lấy BINDING từ wheel CPU 7 MB (index khai ở đầu file). `--only-binary` để pip KHÔNG tự build
@@ -97,6 +97,19 @@ llama-cpp-python==0.3.35
 torch>=2.4
 torchaudio>=2.4
 omnivoice>=0.2.1
+
+# --------------------------------------- Timer SEG: Qwen3-ForcedAligner (tuỳ chọn)
+# Timer mốc cắt `segmentation.timer_engine="qwen3-aligner"` chạy Qwen3-ForcedAligner-0.6B
+# bằng transformers NATIVE (`backend/asr/aligner_timer.py`) ⇒ **KHÔNG** cần gói `qwen-asr`
+# (gói đó ghim `transformers==4.57.6`, xung đột trực tiếp với `transformers>=5.3.0` mà
+# omnivoice/TTS yêu cầu — xem `report/audit/26_KHA_THI_QWEN3_ASR_TRANSFORMERS.md`).
+#   * nagisa: BẮT BUỘC cho tiếng Nhật — `split_words_for_alignment(..., "Japanese")` nạp từ
+#     điển nagisa và lần gọi ĐẦU TIÊN tốn ~1,5 s (đã đo). Thiếu gói ⇒ ImportError ⇒ timer
+#     tiếng Nhật hỏng hoàn toàn.
+#   * soynlp: tương tự cho tiếng Hàn.
+#   * Chỉ cần khi bật engine timer aligner; vẫn cài mặc định vì repo này dùng tiếng Nhật.
+nagisa==0.3.0
+soynlp==0.0.493
 
 # ------------------------------------------------------------------------- VAD engine
 fireredvad>=0.0.2           # mặc định (FireRed Stream-VAD)
