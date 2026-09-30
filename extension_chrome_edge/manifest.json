@@ -2,17 +2,7 @@
   "manifest_version": 3,
   "name": "Bilingual Subtitle",
   "version": "0.6.4",
-  "description": "Real-time bilingual subtitles for videos using transcribe.cpp (giao thức v3: payload gọn)",
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "bilingual-subtitle@local",
-      "data_collection_permissions": {
-        "required": [
-          "none"
-        ]
-      }
-    }
-  },
+  "description": "Real-time bilingual subtitles for videos using transcribe.cpp",
   "permissions": [
     "activeTab",
     "storage",
@@ -29,11 +19,7 @@
     "extension_pages": "script-src 'self'; connect-src 'self' wss://localhost:8765 ws://localhost:8765 https://localhost:8765 http://localhost:8765 http://localhost:1234"
   },
   "background": {
-    "scripts": [
-      "lib/backpressure-gate.js",
-      "lib/frame-builder.js",
-      "background/service-worker.js"
-    ]
+    "service_worker": "background/service-worker.js"
   },
   "content_scripts": [
     {
@@ -41,7 +27,6 @@
         "<all_urls>"
       ],
       "all_frames": true,
-      "match_origin_as_fallback": true,
       "js": [
         "lib/frame-builder.js",
         "lib/tts-player.js",

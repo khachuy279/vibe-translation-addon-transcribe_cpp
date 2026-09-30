@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bilingual Subtitle</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+  <div class="popup">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-brand">
+        <span class="header-icon">🎬</span>
+        <h1>Bilingual Subtitle</h1>
+      </div>
+      <div id="statusBadge" class="badge badge-disconnected">
+        <span class="badge-dot"></span>
+        <span class="badge-text">Disconnected</span>
+      </div>
+    </header>
+    <!-- Status Toast / Log -->
+    <div id="messageArea" class="message-area"></div>
+    <!-- Top Action Buttons -->
+    <div class="controls">
+      <button id="btnStart" class="btn btn-primary">
+        <span class="btn-icon">▶</span>
+        <span>Start</span>
+      </button>
+      <button id="btnStop" class="btn btn-secondary" disabled>
+        <span class="btn-icon">⏹</span>
+        <span>Stop</span>
+      </button>
+      <button id="btnTest" class="btn btn-outline">
+        <span class="btn-icon">⚡</span>
+        <span>Test</span>
+      </button>
+    </div>
+
+    <!-- Active Model HUD Chip -->
+    <!-- <div class="model-info-banner">
+      <span class="model-info-icon">🧠</span>
+      <span class="model-info-label">MODEL</span>
+      <span id="lblActiveModel" class="model-info-value" title="Mô hình ASR đang nạp trong VRAM">--</span>
+    </div> -->
+
+    <!-- Main Settings Container -->
+    <div class="settings">
+
+      <!-- Section: Speech & Translation -->
+      <div class="section-title">
+        <span>ASR</span>
+      </div>
+      
+      <div class="setting-group">
+        <label for="selSourceLang">SourceLang</label>
+        <select id="selSourceLang">
+          <option value="auto" selected>Auto-detect</option>
+          <option value="en">English (en)</option>
+          <option value="ja">Japanese (ja)</option>
+          <option value="zh">Chinese (zh)</option>
+          <option value="ko">Korean (ko)</option>
+          <option value="ru">Russian (ru)</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <label for="selAsrEngine">ASR Engine</label>
+          <select id="selAsrEngine">
+            <option value="qwen3-asr-1.7b" selected>Qwen3 ASR 1.7B ⚡</option>
+            <option value="qwen3-asr-0.6b">Qwen3 ASR 0.6B</option>
+            <option value="sensevoice-small">SenseVoice Small</option>
+            <option value="cohere-transcribe">Cohere Transcribe (03-2026)</option>
+            <option value="voxtral-mini-4b">Voxtral Mini 4B Realtime</option>
+            <option value="whisper-large-v3-turbo">Whisper Large V3 Turbo</option>
+            <option value="nemotron-3.5-streaming">Nemotron 3.5 Streaming</option>
+          </select>
+        </div>
+        <div class="setting-group flex-1">
+          <label for="selVadEngine">VAD Engine</label>
+          <select id="selVadEngine">
+            <option value="firered-vad" selected>FireRed VAD</option>
+            <option value="fsmn-vad">FSMN-VAD</option>
+            <option value="silero-vad">Silero VAD</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>VAD Silence</label>
+            <span class="val-badge"><span id="valVadSilence">0</span><span id="valVadSilenceUnit"></span></span>
+          </div>
+          <!-- 0 = OFF: để chính VAD dùng mặc định trong docs của nó (FireRed 200 ms,
+               Silero 100 ms, FSMN 800 ms).
+               > 0: `silenceDurationMs` là ĐIỀU KIỆN SỐ 1 để chốt câu — backend tự chốt
+               Speech END sau ĐÚNG ngần ấy ms im lặng, ghi đè min_silence_frame /
+               min_silence_duration_ms / max_end_silence_time của engine.
+               Không còn hangover/pre-speech ở tầng processor. -->
+          <input type="range" id="rangeVadSilence" min="0" max="2000" step="50" value="0">
+        </div>
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>VAD Threshold</label>
+            <span class="val-badge"><span id="valVadThreshold">0.50</span></span>
+          </div>
+          <input type="range" id="rangeVadThreshold" min="0.10" max="0.90" step="0.05" value="0.50">
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="label-with-value">
+          <label>Hold cut until (s)</label>
+          <span class="val-badge"><span id="valStableMinSec">3</span> s</span>
+        </div>
+        <!-- Độ dài phát âm tối thiểu trước khi VAD END được phép chốt câu.
+             Nếu câu ngắn hơn ngưỡng này, VAD END sẽ GIỮ câu lại thay vì chốt ngày -->
+        <input type="range" id="rangeStableMinSec" min="0" max="10" step="0.5" value="3">
+      </div>
+
+      <div class="setting-group">
+        <div class="label-with-value">
+          <label>Min Words Filter</label>
+          <span class="val-badge"><span id="valMinWords">3</span> words</span>
+        </div>
+        <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="3">
+      </div>
+
+      <!-- Section: Translation -->
+      <div class="section-title">
+        <span>Translation</span>
+      </div>
+
+      <div class="setting-group">
+        <label for="selTranslationModel">Translation Model</label>
+        <select id="selTranslationModel">
+          <option value="tencent-1.8b">Hunyuan-MT2 1.8B (Tencent) ⚡ Siêu nhanh (~2.0GB)</option>
+          <option value="tencent">Hunyuan-MT2 7B (Tencent) 🎯 Chuẩn (~4.6GB)</option>
+          <option value="xiaomi">MiLM-MT 4.6B (Xiaomi) ⚡ Nhanh (~2.5GB)</option>
+          <option value="gemmax">GemmaX2 28-9B v0.2 (Xiaomi) 🌟 Cao cấp (~5.8GB)</option>
+          <option value="index-translate">Index-Translate-2B (IndexTeam) 🎌 2B nhẹ (~2.2GB)</option>
+        </select>
+      </div>
+
+      <div class="setting-group">
+        <label for="selTargetLang">TargetLang</label>
+        <select id="selTargetLang">
+          <option value="vi" selected>Vietnamese</option>
+        </select>
+      </div>
+    
+      <!-- Section: cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut) -->
+      <div class="section-title">
+        <span>Segmentation</span>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="stableToggleRow">
+          <span class="toggle-label">
+            Cut when the text stable.
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkStableCut" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="label-with-value">
+          <label>Stable for (ms)</label>
+          <span class="val-badge"><span id="valStableMs">0</span> ms</span>
+        </div>
+        <input type="range" id="rangeStableMs" min="0" max="500" step="50" value="0">
+      </div>
+
+      <div class="setting-group">
+        <div class="label-with-value">
+          <label>Stable min words</label>
+          <span class="val-badge"><span id="valStableMinWords">4</span></span>
+        </div>
+        <input type="range" id="rangeStableMinWords" min="0" max="10" step="1" value="4">
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="stableTraceToggleRow">
+          <span class="toggle-label">
+            Log each poll (SEG_TRACE)
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkStableTrace">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Section: TTS Dubbing (Always Visible, Flat) -->
+      <div class="section-title">
+        <span>TTS</span>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="ttsToggleRow">
+          <span class="toggle-label">
+            Activate
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkEnableTts">
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <label for="selTtsVoice">Voice Clone</label>
+        <select id="selTtsVoice">
+          <!-- <option value="audio.wav" selected>👩 Giọng Nữ 1 (audio.wav)</option> -->
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label for="selTtsSpeed">TTS Speed</label>
+            <span class="val-badge"><span id="valTtsSpeed">1.0</span>x</span>
+          </div>
+          <select id="selTtsSpeed">
+            <option value="0.9">0.9x</option>
+            <option value="1.0" selected>1.0x</option>
+            <option value="1.1">1.1x</option>
+            <option value="1.2">1.2x</option>
+            <option value="1.3">1.3x</option>
+          </select>
+        </div>
+        <div class="setting-group flex-1">
+          <label for="selTtsDucking">Auto-Ducking</label>
+          <select id="selTtsDucking">
+            <option value="true" selected>On</option>
+            <option value="false">Off</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="setting-group" id="duckingSliderRow">
+        <div class="label-with-value">
+          <label>Original audio</label>
+          <span class="val-badge"><span id="valDuckingLevel">50</span>%</span>
+        </div>
+        <input type="range" id="rangeDuckingLevel" min="0" max="100" step="5" value="50">
+      </div>
+
+      <!-- Section: Subtitle Style -->
+      <div class="section-title">
+        <span>Subtitle</span>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="translationOnceToggleRow">
+          <span class="toggle-label">
+            Show translation once
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkTranslationOnce" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>Position Y</label>
+            <span class="val-badge"><span id="valSubPosY">10</span>%</span>
+          </div>
+          <input type="range" id="rangeSubPosY" min="0" max="80" step="1" value="10">
+        </div>
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>Width</label>
+            <span class="val-badge"><span id="valSubWidth">80</span>%</span>
+          </div>
+          <input type="range" id="rangeSubWidth" min="30" max="100" step="1" value="80">
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>Origin size</label>
+            <span class="val-badge"><span id="valOrigSize">2.0</span>%</span>
+          </div>
+          <input type="range" id="rangeOrigSize" min="1.0" max="3.0" step="0.1" value="2.0">
+        </div>
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>Translate size</label>
+            <span class="val-badge"><span id="valTransSize">4.0</span>%</span>
+          </div>
+          <input type="range" id="rangeTransSize" min="2.0" max="5.0" step="0.1" value="4.0">
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <label for="selFontFamily">Font Family</label>
+        <select id="selFontFamily">
+          <option value="default">Noto Sans + CJK (Mặc định)</option>
+          <option value="Noto Sans">Noto Sans (Latin / Vi / En)</option>
+          <option value="Noto Sans JP">Noto Sans JP (Japanese)</option>
+          <option value="Noto Sans SC">Noto Sans SC (Chinese)</option>
+          <option value="Segoe UI">Segoe UI</option>
+          <option value="Roboto">Roboto</option>
+          <option value="Inter">Inter</option>
+          <option value="Outfit">Outfit</option>
+          <option value="Arial">Arial</option>
+          <option value="Times New Roman">Times New Roman</option>
+          <option value="Courier New">Courier New</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>Font weight</label>
+            <span class="val-badge"><span id="valFontWeight">600</span></span>
+          </div>
+          <input type="range" id="rangeFontWeight" min="300" max="900" step="100" value="600">
+        </div>
+        <div class="setting-group flex-1">
+          <div class="label-with-value">
+            <label>Max lines</label>
+            <span class="val-badge"><span id="valMaxLines">2</span></span>
+          </div>
+          <input type="range" id="rangeMaxLines" min="1" max="6" value="2">
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>
