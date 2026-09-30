@@ -46,7 +46,12 @@ def test_pre_roll_does_not_include_previous_utterance(session_factory):
 
     Bug cũ: `on_speech_start` tính `_speech_start_sample = total_written - 4800`
     TRƯỚC khi VAD flush pre-roll, nên lùi vào cuối câu trước.
+
+    LƯU Ý: tắt cửa sổ GIỮ CÂU (`hold_short_sentence`) — bài này cần VAD END chốt NGAY câu 1 để
+    đo mốc đầu câu 2. Bật giữ câu thì câu 2 (sau 0,8 s im lặng) nằm trong cửa sổ giữ và sẽ được
+    GHÉP vào câu 1 (đúng thiết kế mới, xem `test_53_hold_short_sentence.py`).
     """
+    config.sentence.hold_short_sentence = False
     session = session_factory()
     engine = session.asr_engine
 
@@ -545,6 +550,9 @@ def test_stream_tokens_end_to_end_with_fake_engine(session_factory, restore_conf
     config.asr.min_transcribe_sec = 0.2
     # Tắt BẬC 3 cho test này để chốt câu xảy ra qua VAD (BẬC 1) như thiết kế.
     config.sentence.stability_min_duration_sec = 60.0
+    # ...và tắt luôn cửa sổ GIỮ CÂU (nếu bật, VAD END của câu 0,9 s sẽ bị hoãn tới 60 s ⇒ không
+    # có `final` nào để kiểm tra — xem `test_53_hold_short_sentence.py` cho hành vi đó).
+    config.sentence.hold_short_sentence = False
     session = session_factory(text_fn=lambda n: "alpha beta gamma")
     engine = session.asr_engine
     engine.poll_interval_ms = 40

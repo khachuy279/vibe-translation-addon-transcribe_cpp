@@ -67,6 +67,8 @@ class SessionConfigPayload(BaseModel):
     stability_min_words: Optional[int] = Field(default=None, alias="stabilityMinWords")
     #: Chẩn đoán `[SEG_TRACE]`/`[SEG_CUT]` từng nhịp preview (mặc định TẮT).
     trace_stability: Optional[bool] = Field(default=None, alias="traceStability")
+    #: GIỮ CÂU khi VAD báo END mà câu chưa đủ `stability_min_duration_sec` (mặc định BẬT).
+    hold_short_sentence: Optional[bool] = Field(default=None, alias="holdShortSentence")
 
     # P2.3/P2.4: cho phép chỉnh từ popup
     preview_window_sec: Optional[float] = Field(default=None, alias="previewWindowSec")
@@ -95,6 +97,7 @@ class SessionConfig:
             "stability_min_words": config.sentence.stability_min_words,
             "split_on_stability": config.sentence.split_on_stability,
             "trace_stability": config.sentence.trace_stability,
+            "hold_short_sentence": config.sentence.hold_short_sentence,
             "tts_enabled": config.tts.enabled,
             "tts_voice": config.tts.default_voice,
             "tts_speed": config.tts.speed,
@@ -490,6 +493,9 @@ class SessionState:
             if parsed.trace_stability is not None:
                 sentence_updates["trace_stability"] = bool(parsed.trace_stability)
                 self.config["trace_stability"] = bool(parsed.trace_stability)
+            if parsed.hold_short_sentence is not None:
+                sentence_updates["hold_short_sentence"] = bool(parsed.hold_short_sentence)
+                self.config["hold_short_sentence"] = bool(parsed.hold_short_sentence)
 
             if sentence_updates:
                 self.asr_engine.update_sentence_config(**sentence_updates)

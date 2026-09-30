@@ -54,7 +54,7 @@
       ? cfg.stability_duration_ms
       : (cfg.stabilityDurationSec !== undefined ? parseFloat(cfg.stabilityDurationSec) * 1000 : undefined);
     if (stableMs !== undefined && !isNaN(parseFloat(stableMs))) {
-      out.stabilityDurationSec = Math.max(0.1, parseFloat(stableMs) / 1000);
+      out.stabilityDurationSec = Math.max(0.0, parseFloat(stableMs) / 1000);
     }
     const stableMinSec = cfg.stability_min_duration_sec !== undefined
       ? cfg.stability_min_duration_sec

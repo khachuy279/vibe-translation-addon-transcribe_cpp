@@ -302,6 +302,8 @@ class SwitchModelRequest(BaseModel):
     split_on_stability: Optional[bool] = None
     #: Chẩn đoán `[SEG_TRACE]`/`[SEG_CUT]` từng nhịp preview (mặc định TẮT).
     trace_stability: Optional[bool] = None
+    #: GIỮ CÂU khi VAD báo END mà câu chưa đủ `stability_min_duration_sec` (mặc định BẬT).
+    hold_short_sentence: Optional[bool] = None
     tts_enabled: Optional[bool] = None
     tts_voice: Optional[str] = None
     tts_speed: Optional[float] = None
@@ -583,6 +585,9 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             "min_duration_sec": config.sentence.stability_min_duration_sec,
             "min_words": config.sentence.stability_min_words,
             "threshold_polls": config.sentence.stability_threshold_polls,
+            # GIỮ CÂU khi VAD báo END sớm (câu chưa đủ `min_duration_sec`) — xem
+            # `TranscribeEngine.on_speech_end`.
+            "hold_short_sentence": config.sentence.hold_short_sentence,
             # Chẩn đoán `[SEG_TRACE]`/`[SEG_CUT]` (mặc định TẮT) — popup đọc để hiển thị.
             "trace": config.sentence.trace_stability,
         },
@@ -751,13 +756,15 @@ async def update_backend_config(req: SwitchModelRequest):
     if req.split_on_stability is not None:
         config.sentence.split_on_stability = bool(req.split_on_stability)
     if req.stability_duration_ms is not None:
-        config.sentence.stability_duration_sec = max(0.05, float(req.stability_duration_ms) / 1000.0)
+        config.sentence.stability_duration_sec = max(0.0, float(req.stability_duration_ms) / 1000.0)
     if req.stability_min_duration_sec is not None:
         config.sentence.stability_min_duration_sec = max(0.0, float(req.stability_min_duration_sec))
     if req.stability_min_words is not None:
         config.sentence.stability_min_words = max(0, int(req.stability_min_words))
     if req.trace_stability is not None:
         config.sentence.trace_stability = bool(req.trace_stability)
+    if req.hold_short_sentence is not None:
+        config.sentence.hold_short_sentence = bool(req.hold_short_sentence)
     if req.target_lang is not None:
         config.translation.target_lang = req.target_lang
     if req.source_lang is not None:
@@ -869,6 +876,8 @@ async def update_backend_config(req: SwitchModelRequest):
         session_payload["split_on_stability"] = bool(req.split_on_stability)
     if req.trace_stability is not None:
         session_payload["trace_stability"] = bool(req.trace_stability)
+    if req.hold_short_sentence is not None:
+        session_payload["hold_short_sentence"] = bool(req.hold_short_sentence)
     if req.target_lang is not None:
         session_payload["target_lang"] = req.target_lang
     if req.source_lang is not None:
@@ -922,6 +931,8 @@ async def update_backend_config(req: SwitchModelRequest):
         updated_items.append(f"stable_cut={req.split_on_stability}")
     if req.trace_stability is not None:
         updated_items.append(f"seg_trace={req.trace_stability}")
+    if req.hold_short_sentence is not None:
+        updated_items.append(f"hold_short_sentence={req.hold_short_sentence}")
     if req.source_lang is not None:
         updated_items.append(f"src='{req.source_lang}'")
     if req.target_lang is not None:

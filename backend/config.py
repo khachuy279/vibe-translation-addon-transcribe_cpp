@@ -314,12 +314,23 @@ class SentenceConfig(BaseModel):
     max_duration_sec: float = 15.0         # Giới hạn tối đa độ dài 1 câu nói liên tục
     min_words_to_commit: int = 2           # Số từ tối thiểu để gửi sang dịch/TTS (lọc tiếng ậm ừ)
     split_on_stability: bool = True        # Tự động ngắt câu khi preview text ổn định
-    stability_duration_sec: float = 0.6    # Thời gian (giây) preview text bất biến (P3: cắt ở ranh giới từ)
-    stability_threshold_polls: int = 3     # Số chu kỳ poll tối thiểu xác nhận ổn định
+    stability_duration_sec: float = 0.0    # Thời gian (giây) preview text bất biến (P3: cắt ở ranh giới từ)
+    stability_threshold_polls: int = 2     # Số chu kỳ poll tối thiểu xác nhận ổn định
     # C4: sàn thời lượng trước khi cho phép BẬC 3 cắt câu. Nếu không có sàn này, một
     # câu mới bắt đầu mà model trả text ngắn không đổi (ví dụ chỉ nhận được 1-2 từ
     # trong 1 giây đầu) sẽ bị cắt ngay => mất chữ. Chỉ cắt khi câu đã đủ dài.
     stability_min_duration_sec: float = 2.5
+    #: GIỮ CÂU khi VAD báo hết tiếng QUÁ SỚM (mặc định BẬT).
+    #: `VAD_SILENCE` là BẬC 1 nên trước đây nó LUÔN thắng `stability_min_duration_sec`: câu mới
+    #: nói 1,2 s mà người nói ngừng ~1 s (`vad.silence_duration_ms`) là bị chốt CỤT — hai sàn
+    #: chống-cắt-sớm của BẬC 3 hoàn toàn vô hiệu. Bật cờ này ⇒ khi VAD END mà vùng nói chưa đủ
+    #: `stability_min_duration_sec`, engine KHÔNG chốt ngay mà GIỮ câu:
+    #:   * VAD START lại trong cửa sổ giữ ⇒ GHÉP audio mới vào CÙNG câu (giữ nguyên
+    #:     `utterance_id` và mốc đầu câu) — câu nói tiếp thì phải ghép lại, không cắt cụt;
+    #:   * hết cửa sổ mà vẫn im lặng      ⇒ chốt câu như `VAD_SILENCE` bình thường.
+    #: Cửa sổ giữ = `stability_min_duration_sec` − độ dài audio ĐÃ có (phần thiếu đo bằng đồng
+    #: hồ thật) nên không bao giờ chờ vô hạn. Đặt False = hành vi cũ (VAD END chốt ngay).
+    hold_short_sentence: bool = True
     # C4: số từ tối thiểu của preview trước khi cho phép BẬC 3 cắt câu.
     stability_min_words: int = 4
     inactivity_timeout_sec: float = 1.2    # Timeout ép chốt câu nếu không có frame mới

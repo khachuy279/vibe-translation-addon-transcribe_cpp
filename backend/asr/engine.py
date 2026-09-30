@@ -282,6 +282,11 @@ class TranscribeEngine(BaseASREngine):
         self._trace_stability: bool = bool(getattr(config.sentence, "trace_stability", False))
         #: Lý do còn chờ của nhịp gần nhất (do `_evaluate_tier234` ghi).
         self._stability_hold: str = ""
+        #: Cửa sổ GIỮ CÂU khi VAD báo hết tiếng quá sớm (`sentence.hold_short_sentence`):
+        #: `_hold_until` = mốc `perf_counter()` phải chốt câu đang giữ (0 = không giữ);
+        #: `_hold_reason` = lý do commit sẽ dùng khi hết cửa sổ.
+        self._hold_until: float = 0.0
+        self._hold_reason: str = ""
         # P1.5: trần audio hợp lệ của session (samples). 0 = không biết.
         self._max_audio_samples: int = 0
         self._window_warned: bool = False
@@ -576,23 +581,52 @@ class TranscribeEngine(BaseASREngine):
         self.commit_manager.record_activity()
 
     def on_speech_start(self) -> None:
-        """Callback khi VAD phát hiện bắt đầu nói."""
+        """Callback khi VAD phát hiện bắt đầu nói.
+
+        Nếu câu trước đang được GIỮ trong cửa sổ `stability_min_duration_sec` (VAD đã báo END
+        quá sớm — xem `on_speech_end`) thì đây là CÂU NÓI TIẾP của cùng một câu: **GHÉP** audio
+        mới vào vùng đang giữ (giữ nguyên `utterance_id` + mốc đầu câu) thay vì chốt cụt rồi mở
+        câu mới. Hết cửa sổ rồi mới có tiếng nói lại thì chốt phần cũ trước, rồi mở câu mới.
+        """
+        # Cửa sổ giữ đã HẾT mà vòng stream chưa kịp chốt (đua hiếm) ⇒ chốt phần CŨ TRƯỚC, lúc
+        # `_active_utterance_id` còn là của câu cũ, để audio mới không bị trộn vào câu quá hạn
+        # và phụ đề cũ không bị gán sang câu mới.
+        if self._hold_until > 0.0 and time.perf_counter() >= self._hold_until:
+            self._flush_held_commit()
+
         with self._lock:
-            self._speech_active = True
-            self._active_utterance_id = str(uuid.uuid4())[:8]
-            # Điểm bắt đầu thật sẽ được chốt trong feed_audio (P1.3).
-            self._awaiting_pre_roll = True
-            self._speech_start_sample = -1
-            self._last_preview_end_sample = -1
-            self._last_preview_text = ""
-            # K2: mốc để đo "thời gian tới preview ĐẦU TIÊN" của câu này.
-            self._speech_started_at = time.perf_counter()
-            self._first_preview_reported = False
-            # FIX-10: reset bộ đếm lãng phí compute cho câu mới.
-            self._preview_sec_processed = 0.0
-            self._preview_sec_unique_peak = 0.0
+            merging = self._hold_until > 0.0
+            if merging:
+                # GHÉP: giữ `_active_utterance_id`, `_speech_start_sample` (vùng gồm audio cũ),
+                # `_speech_started_at` (K2 vẫn đo từ lần nói ĐẦU) và bộ đếm FIX-10.
+                self._hold_until = 0.0
+                self._hold_reason = ""
+                self._speech_active = True
+                self._awaiting_pre_roll = False
+            else:
+                self._speech_active = True
+                self._active_utterance_id = str(uuid.uuid4())[:8]
+                # Điểm bắt đầu thật sẽ được chốt trong feed_audio (P1.3).
+                self._awaiting_pre_roll = True
+                self._speech_start_sample = -1
+                self._last_preview_end_sample = -1
+                self._last_preview_text = ""
+                # K2: mốc để đo "thời gian tới preview ĐẦU TIÊN" của câu này.
+                self._speech_started_at = time.perf_counter()
+                self._first_preview_reported = False
+                # FIX-10: reset bộ đếm lãng phí compute cho câu mới.
+                self._preview_sec_processed = 0.0
+                self._preview_sec_unique_peak = 0.0
+        if merging:
+            metrics_collector.increment_counter("asr.hold_short_sentence_merged")
+            logger.info(
+                f"[utt={self._active_utterance_id}] Có tiếng nói trở lại trong cửa sổ giữ câu — "
+                f"GHÉP vào cùng câu (không cắt cụt).",
+                extra={"module_tag": "ASR"},
+            )
         self.commit_manager.reset_stability()
         # Câu mới ⇒ lịch sử giả thuyết của câu trước không được dùng để chẩn đoán câu này.
+        # (Khi GHÉP thì text sẽ đổi vì có audio mới ⇒ reset bộ đếm ổn định là đúng.)
         self._hypothesis_consensus.reset()
         # K2: ĐÁNH THỨC generator ngay. Trước đây nhánh idle ngủ tới `poll_interval_ms`
         # (mặc định 300 ms) nên preview đầu tiên của câu bị trễ thêm tới ~300 ms chỉ vì
@@ -603,7 +637,14 @@ class TranscribeEngine(BaseASREngine):
         metrics_collector.increment_counter("asr.speech_start")
 
     def on_speech_end(self, reason: str = "VAD_SILENCE") -> None:
-        """Callback khi VAD phát hiện kết thúc nói (BẬC 1: kích hoạt chốt câu)."""
+        """Callback khi VAD phát hiện kết thúc nói (BẬC 1: kích hoạt chốt câu).
+
+        ⚠️ TRỪ khi câu còn QUÁ NGẮN: nếu vùng nói chưa đủ `stability_min_duration_sec` thì
+        KHÔNG chốt ngay (xem `_hold_deadline`) — nếu chốt thì `VAD_SILENCE` (BẬC 1) luôn thắng
+        hai sàn chống-cắt-sớm của BẬC 3, và câu bị cắt cụt đúng như log thật: người nói ngừng
+        ~1 s giữa hai mệnh đề là phụ đề bị chẻ đôi. Câu được GIỮ trong cửa sổ; nếu có tiếng nói
+        trở lại thì `on_speech_start` GHÉP vào cùng câu, hết cửa sổ thì chốt như thường.
+        """
         with self._lock:
             if not self._speech_active:
                 return
@@ -616,15 +657,88 @@ class TranscribeEngine(BaseASREngine):
             # K4: mốc "người nói dừng" để đo E2E tới phụ đề gốc chốt.
             self._speech_ended_at = time.perf_counter()
 
-            self._enqueue_commit_locked(
-                utterance_id=self._active_utterance_id,
-                start_sample=start_sample,
-                end_sample=end_sample,
-                reason=reason,
+            deadline = self._hold_deadline(start_sample, end_sample)
+            hold_info = None
+            if deadline > 0.0:
+                # GIỮ CÂU: chưa đủ `stability_min_duration_sec` ⇒ hoãn chốt.
+                self._hold_until = deadline
+                self._hold_reason = reason
+                hold_info = (
+                    (end_sample - start_sample) / 16000.0,
+                    float(getattr(self.commit_manager.cfg, "stability_min_duration_sec", 0.0)),
+                    deadline - time.perf_counter(),
+                )
+            else:
+                self._hold_until = 0.0
+                self._hold_reason = ""
+                self._enqueue_commit_locked(
+                    utterance_id=self._active_utterance_id,
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    reason=reason,
+                )
+
+        if hold_info is not None:
+            audio_sec, min_dur, wait_s = hold_info
+            metrics_collector.increment_counter("asr.hold_short_sentence_started")
+            logger.info(
+                f"[utt={self._active_utterance_id}] VAD END khi câu mới {audio_sec:.1f}s "
+                f"< {min_dur:.1f}s — GIỮ câu thêm {wait_s:.1f}s (nói tiếp thì ghép, "
+                f"im lặng tiếp thì chốt).",
+                extra={"module_tag": "ASR"},
             )
 
         # Đánh thức stream_tokens ngay lập tức (thread-safe, gọi từ sync VAD thread)
         self._wake_stream()
+
+    def _hold_deadline(self, start_sample: int, end_sample: int) -> float:
+        """Mốc phải chốt câu đang GIỮ, hoặc 0 nếu không giữ (xem `sentence.hold_short_sentence`).
+
+        Cửa sổ giữ = `stability_min_duration_sec` − độ dài audio ĐÃ có. Phần còn thiếu đo bằng
+        ĐỒNG HỒ THẬT vì trong lúc giữ thì không có frame mới (`audio_buffer.total_written` đứng
+        yên), nên nếu đo bằng audio thì mốc sẽ không bao giờ tới.
+        """
+        cfg = self.commit_manager.cfg
+        if not bool(getattr(cfg, "hold_short_sentence", True)):
+            return 0.0
+        min_dur = float(getattr(cfg, "stability_min_duration_sec", 0.0) or 0.0)
+        if min_dur <= 0.0 or end_sample <= start_sample:
+            return 0.0
+        audio_sec = (end_sample - start_sample) / 16000.0
+        if audio_sec >= min_dur:
+            return 0.0
+        return time.perf_counter() + (min_dur - audio_sec)
+
+    def _flush_held_commit(self) -> bool:
+        """Hết cửa sổ giữ câu ⇒ chốt câu đang giữ bằng đúng lý do VAD đã báo. True nếu vừa chốt."""
+        with self._lock:
+            if self._hold_until <= 0.0:
+                return False
+            reason = self._hold_reason or "VAD_SILENCE"
+            self._hold_until = 0.0
+            self._hold_reason = ""
+            end_sample = self.audio_buffer.total_written
+            start_sample = (
+                self._speech_start_sample if self._speech_start_sample >= 0 else end_sample
+            )
+            if end_sample > start_sample:
+                # K4: tính lại mốc "ngừng nói" = LÚC CHỐT, để cửa sổ giữ (chờ CÓ CHỦ Ý) không
+                # bị tính thành độ trễ của pipeline.
+                self._speech_ended_at = time.perf_counter()
+                self._enqueue_commit_locked(
+                    utterance_id=self._active_utterance_id,
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    reason=reason,
+                )
+        metrics_collector.increment_counter("asr.hold_short_sentence_committed")
+        logger.info(
+            f"[utt={self._active_utterance_id}] Hết cửa sổ giữ câu "
+            f"({float(getattr(self.commit_manager.cfg, 'stability_min_duration_sec', 0.0)):.1f}s) — "
+            f"chốt phần đã có ({reason}).",
+            extra={"module_tag": "ASR"},
+        )
+        return True
 
     def _wake_stream(self) -> None:
         """Đánh thức generator stream_tokens từ một thread đồng bộ."""
@@ -1404,6 +1518,12 @@ class TranscribeEngine(BaseASREngine):
         await preload_loop.run_in_executor(_EXECUTOR, self._preload_model)
 
         while self._is_running:
+            # 0) Cửa sổ GIỮ CÂU đã hết hạn (VAD báo END khi câu còn quá ngắn) ⇒ chốt phần đã
+            #    có. Chạy TRƯỚC mọi việc khác và chạy cả khi đang IDLE — nhánh idle chỉ ngủ
+            #    tối đa `poll_interval` nên mốc chốt trễ nhất ~1 nhịp poll.
+            if self._hold_until > 0.0 and time.perf_counter() >= self._hold_until:
+                self._flush_held_commit()
+
             # 1) Commit đang chờ (VAD silence hoặc do BẬC 2/3/4 sinh ra ở vòng trước)
             commit_req = self._pop_commit_request()
             if commit_req:
@@ -1600,8 +1720,13 @@ class TranscribeEngine(BaseASREngine):
                 # (stack đã bắt được: `asyncio/tasks.py:459 in wait_for` ← engine.py:1308).
                 if self._commit_event.is_set():
                     self._commit_event.clear()
+                # Đang GIỮ CÂU ⇒ chỉ ngủ tới mốc chốt (không chờ hết nhịp poll) để câu chốt
+                # đúng hạn `stability_min_duration_sec`, không cộng thêm tới 1 nhịp poll.
+                timeout_s = poll_interval
+                if self._hold_until > 0.0:
+                    timeout_s = min(poll_interval, max(0.01, self._hold_until - time.perf_counter()))
                 try:
-                    await asyncio.wait_for(self._commit_event.wait(), timeout=poll_interval)
+                    await asyncio.wait_for(self._commit_event.wait(), timeout=timeout_s)
                 except asyncio.TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -1641,6 +1766,9 @@ class TranscribeEngine(BaseASREngine):
             self._speech_started_at = 0.0
             self._speech_ended_at = 0.0
             self._first_preview_reported = True
+            # Cửa sổ giữ câu thuộc đoạn CŨ (trước khi tua) ⇒ bỏ, không chốt nữa.
+            self._hold_until = 0.0
+            self._hold_reason = ""
         self.audio_buffer.clear()
         self.commit_manager.reset_stability()
         self._hypothesis_consensus.reset()
@@ -1661,6 +1789,9 @@ class TranscribeEngine(BaseASREngine):
         with self._lock:
             self._speech_active = False
             self._pending_commits.clear()
+            # Cửa sổ giữ câu không được chốt khi phiên đã dừng.
+            self._hold_until = 0.0
+            self._hold_reason = ""
         self.audio_buffer.clear()
         # F-39 (native): nếu RAM đã phình quá xa mốc lúc nạp model thì đóng phiên native
         # để lần sau nạp lại sạch. Lỗi nằm trong native/Vulkan nên đây là cách duy nhất

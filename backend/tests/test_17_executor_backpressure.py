@@ -322,6 +322,10 @@ def test_e2e_commit_metric_is_recorded(session_factory, restore_config):
     config.asr.min_transcribe_sec = 0.2
     config.asr.inference_watchdog_sec = 0.0
     config.sentence.stability_min_duration_sec = 60.0
+    # Tắt cửa sổ GIỮ CÂU: bài này cần VAD END (BẬC 1) chốt NGAY câu 0,9 s để đo
+    # `asr.e2e_commit_ms`. Bật giữ câu thì commit bị hoãn 59 s (đúng thiết kế, xem
+    # `test_53_hold_short_sentence.py`).
+    config.sentence.hold_short_sentence = False
 
     session = session_factory(text_fn=lambda n: "alpha beta gamma")
     engine = session.asr_engine

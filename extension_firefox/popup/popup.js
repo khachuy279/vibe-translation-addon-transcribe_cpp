@@ -113,6 +113,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const vadThresholdVal = isNaN(rawThresh) ? 0.5 : rawThresh;
     const rawMinWords = rangeMinWords ? parseInt(rangeMinWords.value, 10) : 2;
     const minWords = isNaN(rawMinWords) ? 2 : Math.max(0, rawMinWords);
+    const rawStableMs = rangeStableMs ? parseFloat(rangeStableMs.value) : 0;
+    const stableMs = isNaN(rawStableMs) ? 0 : Math.max(0, rawStableMs);
     const cfg = {
       asrEngine: selAsrEngine ? selAsrEngine.value : undefined,
       vadEngine: selVadEngine ? selVadEngine.value : undefined,
@@ -126,10 +128,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       min_words_to_commit: minWords,
       // Cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut): text đứng im đủ lâu ⇒ chốt câu.
       splitOnStability: chkStableCut ? chkStableCut.checked : true,
-      stabilityDurationSec: parseFloat(rangeStableMs ? rangeStableMs.value : 600) / 1000 || 0.6,
+      stabilityDurationSec: stableMs / 1000,
       stabilityMinDurationSec: rangeStableMinSec ? parseFloat(rangeStableMinSec.value) : 2.5,
       stabilityMinWords: rangeStableMinWords ? parseInt(rangeStableMinWords.value, 10) : 4,
-      stability_duration_ms: parseFloat(rangeStableMs ? rangeStableMs.value : 600) || 600,
+      stability_duration_ms: stableMs,
       stability_min_duration_sec: rangeStableMinSec ? parseFloat(rangeStableMinSec.value) : 2.5,
       stability_min_words: rangeStableMinWords ? parseInt(rangeStableMinWords.value, 10) : 4,
       split_on_stability: chkStableCut ? chkStableCut.checked : true,
@@ -499,7 +501,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         vad_threshold: !isNaN(parseFloat(rangeVadThreshold?.value)) ? parseFloat(rangeVadThreshold.value) : 0.5,
         min_words_to_commit: !isNaN(parseInt(rangeMinWords?.value, 10)) ? Math.max(0, parseInt(rangeMinWords.value, 10)) : 2,
         split_on_stability: chkStableCut ? chkStableCut.checked : true,
-        stability_duration_ms: !isNaN(parseFloat(rangeStableMs?.value)) ? Math.max(100, parseFloat(rangeStableMs.value)) : 600,
+        stability_duration_ms: !isNaN(parseFloat(rangeStableMs?.value)) ? Math.max(0, parseFloat(rangeStableMs.value)) : 0,
         stability_min_duration_sec: !isNaN(parseFloat(rangeStableMinSec?.value)) ? Math.max(0, parseFloat(rangeStableMinSec.value)) : 2.5,
         stability_min_words: !isNaN(parseInt(rangeStableMinWords?.value, 10)) ? Math.max(0, parseInt(rangeStableMinWords.value, 10)) : 4,
         trace_stability: chkStableTrace ? chkStableTrace.checked : false,
@@ -816,7 +818,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         ? s.stability_duration_ms
         : (s.stabilityDurationSec !== undefined ? parseFloat(s.stabilityDurationSec) * 1000 : undefined);
       if (savedStableMs !== undefined && rangeStableMs) {
-        rangeStableMs.value = Math.round(savedStableMs);
+        const maxMs = parseFloat(rangeStableMs.max) || 500;
+        if (savedStableMs > maxMs) {
+          rangeStableMs.value = rangeStableMs.defaultValue || "0";
+        } else {
+          rangeStableMs.value = Math.round(savedStableMs);
+        }
         rangeStableMs.dataset.userEdited = "true";
       }
       const savedMinSec = s.stability_min_duration_sec !== undefined

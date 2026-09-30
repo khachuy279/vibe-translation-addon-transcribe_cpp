@@ -81,7 +81,7 @@ def test_api_config_tra_khoi_stable_thay_cho_seg():
     resp = _build_config_response(include_catalog=False)
     assert "seg" not in resp, "khối `seg` phải bị gỡ khỏi /api/config"
     assert resp["stable"]["split_on_stability"] is True
-    assert resp["stable"]["duration_ms"] > 0
+    assert resp["stable"]["duration_ms"] >= 0
     assert "stability_duration_sec" in resp["streaming"]
 
 
