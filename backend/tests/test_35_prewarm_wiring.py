@@ -109,3 +109,32 @@ def test_tts_prewarm_that_su_nap_model(monkeypatch):
     engine._is_loaded = True
     assert asyncio.run(engine.prewarm()) is True
     assert loads == [1], "không được nạp lại khi đã sẵn sàng"
+
+
+# ─────────────────────────────────────────────── 4. Lưu / nạp trạng thái TTS runtime
+
+def test_runtime_state_persistence_and_tts_prewarm(monkeypatch, tmp_path):
+    """Kiểm tra lưu / đọc trạng thái runtime_state.json phục vụ prewarm TTS khi khởi động."""
+    import sys
+    from backend import config as _
+    cfg_mod = sys.modules["backend.config"]
+    from backend.config import load_runtime_state, save_runtime_state
+
+    test_state_file = tmp_path / "runtime_state.json"
+    monkeypatch.setattr(cfg_mod, "RUNTIME_STATE_FILE", test_state_file)
+
+    # Ban đầu chưa có file
+    assert load_runtime_state() == {}
+
+    # Lưu trạng thái bật TTS
+    save_runtime_state({"tts_enabled": True, "tts_speed": 1.25})
+    loaded = load_runtime_state()
+    assert loaded.get("tts_enabled") is True
+    assert loaded.get("tts_speed") == 1.25
+
+    # Cập nhật tắt TTS
+    save_runtime_state({"tts_enabled": False})
+    loaded_after = load_runtime_state()
+    assert loaded_after.get("tts_enabled") is False
+    assert loaded_after.get("tts_speed") == 1.25
+

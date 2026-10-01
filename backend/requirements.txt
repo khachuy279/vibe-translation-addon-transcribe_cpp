@@ -124,3 +124,7 @@ funasr>=1.1                 # tuỳ chọn (FSMN-VAD) — khá nặng, kéo mode
 # ------------------------------------------------------------------ Tải model / giọng
 huggingface_hub>=0.23
 datasets>=2.18              # TUỲ CHỌN — chỉ cần cho backend/voices/wav_downloader.py
+
+# ------------------------------------------------------------------ Lookahead Video Buffering
+
+av>=19.0.0

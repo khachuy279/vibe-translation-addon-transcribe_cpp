@@ -15,13 +15,46 @@ Audio tab → VAD → ASR (transcribe.cpp) → cắt câu → Dịch GGUF → Ph
 
 ---
 
+## Kiến trúc 2 Pipeline (Pipeline A vs Pipeline B)
+
+Hệ thống hỗ trợ 2 chế độ xử lý linh hoạt tùy theo định dạng video và nhu cầu của người dùng:
+
+```text
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ PIPELINE A: Real-time Audio Streaming (Live / Livestream / Họp trực tuyến)             │
+│   Audio Tab (Capture) ──> /ws ──> VAD & ASR Realtime ──> Cắt câu ──> Dịch ──> Live TTS │
+│   (Độ trễ thấp ~1.0s, thích ứng backpressure cho các luồng phát trực tiếp)             │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│ PIPELINE B: Lookahead Video Buffering (Video VoD / YouTube / Phim — Độ trễ 0.0s)      │
+│   MSE Demuxer (Nạp trước 10-15s) ──> /ws/lookahead ──> Dịch trước ──> Lên lịch timeline│
+│   (Độ trễ nhận thức 0.0s, tự nạp đệm khi khởi động/tua, TTS khớp thời gian hiển thị)   │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### So sánh chi tiết
+
+| Đặc điểm | Pipeline A (Real-time Streaming) | Pipeline B (Lookahead Video Buffering) |
+|---|---|---|
+| **Kịch bản phù hợp** | Livestream, họp online, video không đệm | Video VoD, YouTube, phim, khoá học |
+| **Cơ chế thu âm** | Web Audio Capture từ tab thời gian thực | Móc nối qua MediaSource (MSE) đọc trước buffer video |
+| **Độ trễ phụ đề** | ~0.8s – 1.5s (chờ phát âm thanh thật) | **0.0s (Zero Latency)** — phụ đề hiện ngay lúc nói |
+| **Độ trễ lồng tiếng** | TTS đọc đuổi theo sau khi dịch xong | **0.0s** — giọng đọc khớp đúng lúc câu bắt đầu |
+| **Khớp thời lượng TTS**| Trực tiếp theo luồng âm thanh | Tự động nén thời gian (WSOLA) vừa vặn cửa sổ phụ đề |
+| **Đồng bộ khi tua (Seek)**| Xoá buffer và phát tiếp ngay | Tạm dừng nạp đệm một thoáng để dịch trước đoạn mới |
+| **Cách chọn chế độ** | Tắt công tắc *Lookahead Video Buffering* | Bật công tắc *Lookahead Video Buffering* (mặc định) |
+
+> **Lưu ý**: Để bảo đảm tính toàn vẹn và không ngắt quãng phiên làm việc, nút chuyển đổi giữa Pipeline A và Pipeline B sẽ được tự động khóa (disable) trong lúc đang dịch video.
+
+---
+
 ## Tính năng
 
-- **Phụ đề song ngữ**: preview dần, chốt khi hết câu, bản dịch hiện song song.
+- **Phụ đề song ngữ**: preview dần, chốt khi hết câu, bản dịch hiện song song (hỗ trợ bật/tắt phụ đề gốc).
+- **Lookahead Video Buffering (0.0s Lag)**: tự động nạp đệm trước 10–15s cho video, loại bỏ hoàn toàn độ trễ nhận thức.
 - **Cắt câu 4 bậc**: `VAD_SILENCE` › `MAX_DURATION` › `STABLE_PREFIX` › `TIMEOUT_FORCE`.
 - **Đổi model nóng**: thay ASR / VAD / model dịch / giọng TTS ngay trong popup, không cần restart.
-- **Lồng tiếng (TTS)**: OmniVoice voice-cloning, auto-ducking âm lượng video gốc.
-- **Seek an toàn**: extension phát hiện tua video, backend xoá trạng thái cũ ngay lập tức.
+- **Lồng tiếng (TTS)**: OmniVoice voice-cloning, nén âm thanh thông minh (WSOLA), auto-ducking âm lượng video gốc.
+- **Seek an toàn**: extension phát hiện tua video, backend xoá trạng thái cũ và nạp đệm tức thì.
 - **Hoàn toàn offline**: không telemetry, không API bên ngoài sau khi tải model.
 
 ---

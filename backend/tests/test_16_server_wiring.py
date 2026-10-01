@@ -289,3 +289,13 @@ def test_metrics_endpoints_present_in_openapi():
     schema = main_mod.app.openapi()
     assert "/api/metrics/pipeline" in schema["paths"]
     assert "/health" in schema["paths"]
+
+
+def test_tts_endpoints_present_in_openapi():
+    """/api/tts/prewarm và /api/tts/unload phải xuất hiện trong routes và openapi."""
+    import backend.main as main_mod
+
+    schema = main_mod.app.openapi()
+    assert "/api/tts/prewarm" in schema["paths"]
+    assert "/api/tts/unload" in schema["paths"]
+

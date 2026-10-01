@@ -183,8 +183,23 @@ class OmniVoiceTTS(BaseTTSEngine):
                     self._voice_prompt_cache.move_to_end(cache_key)
                     return self._voice_prompt_cache[cache_key]
 
+            actual_ref_audio = ref_audio_path
+            # Tự động cắt bớt nếu audio tham chiếu dài > 10 giây (OmniVoice khuyến nghị 3-10s)
             try:
-                prompt = self.model.create_voice_clone_prompt(ref_audio=ref_audio_path, ref_text=ref_text)
+                import soundfile as sf
+                info = sf.info(ref_audio_path)
+                if info.duration > 10.0:
+                    p = Path(ref_audio_path)
+                    trim_path = p.with_name(f"{p.stem}_trimmed10s.wav")
+                    if not trim_path.exists():
+                        data, sr = sf.read(ref_audio_path, stop=int(10.0 * info.samplerate))
+                        sf.write(str(trim_path), data, sr)
+                    actual_ref_audio = str(trim_path)
+            except Exception as e:
+                logger.debug(f"Không trim được ref_audio: {e}", extra={"module_tag": "TTS"})
+
+            try:
+                prompt = self.model.create_voice_clone_prompt(ref_audio=actual_ref_audio, ref_text=ref_text)
             except Exception as e:
                 logger.debug(f"Không tạo được cache VoiceClonePrompt ({e}), dùng thẳng ref_audio.", extra={"module_tag": "TTS"})
                 return None
@@ -371,6 +386,9 @@ class OmniVoiceTTS(BaseTTSEngine):
         audio_np = AudioProcessor.convert_to_numpy(audio_output)
         del audio_output
 
+        # 1b. Cắt tỉa khoảng lặng thừa (Silence Trimming) ở đầu và cuối câu
+        audio_np = AudioProcessor.trim_silence(audio_np, sample_rate=self.sample_rate)
+
         # 2. Điều chỉnh tốc độ (Time-stretching) nếu cần
         effective_speed = float(speed if speed is not None else getattr(config.tts, "speed", 1.0) or 1.0)
         if abs(effective_speed - 1.0) >= 0.02 and len(audio_np) > 0:
@@ -431,6 +449,68 @@ class OmniVoiceTTS(BaseTTSEngine):
         """
         await gpu_arbiter.admit(PRIORITY_TTS)
         return await asyncio.to_thread(self.synthesize_wav_bytes, text, voice_id, speed)
+
+    def synthesize_fitted_sync(
+        self,
+        text: str,
+        voice_id: Optional[str] = None,
+        speed: float = 1.0,
+        max_duration_sec: float = 0.0,
+        max_speed: float = 1.5,
+    ) -> Tuple[Optional[bytes], float]:
+        """Tổng hợp giọng nói VỪA một ngân sách thời gian (dùng cho lồng tiếng Lookahead).
+
+        Vì sao cần: khi phụ đề chỉ chiếm `[start_pts, end_pts]` mà câu đọc dài hơn, việc phát
+        nốt phần dư sẽ **đẩy lùi mọi câu sau** ⇒ lồng tiếng trễ dần không cách nào bắt kịp.
+        Cách xử lý ở đây là **nén thời gian giữ nguyên cao độ** (phase vocoder) để câu đọc
+        nằm gọn trong ngân sách:
+
+        1. Sinh audio ở `speed` (thông số người dùng).
+        2. Nếu vẫn dài hơn `max_duration_sec`: nén thêm hệ số `f = duration / max_duration`,
+           nhưng không vượt `max_speed` (tính cả `speed` gốc) để giọng còn rõ.
+        3. Phần vượt quá `max_speed` (nếu có) do phía client cắt/nén nốt — xem
+           `lib/tts-timeline.js`.
+
+        Returns:
+            (wav_bytes, duration_sec) sau khi đã nén; (None, 0.0) nếu không tổng hợp được.
+        """
+        audio_np, duration_sec = self._synthesize_audio(text, voice_id, speed)
+        if audio_np is None or len(audio_np) == 0:
+            return None, 0.0
+
+        budget = float(max_duration_sec or 0.0)
+        if budget > 0.05 and duration_sec > budget:
+            base_speed = max(0.01, float(speed or 1.0))
+            allowed = max(1.0, float(max_speed) / base_speed)
+            factor = min(duration_sec / budget, allowed)
+            if factor > 1.02:
+                before = duration_sec
+                audio_np = AudioProcessor.apply_time_stretch(
+                    audio_np, speed=factor, sample_rate=self.sample_rate
+                )
+                vol = float(getattr(config.tts, "volume", 1.0) or 1.0)
+                audio_np = AudioProcessor.normalize_audio(audio_np, volume=vol, target_peak=0.95)
+                duration_sec = len(audio_np) / self.sample_rate if self.sample_rate > 0 else 0.0
+                logger.info(
+                    f"Nén lồng tiếng {before:.2f}s -> {duration_sec:.2f}s "
+                    f"(ngân sách {budget:.2f}s, hệ số {factor:.2f}x WSOLA)",
+                    extra={"module_tag": "TTS"},
+                )
+        return AudioProcessor.encode_wav_bytes(audio_np, self.sample_rate), duration_sec
+
+    async def synthesize_fitted_bytes(
+        self,
+        text: str,
+        voice_id: Optional[str] = None,
+        speed: float = 1.0,
+        max_duration_sec: float = 0.0,
+        max_speed: float = 1.5,
+    ) -> Tuple[Optional[bytes], float]:
+        """Bản async của `synthesize_fitted_sync` (chạy trên thread, không block event loop)."""
+        await gpu_arbiter.admit(PRIORITY_TTS)
+        return await asyncio.to_thread(
+            self.synthesize_fitted_sync, text, voice_id, speed, max_duration_sec, max_speed
+        )
 
     async def synthesize_clone(
         self,

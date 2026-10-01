@@ -94,6 +94,9 @@ class SileroVADEngine(BaseVADEngine):
         self.max_lookback_frames = max(
             1, int(ceil((float(cfg.speech_pad_ms) / 1000.0 * 16000 + WINDOW_SAMPLES) / WINDOW_SAMPLES))
         )
+        #: `res["start"]` của VADIterator đã lùi lại `speech_pad_samples` ⇒ mép đoạn nói được
+        #: báo SỚM hơn thực tế ngần này ms. Pipeline Lookahead dùng để canh lại mốc phụ đề/TTS.
+        self.start_pad_ms = int(cfg.speech_pad_ms)
 
         logger.info(
             f"Silero-VAD sẵn sàng (cửa sổ {WINDOW_SAMPLES} mẫu, model={self.model_path})",

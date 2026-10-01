@@ -225,6 +225,35 @@ body::-webkit-scrollbar-thumb:hover {
   white-space: nowrap;
 }
 
+/* Hint text dưới slider */
+.hint {
+  font-size: 11px;
+  color: var(--text-ter, #8a8a90);
+  margin-top: 5px;
+  line-height: 1.4;
+}
+
+/* Trạng thái buffer Lookahead (thay cho HUD nổi trên trang) */
+.lookahead-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-sec);
+}
+.lookahead-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+  flex: 0 0 auto;
+}
+.lookahead-status.is-ready .lookahead-status-dot { background: #22c55e; }
+.lookahead-status.is-ready { color: #15803d; }
+.lookahead-status.is-low .lookahead-status-dot { background: #f59e0b; }
+.lookahead-status.is-off .lookahead-status-dot { background: #9ca3af; }
+
 /* Select — clean modern control */
 .setting-group select {
   width: 100%;

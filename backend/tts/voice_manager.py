@@ -110,6 +110,12 @@ class VoiceManager:
         target = str(voice_id_or_path).strip().lower()
         target_name = Path(target).name.lower()
 
+        # Nếu yêu cầu giọng ElevenLabs, ưu tiên bản 10s đã được chuẩn hoá để không phình VRAM
+        if target_name in ("elevenlabs.wav", "elevenlabs", "elevenlabs_10s.wav", "elevenlabs_10s"):
+            for v in voices:
+                if "elevenlabs_10s" in v["id"].lower() or "elevenlabs_10s" in Path(v["audio"]).name.lower():
+                    return v["audio"], v["text"]
+
         # Kiểm tra danh sách giọng đã đăng ký
         for v in voices:
             if v["id"].lower() == target or Path(v["audio"]).name.lower() == target_name:

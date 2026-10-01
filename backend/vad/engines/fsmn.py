@@ -92,11 +92,14 @@ class FsmnVADEngine(BaseVADEngine):
 
         # Pre-roll: VAD báo START muộn hơn mép đầu đoạn nói (lookback + xác nhận speech),
         # nên vòng đệm phải đủ lớn để xả lại trọn phần đó (+1 frame an toàn).
-        self.max_lookback_frames = max(
-            1,
+        self.max_lookback_frames = max(            1,
             int(ceil((int(cfg.window_size_ms) + int(cfg.sil_to_speech_time_thres)
                       + int(cfg.lookback_time_start_point)) / float(self.chunk_size_ms))) + 1,
         )
+        #: FunASR FSMN VAD báo `start` SỚM hơn mép tiếng nói thật đúng
+        #: `lookback_time_start_point` ms (nó lùi mép đầu để lấy ngữ cảnh). Pipeline Lookahead
+        #: dùng con số này để phụ đề/lồng tiếng không hiện trước tiếng nói.
+        self.start_pad_ms = int(cfg.lookback_time_start_point)
 
         logger.info(
             f"FSMN-VAD sẵn sàng (chunk {self.chunk_size_ms} ms = {self.frame_samples} mẫu, "

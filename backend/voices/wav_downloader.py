@@ -16,7 +16,7 @@ DATASET_NAME = "dolly-vn/dolly-audio-1000h-vietnamese"
 
 # 🎯 Nhập tên file bạn muốn tải từ Dataset Viewer tại đây (hoặc truyền qua dòng lệnh)
 # Ví dụ: "520aa164-6a34-4611-8c6d-c401a3a43b02.wav" hoặc "607e02ea-dc2c-411e-a313-100c805191c6.wav"
-DEFAULT_TARGET_FILENAME = "70472cbf-aed7-44b3-9771-fd95a4e7467c.wav"
+DEFAULT_TARGET_FILENAME = "3d8cbf2e-352e-45bc-811b-31ec2dced7fb.wav"
 
 # Tên file muốn lưu trong thư mục voices (nếu để None sẽ tự đặt theo tên hoặc voice_id)
 # Ví dụ: "nu_calm_woman.wav" hoặc giữ nguyên DEFAULT_TARGET_FILENAME

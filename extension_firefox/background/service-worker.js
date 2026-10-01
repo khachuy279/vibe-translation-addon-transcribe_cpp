@@ -27,7 +27,7 @@ const SEND_BUFFER_HARD_LIMIT = 512 * 1024;   // 512 KB ~ 16 giây
 const BACKPRESSURE_RESUME_CHECK_MS = 100;
 
 api.runtime.onConnect.addListener((port) => {
-  if (port.name !== "bs-ws-bridge") return;
+  if (port.name !== "bs-ws-bridge" && port.name !== "bs-lookahead-bridge") return;
 
   let ws = null;
   let isClosed = false;
@@ -179,7 +179,10 @@ api.runtime.onConnect.addListener((port) => {
     if (!msg) return;
 
     if (msg.action === "CONNECT") {
-      const url = msg.url || "wss://localhost:8765/ws";
+      const defaultUrl = port.name === "bs-lookahead-bridge"
+        ? "wss://localhost:8765/ws/lookahead"
+        : "wss://localhost:8765/ws";
+      const url = msg.url || defaultUrl;
       try {
         // FIX-01: kết nối mới => xoá trạng thái tạm dừng còn sót của kết nối cũ và
         // huỷ timer cũ, tránh timer "zombie" bắn vào socket đã đóng.
@@ -190,7 +193,10 @@ api.runtime.onConnect.addListener((port) => {
         ws.binaryType = "arraybuffer";
 
         ws.onopen = () => {
-          if (!isClosed) port.postMessage({ type: "connected" });
+          if (!isClosed) {
+            console.log(`[BS Background][${port.name}] 🟢 WS connected to ${url}`);
+            port.postMessage({ type: "connected" });
+          }
         };
 
         ws.onmessage = (event) => {
@@ -203,28 +209,31 @@ api.runtime.onConnect.addListener((port) => {
               port.postMessage({ type: "ws_json_raw", data: event.data });
             }
           } else {
-            // P3.1: audio TTS có thể tới dưới dạng binary frame (không base64).
+            // P3.1: audio TTS hoặc audio binary frame có thể tới dưới dạng binary frame (không base64).
             port.postMessage({ type: "ws_binary", data: event.data });
           }
         };
 
         ws.onerror = (err) => {
           if (!isClosed) {
-            console.error("[BS Background] WS error:", err);
+            console.error(`[BS Background][${port.name}] ❌ WS error on ${url}:`, err);
             port.postMessage({
               type: "error",
-              error: "Lỗi kết nối tới " + url + ". Vui lòng kiểm tra backend đang chạy."
+              error: "Lỗi kết nối tới " + url + ". Vui lòng kiểm tra backend đang chạy.",
+              details: err?.message || String(err)
             });
           }
         };
 
         ws.onclose = (event) => {
           if (!isClosed) {
+            console.log(`[BS Background][${port.name}] 🔴 WS closed: code=${event.code}, reason=${event.reason || "none"}`);
             port.postMessage({ type: "disconnected", code: event.code, reason: event.reason });
           }
         };
       } catch (e) {
         if (!isClosed) {
+          console.error(`[BS Background][${port.name}] ❌ Tạo WebSocket thất bại:`, e);
           port.postMessage({ type: "error", error: e.message });
         }
       }
@@ -252,6 +261,15 @@ api.runtime.onConnect.addListener((port) => {
           })();
 
       sendOrQueue(buffer);
+    } else if (msg.action === "SEND_RAW_BINARY" || msg.action === "SEND_BUFFER") {
+      const buf = msg.buffer || msg.data;
+      if (ws && ws.readyState === WebSocket.OPEN && buf) {
+        try {
+          ws.send(buf);
+        } catch (e) {
+          console.error(`[BS Background][${port.name}] Send raw binary error:`, e);
+        }
+      }
     } else if (msg.action === "FLUSH_PENDING") {
       // FIX-01: đây là "liveness probe" do content script bắn định kỳ KHI ĐANG tạm dừng
       // (phòng trường hợp timer trong service worker bị MV3 tạm ngưng). Trước đây nhánh
@@ -292,6 +310,14 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       eventType: msg.eventType,
       payload: msg.payload
     }, { frameId: TOP_FRAME_ID }).catch(() => {});
+  } else if (msg?.action === "INJECT_MAIN_WORLD_INTERCEPTOR" && sender.tab?.id) {
+    if (api.scripting && typeof api.scripting.executeScript === "function") {
+      api.scripting.executeScript({
+        target: { tabId: sender.tab.id, allFrames: true },
+        world: "MAIN",
+        files: ["content/buffer_interceptor_poc.js"]
+      }).catch(() => {});
+    }
   }
 });
 

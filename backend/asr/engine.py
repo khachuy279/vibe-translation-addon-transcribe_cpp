@@ -300,6 +300,22 @@ class TranscribeEngine(BaseASREngine):
         # Đây là số liệu QUYẾT ĐỊNH để biết có đáng tối ưu preview hay không (đo trước, sửa sau).
         self._preview_sec_processed: float = 0.0
         self._preview_sec_unique_peak: float = 0.0
+        #: Cho phép TẮT hẳn inference preview. LƯU Ý: tắt preview cũng vô hiệu hoá BẬC 3
+        #: (STABLE_PREFIX — "cắt khi text đứng im"), nên câu sẽ chỉ còn được cắt bởi
+        #: VAD-END / MAX_DURATION ⇒ câu rất dài. Mặc định BẬT cho cả hai pipeline.
+        self.preview_enabled: bool = bool(getattr(config.asr, "preview_enabled", True))
+        #: Chỉ chạy inference preview khi đã có thêm ngần này giây audio MỚI (0 = mỗi nhịp
+        #: poll đều preview — hành vi realtime cũ).
+        self.preview_min_new_audio_sec: float = float(
+            getattr(config.asr, "preview_min_new_audio_sec", 0.0) or 0.0
+        )
+        #: True ⇒ KHÔNG đánh giá BẬC 3 trên text preview cũ khi audio không tiến.
+        #: Pipeline B bật cờ này (xem `LookaheadConfig`); Pipeline A giữ False.
+        self.preview_requires_new_audio: bool = bool(
+            getattr(config.asr, "preview_requires_new_audio", False)
+        )
+        #: `audio_buffer.total_written` tại lần preview gần nhất (đo lượng audio mới).
+        self._last_preview_input_sample: int = 0
         # Số inference đang chạy trong executor. Dùng để biết pipeline còn việc hay không
         # (`_pending_commits` rỗng KHÔNG có nghĩa là đã xử lý xong — commit bị pop ra
         # ngay khi bắt đầu inference).
@@ -905,7 +921,12 @@ class TranscribeEngine(BaseASREngine):
                 return self._pending_commits.popleft()
         return None
 
-    def _evaluate_tier234(self, preview_text: str, duration_sec: float) -> Optional[CommitReason]:
+    def _evaluate_tier234(
+        self,
+        preview_text: str,
+        duration_sec: float,
+        preview_fresh: bool = True,
+    ) -> Optional[CommitReason]:
         """P2.1: đánh giá BẬC 2/3/4 trong lúc đang nói (VAD chưa báo im lặng).
 
         Thứ tự ưu tiên đúng như tài liệu CommitManager:
@@ -916,6 +937,10 @@ class TranscribeEngine(BaseASREngine):
         - `stability_min_words`: không cắt khi preview chưa đủ từ.
         Nếu không có hai sàn này, một text ngắn không đổi trong ~1s đầu câu sẽ bị cắt
         ngay giữa câu => mất chữ.
+
+        `preview_fresh=False` khi text preview KHÔNG tương ứng với lượng audio hiện có
+        (nguồn audio theo lô như Pipeline B). Lúc đó "text đứng im" không phải bằng chứng
+        người nói đã dừng, nên BẬC 3 bị bỏ qua (BẬC 2/4 vẫn chạy).
         """
         if not bool(getattr(config.sentence, "enable_tier234", True)):
             self._stability_hold = "tier234_off"
@@ -932,7 +957,7 @@ class TranscribeEngine(BaseASREngine):
         # `stability_duration_sec` (và đủ số nhịp poll) ⇒ chốt câu. KHÔNG xét dấu câu: ASR
         # thả dấu `.`/`。` sai giữa câu rất thường xuyên (log phim thật: `営業回りを終え。`,
         # `夕食を済ませ。`), nên chỉ "text đứng im" mới là bằng chứng dùng được.
-        if self.commit_manager.cfg.split_on_stability:
+        if self.commit_manager.cfg.split_on_stability and preview_fresh:
             min_dur = float(getattr(cfg, "stability_min_duration_sec", 0.0) or 0.0)
             min_words = int(getattr(cfg, "stability_min_words", 0) or 0)
             tokens = count_content_tokens(preview_text)
@@ -954,7 +979,9 @@ class TranscribeEngine(BaseASREngine):
                     else f"floor_words {tokens}/{min_words}"
                 )
         else:
-            self._stability_hold = "stability_off"
+            # Không đánh giá BẬC 3: hoặc do cấu hình tắt, hoặc do text preview đang CŨ so
+            # với lượng audio hiện có (nguồn audio theo lô).
+            self._stability_hold = "stability_off" if preview_fresh else "stale_preview_no_new_audio"
 
         # BẬC 4 — không có audio mới (lưới an toàn chống treo)
         if self.commit_manager.evaluate_inactivity_timeout(True):
@@ -1129,6 +1156,12 @@ class TranscribeEngine(BaseASREngine):
             self._end_infer()
             if is_commit:
                 gpu_arbiter.commit_end()
+
+    async def transcribe_pcm(self, pcm_data: np.ndarray) -> str:
+        """API ASR nhận trực tiếp mảng float32 PCM 16kHz (dùng cho Lookahead Batch Ingress)."""
+        if pcm_data is None or len(pcm_data) == 0:
+            return ""
+        return await self._infer_with_watchdog(pcm_data, is_commit=True)
 
     def _publish_recompute_ratio(self) -> None:
         """FIX-10: công bố gauge lãng phí compute của preview (giá trị SỐNG, cập nhật mỗi vòng).
@@ -1484,6 +1517,12 @@ class TranscribeEngine(BaseASREngine):
                 "language": self.language,
                 "inference_ms": infer_ms,
                 "commit_reason": reason,
+                # Khoảng mẫu TUYỆT ĐỐI trên `audio_buffer` của câu này. Pipeline realtime
+                # không cần (phụ đề hiện ngay khi tới), nhưng Pipeline B (Lookahead) PHẢI
+                # có để quy đổi sang mốc thời gian video chính xác.
+                "start_sample": int(start_s),
+                "end_sample": int(end_s),
+                "duration_sec": (end_s - start_s) / 16000.0,
             }
 
     # ------------------------------------------------------------------ generator
@@ -1586,16 +1625,34 @@ class TranscribeEngine(BaseASREngine):
                     # Chỉ cho tối đa `max_inflight_infer` inference cùng lúc; vòng nào vượt thì
                     # BỎ vòng đó (preview là best-effort) và ghi counter.
                     max_inflight = int(getattr(config.asr, "max_inflight_infer", 1) or 0)
-                    defer_preview = max_inflight > 0 and self._inflight_count() >= max_inflight
+                    # Lượng audio MỚI kể từ lần preview gần nhất.
+                    new_audio_samples = current_total - self._last_preview_input_sample
+                    min_new_samples = int(max(0.0, self.preview_min_new_audio_sec) * 16000)
+                    stale_input = bool(
+                        self.preview_requires_new_audio and new_audio_samples < max(1, min_new_samples)
+                    )
+                    defer_preview = (not self.preview_enabled) or stale_input or (
+                        max_inflight > 0 and self._inflight_count() >= max_inflight
+                    )
+                    # BẬC 3 chỉ được đánh giá khi text preview phản ánh ĐÚNG lượng audio
+                    # hiện có. Nếu không, "text đứng im" chỉ là hệ quả của việc KHÔNG có
+                    # audio mới ⇒ cắt oan giữa câu (xem `preview_requires_new_audio`).
+                    preview_fresh = not stale_input
 
                     if defer_preview:
-                        metrics_collector.increment_counter("asr.preview_deferred_inflight")
+                        if not self.preview_enabled:
+                            metrics_collector.increment_counter("asr.preview_disabled")
+                        elif stale_input:
+                            metrics_collector.increment_counter("asr.preview_skipped_no_new_audio")
+                        else:
+                            metrics_collector.increment_counter("asr.preview_deferred_inflight")
                         audio_slice = None
                         preview_text = ""
                         infer_ms = 0.0
                     else:
                         t_slice = time.perf_counter()
                         audio_slice = self.audio_buffer.get_slice(win_start, current_total)
+                        self._last_preview_input_sample = current_total
                         metrics_collector.record_metric(
                             "asr", "slice_ms", (time.perf_counter() - t_slice) * 1000.0
                         )
@@ -1652,7 +1709,9 @@ class TranscribeEngine(BaseASREngine):
                     # dài ~45 s (infer 1294 ms) dù `max_duration_sec` chỉ 6 s.
                     if self._speech_active:
                         duration_sec = (current_total - seg_start) / 16000.0
-                        reason = self._evaluate_tier234(self._last_preview_text, duration_sec)
+                        reason = self._evaluate_tier234(
+                            self._last_preview_text, duration_sec, preview_fresh=preview_fresh
+                        )
                         # Chẩn đoán (`sentence.trace_stability`, mặc định TẮT).
                         self._trace_stability_poll(
                             reason, self._last_preview_text, duration_sec, current_total, seg_start
@@ -1762,6 +1821,7 @@ class TranscribeEngine(BaseASREngine):
             self._awaiting_pre_roll = False
             self._last_preview_end_sample = -1
             self._last_preview_text = ""
+            self._last_preview_input_sample = 0
             self._last_committed_sample = -1
             self._speech_started_at = 0.0
             self._speech_ended_at = 0.0

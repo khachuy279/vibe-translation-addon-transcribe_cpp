@@ -25,6 +25,14 @@ function makeClassList(el) {
       names.forEach((n) => set.delete(n));
       el._class = Array.from(set).join(" ");
     },
+    toggle: (name, force) => {
+      const set = new Set(String(el._class || "").split(/\s+/).filter(Boolean));
+      const shouldHave = force !== undefined ? !!force : !set.has(name);
+      if (shouldHave) set.add(name);
+      else set.delete(name);
+      el._class = Array.from(set).join(" ");
+      return shouldHave;
+    },
     contains: (name) => String(el._class || "").split(/\s+/).filter(Boolean).includes(name),
   };
 }
@@ -65,6 +73,7 @@ class FakeElement {
     this._class = "";
     this._text = "";
     this._attrs = {};
+    this.style = {};
   }
   get className() {
     return this._class;
@@ -340,6 +349,33 @@ console.log("\n[8] Không sinh phần tử trùng id trong lúc cập nhật b�
   const visible = all.filter((el) => !el.classList.contains("bs-evicting") && !el.classList.contains("bs-fading-out"));
   const ids = visible.map((el) => el.getAttribute("data-sentence-id"));
   check(new Set(ids).size === ids.length, "mỗi câu chỉ có 1 phần tử đang hiển thị", JSON.stringify(ids));
+}
+
+// ── 9. On/Off phụ đề gốc (showOriginalSubtitles) ─────────────────────────
+console.log("\n[9] Bật / Tắt hiển thị phụ đề gốc (showOriginalSubtitles)");
+{
+  const { renderer, container } = newRenderer();
+  renderer.onUtteranceUpdate(finalUpdate("A", "original text"));
+  renderer.onTranslation(finalTranslation("A", "bản dịch tiếng Việt"));
+
+  // Mặc định: hiện cả hai
+  check(renderer.showOriginal === true, "mặc định showOriginal là true");
+  let origEl = renderer.focusLayer.querySelector(".bs-original");
+  check(origEl && origEl.style.display !== "none", "mặc định .bs-original không bị ẩn");
+
+  // Tắt phụ đề gốc
+  renderer.applySettings({ showOriginalSubtitles: false });
+  check(renderer.showOriginal === false, "showOriginal đổi sang false");
+  check(container.classList.contains("bs-hide-original"), "container có class bs-hide-original");
+  origEl = renderer.focusLayer.querySelector(".bs-original");
+  check(origEl && origEl.style.display === "none", ".bs-original bị ẩn display: none khi tắt");
+
+  // Bật lại phụ đề gốc
+  renderer.applySettings({ showOriginalSubtitles: true });
+  check(renderer.showOriginal === true, "showOriginal bật lại true");
+  check(!container.classList.contains("bs-hide-original"), "container gỡ class bs-hide-original");
+  origEl = renderer.focusLayer.querySelector(".bs-original");
+  check(origEl && origEl.style.display !== "none", ".bs-original hiện lại khi bật");
 }
 
 console.log("");

@@ -34,6 +34,7 @@ class SubtitleRenderer {
     // Cache state to avoid DOM thrashing
     this.currentFocusId = null;
     this._historyFingerprint = "";
+    this.showOriginal = true;
 
     // DOM Elements for 3 distinct layers
     this._buildDOM();
@@ -221,6 +222,24 @@ class SubtitleRenderer {
     if (settings.showTranslationOnce !== undefined) {
       this.showTranslationOnce = !!settings.showTranslationOnce;
     }
+    // On/Off phụ đề gốc (mặc định BẬT; tắt thì chỉ hiện bản dịch, phù hợp pipeline B).
+    if (settings.showOriginalSubtitles !== undefined) {
+      const prev = this.showOriginal;
+      this.showOriginal = !!settings.showOriginalSubtitles;
+      if (this.container && this.container.classList) {
+        if (typeof this.container.classList.toggle === "function") {
+          this.container.classList.toggle("bs-hide-original", !this.showOriginal);
+        } else if (!this.showOriginal) {
+          this.container.classList.add("bs-hide-original");
+        } else {
+          this.container.classList.remove("bs-hide-original");
+        }
+      }
+      if (prev !== this.showOriginal) {
+        this._historyFingerprint = "";
+        this._renderAll();
+      }
+    }
   }
 
   // ── Utterance Update (Realtime Live Stream & Finalization) ─────────────
@@ -311,9 +330,9 @@ class SubtitleRenderer {
 
     if (typeof sentenceId === "object" && sentenceId !== null) {
       payload = sentenceId;
-      // v3 (F-30): chỉ đọc tên chuẩn snake_case.
-      id = sentenceId.sentence_id || sentenceId.utterance_id;
-      text = sentenceId.translated || translatedText;
+      // v3 (F-30): chỉ đọc tên chuẩn snake_case và hỗ trợ translated_text từ Lookahead / v3 API
+      id = sentenceId.sentence_id || sentenceId.utterance_id || sentenceId.id;
+      text = sentenceId.translated || sentenceId.translated_text || sentenceId.text || translatedText;
       st = sentenceId.status || status || "ok";
     }
 
@@ -334,8 +353,14 @@ class SubtitleRenderer {
 
     const cleanTranslation = (st === "ok" && text) ? text : null;
 
-    // Lấy câu gốc đã lưu trong utteranceStore
+    // Lấy câu gốc đã lưu trong utteranceStore hoặc trực tiếp từ payload (hỗ trợ Lookahead)
     const stored = this.utteranceStore.get(id) || {};
+    const payloadOrig = payload ? (payload.original_text || payload.originalText || payload.text) : "";
+    const originalText = payloadOrig || stored.originalText || "";
+
+    if (originalText && !stored.originalText) {
+      this.utteranceStore.set(id, { id, originalText });
+    }
 
     // 1. Nếu câu đang ở pendingFocus (Layer 2, chờ dịch) -> điền bản dịch vào, chuyển sang completedSentences
     if (this.pendingFocus && this.pendingFocus.id === id) {
@@ -343,8 +368,6 @@ class SubtitleRenderer {
       this._renderAll();
       return;
     }
-
-    const originalText = stored.originalText || "";
 
     // 2. Kiểm tra xem câu đã có trong completedSentences chưa
     const existing = this.completedSentences.find((s) => s.id === id);
@@ -511,8 +534,13 @@ class SubtitleRenderer {
       if (existingEl) {
         // Cập nhật in-place nội dung nếu câu đã có trong DOM
         const origEl = existingEl.querySelector(".bs-original");
-        if (origEl && origEl.textContent !== item.originalText) {
-          origEl.textContent = item.originalText || "";
+        if (origEl) {
+          if (origEl.style) {
+            origEl.style.display = this.showOriginal === false ? "none" : "";
+          }
+          if (origEl.textContent !== item.originalText) {
+            origEl.textContent = item.originalText || "";
+          }
         }
         const transEl = existingEl.querySelector(".bs-translated");
         if (item.translatedText) {
@@ -568,8 +596,13 @@ class SubtitleRenderer {
       }
 
       const origEl = currentEl.querySelector(".bs-original");
-      if (origEl && origEl.textContent !== targetItem.originalText) {
-        origEl.textContent = targetItem.originalText || "";
+      if (origEl) {
+        if (origEl.style) {
+          origEl.style.display = this.showOriginal === false ? "none" : "";
+        }
+        if (origEl.textContent !== targetItem.originalText) {
+          origEl.textContent = targetItem.originalText || "";
+        }
       }
 
       let transEl = currentEl.querySelector(".bs-translated");
@@ -611,6 +644,12 @@ class SubtitleRenderer {
 
   // TẦNG 3: Liveview nhận diện chưa chốt (Dưới cùng) — Update in-place
   _renderLiveLayer() {
+    if (this.showOriginal === false) {
+      if (this.liveLayer.firstElementChild) {
+        this.liveLayer.textContent = "";
+      }
+      return;
+    }
     if (this.currentDraft && this.currentDraft.originalText && !this.currentDraft.isFinal) {
       const text = this.currentDraft.originalText;
       let liveEl = this.liveLayer.firstElementChild;
@@ -644,6 +683,9 @@ class SubtitleRenderer {
     const originalDiv = document.createElement("div");
     originalDiv.className = "bs-original";
     originalDiv.textContent = item.originalText || "";
+    if (this.showOriginal === false && originalDiv.style) {
+      originalDiv.style.display = "none";
+    }
     sentenceDiv.appendChild(originalDiv);
 
     // Indicator chờ dịch
@@ -667,6 +709,9 @@ class SubtitleRenderer {
     const originalDiv = document.createElement("div");
     originalDiv.className = "bs-original";
     originalDiv.textContent = item.originalText || "";
+    if (this.showOriginal === false && originalDiv.style) {
+      originalDiv.style.display = "none";
+    }
     sentenceDiv.appendChild(originalDiv);
 
     // Bản dịch

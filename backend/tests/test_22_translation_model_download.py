@@ -74,9 +74,11 @@ def test_list_models_marks_is_downloaded(tmp_models):
     """Popup cần biết model nào đã có file để không hiển thị như thể dùng được ngay."""
     from backend.translation.registry import TranslationModelRegistry
 
-    (tmp_models / "Hy-MT2-7B-UD-Q4_K_XL.gguf").write_bytes(b"gguf")
+    reg = TranslationModelRegistry.get_instance()
+    filename = reg.get_model("tencent")["gguf_file"]
+    (tmp_models / filename).write_bytes(b"gguf")
 
-    models = {m["id"]: m for m in TranslationModelRegistry.get_instance().list_models()}
+    models = {m["id"]: m for m in reg.list_models()}
     assert models["tencent"]["is_downloaded"] is True
     assert models["tencent-1.8b"]["is_downloaded"] is False
     assert all("is_downloaded" in m for m in models.values())

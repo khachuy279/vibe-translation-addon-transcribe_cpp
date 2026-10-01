@@ -7,6 +7,7 @@ Hỗ trợ:
 - Đầy đủ chú thích tiếng Việt cho từng trường cấu hình.
 """
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -260,6 +261,21 @@ class ASRConfig(BaseModel):
     # `test_09_wer_ab.py` theo TỪNG family model rồi mới đổi.
     preview_reuse_for_commit: bool = False
     preview_reuse_max_delta_sec: float = 0.4
+    #: Cho phép TẮT hẳn inference preview. Pipeline A (realtime) cần preview để hiện chữ
+    #: chạy; Pipeline B (Lookahead) chỉ cần CÂU CHỐT vì audio được nạp nhanh hơn thời gian
+    #: thực. TUY NHIÊN preview còn là NGUỒN DUY NHẤT của BẬC 3 (STABLE_PREFIX — "cắt khi
+    #: text đứng im"), nên tắt preview = mất khả năng cắt câu theo độ ổn định ⇒ câu bị dài
+    #: tới `max_duration_sec`. Vì vậy mặc định BẬT cho cả hai pipeline.
+    preview_enabled: bool = True
+    #: Chỉ chạy inference preview khi đã có thêm ít nhất ngần này giây audio MỚI.
+    #: 0 = hành vi cũ (mỗi nhịp poll đều preview — cần thiết cho realtime vì phụ đề phải
+    #: chạy theo giọng nói). Pipeline B đặt > 0 để không đốt GPU khi audio tới theo lô.
+    preview_min_new_audio_sec: float = 0.0
+    #: Chặn BẬC 3 (STABLE_PREFIX) khi KHÔNG có audio mới. Cực kỳ quan trọng cho Pipeline B:
+    #: ở đó nguồn audio theo lô nên giữa hai lô, nhịp poll sẽ đọc lại ĐÚNG một cửa sổ audio
+    #: ⇒ text không đổi ⇒ BẬC 3 cắt oan giữa câu dù người nói chưa hề dừng. Pipeline A giữ
+    #: nguyên `False` (mỗi nhịp poll = một khoảng audio mới của luồng realtime).
+    preview_requires_new_audio: bool = False
 
     # --- F-39: chống nghẽn executor ------------------------------------------
     # `_EXECUTOR` (ThreadPoolExecutor) có HÀNG ĐỢI KHÔNG GIỚI HẠN. Nếu một inference
@@ -356,7 +372,7 @@ class SentenceConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "xiaomi"  # tencent, tencent-1.8b, xiaomi, gemmax
+    base: str = "tencent"  # tencent, tencent-1.8b, xiaomi, gemmax
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None
@@ -407,8 +423,8 @@ class TTSConfig(BaseModel):
     # Ở mặc định 1.0 hàm thoát ngay ở dòng đầu (`abs(rate-1.0) < 0.02`) nên **không** nằm
     # trên hot path. Nếu đổi speed, hãy đo lại `tts.infer_ms` trước khi kết luận có hồi quy.
     speed: float = 1.0
-    num_inference_steps: int = 8
-    default_voice: str = "speaker_01_0039.wav"
+    num_inference_steps: int = 16
+    default_voice: str = "ElevenLabs_10s.wav"
     voices_dir: str = str(VOICES_DIR)
     volume: float = 1
     sample_rate: int = 24000
@@ -467,6 +483,69 @@ class GpuConfig(BaseModel):
     admit_poll_ms: int = 15
 
 
+class LookaheadConfig(BaseModel):
+    """Cấu hình Pipeline B — Lookahead Video Buffering (Zero Perceived Latency).
+
+    Kiến trúc: mảnh audio tương lai từ MSE (`SourceBuffer.appendBuffer`) được ghép nối
+    liên tục -> VAD -> ASR -> Dịch, gắn mốc PTS tuyệt đối, rồi trả phụ đề về Extension
+    để hiện ĐÚNG lúc `video.currentTime` đi qua đoạn đó.
+    """
+
+    enabled: bool = True
+    #: Thời gian dịch trước (giây) — khoảng đệm phải sẵn sàng TRƯỚC vị trí phát.
+    lead_time_sec: float = 15.0
+    min_lead_time_sec: float = 10.0
+    max_lead_time_sec: float = 15.0
+    #: Nạp audio tới `currentTime + lead_time + margin` rồi dừng (chặn đốt GPU vô ích).
+    feed_margin_sec: float = 6.0
+    #: Lượng audio tối thiểu phải nạp trước khi cho video phát (khi buffer ngắn).
+    min_prebuffer_sec: float = 10.0
+    #: Ngưỡng tối thiểu coi là "đã sẵn sàng phát" (tránh treo trình phát).
+    min_ready_ahead_sec: float = 2.5
+
+    #: Trần bộ đệm byte ghép nối của StreamDemuxer (RAM) và số ranh giới cluster giữ lại.
+    max_media_bytes: int = 8 * 1024 * 1024
+    keep_boundaries: int = 60
+    #: Trần audio chờ đọc (giây) trong ContinuousAudioTimeline.
+    max_pending_sec: float = 90.0
+
+    #: Preview vẫn cần thiết cho BẬC 3 (cắt khi text ổn định) ⇒ BẬT để giữ NGUYÊN chất lượng
+    #: cắt câu của Pipeline A. Chi phí được chặn bằng `preview_min_new_audio_sec`.
+    preview_enabled: bool = True
+    #: Chỉ preview khi có thêm ≥ ngần này giây audio mới (Lookahead nạp theo lô 0,5 s nên
+    #: không cần preview mỗi nhịp poll như realtime; nhịp thực tế còn bị `preview_adaptive_backoff`
+    #: giãn ra khi model chậm).
+    preview_min_new_audio_sec: float = 0.5
+    #: BẬC 4 (TIMEOUT_FORCE) của CommitManager dùng đồng hồ THỜI GIAN THỰC; trong Lookahead
+    #: audio tới theo lô nên đồng hồ này dễ chốt oan giữa câu. Nới trần cho phiên Lookahead.
+    inactivity_timeout_sec: float = 30.0
+    #: Nhịp gửi `lookahead_status` về client (ms).
+    status_interval_ms: int = 500
+    #: Số đoạn audio tối đa gửi cho VAD mỗi vòng nạp (giây) — chia lô để nhường event loop.
+    feed_block_sec: float = 0.5
+
+    # ── Lồng tiếng (TTS) cho Pipeline B ───────────────────────────────────────
+    #: Hệ số nén thời gian TỐI ĐA khi câu đọc dài hơn cửa sổ phụ đề (giữ nguyên cao độ,
+    #: WSOLA). Giúp giọng đọc luôn nằm gọn trong thời gian phụ đề hiển thị.
+    tts_max_speed: float = 1.85
+    #: Cho phép câu đọc dài hơn cửa sổ phụ đề chừng này (giây) trước khi phải nén (mặc định 0.0 để khớp phụ đề).
+    tts_tail_allowance_sec: float = 0.0
+    #: Trần ngân sách thời gian cho một câu lồng tiếng (giây) — chặn câu quá dài.
+    tts_max_budget_sec: float = 12.0
+    #: Trần số câu chờ trong hàng đợi lồng tiếng (tránh phình hàng đợi gây nghẽn VRAM).
+    tts_max_queue: int = 12
+    #: Trần ký tự cho một lần tổng hợp (câu rất dài ⇒ diffusion tốn VRAM/thời gian, mà phần
+    #: vượt cửa sổ phụ đề cũng sẽ bị cắt khi phát).
+    tts_max_chars: int = 220
+    #: VRAM trống tối thiểu (MB) mới chạy TTS. Dưới mức này thì BỎ câu lồng tiếng — thà mất
+    #: tiếng lồng còn hơn tràn VRAM làm ASR không chạy được ⇒ MẤT CẢ phụ đề.
+    tts_min_free_vram_mb: float = 1500.0
+    #: Trước mỗi câu lồng tiếng, nhường GPU cho ASR tối đa ngần này giây (để ASR và TTS phối hợp mượt mà).
+    tts_asr_yield_max_sec: float = 0.2
+    #: Cảnh báo khi một lần tổng hợp vượt ngần này ms (dấu hiệu GPU quá tải / tràn VRAM).
+    tts_slow_warn_ms: int = 4000
+
+
 class AppConfig(BaseModel):
     """Cấu hình gốc toàn hệ thống Backend."""
     ws: WSConfig = Field(default_factory=WSConfig)
@@ -478,6 +557,7 @@ class AppConfig(BaseModel):
     audio_buffer: AudioBufferConfig = Field(default_factory=AudioBufferConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     gpu: GpuConfig = Field(default_factory=GpuConfig)
+    lookahead: LookaheadConfig = Field(default_factory=LookaheadConfig)
 
     def hot_reload(self, updates: Dict[str, Any]) -> None:
         """Cập nhật cấu hình runtime nhanh chóng không cần khởi động lại server."""
@@ -491,9 +571,50 @@ class AppConfig(BaseModel):
                 setattr(self, key, value)
 
 
+RUNTIME_STATE_FILE = BACKEND_DIR / "runtime_state.json"
+
+
+def load_runtime_state() -> Dict[str, Any]:
+    """Đọc trạng thái cấu hình runtime đã lưu từ lần chạy trước (từ popup/REST)."""
+    if not RUNTIME_STATE_FILE.is_file():
+        return {}
+    try:
+        data = json.loads(RUNTIME_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_runtime_state(updates: Dict[str, Any]) -> None:
+    """Lưu cập nhật trạng thái runtime ra file persistent (an toàn, ghi tạm rồi đổi tên)."""
+    if not updates:
+        return
+    try:
+        current = load_runtime_state()
+        current.update(updates)
+        temp_file = RUNTIME_STATE_FILE.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_file.replace(RUNTIME_STATE_FILE)
+    except Exception:
+        pass
+
+
 def load_config() -> AppConfig:
-    """Khởi tạo cấu hình mặc định."""
-    return AppConfig()
+    """Khởi tạo cấu hình mặc định và đồng bộ trạng thái runtime đã lưu nếu có."""
+    cfg = AppConfig()
+    saved = load_runtime_state()
+    if "tts_enabled" in saved:
+        cfg.tts.enabled = bool(saved["tts_enabled"])
+    if saved.get("tts_voice"):
+        cfg.tts.default_voice = str(saved["tts_voice"])
+    if saved.get("tts_speed") is not None:
+        try:
+            cfg.tts.speed = float(saved["tts_speed"])
+        except (ValueError, TypeError):
+            pass
+    return cfg
 
 
 config = load_config()

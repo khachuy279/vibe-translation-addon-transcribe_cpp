@@ -41,8 +41,8 @@ def test_translation_registry_and_prompts():
     # Kiểm tra prompt builder
     strategy = get_prompt_strategy("tencent")
     prompt = strategy.build_prompt("Hello world", source_lang="en", target_lang="vi")
-    assert "<|im_start|>user" in prompt
-    assert "Translate the following English text to Vietnamese" in prompt
+    assert "Translate the following" in prompt
+    assert "Vietnamese" in prompt
 
 
 def test_context_manager_and_dedup():

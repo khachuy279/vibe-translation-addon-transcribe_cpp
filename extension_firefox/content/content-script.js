@@ -15,6 +15,32 @@
   // giá trị, không còn `original`/`ui_text`/`utteranceId`/`stableText`…).
   const PROTOCOL_VERSION = 3;
 
+  // Tự động inject Buffer Interceptor vào Page Context (Main World)
+  function injectBufferInterceptor() {
+    try {
+      api.runtime.sendMessage({ action: "INJECT_MAIN_WORLD_INTERCEPTOR" }).catch(() => {});
+      if (document.getElementById("vibe-lookahead-injected-script")) return;
+      const s = document.createElement("script");
+      s.id = "vibe-lookahead-injected-script";
+      s.src = api.runtime.getURL("content/buffer_interceptor_poc.js");
+      s.onload = function () { this.remove(); };
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+  }
+  injectBufferInterceptor();
+
+  let lookaheadClient = null;
+  let timelineQueue = null;
+  let ttsTimeline = null;
+  //: Pipeline B tự tạm dừng video để nạp đệm trước ⇒ phải nhớ để TRẢ LẠI trạng thái phát
+  //: khi Stop hoặc khi fallback sang Pipeline A (nếu không, video kẹt ở trạng thái pause).
+  let lookaheadPausedVideo = false;
+  let lookaheadPauseForBuffering = null;
+  let activePipeline = "A";
+  //: Thế hệ phiên capture — tăng mỗi lần Start VÀ mỗi lần Stop/cleanup. Dùng để chặn
+  //: pipeline "hồi sinh" sau khi người dùng đã bấm Stop (xem `startCapture`).
+  let captureGeneration = 0;
+
   function buildWsConfig(cfg) {
     // 0 = OFF: để backend dùng mặc định trong docs của VAD engine đang chọn
     // (FireRed 600 ms · Silero 100 ms · FSMN 800 ms). KHÔNG dùng `||` vì 0 là giá trị hợp lệ
@@ -49,6 +75,13 @@
     };
     if (cfg.translationModel) out.translationModel = cfg.translationModel;
     if (cfg.vadEngine) out.vadEngine = cfg.vadEngine;
+    // Pipeline B: offset canh đồng bộ phụ đề/TTS (ms, người dùng chỉnh trong popup).
+    const syncMs = parseInt(cfg.lookaheadSyncOffsetMs, 10);
+    if (!isNaN(syncMs)) out.lookaheadSyncOffsetMs = Math.max(-600, Math.min(600, syncMs));
+    if (cfg.lookaheadLeadTimeSec !== undefined) {
+      const lead = parseInt(cfg.lookaheadLeadTimeSec, 10);
+      if (!isNaN(lead)) out.lookaheadLeadTimeSec = lead;
+    }
     // stable_cut: nhận cả camelCase (getSettings) lẫn snake_case (settings cũ đã lưu).
     const stableMs = cfg.stability_duration_ms !== undefined
       ? cfg.stability_duration_ms
@@ -77,7 +110,7 @@
   let wsClient = null, audioCapture = null, overlayManager = null;
   let captureAbortController = null;
   let isCapturing = false;
-  let settings = { targetLang: "vi", subPosY: 10, subWidth: 80 };
+  let settings = { targetLang: "vi", subPosY: 10, subWidth: 80, showOriginalSubtitles: true };
   let cachedVideo = null;
   // FIX-01: handle của "liveness probe" backpressure. Khi socket nghẽn tới mức HARD,
   // content script tắt capture nên không còn frame nào để service worker tự kiểm tra lại;
@@ -221,6 +254,11 @@
       return;
     }
 
+    // Khi Lookahead đang hiển thị phụ đề đã nạp sẵn, chặn partial transcript đè nhấp nháy
+    if (eventType === "partial_transcript" && timelineQueue && timelineQueue.activeSubtitle) {
+      return;
+    }
+
     const video = getVideo();
     // 1. If this frame HAS the video element, render overlay directly inside this frame
     if (video) {
@@ -246,6 +284,82 @@
     // do not render a fallback overlay on body to avoid duplicate or misplaced subtitles.
   }
 
+  function emitSubtitleEvent(eventType, payload) {
+    // 1. Render locally if eligible
+    handleSubtitleEvent(eventType, payload);
+
+    // 2. Broadcast to other frames (Top frame) only if inside a child iframe
+    if (window !== window.top) {
+      try {
+        api.runtime.sendMessage({
+          action: "BROADCAST_SUBTITLE",
+          eventType,
+          payload
+        }).catch(() => {});
+      } catch (e) {}
+    }
+  }
+
+  // Hỏi injected script (buffer_interceptor_poc.js) trạng thái đệm audio tương lai.
+  // Đây là nguồn dữ liệu cho dòng "Lookahead available +Xs" trong POPUP.
+  function getLookaheadBufferStatus(timeoutMs = 400) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        window.removeEventListener("message", handler);
+        resolve(value);
+      };
+      const handler = (event) => {
+        if (event.source !== window || !event.data) return;
+        if (event.data.source === "VIBE_LOOKAHEAD_POC" && event.data.type === "BUFFER_STATUS_RESPONSE") {
+          finish(event.data.payload || null);
+        }
+      };
+      window.addEventListener("message", handler);
+      window.postMessage({ source: "VIBE_LOOKAHEAD_CLIENT", type: "CHECK_BUFFER_STATUS" }, "*");
+      setTimeout(() => finish(null), timeoutMs);
+    });
+  }
+
+  // Kiểm tra xem trình phát video có nạp sẵn buffer âm thanh (MSE / VOD) không
+  async function checkBufferAvailable(video) {
+    if (!video) return false;
+    // Nếu là livestream không xác định độ dài -> không thể dùng Lookahead
+    if (!isFinite(video.duration) || video.duration <= 0) {
+      return false;
+    }
+
+    // 1. Kiểm tra trực tiếp TimeRanges trong video.buffered
+    let hasVideoBuffered = false;
+    if (video.buffered && video.buffered.length > 0) {
+      const cur = video.currentTime;
+      let ahead = 0;
+      for (let i = 0; i < video.buffered.length; i++) {
+        if (cur >= video.buffered.start(i) - 0.5 && cur <= video.buffered.end(i) + 0.5) {
+          ahead = video.buffered.end(i) - cur;
+          break;
+        }
+      }
+      if (!ahead && video.buffered.length > 0) {
+        ahead = video.buffered.end(video.buffered.length - 1) - cur;
+      }
+      if (ahead >= 1.5) {
+        hasVideoBuffered = true;
+      }
+    }
+
+    // 2. Hỏi injected script (buffer_interceptor_poc.js) qua postMessage
+    const p = await getLookaheadBufferStatus();
+    if (!p) return false; // Interceptor không phản hồi -> không lấy được audio raw
+
+    // ĐIỀU KIỆN BẮT BUỘC: interceptor phải THỰC SỰ bắt được byte audio (mảnh MSE hoặc
+    // init segment). Nếu site phát bằng blob URL / XHR (không MSE) thì `video.buffered`
+    // vẫn lớn nhưng ta KHÔNG có byte nào để giải mã ⇒ Pipeline B sẽ chạy mà không bao giờ
+    // có phụ đề. Trường hợp đó phải quay về Pipeline A.
+    return Boolean(hasVideoBuffered && (p.cachedChunksCount > 0 || p.hasInitSegment));
+  }
   api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg.type || msg.action) {
       case "START_TRANSLATION": case "start_capture":
@@ -268,13 +382,20 @@
         handleSubtitleEvent(msg.eventType, msg.payload);
         break;
       case "GET_STATUS": case "content_status":
-        sendResponse?.({
-          isCapturing,
-          hasVideo: !!findVideo(),
-          overlayActive: !!overlayManager,
-          sampleRate: audioCapture?.audioContext?.sampleRate || null
+        // Bất đồng bộ: cần hỏi injected script về buffer Lookahead trước khi trả lời.
+        getLookaheadBufferStatus().then((lookahead) => {
+          sendResponse?.({
+            isCapturing,
+            hasVideo: !!findVideo(),
+            overlayActive: !!overlayManager,
+            sampleRate: audioCapture?.audioContext?.sampleRate || null,
+            pipeline: activePipeline,
+            lookahead,
+          });
+        }).catch(() => {
+          sendResponse?.({ isCapturing, hasVideo: !!findVideo(), overlayActive: !!overlayManager, pipeline: activePipeline, lookahead: null });
         });
-        break;
+        return true;
       case "set_overlay_mode":
         if (msg.payload?.mode) settings.overlayStyle = msg.payload.mode;
         if (overlayManager) overlayManager.setMode(settings.overlayStyle);
@@ -299,19 +420,34 @@
           wsClient.sendJSON(buildWsConfig(settings));
           console.log("[BS] Settings updated live:", msg.settings);
         }
+        // Pipeline B: đẩy cấu hình mới sang /ws/lookahead (VAD, phân câu, model, TTS…).
+        if (lookaheadClient && msg.settings) {
+          try { lookaheadClient.updateConfig(buildWsConfig(settings)); } catch (e) {}
+          console.log("[BS] Lookahead settings updated live:", msg.settings);
+        }
+        if (ttsTimeline && msg.settings) {
+          ttsTimeline.setEnabled(!!settings.ttsEnabled);
+        }
         sendResponse?.({ success: true, settings });
         break;
     }
   });
 
   async function startCapture(msg) {
+    // Thế hệ phiên: mỗi lần Start tăng lên, mỗi lần Stop/cleanup cũng tăng. Nhờ vậy một
+    // tiến trình Start đang `await` (chờ kiểm tra buffer / chờ backend Lookahead) KHÔNG thể
+    // "hồi sinh" pipeline sau khi người dùng đã bấm Stop — trước đây nó vẫn gán
+    // `isCapturing = true` và có thể để lại socket/đồ thị audio sống sót.
+    const myGen = ++captureGeneration;
+
     // F-45: nếu cờ `isCapturing` còn kẹt từ phiên trước nhưng WS đã đóng thì dọn trước,
     // để bấm Start không bị "Already capturing" (trước đây phải tải lại trang).
-    if (isCapturing && (!wsClient || !wsClient.isConnected)) {
+    if (isCapturing && (!wsClient || !wsClient.isConnected) && (!lookaheadClient || !lookaheadClient.isConnected)) {
       console.warn("[BS] Trạng thái capture cũ đã kẹt — dọn dẹp rồi Start lại.");
       try {
         await cleanup();
       } catch (e) {}
+      if (myGen !== captureGeneration) return { success: false, error: "Đã dừng" };
     }
     if (isCapturing) {
       return {
@@ -328,6 +464,7 @@
         // Retry for up to ~1s if video element is lazily loaded upon play
         for (let i = 0; i < 4; i++) {
           await new Promise(r => setTimeout(r, 250));
+          if (myGen !== captureGeneration) return { success: false, error: "Đã dừng" };
           video = findVideo();
           if (video) break;
         }
@@ -338,206 +475,506 @@
       captureAbortController = new AbortController();
       const { signal } = captureAbortController;
 
-      ttsPlayer.setTargetVideo(
-        video,
-        settings.ttsDucking !== false,
-        settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25,
-        !!settings.ttsEnabled
-      );
-      ttsPlayer.clear();
-
-      // F-44: TUA VIDEO => phải reset pipeline, nếu không audio trước/sau khi tua bị trộn
-      // vào cùng một câu (đã gặp phụ đề lặp nội dung cũ, mảnh commit dài cả phút).
-      const handleSeek = (event) => {
-        const reason = event && event.type === "seeking" ? "seeking" : "seek";
-        try {
-          ttsPlayer.clear();
-        } catch (e) {}
-        // 1. Xoá phụ đề đang hiển thị (đã thuộc đoạn cũ)
-        if (overlayManager) {
-          try {
-            overlayManager.clear();
-          } catch (e) {}
-        }
-        // 2. Bỏ audio còn đệm trong worklet/ScriptProcessor
-        if (audioCapture && typeof audioCapture.reset === "function") {
-          try {
-            audioCapture.reset();
-          } catch (e) {}
-        }
-        // 3. Báo backend xoá audio/commit/hàng đợi cũ
-        if (wsClient) {
-          try {
-            wsClient.sendJSON({ type: "reset_stream", reason });
-          } catch (e) {}
-        }
-      };
-      // `seeking` bắt ngay khi người dùng kéo thanh thời gian (audio cũ dừng sớm nhất);
-      // `seeked` là chốt cuối sau khi trình duyệt nhảy xong.
-      video.addEventListener("seeking", handleSeek, { signal });
-      video.addEventListener("seeked", handleSeek, { signal });
-
-      // Connect to WebSocket Backend
-      wsClient = new WSClient("wss://localhost:8765/ws");
-      wsClient.on("connected", () => {
-        wsClient.sendJSON(buildWsConfig(settings));
-      });
-
-      function emitSubtitleEvent(eventType, payload) {
-        // 1. Render locally if eligible
-        handleSubtitleEvent(eventType, payload);
-
-        // 2. Broadcast to other frames (Top frame) only if inside a child iframe
-        if (window !== window.top) {
-          try {
-            api.runtime.sendMessage({
-              action: "BROADCAST_SUBTITLE",
-              eventType,
-              payload
-            }).catch(() => {});
-          } catch (e) {}
-        }
+      // Xác định chạy Pipeline A hay Pipeline B
+      const lookaheadRequested = settings.lookaheadEnabled !== false;
+      let canBuffer = false;
+      if (lookaheadRequested) {
+        canBuffer = await checkBufferAvailable(video);
+      }
+      if (myGen !== captureGeneration) {
+        console.warn("[BS] Đã bấm Stop trong lúc khởi động — huỷ phiên vừa dựng.");
+        await cleanup();
+        return { success: false, error: "Đã dừng" };
       }
 
-      wsClient.on("partial_transcript", p => emitSubtitleEvent("partial_transcript", p));
-      wsClient.on("utterance_update", p => emitSubtitleEvent("utterance_update", p));
-      wsClient.on("translation", p => emitSubtitleEvent("translation", p));
-      wsClient.on("tts_audio", p => emitSubtitleEvent("tts_audio", p));
-      wsClient.on("error", p => console.error("[BS] Backend:", p));
-
-      // P1.7/P1.8: trạng thái nạp model — hiển thị rõ thay vì "im lặng vài giây".
-      wsClient.on("model_status", p => {
-        const msg = `[BS] Model ${p?.stage || "?"}: ${p?.model || ""} -> ${p?.state || "?"}`;
-        if (p?.state === "error") console.warn(msg, p?.message || "");
-        else console.log(msg);
-      });
-
-      // P3.1: audio TTS dạng binary (không base64) — decode off-thread.
-      wsClient.on("tts_binary", (data) => {
-        try {
-          const buf = data instanceof ArrayBuffer ? data : (data && data.buffer) || null;
-          if (!buf || buf.byteLength < 9) return;
-          // Header nhỏ: magic "BTTS" + uint8 version + uint16 jsonLen + JSON header
-          const view = new DataView(buf);
-          const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-          if (magic !== "BTTS") return;
-          const jsonLen = view.getUint16(5, true);
-          const headerJson = new TextDecoder().decode(new Uint8Array(buf, 7, jsonLen));
-          const header = JSON.parse(headerJson);
-          const ownerVideo = cachedVideo && cachedVideo.isConnected;
-          const shouldPlay = ownerVideo ? (window !== window.top || isCapturing) : isCapturing;
-          if (shouldPlay) ttsPlayer.enqueueBinary(header, buf.slice(7 + jsonLen));
-        } catch (e) {
-          console.warn("[BS TTS] Không xử lý được binary TTS:", e);
+      let result = null;
+      if (lookaheadRequested && canBuffer) {
+        activePipeline = "B";
+        result = await startPipelineB(video, settings, signal);
+        if (result && result.fallbackToA) {
+          console.warn("[BS] Pipeline B không khả dụng (" + (result.reason || "unknown") + ") -> chuyển sang Pipeline A (Realtime Streaming)");
+          activePipeline = "A";
+          result = await startPipelineA(video, settings, signal);
         }
-      });
-
-      // F-45: WebSocket ĐÓNG (backend restart / phiên bị đóng) ⇒ dừng capture NGAY để
-      // trạng thái không kẹt ở "đang capture". Trước đây cờ `isCapturing` vẫn true nên
-      // popup báo Disconnected mà bấm Start lại bị "Already capturing", buộc phải tải lại trang.
-      wsClient.on("disconnected", () => {
-        if (!isCapturing) return;
-        console.warn("[BS] Mất kết nối backend — dừng capture để có thể Start lại.");
-        try {
-          stopCapture();
-        } catch (e) {}
-      });
-
-      wsClient.on("backpressure", (bp) => {
-        if (bp.state === "paused") {
-          if (audioCapture && audioCapture.isCapturing) {
-            console.warn(
-              "[BS] Backend chậm: tạm dừng gửi audio để tránh trôi độ trễ.",
-              `(pause #${bp.pauseCount || 0}, đã mất ${bp.droppedFrames || 0} frame)`
-            );
-            audioCapture.isCapturing = false;
-          }
-          // FIX-01: capture đã dừng nên KHÔNG còn SEND_BINARY nào để service worker biết
-          // lúc nào hàng đợi rút hết. Bắn probe định kỳ để nó nhả trạng thái tạm dừng.
-          startBackpressureProbe();
-        } else if (bp.state === "ok") {
-          stopBackpressureProbe();
-          if (audioCapture && !audioCapture.isCapturing) {
-            audioCapture.isCapturing = true;
-            console.log(
-              "[BS] Backend đã bắt kịp: tiếp tục gửi audio.",
-              `(paused ${Math.round((bp.pausedMs || 0))}ms, resume #${bp.resumeCount || 0})`
-            );
-          }
+      } else {
+        activePipeline = "A";
+        if (lookaheadRequested && !canBuffer) {
+          console.warn("[BS] Không phát hiện buffer video nạp trước -> Tự động chuyển sang Pipeline A (Realtime Streaming)");
         }
-      });
+        result = await startPipelineA(video, settings, signal);
+      }
 
-      await wsClient.connect();
+      if (myGen !== captureGeneration) {
+        // Stop đã được bấm trong lúc pipeline đang dựng ⇒ dọn sạch, KHÔNG bật cờ capture.
+        console.warn("[BS] Stop trong lúc khởi động — dọn pipeline vừa tạo.");
+        await cleanup();
+        return { success: false, error: "Đã dừng" };
+      }
 
       isCapturing = true;
-
-      // Start Audio Capture module
-      audioCapture = new AudioCapture();
-      audioCapture.onChunk = (pcmBuffer, timestamp, chunkIdx) => {
-        if (wsClient && wsClient.isConnected) {
-          wsClient.sendBinary(pcmBuffer, timestamp, chunkIdx);
-        }
-      };
-      await audioCapture.start(video);
-
-      // Nối ducking vào ĐỒ THỊ AUDIO của capture. Từ đây slider 🔉 Original audio điều khiển
-      // GainNode trên nhánh NGHE, nên `video.volume` không bị đụng tới và ASR (lấy từ cùng
-      // `sourceNode`) luôn nhận audio full-scale ⇒ kéo về 0% vẫn còn phụ đề + TTS.
-      // Phải gọi SAU `start()` vì gain chỉ tồn tại sau khi đồ thị được dựng.
-      ttsPlayer.setDuckSink(audioCapture);
-
-      // Initialize overlay for Top window or if already in Fullscreen
-      if (window === window.top || document.fullscreenElement) {
-        ensureOverlay(video);
-      }
-
-      // Ensure AudioContext and Fullscreen overlay transitions
-      const handleStateKeepAlive = () => {
-        if (audioCapture) {
-          audioCapture.resumeAudioContext();
-        }
-        if (document.fullscreenElement && !overlayManager) {
-          ensureOverlay(video);
-        }
-        // Lưới an toàn thứ hai cho ducking: nhiều trang reset `video.volume` ngay khi bắt đầu
-        // phát (hoặc khi người dùng kéo thanh âm lượng của chính trang). Guard `volumechange`
-        // trong tts-player đã bắt phần lớn trường hợp; đây là bản áp lại ở mốc `play`/`playing`.
-        try { ttsPlayer.reapplyDucking(); } catch (e) {}
-        // Cảnh báo nếu trình phát đang tắt tiếng ⇒ ASR sẽ không nhận được gì.
-        checkCaptureAudibility(video);
-      };
-
-      document.addEventListener("fullscreenchange", handleStateKeepAlive, { signal });
-      document.addEventListener("webkitfullscreenchange", handleStateKeepAlive, { signal });
-      document.addEventListener("mozfullscreenchange", handleStateKeepAlive, { signal });
-      if (video) {
-        video.addEventListener("play", handleStateKeepAlive, { signal });
-        video.addEventListener("playing", handleStateKeepAlive, { signal });
-        // Người dùng kéo volume/mute của trình phát ⇒ kiểm tra ngay (im lặng là lỗi khó đoán).
-        video.addEventListener("volumechange", handleStateKeepAlive, { signal });
-      }
-      checkCaptureAudibility(video);
-
-      const actualRate = audioCapture?.audioContext?.sampleRate || null;
-      console.log("[BS] Capture started (rate:", actualRate, ")");
-      return { success: true, sampleRate: actualRate };
+      console.log(`[BS] Capture started via Pipeline ${activePipeline}`);
+      return result;
     } catch (e) {
       console.error("[BS] Start error:", e);
       await cleanup();
-      const errText = e?.message || (typeof e === "string" ? e : "Không thể kết nối tới Backend WebSocket (wss://localhost:8765/ws)");
+      const errText = e?.message || (typeof e === "string" ? e : "Không thể khởi động dịch video");
       return { success: false, error: errText };
     }
+  }
+
+  // ── PIPELINE A: Realtime Audio Streaming (ASR + VAD Realtime) ──────────────
+  async function startPipelineA(video, settings, signal) {
+    console.log("%c[BS] 🎙️ Khởi động Pipeline A: Realtime Streaming qua /ws", "color: #38bdf8; font-weight: bold;");
+
+    ttsPlayer.setTargetVideo(
+      video,
+      settings.ttsDucking !== false,
+      settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25,
+      !!settings.ttsEnabled
+    );
+    ttsPlayer.clear();
+
+    const handleSeek = (event) => {
+      const reason = event && event.type === "seeking" ? "seeking" : "seek";
+      try { ttsPlayer.clear(); } catch (e) {}
+      if (overlayManager) {
+        try { overlayManager.clear(); } catch (e) {}
+      }
+      if (audioCapture && typeof audioCapture.reset === "function") {
+        try { audioCapture.reset(); } catch (e) {}
+      }
+      if (wsClient) {
+        try { wsClient.sendJSON({ type: "reset_stream", reason }); } catch (e) {}
+      }
+    };
+    video.addEventListener("seeking", handleSeek, { signal });
+    video.addEventListener("seeked", handleSeek, { signal });
+
+    wsClient = new WSClient("wss://localhost:8765/ws");
+    wsClient.on("connected", () => {
+      wsClient.sendJSON(buildWsConfig(settings));
+    });
+
+    wsClient.on("partial_transcript", p => emitSubtitleEvent("partial_transcript", p));
+    wsClient.on("utterance_update", p => emitSubtitleEvent("utterance_update", p));
+    wsClient.on("translation", p => emitSubtitleEvent("translation", p));
+    wsClient.on("tts_audio", p => emitSubtitleEvent("tts_audio", p));
+    wsClient.on("error", p => console.error("[BS] Backend:", p));
+
+    wsClient.on("model_status", p => {
+      const msg = `[BS] Model ${p?.stage || "?"}: ${p?.model || ""} -> ${p?.state || "?"}`;
+      if (p?.state === "error") console.warn(msg, p?.message || "");
+      else console.log(msg);
+    });
+
+    wsClient.on("tts_binary", (data) => {
+      try {
+        const buf = data instanceof ArrayBuffer ? data : (data && data.buffer) || null;
+        if (!buf || buf.byteLength < 9) return;
+        const view = new DataView(buf);
+        const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+        if (magic !== "BTTS") return;
+        const jsonLen = view.getUint16(5, true);
+        const headerJson = new TextDecoder().decode(new Uint8Array(buf, 7, jsonLen));
+        const header = JSON.parse(headerJson);
+        const ownerVideo = cachedVideo && cachedVideo.isConnected;
+        const shouldPlay = ownerVideo ? (window !== window.top || isCapturing) : isCapturing;
+        if (shouldPlay) ttsPlayer.enqueueBinary(header, buf.slice(7 + jsonLen));
+      } catch (e) {
+        console.warn("[BS TTS] Không xử lý được binary TTS:", e);
+      }
+    });
+
+    wsClient.on("disconnected", () => {
+      if (!isCapturing) return;
+      console.warn("[BS] Mất kết nối backend — dừng capture để có thể Start lại.");
+      try { stopCapture(); } catch (e) {}
+    });
+
+    wsClient.on("backpressure", (bp) => {
+      if (bp.state === "paused") {
+        if (audioCapture && audioCapture.isCapturing) {
+          audioCapture.isCapturing = false;
+        }
+        startBackpressureProbe();
+      } else if (bp.state === "ok") {
+        stopBackpressureProbe();
+        if (audioCapture && !audioCapture.isCapturing) {
+          audioCapture.isCapturing = true;
+        }
+      }
+    });
+
+    await wsClient.connect();
+
+    audioCapture = new AudioCapture();
+    audioCapture.onChunk = (pcmBuffer, timestamp, chunkIdx) => {
+      if (wsClient && wsClient.isConnected) {
+        wsClient.sendBinary(pcmBuffer, timestamp, chunkIdx);
+      }
+    };
+    await audioCapture.start(video);
+    ttsPlayer.setDuckSink(audioCapture);
+
+    if (window === window.top || document.fullscreenElement) {
+      ensureOverlay(video);
+    }
+
+    const handleStateKeepAlive = () => {
+      if (audioCapture) audioCapture.resumeAudioContext();
+      if (document.fullscreenElement && !overlayManager) ensureOverlay(video);
+      try { ttsPlayer.reapplyDucking(); } catch (e) {}
+      checkCaptureAudibility(video);
+    };
+
+    document.addEventListener("fullscreenchange", handleStateKeepAlive, { signal });
+    document.addEventListener("webkitfullscreenchange", handleStateKeepAlive, { signal });
+    document.addEventListener("mozfullscreenchange", handleStateKeepAlive, { signal });
+    video.addEventListener("play", handleStateKeepAlive, { signal });
+    video.addEventListener("playing", handleStateKeepAlive, { signal });
+    video.addEventListener("volumechange", handleStateKeepAlive, { signal });
+    checkCaptureAudibility(video);
+
+    const actualRate = audioCapture?.audioContext?.sampleRate || null;
+    return { success: true, sampleRate: actualRate, pipeline: "A" };
+  }
+
+  // ── PIPELINE B: Lookahead Video Buffering (0.0s Zero Perceived Latency) ────
+  async function startPipelineB(video, settings, signal) {
+    const leadTimeSec = parseInt(settings.lookaheadLeadTimeSec || 15, 10);
+    console.log(`%c[BS] 🚀 Khởi động Pipeline B: Lookahead Video Buffering (dịch trước ${leadTimeSec}s, 0.0s Lag)`, "color: #00ffcc; font-weight: bold;");
+    // Log THIẾT LẬP hiệu dụng: nếu TTS không kêu thì đây là chỗ đầu tiên cần xem.
+    console.log("[BS] Lookahead settings:", {
+      lookaheadEnabled: settings.lookaheadEnabled,
+      leadTimeSec,
+      ttsEnabled: !!settings.ttsEnabled,
+      ttsDucking: settings.ttsDucking !== false,
+      duckingLevel: settings.duckingLevel,
+      vadEngine: settings.vadEngine,
+      sourceLanguage: settings.sourceLanguage,
+      targetLang: settings.targetLang,
+    });
+
+    const om = ensureOverlay(video);
+
+    // 1. Kiểm tra xem video đã có sẵn lượng buffer phía trước chưa
+    const curTime = video.currentTime;
+    let aheadSec = 0;
+    if (video.buffered && video.buffered.length > 0) {
+      for (let i = 0; i < video.buffered.length; i++) {
+        if (curTime >= video.buffered.start(i) - 0.5 && curTime <= video.buffered.end(i) + 0.5) {
+          aheadSec = video.buffered.end(i) - curTime;
+          break;
+        }
+      }
+      if (!aheadSec && video.buffered.length > 0) {
+        aheadSec = video.buffered.end(video.buffered.length - 1) - curTime;
+      }
+    }
+
+    let pausedByLookahead = false;
+    let currentBufferingWhy = "start";
+    const showBufferingStatus = (msg) => {
+      if (om && typeof om.showBuffering === "function") {
+        om.showBuffering(msg || "Đang nạp đệm và dịch trước...");
+      }
+    };
+    const hideBufferingStatus = () => {
+      if (om && typeof om.hideBuffering === "function") {
+        om.hideBuffering();
+      }
+    };
+
+    // Tạm dừng video để nạp phụ đề trước (chỉ lúc bắt đầu hoặc khi tua video).
+    let resumeTimer = null;
+    let lastResumeAt = 0;
+    let firstTtsReceived = false;
+    const pauseForBuffering = (why) => {
+      firstTtsReceived = false;
+      if (!video.paused) {
+        try { video.pause(); } catch (e) {}
+      }
+      pausedByLookahead = true;
+      lookaheadPausedVideo = true;
+      currentBufferingWhy = why || "start";
+      showBufferingStatus(
+        why === "seek"
+          ? "Đang dịch trước đoạn vừa tua..."
+          : (why === "tts_enable" ? "Đang chuẩn bị lồng tiếng TTS..." : "Đang nạp đệm và dịch trước...")
+      );
+      // Chốt an toàn: tối đa 5.0s nếu bật TTS (cho OmniVoice tổng hợp), 3.5s nếu chỉ phụ đề
+      const timeoutMs = settings.ttsEnabled ? 5000 : 3500;
+      if (resumeTimer) clearTimeout(resumeTimer);
+      resumeTimer = setTimeout(() => {
+        if (lookaheadPausedVideo) {
+          console.log("[BS] Đã nạp đệm ban đầu xong -> tiếp tục phát video.");
+          resumePlayback("timeout");
+        }
+      }, timeoutMs);
+    };
+    lookaheadPauseForBuffering = pauseForBuffering;
+
+    // Nếu video đã có buffer phía trước thì tạm dừng để xử lý dịch trước.
+    if (aheadSec >= 1.0) pauseForBuffering("start");
+
+    // 2. Khởi tạo SubtitleTimelineQueue
+    timelineQueue = new SubtitleTimelineQueue({
+      onSubtitleChange: (sub) => {
+        if (sub) {
+          emitSubtitleEvent("translation", {
+            utterance_id: sub.id,
+            original_text: sub.original_text,
+            translated_text: sub.translated_text,
+            translated: sub.translated_text,
+            status: "ok",
+            is_final: true,
+          });
+        } else {
+          if (overlayManager) {
+            try { overlayManager.clear(); } catch (e) {}
+          }
+        }
+      },
+      onSeekTriggered: (seekId, targetTime) => {
+        // Lồng tiếng cũ thuộc đoạn trước khi tua ⇒ bỏ hết.
+        if (ttsTimeline) {
+          try { ttsTimeline.clear(); } catch (e) {}
+        }
+        if (lookaheadClient) {
+          lookaheadClient.notifySeek(seekId, targetTime);
+        }
+        // Vị trí mới chưa có phụ đề: TẠM DỪNG video chờ backend dịch trước, rồi tự phát lại
+        // khi `lookahead_status.prebuffer_ready` báo sẵn sàng.
+        pauseForBuffering("seek");
+      },
+    });
+    timelineQueue.attachVideo(video);
+
+    // 2b. Lồng tiếng theo timeline: audio TTS được phát ĐÚNG lúc video.currentTime đi qua
+    // `start_pts` (xem `lib/tts-timeline.js`), có nén/cắt để không trễ dây chuyền.
+    ttsPlayer.setTargetVideo(
+      video,
+      settings.ttsDucking !== false,
+      settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25,
+      !!settings.ttsEnabled
+    );
+    ttsPlayer.clear();
+    ttsTimeline = new TtsTimelineScheduler({
+      enabled: !!settings.ttsEnabled,
+      getAudioContext: () => ttsPlayer._getAudioContext(),
+      allowPitchShift: false, // Chống méo tiếng: AudioBufferSourceNode không giữ cao độ, backend đã nén bằng WSOLA
+      tailAllowanceSec: 2.0,  // Cho phép câu đọc kết thúc trọn vẹn vào khoảng lặng kế tiếp, không bị cụt từ cuối
+    });
+    ttsTimeline.attach(video);
+
+    // 3. Khởi tạo LookaheadClient kết nối tới /ws/lookahead
+    // `resumePlayback` KHÔNG còn là one-shot: nó được gọi lại sau mỗi lần tua.
+    var resumePlayback = (reason) => {
+      if (!lookaheadPausedVideo) return;
+      lookaheadPausedVideo = false;
+      lastResumeAt = Date.now();
+      underrunStreak = 0;
+      if (resumeTimer) {
+        clearTimeout(resumeTimer);
+        resumeTimer = null;
+      }
+      console.log(`%c[BS] ✅ Phát video với phụ đề Lookahead (${reason || "ready"})`, "color: #34c759; font-weight: bold;");
+      hideBufferingStatus();
+      try { om.clear(); } catch (e) {}
+      try { video.play(); } catch (e) {}
+      // `om.clear()` vừa xoá cả câu đang đúng ⇒ buộc timeline vẽ lại ngay, nếu không phải
+      // đợi sang câu kế tiếp mới thấy phụ đề (lỗi "câu đầu không hiển thị").
+      if (timelineQueue) {
+        try { timelineQueue.refreshNow(); } catch (e) {}
+      }
+    };
+
+    let settled = false;
+    const availability = await new Promise((resolve) => {
+      const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+
+      lookaheadClient = new LookaheadClient({
+        serverUrl: "wss://localhost:8765/ws/lookahead",
+        timelineQueue: timelineQueue,
+        leadTime: leadTimeSec,
+        sourceLang: settings.sourceLanguage || "auto",
+        targetLang: settings.targetLang || "vi",
+        // Cấu hình ĐẦY ĐỦ từ popup (VAD engine/threshold/silence, model ASR, phân câu,
+        // model dịch…) — Pipeline B phải chạy đúng thông số người dùng đã chọn.
+        config: buildWsConfig(settings),
+        onPrebufferReady: (st) => {
+          // Nếu bật TTS nhưng chưa nhận câu TTS nào và đang có câu nói: chờ onTts kích hoạt
+          if (settings.ttsEnabled && !firstTtsReceived && Number(st?.ready_ahead || 0) > 0) {
+            return;
+          }
+          resumePlayback(st && st.reason ? st.reason : "ready");
+        },
+        onTts: (header, wavBuffer) => {
+          if (!settings.ttsEnabled) return;
+          if (timelineQueue && header && header.start_pts && header.duration_sec) {
+            // Bước 1 & 2: Đồng bộ phụ đề giữ trên màn hình cho tới khi TTS đọc xong
+            timelineQueue.extendSubtitleEnd(
+              Number(header.start_pts),
+              Number(header.start_pts) + Number(header.duration_sec) + 0.10
+            );
+          }
+          if (ttsTimeline) ttsTimeline.enqueue(header, wavBuffer);
+
+          // Nếu đang tạm dừng nạp đệm và bật TTS: nhận được câu TTS đầu tiên ⇒ phát video ngay!
+          if (settings.ttsEnabled && lookaheadPausedVideo && !firstTtsReceived) {
+            firstTtsReceived = true;
+            resumePlayback("tts_first_ready");
+          }
+        },
+        onReady: () => finish(null),
+        onUnavailable: (reason) => {
+          console.warn("[BS] LookaheadClient báo không khả dụng:", reason);
+          finish(reason || "unavailable");
+        },
+        onError: (err) => {
+          console.error("[BS] LookaheadClient báo lỗi kết nối:", err);
+          finish(typeof err === "string" ? err : (err?.message || "connection_error"));
+        },
+        onStatus: (st) => {
+          const ready = Number(st.ready_ahead || 0);
+          const fed = Number(st.fed_ahead || 0);
+          const isTts = Boolean(settings.ttsEnabled);
+
+          if (lookaheadPausedVideo) {
+            const target = Number(st.target_ahead || 0);
+            if (ready > 0 && target > 0) {
+              const prefix = currentBufferingWhy === "seek" ? "Đang dịch trước đoạn vừa tua" : "Đang nạp đệm và dịch trước";
+              const extra = isTts && !firstTtsReceived ? " (chờ lồng tiếng)..." : "...";
+              showBufferingStatus(`${prefix} (${ready.toFixed(1)}s / ${target.toFixed(1)}s)${extra}`);
+            }
+
+            // Sẵn sàng phát lại khi:
+            // 1. Backend báo st.prebuffer_ready (đã tính toán cả TTS nếu tts_enabled)
+            // 2. HOẶC nếu TTS BẬT:
+            //    - Đã nhận câu TTS đầu tiên (firstTtsReceived) VÀ ready >= 1.0s
+            //    - HOẶC đoạn trước là khoảng lặng (fed >= 4.0s và ready === 0: không có tiếng nói để đọc TTS)
+            // 3. HOẶC nếu TTS TẮT:
+            //    - ready >= 1.5s
+            //    - HOẶC fed >= 4.0s && ready === 0 (quét qua khoảng lặng)
+            let readyToResume = false;
+            if (st.prebuffer_ready) {
+              if (!isTts || firstTtsReceived || ready === 0) {
+                readyToResume = true;
+              }
+            } else if (isTts) {
+              if (firstTtsReceived && ready >= 1.0) {
+                readyToResume = true;
+              } else if (fed >= 4.0 && ready === 0) {
+                readyToResume = true;
+              }
+            } else {
+              if (ready >= 1.5) {
+                readyToResume = true;
+              } else if (fed >= 4.0 && ready === 0) {
+                readyToResume = true;
+              }
+            }
+
+            if (readyToResume) {
+              resumePlayback(st.prebuffer_ready ? "prebuffer_ready" : "status_ready");
+            }
+          }
+          // ĐANG PHÁT: Tuyệt đối KHÔNG tạm dừng video giữa chừng ("tạm dừng để đuổi kịp").
+          // Người dùng cần trải nghiệm phát mượt mà, phụ đề & TTS cập nhật mốc thời gian khi có.
+        },
+      });
+      lookaheadClient.connect(video);
+
+      // Nếu sau 3.5s chưa kết nối được socket -> coi như Pipeline B thất bại, tự động chuyển về Pipeline A!
+      setTimeout(() => {
+        if (!settled) {
+          if (!lookaheadClient || !lookaheadClient.isConnected) {
+            console.warn("[BS] Quá thời gian chờ kết nối /ws/lookahead (3.5s) -> tự động chuyển về Pipeline A.");
+            finish("connection_timeout");
+          } else {
+            // Đã kết nối socket nhưng backend chưa phản hồi lookahead_ready (backend cũ/chậm): vẫn tiếp tục
+            finish(null);
+          }
+        }
+      }, 3500);
+    });
+
+    if (availability) {
+      // Backend báo KHÔNG chạy được Pipeline B -> gỡ sạch để content script quay về Pipeline A.
+      console.warn(`%c[BS] ⚠️ Pipeline B không khả dụng (${availability}) -> Tự động chuyển sang Pipeline A (Realtime Streaming)`, "color: #f59e0b; font-weight: bold;");
+      try { lookaheadClient.disconnect(); } catch (e) {}
+      lookaheadClient = null;
+      try { timelineQueue.detach(); } catch (e) {}
+      timelineQueue = null;
+      if (ttsTimeline) {
+        try { ttsTimeline.destroy(); } catch (e) {}
+        ttsTimeline = null;
+      }
+      hideBufferingStatus();
+      try { om.clear(); } catch (e) {}
+      // Trả lại trạng thái phát cho video (ta đã pause nó để nạp đệm).
+      lookaheadPausedVideo = false;
+      if (resumeTimer) { clearTimeout(resumeTimer); resumeTimer = null; }
+      if (pausedByLookahead) {
+        try { video.play(); } catch (e) {}
+      }
+      return { success: false, fallbackToA: true, reason: availability, pipeline: "B" };
+    }
+
+    const handleStateKeepAlive = () => {
+      if (document.fullscreenElement && !overlayManager) ensureOverlay(video);
+    };
+    document.addEventListener("fullscreenchange", handleStateKeepAlive, { signal });
+    document.addEventListener("webkitfullscreenchange", handleStateKeepAlive, { signal });
+    document.addEventListener("mozfullscreenchange", handleStateKeepAlive, { signal });
+
+    return { success: true, sampleRate: null, pipeline: "B" };
   }
 
   function stopCapture() { cleanup(); return { success: true }; }
 
   async function cleanup() {
     isCapturing = false;
-    captureSilenceWarned = false;   // phiên sau phải được cảnh báo lại từ đầu
+    // Vô hiệu hoá mọi tiến trình Start đang `await` (xem `startCapture`).
+    captureGeneration++;
     stopBackpressureProbe();   // FIX-01: không để timer probe sống sót qua Stop
+    captureSilenceWarned = false;   // phiên sau phải được cảnh báo lại từ đầu
+    // Trả lại trạng thái phát nếu chính Pipeline B đã tạm dừng video để nạp đệm.
+    lookaheadPauseForBuffering = null;
+    if (lookaheadPausedVideo) {
+      lookaheadPausedVideo = false;
+      try {
+        const v = getVideo();
+        if (v && v.paused) v.play();
+      } catch (e) {}
+    }
+    if (overlayManager && typeof overlayManager.hideBuffering === "function") {
+      overlayManager.hideBuffering();
+    }
     if (captureAbortController) {
       try { captureAbortController.abort(); } catch (e) {}
       captureAbortController = null;
+    }
+    if (lookaheadClient) {
+      try { lookaheadClient.disconnect(); } catch (e) {}
+      lookaheadClient = null;
+    }
+    if (timelineQueue) {
+      try { timelineQueue.detach(); } catch (e) {}
+      timelineQueue = null;
+    }
+    if (ttsTimeline) {
+      try {
+        const snap = ttsTimeline.snapshot();
+        if (snap.received > 0) {
+          console.log(
+            `[BS TTS-LA] Tổng kết: phát ${snap.played}, bỏ muộn ${snap.skippedLate}, ` +
+            `cụt đuôi ${snap.cutShort}, trễ nhất ${snap.maxLateMs.toFixed(0)}ms, rate tối đa ${snap.maxRate.toFixed(2)}x`
+          );
+        }
+        ttsTimeline.destroy();
+      } catch (e) {}
+      ttsTimeline = null;
     }
     ttsPlayer.destroy();
     // Ngắt tham chiếu tới đồ thị audio sắp bị dỡ, để ducking không gọi vào sink đã chết.
@@ -551,8 +988,7 @@
       wsClient = null;
     }
     if (overlayManager) {
-      try { overlayManager.destroy(); } catch (e) {}
-      overlayManager = null;
+      try { overlayManager.clear(); } catch (e) {}
     }
   }
 
@@ -571,15 +1007,20 @@
     }
     return { success: true };
   };
-  window.__bsGetStatus = () => ({
+  window.__bsGetStatus = async () => ({
     isCapturing,
     hasVideo: !!findVideo(),
     overlayActive: !!overlayManager,
-    sampleRate: audioCapture?.audioContext?.sampleRate || null
+    sampleRate: audioCapture?.audioContext?.sampleRate || null,
+    pipeline: activePipeline,
+    lookahead: await getLookaheadBufferStatus()
   });
   window.__bsUpdateSettings = (s) => {
     if (s) {
+      const prevTtsEnabled = !!settings.ttsEnabled;
       Object.assign(settings, s);
+      const newTtsEnabled = !!settings.ttsEnabled;
+
       if (overlayManager) overlayManager.applySettings(settings);
       if (ttsPlayer) {
         if (!ttsPlayer.targetVideo || !ttsPlayer.targetVideo.isConnected) {
@@ -591,6 +1032,32 @@
           settings.duckingLevel !== undefined ? settings.duckingLevel : 0.25,
           !!settings.ttsEnabled
         );
+      }
+
+      // Xử lý bật/tắt TTS động trong Pipeline B (Lookahead)
+      if (activePipeline === "B") {
+        if (prevTtsEnabled && !newTtsEnabled) {
+          // Người dùng vừa TẮT TTS: chặn phát mọi câu TTS đang dở hoặc đã lên lịch
+          if (ttsTimeline) {
+            ttsTimeline.setEnabled(false);
+          }
+          if (ttsPlayer) {
+            ttsPlayer.clear();
+          }
+          console.log("[BS] Đã tắt TTS trong Pipeline B — dừng mọi audio lồng tiếng.");
+        } else if (!prevTtsEnabled && newTtsEnabled) {
+          // Người dùng vừa BẬT LẠI TTS: kích hoạt lại timeline và tạm dừng video để nạp đệm TTS
+          if (ttsTimeline) {
+            ttsTimeline.setEnabled(true);
+          }
+          if (typeof lookaheadPauseForBuffering === "function") {
+            lookaheadPauseForBuffering("tts_enable");
+          }
+          console.log("[BS] Đã bật lại TTS trong Pipeline B — tạm dừng để tổng hợp câu TTS đầu.");
+        }
+        if (lookaheadClient && lookaheadClient.isConnected) {
+          lookaheadClient.updateConfig(buildWsConfig(settings));
+        }
       }
     }
     if (wsClient && wsClient.isConnected && s) {

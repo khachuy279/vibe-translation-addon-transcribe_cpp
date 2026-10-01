@@ -23,6 +23,18 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   const valStableMinSec = document.getElementById("valStableMinSec");
   const rangeStableMinWords = document.getElementById("rangeStableMinWords");
   const valStableMinWords = document.getElementById("valStableMinWords");
+
+  // Lookahead Video Buffering
+  const chkEnableLookahead = document.getElementById("chkEnableLookahead");
+  const rangeLookaheadLeadTime = document.getElementById("rangeLookaheadLeadTime");
+  const valLookaheadLeadTime = document.getElementById("valLookaheadLeadTime");
+  const lookaheadLeadTimeGroup = document.getElementById("lookaheadLeadTimeGroup");
+  const lookaheadStatusEl = document.getElementById("lookaheadStatus");
+  const lookaheadStatusText = document.getElementById("lookaheadStatusText");
+  const rangeLookaheadSync = document.getElementById("rangeLookaheadSync");
+  const valLookaheadSync = document.getElementById("valLookaheadSync");
+  //: Timer làm mới trạng thái Lookahead khi popup đang mở.
+  let lookaheadStatusTimer = null;
   // Chẩn đoán: log mỗi nhịp preview ([SEG_TRACE]) — mặc định TẮT.
   const chkStableTrace = document.getElementById("chkStableTrace");
   const valMinWords = document.getElementById("valMinWords");
@@ -45,6 +57,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   const valMaxLines = document.getElementById("valMaxLines");
   // "Tắt chạy chữ" cho bản dịch (mặc định BẬT: hiện bản dịch 1 lần).
   const chkTranslationOnce = document.getElementById("chkTranslationOnce");
+  const chkShowOriginal = document.getElementById("chkShowOriginal");
+  const showOriginalToggleRow = document.getElementById("showOriginalToggleRow");
 
   const chkEnableTts = document.getElementById("chkEnableTts");
   const selTtsVoice = document.getElementById("selTtsVoice");
@@ -147,8 +161,14 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       fontWeight: parseInt(rangeFontWeight ? rangeFontWeight.value : 600, 10) || 600,
       fontFamily: selFontFamily ? selFontFamily.value : "default",
       maxLines: parseInt(rangeMaxLines ? rangeMaxLines.value : 3, 10) || 3,
+      // Lookahead Video Buffering (Pipeline B vs Pipeline A)
+      lookaheadEnabled: chkEnableLookahead ? chkEnableLookahead.checked : true,
+      lookaheadLeadTimeSec: rangeLookaheadLeadTime ? parseInt(rangeLookaheadLeadTime.value, 10) : 15,
+      lookaheadSyncOffsetMs: rangeLookaheadSync ? parseInt(rangeLookaheadSync.value, 10) : 0,
       // "Tắt chạy chữ": chỉ hiện bản dịch MỘT LẦN khi có bản dịch hoàn chỉnh.
       showTranslationOnce: chkTranslationOnce ? chkTranslationOnce.checked : true,
+      // On/Off phụ đề gốc (mặc định BẬT; tắt thì chỉ hiện bản dịch, phù hợp pipeline B).
+      showOriginalSubtitles: chkShowOriginal ? chkShowOriginal.checked : true,
       ttsEnabled: isTts,
       ttsVoice: selectedVoiceId,
       ttsInstruct: "",
@@ -205,6 +225,13 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (valStableMs && rangeStableMs) valStableMs.textContent = rangeStableMs.value;
     if (valStableMinSec && rangeStableMinSec) valStableMinSec.textContent = rangeStableMinSec.value;
     if (valStableMinWords && rangeStableMinWords) valStableMinWords.textContent = rangeStableMinWords.value;
+    // Lookahead Video Buffering
+    if (valLookaheadLeadTime && rangeLookaheadLeadTime) valLookaheadLeadTime.textContent = rangeLookaheadLeadTime.value;
+    if (valLookaheadSync && rangeLookaheadSync) valLookaheadSync.textContent = rangeLookaheadSync.value;
+    if (lookaheadLeadTimeGroup && chkEnableLookahead) {
+      lookaheadLeadTimeGroup.style.opacity = (chkEnableLookahead.checked && !isCapturingNow) ? "1" : "0.5";
+      if (rangeLookaheadLeadTime) rangeLookaheadLeadTime.disabled = isCapturingNow || !chkEnableLookahead.checked;
+    }
   }
 
   async function fetchActiveTab() {
@@ -739,9 +766,41 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     }
   }
 
+  // ── Trạng thái buffer Lookahead (thay cho HUD nổi trên trang) ──────────────
+  // Nguồn dữ liệu: buffer_interceptor_poc.js trong page → content script → popup.
+  function renderLookaheadStatus(status) {
+    if (!lookaheadStatusEl || !lookaheadStatusText) return;
+    lookaheadStatusEl.classList.remove("is-ready", "is-low", "is-off");
+
+    if (!status || !status.hasVideo) {
+      lookaheadStatusEl.classList.add("is-off");
+      lookaheadStatusText.textContent = "Lookahead: chưa tìm thấy video";
+      return;
+    }
+    const la = status.lookahead;
+    if (!la || (!la.cachedChunksCount && !la.hasInitSegment)) {
+      lookaheadStatusEl.classList.add("is-off");
+      lookaheadStatusText.textContent = "Lookahead: không khả dụng (chạy Realtime)";
+      return;
+    }
+    const ahead = Number(la.aheadSeconds || 0);
+    const enough = ahead >= 10;
+    lookaheadStatusEl.classList.add(enough ? "is-ready" : "is-low");
+    lookaheadStatusText.textContent = `Lookahead available +${ahead.toFixed(2)}s`
+      + (enough ? "" : " (đang nạp)");
+  }
+
+  async function refreshLookaheadStatus() {
+    try {
+      const statuses = await broadcastToFrames("GET_STATUS");
+      if (!statuses || !statuses.length) return;
+      const status = statuses.find(s => s && s.hasVideo) || statuses[0];
+      renderLookaheadStatus(status);
+    } catch (e) { /* popup đang mở ở tab không có content script */ }
+  }
+
   // ── Multi-Frame Broadcast Helper ──────────────────
-  async function broadcastToFrames(action, payload = {}) {
-    const tab = await fetchActiveTab();
+  async function broadcastToFrames(action, payload = {}) {    const tab = await fetchActiveTab();
     if (!tab) return null;
 
     if (api.scripting && api.scripting.executeScript) {
@@ -861,6 +920,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       if (chkTranslationOnce) {
         chkTranslationOnce.checked = s.showTranslationOnce === undefined ? true : !!s.showTranslationOnce;
       }
+      if (chkShowOriginal) {
+        chkShowOriginal.checked = s.showOriginalSubtitles === undefined ? true : !!s.showOriginalSubtitles;
+      }
 
       // Restore TTS Settings
       if (s.ttsEnabled !== undefined && chkEnableTts) {
@@ -877,14 +939,25 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         if (!selTtsSpeed.value) selTtsSpeed.value = "1.0";
       }
       if (s.ttsDucking !== undefined && selTtsDucking) selTtsDucking.value = s.ttsDucking ? "true" : "false";
-      if (s.duckingLevel !== undefined && rangeDuckingLevel) {
-        rangeDuckingLevel.value = Math.round(s.duckingLevel * 100);
+      // Restore Lookahead Settings
+      if (s.lookaheadEnabled !== undefined && chkEnableLookahead) {
+        chkEnableLookahead.checked = !!s.lookaheadEnabled;
+      }
+      if (s.lookaheadLeadTimeSec !== undefined && rangeLookaheadLeadTime) {
+        rangeLookaheadLeadTime.value = s.lookaheadLeadTimeSec;
+      }
+      if (s.lookaheadSyncOffsetMs !== undefined && rangeLookaheadSync) {
+        rangeLookaheadSync.value = s.lookaheadSyncOffsetMs;
       }
 
       updateRangeLabels();
     } catch (e) { }
 
     await fetchBackendEngineConfig();
+
+    if (chkEnableTts && chkEnableTts.checked) {
+      prewarmTTS();
+    }
 
     const tab = await fetchActiveTab();
     if (!tab) return;
@@ -898,6 +971,16 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       api.tabs.sendMessage(tab.id, { action: "GET_STATUS", type: "GET_STATUS" }, (r) => {
         if (!api.runtime.lastError && r?.isCapturing) setUI(true, r?.sampleRate);
       });
+    }
+
+    // Trạng thái buffer Lookahead: hiển thị ngay và làm mới định kỳ khi popup còn mở.
+    if (statuses && statuses.length) {
+      renderLookaheadStatus(statuses.find(s => s && s.hasVideo) || statuses[0]);
+    } else {
+      refreshLookaheadStatus();
+    }
+    if (lookaheadStatusTimer === null) {
+      lookaheadStatusTimer = setInterval(refreshLookaheadStatus, 1200);
     }
   })();
 
@@ -1027,6 +1110,17 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   if (chkStableCut) chkStableCut.onchange = () => onSettingChange(true);
   // Công tắc chẩn đoán: bật/tắt phải có hiệu lực NGAY (không debounce).
   if (chkStableTrace) chkStableTrace.onchange = () => onSettingChange(true);
+  // Lookahead Video Buffering
+  if (chkEnableLookahead) chkEnableLookahead.onchange = () => {
+    if (isCapturingNow) {
+      chkEnableLookahead.checked = !chkEnableLookahead.checked;
+      return;
+    }
+    updateRangeLabels();
+    onSettingChange(true);
+  };
+  if (rangeLookaheadLeadTime) rangeLookaheadLeadTime.oninput = () => onSettingChange();
+  if (rangeLookaheadSync) rangeLookaheadSync.oninput = () => onSettingChange();
   [rangeStableMs, rangeStableMinSec, rangeStableMinWords].forEach((el) => {
     if (el) {
       el.oninput = () => {
@@ -1057,6 +1151,17 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   if (rangeMaxLines) rangeMaxLines.oninput = onSettingChange;
   // Tắt chạy chữ: áp dụng NGAY (không debounce) để thấy hiệu quả tức thì.
   if (chkTranslationOnce) chkTranslationOnce.onchange = () => onSettingChange(true);
+  if (chkShowOriginal) chkShowOriginal.onchange = () => onSettingChange(true);
+
+  if (showOriginalToggleRow && chkShowOriginal) {
+    showOriginalToggleRow.addEventListener("click", (e) => {
+      if (e.target.closest(".switch")) {
+        return;
+      }
+      chkShowOriginal.checked = !chkShowOriginal.checked;
+      chkShowOriginal.dispatchEvent(new Event("change"));
+    });
+  }
 
   function syncTtsConfig(enabled) {
     const payload = {
@@ -1076,12 +1181,18 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     fetchBackend("/api/tts/prewarm", { method: "POST" }).catch(() => { });
   }
 
+  function unloadTTS() {
+    syncTtsConfig(false);
+    fetchBackend("/api/tts/unload", { method: "POST" }).catch(() => { });
+  }
+
   if (chkEnableTts) {
     chkEnableTts.addEventListener("change", () => {
-      onSettingChange();
-      syncTtsConfig(chkEnableTts.checked);
+      onSettingChange(true);
       if (chkEnableTts.checked) {
         prewarmTTS();
+      } else {
+        unloadTTS();
       }
     });
   }
@@ -1126,6 +1237,20 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     }
     if (selVadEngine) {
       selVadEngine.disabled = active || isSwitchingEngine;
+    }
+    if (chkEnableLookahead) {
+      chkEnableLookahead.disabled = active;
+      const row = document.getElementById("lookaheadToggleRow");
+      if (row) {
+        row.style.opacity = active ? "0.6" : "1";
+        row.title = active ? "Không thể chuyển đổi Pipeline khi đang chạy session" : "";
+      }
+    }
+    if (rangeLookaheadLeadTime) {
+      rangeLookaheadLeadTime.disabled = active || !(chkEnableLookahead && chkEnableLookahead.checked);
+    }
+    if (lookaheadLeadTimeGroup && chkEnableLookahead) {
+      lookaheadLeadTimeGroup.style.opacity = (chkEnableLookahead.checked && !active) ? "1" : "0.5";
     }
     statusBadge.textContent = active ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
     statusBadge.className = active ? "badge badge-connected" : "badge badge-ready";

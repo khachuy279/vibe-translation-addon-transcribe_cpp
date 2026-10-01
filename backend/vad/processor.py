@@ -113,6 +113,23 @@ class VADStreamProcessor:
                 self._spawn_engine_load(self.vad_engine)
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def start_pad_ms(self) -> int:
+        """Mép đoạn nói được VAD báo SỚM hơn thực tế bao nhiêu ms.
+
+        Mỗi engine lùi mép đầu đoạn nói để lấy ngữ cảnh (`pad_start_frame` của FireRed,
+        `speech_pad_ms` của Silero, `lookback_time_start_point` của FSMN). Pipeline Lookahead
+        dùng con số này để phụ đề + lồng tiếng xuất hiện ĐÚNG lúc tiếng nói bắt đầu thay vì
+        sớm hơn. Trả 0 nếu engine chưa sẵn sàng/không khai báo.
+        """
+        engine = self._engine
+        if engine is None:
+            return 0
+        try:
+            return max(0, int(getattr(engine, "start_pad_ms", 0) or 0))
+        except Exception:  # noqa: BLE001
+            return 0
+
     @staticmethod
     def _normalize_silence(value: Optional[int]) -> Optional[int]:
         """0 hoặc None ⇒ `None` = để engine dùng đúng mặc định trong docs của nó."""

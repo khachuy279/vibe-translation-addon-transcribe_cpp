@@ -28,12 +28,26 @@
       ],
       "all_frames": true,
       "js": [
+        "content/buffer_interceptor_poc.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "js": [
         "lib/frame-builder.js",
         "lib/tts-player.js",
         "lib/ws-client.js",
         "lib/audio-capture.js",
         "lib/subtitle-policy.js",
         "lib/subtitle-renderer.js",
+        "lib/tts-timeline.js",
+        "lib/lookahead-timeline.js",
+        "lib/lookahead-client.js",
         "content/overlay-manager.js",
         "content/content-script.js"
       ],
@@ -57,7 +71,8 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "lib/audio-processor.js"
+        "lib/audio-processor.js",
+        "content/buffer_interceptor_poc.js"
       ],
       "matches": [
         "<all_urls>"

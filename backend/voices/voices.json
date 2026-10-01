@@ -1,8 +1,14 @@
 [
   {
     "id": "speaker_01_0039.wav",
-    "name": "speaker_01_0039.wav",
-    "audio": "backend/voices/speaker_01_0039.wav",
+    "name": "youtube book",
+    "audio": "speaker_01_0039.wav",
     "text": "Suốt quãng đời còn lại, bởi vì chúng ta không thể nào hợp lý hoá nó, mà cũng không thể nào thuyết phục được chính mình. Có một nhà văn đã từng nói: Vì chúng ta không chịu đi bước đầu tiên, nên ước mơ sẽ cứ mãi xa vời."
+  },
+  {
+    "id": "ElevenLabs_10s.wav",
+    "name": "ElevenLabs",
+    "audio": "ElevenLabs_10s.wav",
+    "text": "Trang cảm thấy một luồng hơi nóng chạy thẳng từ lồng ngực xuống tận đáy quần lót. Vùng kín của cô bắt đầu co bóp, rỉ ra từng đợt dịch nhờn ẩm ướt."
   }
 ]

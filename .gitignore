@@ -74,6 +74,8 @@ perf_report_summary.txt
 metrics_report.json
 # Bản đã đổi tên để so A/B (metrics_sched_ON.json / metrics_sched_OFF.json)
 metrics_sched_*.json
+backend/runtime_state.json
+runtime_state.json
 
 # 9. G2/G3 — bản dựng CUDA ASR & toolchain cục bộ
 # backend/bin/          : bundle native lúc chạy (transcribe.dll + ggml*.dll, gồm

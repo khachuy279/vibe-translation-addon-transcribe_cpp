@@ -46,6 +46,14 @@
       <span id="lblActiveModel" class="model-info-value" title="Mô hình ASR đang nạp trong VRAM">--</span>
     </div> -->
 
+    <!-- Trạng thái buffer Lookahead thay cho HUD nổi trên trang -->
+    <div class="setting-group">
+      <div class="lookahead-status" id="lookaheadStatus">
+        <span class="lookahead-status-dot" id="lookaheadStatusDot"></span>
+        <span id="lookaheadStatusText">Lookahead: chưa kiểm tra</span>
+      </div>
+    </div>
+    
     <!-- Main Settings Container -->
     <div class="settings">
 
@@ -64,6 +72,18 @@
           <option value="ko">Korean (ko)</option>
           <option value="ru">Russian (ru)</option>
         </select>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="showOriginalToggleRow">
+          <span class="toggle-label">
+            Hiện phụ đề gốc
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkShowOriginal" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
 
       <div class="setting-row">
@@ -128,6 +148,44 @@
           <span class="val-badge"><span id="valMinWords">3</span> words</span>
         </div>
         <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="3">
+      </div>
+
+      <!-- Section: Lookahead Video Buffering (0.0s Lag) -->
+      <div class="section-title">
+        <span>Lookahead Buffering (0.0s Lag)</span>
+      </div>
+
+      <div class="setting-group">
+        <div class="toggle-row" id="lookaheadToggleRow">
+          <span class="toggle-label">
+            Lookahead Video Buffering
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="chkEnableLookahead" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="setting-group" id="lookaheadLeadTimeGroup">
+        <div class="label-with-value">
+          <label>Thời gian dịch trước (Pre-buffer Ahead)</label>
+          <span class="val-badge"><span id="valLookaheadLeadTime">15</span> s</span>
+        </div>
+        <input type="range" id="rangeLookaheadLeadTime" min="10" max="15" step="1" value="15">
+        <div class="hint">Từ 10s đến 15s. Càng lớn càng dịch xa về trước nhưng chờ lâu hơn.</div>
+      </div>
+
+      <div class="setting-group" id="lookaheadSyncGroup">
+        <div class="label-with-value">
+          <label>Đồng bộ phụ đề / lồng tiếng</label>
+          <span class="val-badge"><span id="valLookaheadSync">0</span> ms</span>
+        </div>
+        <input type="range" id="rangeLookaheadSync" min="-600" max="600" step="50" value="0">
+        <div class="hint">
+          Phụ đề/TTS hiện SỚM hơn tiếng nói thì tăng (+); hiện MUỘN thì giảm (−).
+          Hệ thống đã tự bù phần VAD lùi mép câu, đây chỉ là tinh chỉnh.
+        </div>
       </div>
 
       <!-- Section: Translation -->
@@ -248,9 +306,9 @@
       <div class="setting-group" id="duckingSliderRow">
         <div class="label-with-value">
           <label>Original audio</label>
-          <span class="val-badge"><span id="valDuckingLevel">50</span>%</span>
+          <span class="val-badge"><span id="valDuckingLevel">25</span>%</span>
         </div>
-        <input type="range" id="rangeDuckingLevel" min="0" max="100" step="5" value="50">
+        <input type="range" id="rangeDuckingLevel" min="0" max="100" step="5" value="25">
       </div>
 
       <!-- Section: Subtitle Style -->

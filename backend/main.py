@@ -49,7 +49,7 @@ except ImportError:
 from backend.utils.cuda import setup_cuda_dll_paths
 setup_cuda_dll_paths()
 
-from backend.config import config, SUPPORTED_LANGUAGES
+from backend.config import config, SUPPORTED_LANGUAGES, load_runtime_state, save_runtime_state
 from backend.vad import SUPPORTED_VAD_ENGINES, VADProcessor
 from backend.asr.registry import ModelRegistry
 from backend.asr.engine import TranscribeEngine
@@ -60,6 +60,7 @@ from backend.translation import hotswap as translation_hotswap
 from backend.tts import VoiceManager, OmniVoiceTTS, get_tts_engine
 from backend.core.metrics import metrics_collector
 from backend.ws.handler import handle_ws
+from backend.ws.lookahead_handler import handle_lookahead_ws
 from backend.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -410,6 +411,11 @@ async def lifespan(app: FastAPI):
     _log_asr_backend_at_startup()
     _log_torch_status_at_startup()
 
+    # Khôi phục trạng thái TTS từ cấu hình popup đã lưu (nếu có)
+    saved_state = load_runtime_state()
+    if "tts_enabled" in saved_state:
+        config.tts.enabled = bool(saved_state["tts_enabled"])
+
     prewarm_jobs = [
         asyncio.to_thread(_prewarm_asr),
         asyncio.to_thread(_prewarm_translation),
@@ -418,6 +424,7 @@ async def lifespan(app: FastAPI):
     # QWEN-Q3: TTS trước đây KHÔNG có trong lifespan ⇒ câu lồng tiếng ĐẦU TIÊN phải trả
     # giá nạp vài GB trọng số. Chỉ prewarm khi người dùng thật sự bật TTS (không chiếm VRAM).
     if bool(getattr(config.tts, "enabled", False)):
+        logger.info("[STARTUP] Phát hiện TTS được bật trong popup/cấu hình => pre-warm OmniVoice TTS...", extra={"module_tag": "TTS"})
         prewarm_jobs.append(asyncio.to_thread(_prewarm_tts))
 
     results = await asyncio.gather(*prewarm_jobs, return_exceptions=True)
@@ -645,6 +652,7 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             "speed": config.tts.speed,
             "default_voice": config.tts.default_voice,
             "voices": VoiceManager.get_available_voices(),
+            "is_loaded": getattr(get_tts_engine(), "_is_loaded", False),
         },
     }
 
@@ -837,6 +845,12 @@ async def update_backend_config(req: SwitchModelRequest):
 
     if req.tts_enabled is not None:
         config.tts.enabled = req.tts_enabled
+        state_updates = {"tts_enabled": bool(req.tts_enabled)}
+        if req.tts_voice is not None:
+            state_updates["tts_voice"] = req.tts_voice
+        if req.tts_speed is not None:
+            state_updates["tts_speed"] = req.tts_speed
+        save_runtime_state(state_updates)
         if req.tts_enabled:
             track_background_task(get_tts_engine().prewarm(), name="tts_prewarm_post_config")
         else:
@@ -850,8 +864,10 @@ async def update_backend_config(req: SwitchModelRequest):
                 logger.debug(f"TTS unload khi tắt thất bại (bỏ qua): {exc}", extra={"module_tag": "MAIN"})
     if req.tts_voice is not None:
         config.tts.default_voice = req.tts_voice
+        save_runtime_state({"tts_voice": req.tts_voice})
     if req.tts_speed is not None:
         config.tts.speed = req.tts_speed
+        save_runtime_state({"tts_speed": req.tts_speed})
 
     # P1.10: đẩy các thay đổi vào phiên ĐANG CHẠY (trước đây REST chỉ đổi config toàn
     # cục, còn SessionState giữ snapshot cũ nên thay đổi không có hiệu lực).
@@ -961,7 +977,20 @@ async def prewarm_tts_endpoint():
     success = await get_tts_engine().prewarm()
     if success:
         config.tts.enabled = True
+        save_runtime_state({"tts_enabled": True})
     return {"status": "ok" if success else "error", "prewarmed": success}
+
+
+@app.post("/api/tts/unload")
+async def unload_tts_endpoint():
+    """Giải phóng mô hình TTS khỏi VRAM GPU."""
+    config.tts.enabled = False
+    save_runtime_state({"tts_enabled": False})
+    try:
+        await asyncio.to_thread(get_tts_engine().unload_model)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"TTS unload thất bại: {exc}", extra={"module_tag": "MAIN"})
+    return {"status": "ok", "unloaded": True}
 
 
 @app.get("/api/metrics")
@@ -998,6 +1027,12 @@ async def get_pipeline_metrics():
 async def websocket_endpoint(ws: WebSocket):
     """Endpoint kết nối WebSocket trực tiếp từ Firefox Extension."""
     await handle_ws(ws)
+
+
+@app.websocket("/ws/lookahead")
+async def websocket_lookahead_endpoint(ws: WebSocket):
+    """Endpoint kết nối WebSocket cho luồng Lookahead Video Buffering (Phase 3)."""
+    await handle_lookahead_ws(ws)
 
 
 def main():

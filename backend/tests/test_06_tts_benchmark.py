@@ -80,11 +80,16 @@ def test_audio_processor():
     norm = AudioProcessor.normalize_audio(res, volume=0.8, target_peak=0.95)
     assert np.max(np.abs(norm)) <= 0.95 + 1e-4, "normalize_audio vượt trần peak!"
 
-    # 3. Test apply_time_stretch
+    # 3. Test trim_silence
+    silence_padded = np.concatenate([np.zeros(2400, dtype=np.float32), norm, np.zeros(2400, dtype=np.float32)])
+    trimmed = AudioProcessor.trim_silence(silence_padded, sample_rate=24000)
+    assert len(trimmed) < len(silence_padded), "trim_silence không loại bỏ khoảng lặng thừa!"
+
+    # 4. Test apply_time_stretch (WSOLA)
     stretched = AudioProcessor.apply_time_stretch(norm, speed=1.5, sample_rate=24000)
     assert len(stretched) < len(norm), "apply_time_stretch 1.5x không làm ngắn audio!"
 
-    # 4. Test encode_wav_to_base64
+    # 5. Test encode_wav_to_base64
     b64 = AudioProcessor.encode_wav_to_base64(norm, sample_rate=24000)
     assert len(b64) > 1000, "encode_wav_to_base64 sinh ra chuỗi quá ngắn!"
     print("✅ AudioProcessor: Toàn bộ kiểm thử xử lý tín hiệu âm thanh thành công!")

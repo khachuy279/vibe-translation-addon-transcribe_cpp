@@ -12,6 +12,7 @@ Quy tắc mới:
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 from backend.config import config
@@ -200,7 +201,11 @@ def test_extension_reads_only_canonical_fields():
     for path in files:
         src = path.read_text(encoding="utf-8")
         for token in forbidden:
-            assert token not in src, f"{path.name} còn đọc alias '{token}'"
+            # Khớp CHÍNH XÁC tên trường, không khớp tiền tố: `payload.original_text` là
+            # tên chuẩn snake_case (dùng cho Lookahead) nên KHÔNG được coi là alias
+            # `payload.original`. Lookahead bất kỳ ký tự định danh nào ngay sau token.
+            pattern = re.compile(rf"{re.escape(token)}(?![A-Za-z0-9_])")
+            assert not pattern.search(src), f"{path.name} còn đọc alias '{token}'"
 
 
 def test_extension_manifest_is_production_one():

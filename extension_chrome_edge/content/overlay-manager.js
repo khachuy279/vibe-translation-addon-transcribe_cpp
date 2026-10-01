@@ -24,6 +24,11 @@ class OverlayManager {
     // QWEN-E1: đối tượng mà `_resizeObserver` hiện đang theo dõi (null nếu chưa dựng).
     this._roVideo = null;
     this._roHost = null;
+
+    // Lookahead Buffering Overlay
+    this.bufferingOverlay = null;
+    this.bufferingText = null;
+    this._origVideoFilter = null;
   }
 
   // ── Lifecycle ────────────────────────────────────────────
@@ -43,6 +48,42 @@ class OverlayManager {
     this.host.id = "bs-overlay-host";
     this.host.style.cssText = "position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2147483647; overflow: hidden;";
     this.shadow = this.host.attachShadow({ mode: "open" });
+
+    // Buffering overlay layer (covers entire video with backdrop blur & modern loading card)
+    this.bufferingOverlay = document.createElement("div");
+    this.bufferingOverlay.className = "bs-buffering-overlay";
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "bs-buffering-backdrop";
+    this.bufferingOverlay.appendChild(backdrop);
+
+    const card = document.createElement("div");
+    card.className = "bs-buffering-card";
+
+    const loader = document.createElement("div");
+    loader.className = "bs-buffering-loader";
+
+    const ringOuter = document.createElement("div");
+    ringOuter.className = "bs-loader-ring bs-ring-outer";
+    loader.appendChild(ringOuter);
+
+    const ringInner = document.createElement("div");
+    ringInner.className = "bs-loader-ring bs-ring-inner";
+    loader.appendChild(ringInner);
+
+    const core = document.createElement("div");
+    core.className = "bs-loader-core";
+    loader.appendChild(core);
+
+    card.appendChild(loader);
+
+    this.bufferingText = document.createElement("div");
+    this.bufferingText.className = "bs-buffering-text";
+    this.bufferingText.textContent = "Đang nạp đệm và dịch trước...";
+    card.appendChild(this.bufferingText);
+
+    this.bufferingOverlay.appendChild(card);
+    this.shadow.appendChild(this.bufferingOverlay);
 
     // Container inside shadow DOM
     this.container = document.createElement("div");
@@ -99,6 +140,12 @@ class OverlayManager {
 
   attachToVideo(video) {
     const sameTarget = !!video && video === this.targetVideo;
+    if (!sameTarget && this.targetVideo && this._origVideoFilter !== null && this._origVideoFilter !== undefined) {
+      try {
+        this.targetVideo.style.filter = this._origVideoFilter;
+      } catch (e) {}
+      this._origVideoFilter = null;
+    }
     this.targetVideo = video;
     if (this.isActive && this.host) {
       // QWEN-E1: đây là đường chạy trên MỖI SỰ KIỆN PHỤ ĐỀ (~3–7 lần/giây), không phải
@@ -343,6 +390,11 @@ class OverlayManager {
   destroy() {
     if (!this.isActive) return;
 
+    this.hideBuffering();
+    this.bufferingOverlay = null;
+    this.bufferingText = null;
+    this._origVideoFilter = null;
+
     document.removeEventListener("fullscreenchange", this._onFullscreenChange);
     document.removeEventListener("webkitfullscreenchange", this._onFullscreenChange);
     document.removeEventListener("mozfullscreenchange", this._onFullscreenChange);
@@ -387,6 +439,9 @@ class OverlayManager {
     }
 
     if (this.container) {
+      if (settings.showOriginalSubtitles !== undefined) {
+        this.container.classList.toggle("bs-hide-original", !settings.showOriginalSubtitles);
+      }
       if (settings.subPosY !== undefined && settings.subPosY !== null) {
         this.subPosY = settings.subPosY;
         this.container.style.setProperty("--bs-sub-bottom", `${settings.subPosY}%`);
@@ -458,10 +513,190 @@ class OverlayManager {
     }
   }
 
+  showBuffering(message) {
+    if (!this.bufferingOverlay) return;
+    if (this.bufferingText && message) {
+      this.bufferingText.textContent = message;
+    }
+    this.bufferingOverlay.classList.add("bs-active");
+    if (this.targetVideo) {
+      try {
+        if (this._origVideoFilter === null) {
+          this._origVideoFilter = this.targetVideo.style.filter || "";
+        }
+        this.targetVideo.style.transition = "filter 0.35s ease";
+        this.targetVideo.style.filter = "blur(6px)";
+      } catch (e) {}
+    }
+  }
+
+  hideBuffering() {
+    if (this.bufferingOverlay) {
+      this.bufferingOverlay.classList.remove("bs-active");
+    }
+    if (this.targetVideo) {
+      try {
+        if (this._origVideoFilter !== null && this._origVideoFilter !== undefined) {
+          this.targetVideo.style.filter = this._origVideoFilter;
+          this._origVideoFilter = null;
+        }
+      } catch (e) {}
+    }
+  }
+
   // ── Styles ────────────────────────────────────────────────
 
   _getStyles() {
     return `
+      /* ── Buffering & Lookahead Overlay ─────────────────── */
+      .bs-buffering-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none !important;
+        user-select: none !important;
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1), visibility 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+        z-index: 100;
+        box-sizing: border-box;
+      }
+
+      .bs-buffering-overlay.bs-active {
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .bs-buffering-backdrop {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: radial-gradient(circle at center, rgba(15, 23, 42, 0.52) 0%, rgba(5, 10, 20, 0.8) 100%);
+        backdrop-filter: blur(8px) saturate(120%);
+        -webkit-backdrop-filter: blur(8px) saturate(120%);
+        pointer-events: none !important;
+      }
+
+      .bs-buffering-card {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        padding: clamp(16px, 2.5vmin, 26px) clamp(22px, 3.5vmin, 38px);
+        min-width: 200px;
+        max-width: min(85%, 440px);
+        background: rgba(15, 23, 42, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.65), 
+                    0 0 24px rgba(56, 189, 248, 0.16),
+                    inset 0 1px 1px rgba(255, 255, 255, 0.18);
+        border-radius: 18px;
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        transform: scale(0.92);
+        transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+        pointer-events: none !important;
+        box-sizing: border-box;
+      }
+
+      .bs-buffering-overlay.bs-active .bs-buffering-card {
+        transform: scale(1);
+      }
+
+      .bs-buffering-loader {
+        position: relative;
+        width: 50px;
+        height: 50px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .bs-loader-ring {
+        position: absolute;
+        border-radius: 50%;
+        box-sizing: border-box;
+      }
+
+      /* Outer glowing ring: cyan to electric indigo */
+      .bs-ring-outer {
+        width: 50px;
+        height: 50px;
+        border: 3px solid transparent;
+        border-top-color: #38bdf8;
+        border-right-color: #818cf8;
+        animation: bs-spin-cw 1.1s cubic-bezier(0.5, 0.1, 0.5, 0.9) infinite;
+        filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.6));
+      }
+
+      /* Inner counter-rotating ring: violet to sky */
+      .bs-ring-inner {
+        width: 32px;
+        height: 32px;
+        border: 2.5px solid transparent;
+        border-bottom-color: #c084fc;
+        border-left-color: #38bdf8;
+        animation: bs-spin-ccw 0.85s cubic-bezier(0.5, 0.1, 0.5, 0.9) infinite;
+        filter: drop-shadow(0 0 5px rgba(192, 132, 252, 0.5));
+      }
+
+      /* Pulsing core dot */
+      .bs-loader-core {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: radial-gradient(circle, #ffffff 15%, #38bdf8 65%, #6366f1 100%);
+        animation: bs-core-pulse 1.6s ease-in-out infinite;
+      }
+
+      .bs-buffering-text {
+        font-family: var(--bs-font-family, "Noto Sans", "Inter", "Segoe UI", Arial, sans-serif);
+        font-size: clamp(13px, 1.8vmin, 17px);
+        font-weight: 500;
+        color: #f8fafc;
+        letter-spacing: 0.3px;
+        text-align: center;
+        line-height: 1.4;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+      }
+
+      @keyframes bs-spin-cw {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+
+      @keyframes bs-spin-ccw {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(-360deg); }
+      }
+
+      @keyframes bs-core-pulse {
+        0%, 100% {
+          transform: scale(0.85);
+          opacity: 0.7;
+          box-shadow: 0 0 8px rgba(56, 189, 248, 0.6);
+        }
+        50% {
+          transform: scale(1.25);
+          opacity: 1;
+          box-shadow: 0 0 16px rgba(129, 140, 248, 0.9);
+        }
+      }
+
       .bs-overlay {
         --bs-orig-size: 14px;
         --bs-trans-size: 22px;
@@ -542,6 +777,20 @@ class OverlayManager {
         font-weight: var(--bs-font-weight);
         color: #ffd866;
         text-shadow: 0 0 6px #000, 0 0 6px #000, 0 2px 4px #000;
+      }
+
+      /* Ẩn phụ đề gốc khi người dùng tắt công tắc */
+      .bs-hide-original .bs-original,
+      .bs-content-area.bs-hide-original .bs-original {
+        display: none !important;
+      }
+      .bs-hide-original .bs-live-layer,
+      .bs-content-area.bs-hide-original .bs-live-layer {
+        display: none !important;
+      }
+      .bs-content-area.bs-hide-original .bs-focus-layer,
+      .bs-hide-original .bs-focus-layer {
+        min-height: calc(var(--bs-trans-size) + 4px);
       }
 
       /* Layer 3: Liveview đang nhận diện & chờ dịch (Dưới cùng, cố định chiều cao) */
