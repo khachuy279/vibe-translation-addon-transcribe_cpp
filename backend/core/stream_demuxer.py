@@ -23,6 +23,7 @@ Mốc thời gian trả về tuân theo đúng đặc tả MSE:
 
 from __future__ import annotations
 
+import bisect
 import io
 import threading
 import time
@@ -130,8 +131,12 @@ def scan_webm_boundaries(buf: bytes) -> List[int]:
     return out
 
 
-def scan_mp4_boundaries(buf: bytes) -> List[int]:
-    """Trả về offset (byte) của các box `moof` (đầu mỗi fragment fMP4)."""
+def scan_mp4_boundaries(buf: bytes, base: int = 0) -> List[int]:
+    """Trả về offset (byte) của các box `moof` (đầu mỗi fragment fMP4).
+
+    `base`: cộng thêm vào mọi offset trả về — cho phép quét một LÁT của bộ đệm lớn mà vẫn
+    nhận được offset tuyệt đối (dùng để bắt đầu quét từ mảnh đang cần).
+    """
     out: List[int] = []
     pos = 0
     n = len(buf)
@@ -151,9 +156,119 @@ def scan_mp4_boundaries(buf: bytes) -> List[int]:
         if size < header:
             break
         if box_type == b"moof":
-            out.append(pos)
+            out.append(pos + base)
         pos += size
     return out
+
+
+def scan_mp4_track_at(buf: bytes, moof_off: int) -> Optional[Tuple[float, int]]:
+    """(baseMediaDecodeTime, track_id) của RIÊNG `moof` tại `moof_off`. None nếu không đọc được."""
+    size = int.from_bytes(buf[moof_off:moof_off + 4], "big")
+    if size < 8:
+        return None
+    traf = _find_box(buf, moof_off + 8, size - 8, b"traf")
+    if traf is None:
+        return None
+    tstart, tsize = traf
+    decode_time = 0.0
+    tfdt = _find_box(buf, tstart, tsize, b"tfdt")
+    if tfdt is not None:
+        dstart, dsize = tfdt
+        if dsize >= 12:
+            decode_time = float(int.from_bytes(buf[dstart + 4:dstart + 12], "big"))
+    track_id = 0
+    tfhd = _find_box(buf, tstart, tsize, b"tfhd")
+    if tfhd is not None:
+        hstart, hsize = tfhd
+        if hsize >= 8:
+            flags = int.from_bytes(buf[hstart + 1:hstart + 4], "big")
+            p = hstart + 4
+            if flags & 0x000001:   # base-data-offset-present
+                p += 8
+            if p + 4 <= hstart + hsize:
+                track_id = int.from_bytes(buf[p:p + 4], "big")
+    return decode_time, track_id
+
+
+def scan_mp4_fragment_times(buf: bytes, limit: int = 100000) -> List[Tuple[float, int]]:
+    """(baseMediaDecodeTime THEO TIMESCALE CỦA TRACK, track_id) của từng `moof` trong `buf`.
+
+    Đây là cách DUY NHẤT đo được "dòng fragment fMP4 nhận được có liền mạch không": mỗi
+    `moof` mang `tfdt.baseMediaDecodeTime` (mốc media) và `tfhd.track_ID`. Nếu hai mốc liên
+    tiếp của CÙNG track cách nhau vài chục giây thì **mảnh của khoảng đó chưa bao giờ được
+    append** — tức audio mất ở phía nguồn, khác hẳn với mất do logic giải mã.
+
+    Giá trị trả về CHƯA đổi sang giây (timescale lấy từ track, xem
+    `_mp4_fragment_chain_report`).
+    """
+    out: List[Tuple[float, int]] = []
+    for off in scan_mp4_boundaries(buf)[:limit]:
+        pos = off + 8
+        traf = _find_box(buf, pos, int.from_bytes(buf[off:off + 4], "big") - 8, b"traf")
+        if traf is None:
+            continue
+        tstart, tsize = traf
+        tfdt = _find_box(buf, tstart, tsize, b"tfdt")
+        tfhd = _find_box(buf, tstart, tsize, b"tfhd")
+        decode_time = 0.0
+        if tfdt is not None:
+            # `_find_box` trả offset NGAY SAU header box ⇒ `dstart` là byte version/flags.
+            dstart, dsize = tfdt
+            if dsize >= 12:
+                decode_time = float(int.from_bytes(buf[dstart + 4:dstart + 12], "big"))
+        track_id = 0
+        if tfhd is not None:
+            # `tfhd`: [version(1)][flags(3)][track_ID(4)]... ⇒ track_ID ở `hstart + 4`.
+            hstart, hsize = tfhd
+            if hsize >= 8:
+                flags = int.from_bytes(buf[hstart + 1:hstart + 4], "big")
+                p = hstart + 4
+                if flags & 0x000001:   # base-data-offset-present
+                    p += 8
+                if p + 4 <= hstart + hsize:
+                    track_id = int.from_bytes(buf[p:p + 4], "big")
+        out.append((decode_time, track_id))
+    return out
+
+
+def _iter_adts_frames(buf: bytes) -> List[bytes]:
+    """Tách các frame ADTS (`0xFFF`) khỏi payload AAC thô. Bỏ qua byte rác giữa các frame."""
+    out: List[bytes] = []
+    i = 0
+    n = len(buf)
+    while i + 7 <= n:
+        if buf[i] != 0xFF or (buf[i + 1] & 0xF0) != 0xF0:
+            i += 1
+            continue
+        frame_len = ((buf[i + 3] & 0x03) << 11) | (buf[i + 4] << 3) | ((buf[i + 5] & 0xE0) >> 5)
+        if frame_len < 7 or i + frame_len > n:
+            i += 1
+            continue
+        out.append(buf[i:i + frame_len])
+        i += frame_len
+    return out
+
+
+def _find_box(buf: bytes, start: int, size: int, want: bytes) -> Optional[Tuple[int, int]]:
+    pos = start
+    end = min(len(buf), start + size)
+    while pos + 8 <= end:
+        bsize = int.from_bytes(buf[pos:pos + 4], "big")
+        btype = buf[pos + 4:pos + 8]
+        header = 8
+        if bsize == 1:
+            if pos + 16 > end:
+                return None
+            bsize = int.from_bytes(buf[pos + 8:pos + 16], "big")
+            header = 16
+        elif bsize == 0:
+            bsize = end - pos
+        if bsize < header:
+            return None
+        if btype == want:
+            return pos + header, bsize - header
+        pos += bsize
+    return None
 
 
 def detect_container(data: bytes) -> str:
@@ -235,6 +350,24 @@ class StreamDemuxer:
         self.decode_time_sec: float = 0.0
         self.init_bytes: int = 0
         self._seek_fallbacks: int = 0
+        #: Chẩn đoán mất audio (2026-10-01): `emitted_sec` = tổng audio ĐÃ PHÁT ra PCM;
+        #: `frames_skipped` = frame bị lọc vì cũ hơn mốc đã phát; `gaps_in_media` = số khe hở
+        #: thật giữa hai frame trong dữ liệu nhận được (dấu hiệu mảnh bị cắt/mất).
+        self._emitted_sec: float = 0.0
+        self._frames_skipped: int = 0
+        self._gaps_in_media: int = 0
+        #: `tfdt.baseMediaDecodeTime` của fragment ĐẦU TIÊN (mốc media của mẫu đầu bộ đệm) và
+        #: số lần phải dùng đường dự phòng bóc AAC thô.
+        self._first_audio_tfdt: Optional[float] = None
+        self._raw_fallback_used: int = 0
+        self._raw_fallback_rejected: int = 0
+        self._frag_decode_used: int = 0
+        #: Cache [(tfdt, track_id)] của fragment audio + sample rate (tránh quét lại mỗi lượt).
+        self._frag_times_cache: Optional[List[Tuple[float, int]]] = None
+        self._frag_times_key: int = -1
+        self._cached_sample_rate: int = 0
+        self._offsets_cache: List[int] = []
+        self._offsets_key: int = -1
 
     # ------------------------------------------------------------------ quản trị
     @property
@@ -325,6 +458,14 @@ class StreamDemuxer:
             container = detect_container(raw_bytes)
             if self._container == "unknown" and container != "unknown":
                 self._container = container
+            # Ghi mốc media của fragment ĐẦU TIÊN (dùng làm neo cho đường dự phòng AAC thô).
+            if self._first_audio_tfdt is None and container == "mp4":
+                try:
+                    times = scan_mp4_fragment_times(raw_bytes, limit=4)
+                    if times:
+                        self._first_audio_tfdt = float(times[0][0])
+                except Exception:  # noqa: BLE001
+                    pass
 
             # Định dạng TỰ CHỨA (WAV/MP3/…): không ghép vào bộ đệm byte — mỗi mảnh là một
             # file hoàn chỉnh, ghép lại sẽ hỏng header. Giải mã độc lập.
@@ -359,26 +500,42 @@ class StreamDemuxer:
 
     # ------------------------------------------------------------------ nội bộ
     def _trim(self) -> None:
-        """Giữ bộ đệm byte trong trần RAM, cắt theo ĐÚNG ranh giới cluster/fragment."""
+        """Giữ bộ đệm byte trong trần RAM, cắt theo ĐÚNG ranh giới cluster/fragment.
+
+        ⚠️ TUYỆT ĐỐI không cắt thô giữa cấu trúc: một lần cắt sai làm `scan_*_boundaries`
+        không tìm thấy ranh giới nào nữa ⇒ CẢ HAI đường giải mã đều chết vĩnh viễn (đo thật
+        2026-10-01: bộ đệm 8 MB, `n_moof=0`, `frames=0`, `emitted` đứng yên). Thà giữ bộ đệm
+        lớn hơn trần một chút còn hơn làm hỏng luồng byte.
+        """
         if len(self._media) <= self.max_media_bytes:
             return
+        # Giữ 3/4 trần: cắt bớt một lần rồi thôi, không cắt lại ở mọi mảnh.
+        target = int(self.max_media_bytes * 0.75)
         snapshot = bytes(self._media)
         bounds = (
             scan_mp4_boundaries(snapshot)
             if self._container == "mp4"
             else scan_webm_boundaries(snapshot)
         )
-        if len(bounds) <= self.keep_boundaries:
-            # Không đủ ranh giới để cắt an toàn (mảnh quá lớn / container lạ): cắt thô
-            # phần đầu và buộc giải mã lại từ mốc mới.
-            cut = len(self._media) - self.max_media_bytes // 2
-            if cut > 0:
-                del self._media[:cut]
-                self._last_pts = float("-inf")
+        # Chỉ cắt tại ranh giới thật và phải chừa lại ít nhất một ranh giới trong bộ đệm.
+        usable = [b for b in bounds if b <= len(self._media) - target]
+        if not usable:
+            # Không có ranh giới an toàn ⇒ GIỮ NGUYÊN (chỉ cảnh báo), vì cắt thô sẽ phá luồng.
+            logger.warning(
+                f"Bộ đệm ghép nối {len(self._media)}B vượt trần nhưng không tìm được ranh "
+                f"giới cluster/fragment an toàn — giữ nguyên thay vì cắt hỏng luồng byte.",
+                extra={"module_tag": "WS"},
+            )
             return
-        cut = bounds[len(bounds) - self.keep_boundaries]
-        if cut > 0:
-            del self._media[:cut]
+        cut = usable[-1]
+        if cut <= 0:
+            return
+        del self._media[:cut]
+        # Mọi offset/mốc đã cache theo độ dài bộ đệm đều không còn hợp lệ.
+        self._offsets_cache = []
+        self._offsets_key = -1
+        self._frag_times_cache = None
+        self._frag_times_key = -1
 
     def _decode_standalone(self, raw_bytes: bytes, ts_offset: float) -> List[StreamAudioChunk]:
         """Giải mã một mảnh TỰ CHỨA (WAV/MP3/…): PTS = container_pts + timestampOffset."""
@@ -438,7 +595,22 @@ class StreamDemuxer:
         return chunks
 
     def _decode_new(self) -> List[StreamAudioChunk]:
-        """Giải mã `init + media` và chỉ trả các frame mới hơn `self._last_pts`."""
+        """Giải mã `init + media` và chỉ trả các frame MỚI hơn phần đã phát ra PCM.
+
+        Ba quy tắc chống-mất-audio (đúc kết từ log thật 2026-10-01, khi mỗi lượt giải mã
+        chỉ thu được ~4,1 s trong khi ~20 s audio đã về ⇒ phụ đề chỉ hiện 1/3-5 câu):
+
+        1. **Mọi phép so mốc đều trên CÙNG một trục thời gian** = `container_pts + bias`.
+           `self._last_pts` là mốc đã PHÁT (đã cộng `bias`). Seek mà trừ `bias` còn filter
+           thì không là tự tạo khoảng lệch đúng bằng `timestampOffset` của SourceBuffer —
+           với trang có offset lớn, mọi frame mới đều bị coi là "cũ" và bị bỏ.
+        2. **`_last_pts` chỉ tiến khi PCM THỰC SỰ được phát ra.** Trước đây nó tiến theo
+           `run_end` của MỌI frame (kể cả frame mà resampler chưa nhả mẫu nào) ⇒ mốc tiến
+           vượt phần audio đã có, và vì lượt sau lọc `pts < _last_pts`, phần bị vượt đó bị
+           bỏ VĨNH VIỄN.
+        3. **Cắt phần chồng lấn ở mép frame** để mốc chỉ tiến đúng số mẫu đã phát (không
+           phát lặp 20 ms mỗi lượt).
+        """
         t0 = time.perf_counter()
         payload = self._init + bytes(self._media)
         chunks: List[StreamAudioChunk] = []
@@ -456,71 +628,104 @@ class StreamDemuxer:
             time_base = stream.time_base
             if time_base is None:
                 return []
+            tb = float(time_base)
+            #: Mọi mốc dưới đây nằm trên trục "giây media" = `container_pts + timestampOffset`
+            #: (đúng đặc tả MSE). `container_pts` MỘT MÌNH chỉ đúng khi `timestampOffset = 0`
+            #: (YouTube); với SourceBuffer có offset, trộn hai trục sẽ tạo khoảng lệch đúng
+            #: bằng offset ⇒ mọi frame mới bị coi là cũ và bị bỏ.
+            bias = float(self._latest_ts_offset)
+            frontier = self._last_pts
 
-            if self._last_pts > float("-inf"):
-                back = max(0.0, self._last_pts - _SEEK_BACKOFF_SEC)
+            if frontier > float("-inf"):
+                # `frontier` nằm trên trục media (đã cộng bias) còn `container.seek()` nhận
+                # mốc trên trục CONTAINER ⇒ phải trừ bias, nếu không sẽ seek vượt cuối
+                # container (trang neo segment bằng `timestampOffset` lớn) và mất gần hết audio.
+                back = max(0.0, frontier - bias - _SEEK_BACKOFF_SEC)
                 try:
-                    container.seek(int(back / float(time_base)), backward=True, stream=stream)
+                    container.seek(int(back / tb), backward=True, stream=stream)
                 except Exception:  # noqa: BLE001
                     self._seek_fallbacks += 1
 
             resampler = av.AudioResampler(
                 format="flt", layout="mono", rate=self.target_sample_rate
             )
-            bias = self._latest_ts_offset
             prev_pts: Optional[float] = None
             run_pts: Optional[float] = None
             run_end: Optional[float] = None
             run_frames: List[np.ndarray] = []
+            #: Mốc ĐÃ PHÁT cuối cùng (trong lượt này hoặc lượt trước). Mọi phép cắt chồng lấn
+            #: phải so với mốc này, KHÔNG so với `self._last_pts` — `_last_pts` được cập nhật
+            #: ngay khi flush nên nếu dùng nó để cắt thì chunk vừa tạo sẽ bị cắt mất toàn bộ.
+            final_pts = float(self._last_pts) if self._last_pts > float("-inf") else None
+            stats = {"emitted": 0.0}
 
             def flush_run() -> None:
-                if run_frames and run_pts is not None:
-                    pcm = np.concatenate(run_frames) if len(run_frames) > 1 else run_frames[0]
-                    if pcm.size > 0:
-                        # `pts_end` suy ra từ ĐỘ DÀI PCM thực để chunk luôn tự nhất quán
-                        # (timeline phía sau đối chiếu số mẫu, không tin `frame.samples`).
-                        end = run_pts + float(pcm.size) / float(self.target_sample_rate)
-                        chunks.append(
-                            StreamAudioChunk(
-                                pts_start=run_pts + bias,
-                                pts_end=end + bias,
-                                duration=end - run_pts,
-                                pcm=pcm,
-                            )
-                        )
+                """Chốt đoạn đã gom: cắt chồng lấn mép đầu rồi phát ra PCM."""
+                nonlocal run_frames, final_pts
+                if not run_frames or run_pts is None:
+                    return
+                pcm = np.concatenate(run_frames) if len(run_frames) > 1 else run_frames[0]
+                start = run_pts
+                if final_pts is not None and start < final_pts:
+                    trim = int(round((final_pts - start) * self.target_sample_rate))
+                    if trim >= pcm.size:
+                        return
+                    if trim > 0:
+                        pcm = pcm[trim:]
+                        start = final_pts
+                if pcm.size <= 0:
+                    return
+                # `pts_end` suy từ ĐỘ DÀI PCM thực để chunk luôn tự nhất quán (timeline phía
+                # sau đối chiếu số mẫu, không tin `frame.samples`).
+                end = start + float(pcm.size) / float(self.target_sample_rate)
+                chunks.append(
+                    StreamAudioChunk(
+                        pts_start=start,
+                        pts_end=end,
+                        duration=end - start,
+                        pcm=np.ascontiguousarray(pcm),
+                    )
+                )
+                self._last_pts = max(self._last_pts, end)
+                self._emitted_sec += end - start
+                stats["emitted"] += end - start
+                final_pts = end
 
             for frame in container.decode(stream):
                 if frame.pts is None:
                     continue
-                pts = float(frame.pts) * float(time_base)
+                # `+ bias` đưa frame về ĐÚNG trục thời gian mà `_last_pts` đang dùng.
+                pts_media = float(frame.pts) * tb + bias
                 # `_last_pts` là mốc KẾT THÚC (exclusive) của audio đã phát. Frame bắt đầu
                 # ĐÚNG tại mốc đó là frame MỚI ⇒ phải dùng `<` chứ không phải `<=`, nếu
                 # không sẽ bỏ sót đúng một nửa số frame (đã đo: WebM 32 KB/mảnh chỉ thu
                 # được ~50% audio vì lý do này).
-                if pts < self._last_pts - 1e-6:
+                if pts_media < self._last_pts - 1e-6:
+                    self._frames_skipped += 1
                     continue
 
                 # Độ dài frame suy từ CHÍNH frame đầu vào (PTS kế tiếp - PTS hiện tại),
                 # KHÔNG suy từ số mẫu PCM ra của resampler: resampler có bộ đệm nội bộ nên
-                # vài frame đầu trả về RỖNG. Nếu lấy PCM làm thước đo thì mốc tiến độ sẽ
-                # đứng yên rồi nhảy, tạo "khe hở giả" và làm mất audio ở lượt sau.
+                # vài frame đầu trả về RỖNG.
                 rate = float(getattr(frame, "sample_rate", 0) or 0)
                 if rate > 0 and frame.samples:
                     frame_dur = float(frame.samples) / rate
                 elif prev_pts is not None:
-                    frame_dur = max(0.001, pts - prev_pts)
+                    frame_dur = max(0.001, pts_media - prev_pts)
                 else:
                     frame_dur = 0.02
-                prev_pts = pts
+                prev_pts = pts_media
 
-                if run_end is not None and abs(pts - run_end) > 0.02:
+                if run_end is not None and abs(pts_media - run_end) > 0.02:
                     # Khe hở thật trong dữ liệu ⇒ tách thành 2 đoạn rời.
                     flush_run()
                     run_frames = []
                     run_pts = None
                     run_end = None
+                    self._gaps_in_media += 1
                 if run_pts is None:
-                    run_pts = pts
+                    # Điểm bắt đầu của đoạn = mép frame, KHÔNG được sớm hơn mốc đã phát.
+                    run_pts = pts_media if final_pts is None else max(pts_media, final_pts)
 
                 for resampled in resampler.resample(frame):
                     arr = resampled.to_ndarray()
@@ -530,14 +735,10 @@ class StreamDemuxer:
                     if arr.size:
                         run_frames.append(arr.copy())
 
-                run_end = pts + frame_dur
-                # Cập nhật tiến độ NGAY để nếu lỗi giữa chừng thì lần sau không phát lại.
-                self._last_pts = max(self._last_pts, run_end)
+                run_end = pts_media + frame_dur
 
-            # Xả nốt phần mẫu còn lại trong resampler. Nếu bỏ bước này, mỗi lượt giải mã
-            # mất ~1 frame (20 ms) ở mép cuối ⇒ dòng PCM bị "răng cưa" và phải bù silence
-            # liên tục. Các mẫu này thuộc frame cuối (đã tính vào `run_end`) nên lượt sau
-            # (seek lùi 0.5 s) sẽ không phát lại chúng (frame đó có pts < `_last_pts`).
+            # Xả nốt phần mẫu còn lại trong resampler (nếu bỏ bước này, mỗi lượt mất ~1 frame
+            # ở mép cuối ⇒ dòng PCM bị "răng cưa" và phải bù silence liên tục).
             try:
                 for resampled in resampler.resample(None):
                     arr = resampled.to_ndarray()
@@ -560,10 +761,534 @@ class StreamDemuxer:
         elapsed = time.perf_counter() - t0
         self.decode_time_sec += elapsed
         self.decoded_seconds += sum(c.duration for c in chunks)
+
+        # ── DỰ PHÒNG fMP4: giải mã TỪNG fragment độc lập ───────────────────────────
+        # Đường chuẩn nối mọi mảnh thành MỘT container; nếu có một `moof` hỏng/không khớp,
+        # PyAV dừng ở đó và phần sau KHÔNG BAO GIỜ được đọc (triệu chứng thật: bộ đệm đặc
+        # `duration/span=1.00`, `skipped_frames=0` mà mỗi lượt chỉ ra 1,5–8 s PCM). Giải mã
+        # riêng từng cặp `moof`+`mdat` (ghép với init) thì một mảnh hỏng chỉ mất chính nó.
+        last_tfdt = self._last_audio_tfdt_sec()
+        if self._container == "mp4" and self._init and not (
+            last_tfdt > float("-inf") and self._last_pts >= last_tfdt - 2.0
+        ):
+            per_frag = self._decode_fragments_individually()
+            if per_frag:
+                self._frag_decode_used += 1
+                if self._frag_decode_used == 1:
+                    logger.warning(
+                        f"Đường giải mã nối-liền không ra PCM — đã chuyển sang giải mã TỪNG "
+                        f"fragment ({sum(c.duration for c in per_frag):.1f}s).",
+                        extra={"module_tag": "WS"},
+                    )
+                self.decoded_seconds += sum(c.duration for c in per_frag)
+                self._emitted_sec += sum(c.duration for c in per_frag)
+                self._last_pts = max(self._last_pts, per_frag[-1].pts_end)
+                return per_frag
+
+        # ── DỰ PHÒNG fMP4/AAC ─────────────────────────────────────────────────────
+        # Nếu đường chuẩn không lấy ra được gì trong khi bộ đệm ĐÃ có byte media, thử bóc
+        # thẳng frame AAC từ `mdat`. Chỉ chạy khi thực sự cần nên không tốn CPU lúc bình thường.
+        if not chunks and len(self._media) > 64 * 1024 and self._container == "mp4":
+            fallback = self._decode_raw_aac()
+            if fallback:
+                self._raw_fallback_used += 1
+                self.decoded_seconds += sum(c.duration for c in fallback)
+                self._last_pts = max(self._last_pts, fallback[-1].pts_end)
+                self._emitted_sec += sum(c.duration for c in fallback)
+                if self._raw_fallback_used == 1:
+                    logger.warning(
+                        f"Đường giải mã chuẩn không ra PCM — đã chuyển sang bóc frame AAC thô "
+                        f"từ mdat ({sum(c.duration for c in fallback):.1f}s).",
+                        extra={"module_tag": "WS"},
+                    )
+                return fallback
         return chunks
+
+    def _mp4_fragment_chain_report(self, sample_rate_hz: Optional[int]) -> str:
+        """Tính LIỀN MẠCH của dòng fragment fMP4 (chuyển `tfdt` sang giây bằng `audio_tb`).
+
+        Đây là phép đo quyết định để phân biệt hai nguyên nhân hoàn toàn khác nhau:
+          * Có KHE HỞ lớn giữa hai `moof` ⇒ mảnh của khoảng đó **chưa bao giờ được append**
+            (mất ở phía nguồn/extension), không phải lỗi giải mã.
+          * Không có khe hở ⇒ byte liền mạch mà decoder vẫn không lấy ra hết ⇒ lỗi ở tầng giải mã.
+        """
+        try:
+            times = scan_mp4_fragment_times(bytes(self._media))
+            if not times:
+                return "n_moof=0"
+            # CHỈ xét fragment của track AUDIO: nếu dòng có xen kẽ track khác (video), so mốc
+            # giữa hai `moof` khác track là vô nghĩa và sẽ báo khe hở giả.
+            tracks: Dict[int, int] = {}
+            for _d, t in times:
+                tracks[t] = tracks.get(t, 0) + 1
+            audio_track = max(tracks, key=lambda k: tracks[k])
+            scale = 1.0 / (float(sample_rate_hz or 0) or 1.0)
+            secs = [d * scale for d, t in times if t == audio_track]
+            if len(secs) < 2:
+                return f"n_moof={len(times)}, tracks={tracks} (thiếu fragment audio liền kề)"
+            gaps = [(secs[i] - secs[i - 1], secs[i - 1], secs[i]) for i in range(1, len(secs))]
+            # `tfdt` là mốc BẮT ĐẦU của fragment ⇒ hiệu hai mốc liên tiếp chính là ĐỘ DÀI
+            # fragment bình thường (2 s với `frag_duration` 2 s), KHÔNG phải khe hở. Chỉ coi là
+            # khe hở khi hiệu đó lớn hơn hẳn độ dài điển hình (trung vị) của dòng.
+            deltas = sorted(g[0] for g in gaps)
+            typical = deltas[len(deltas) // 2] if deltas else 0.0
+            threshold = max(1.5, typical * 1.8)
+            big = [g for g in gaps if g[0] > threshold]
+            out = (
+                f"n_moof={len(times)}, tracks={tracks}, "
+                f"tfdt_giây=[{secs[0]:.2f}, {secs[-1]:.2f}], "
+                f"bước_điển_hình={typical:.2f}s"
+            )
+            if big:
+                # Khe hở thật = phần vượt quá độ dài fragment điển hình.
+                missing = sum(g[0] - typical for g in big)
+                out += (
+                    f", KHE_HỞ={len(big)} (thiếu ~{missing:.1f}s; ví dụ "
+                    + ", ".join(f"{a:.1f}->{b:.1f}" for _g, a, b in big[:3])
+                    + ")"
+                )
+            else:
+                out += ", LIỀN MẠCH"
+            return out
+        except Exception as exc:  # noqa: BLE001
+            return f"chuỗi fragment lỗi: {exc}"
+
+    def _last_audio_tfdt_sec(self) -> float:
+        """Mốc media (giây) của fragment audio CUỐI CÙNG trong bộ đệm.
+
+        Dùng để biết đường giải mã nối-liền đã lấy hết audio đang có chưa: `_last_pts` tiến
+        tới đây nghĩa là không còn gì để lấy, nên KHÔNG cần chạy đường dự phòng (tránh tốn CPU
+        mở lại container cho từng mảnh mỗi lượt).
+        """
+        try:
+            times = scan_mp4_fragment_times(bytes(self._media))
+        except Exception:  # noqa: BLE001
+            return float("-inf")
+        if not times:
+            return float("-inf")
+        sr = 0
+        try:
+            container = av.open(io.BytesIO(self._init))
+            if container.streams.audio:
+                sr = int(container.streams.audio[0].codec_context.sample_rate or 0)
+            container.close()
+        except Exception:  # noqa: BLE001
+            sr = 0
+        scale = 1.0 / float(sr) if sr > 0 else 1.0
+        return max(d for d, _t in times) * scale + self._latest_ts_offset
+
+    def _decode_fragments_individually(self) -> List[StreamAudioChunk]:
+        """Giải mã RIÊNG từng cặp `moof`+`mdat` (ghép với init), bỏ qua fragment hỏng.
+
+        Trả về các đoạn PCM > `_last_pts`, ĐÃ sắp theo PTS và cắt chồng lấn. Trả `[]` nếu
+        cách này không tốt hơn đường nối-liền (tránh thay thế vô ích).
+        """
+        pairs = self._fragment_byte_ranges()
+        if not pairs:
+            return []
+        # Nhắm thẳng vào vùng cần: bỏ qua các mảnh ĐÃ phát và chỉ lấy tối đa 200 mảnh kế tiếp.
+        # Nếu lấy 200 mảnh ĐẦU bộ đệm thì hàm này giải mã lại mãi phần cũ và không bao giờ tới
+        # phần đang cần (lỗi đã gặp: bộ đệm 6 MB / 3000+ mảnh, chỉ 46 mảnh đầu được xét).
+        frontier = self._last_pts if self._last_pts > float("-inf") else float("-inf")
+        pending = []
+        for pair in pairs:
+            if pair[2] < frontier - 0.05:
+                continue
+            pending.append(pair)
+            if len(pending) >= 200:
+                break
+        if not pending:
+            return []
+        pairs = pending
+
+        # `_last_pts` âm vô cực có nghĩa: chưa có mốc đã phát. Trong trường hợp đó, CỨU mốc
+        # tiến độ bằng mốc của mảnh cuối vùng vừa xử lý — nếu để `-inf` thì mọi lượt sau lại
+        # bắt đầu lại từ mảnh đầu tiên và pipeline đứng yên (lỗi đã gặp: bộ đệm 8 MB,
+        # `emitted` không tăng, `last_pts=-infs`).
+        recovered_frontier = float("-inf")
+        for _s, _e, dt in pairs:
+            if dt > recovered_frontier:
+                recovered_frontier = dt
+        out: List[StreamAudioChunk] = []
+        frontier = self._last_pts
+        for start, end, decode_time in pairs:
+            block = self._init + bytes(self._media[start:end])
+            try:
+                container = av.open(io.BytesIO(block))
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if not container.streams.audio:
+                    continue
+                stream = container.streams.audio[0]
+                tb = float(stream.time_base or 0) or 0.0
+                if tb <= 0:
+                    continue
+                resampler = av.AudioResampler(
+                    format="flt", layout="mono", rate=self.target_sample_rate
+                )
+                parts: List[np.ndarray] = []
+                first_pts: Optional[float] = None
+                for frame in container.decode(stream):
+                    if frame.pts is None:
+                        continue
+                    pts = float(frame.pts) * tb + self._latest_ts_offset
+                    if pts < frontier - 1e-6:
+                        continue
+                    if first_pts is None:
+                        first_pts = pts
+                    for rs in resampler.resample(frame):
+                        arr = rs.to_ndarray()
+                        arr = arr.reshape(-1) if arr.ndim > 1 else arr
+                        if arr.size:
+                            parts.append(arr.astype(np.float32, copy=True))
+                try:
+                    for rs in resampler.resample(None):
+                        arr = rs.to_ndarray()
+                        arr = arr.reshape(-1) if arr.ndim > 1 else arr
+                        if arr.size:
+                            parts.append(arr.astype(np.float32, copy=True))
+                except Exception:  # noqa: BLE001
+                    pass
+                if not parts or first_pts is None:
+                    continue
+                pcm = np.concatenate(parts) if len(parts) > 1 else parts[0]
+                if pcm.size <= 0:
+                    continue
+                start_pts = max(first_pts, frontier)
+                trim = int(round((start_pts - first_pts) * self.target_sample_rate))
+                if trim > 0:
+                    if trim >= pcm.size:
+                        continue
+                    pcm = pcm[trim:]
+                end_pts = start_pts + pcm.size / float(self.target_sample_rate)
+                out.append(StreamAudioChunk(
+                    pts_start=start_pts, pts_end=end_pts, duration=end_pts - start_pts,
+                    pcm=np.ascontiguousarray(pcm),
+                ))
+                frontier = end_pts
+            except Exception:  # noqa: BLE001
+                continue
+            finally:
+                try:
+                    container.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        # Không ra PCM nhưng vùng này đã được xử lý: ghi nhận mốc để lượt sau TIẾN tiếp thay vì
+        # giải mã lại đúng 200 mảnh đó mãi (nguyên nhân `emitted` đứng yên ở log thật).
+        if not out and recovered_frontier > float("-inf"):
+            self._last_pts = max(self._last_pts, recovered_frontier + 0.02)
+        return out
+
+    def _fragment_byte_ranges(self) -> List[Tuple[int, int, float]]:
+        """[(byte_start, byte_end, tfdt_giây)] cho từng cặp `moof`+`mdat` liền nhau.
+
+        `tfdt` được quy về GIÂY để bên gọi lọc được theo mốc đã phát (nếu không, hàm giải mã
+        từng mảnh sẽ luôn quét các mảnh ĐẦU bộ đệm và không bao giờ tới phần đang cần).
+        """
+        buf = bytes(self._media)
+        sr = self._audio_sample_rate()
+        scale = (1.0 / float(sr)) if sr > 0 else 1.0
+        times = self._audio_fragment_times()
+        audio_track = self._dominant_audio_track(times)
+        first_needed = self._last_pts - 0.05
+
+        # ── ĐƯỜNG NHANH ───────────────────────────────────────────────────────────
+        # Đa số trường hợp chỉ có MỘT track trong dòng và cửa sổ cần nằm ở CUỐI bộ đệm. Quét
+        # từ offset của mảnh gần `first_needed` trở đi thay vì duyệt toàn bộ (bộ đệm có thể
+        # tới hàng nghìn `moof`; duyệt hết mỗi lượt là quá đắt).
+        start_off = self._first_offset_at_or_after(first_needed, scale, audio_track, times)
+        if start_off is not None:
+            out_fast: List[Tuple[int, int, float]] = []
+            for off in scan_mp4_boundaries(buf[start_off:], base=start_off):
+                size = int.from_bytes(buf[off:off + 4], "big")
+                if size < 8 or off + size + 8 > len(buf):
+                    break
+                info = scan_mp4_track_at(buf, off)
+                if audio_track >= 0 and info is not None and info[1] != audio_track:
+                    continue
+                mdat_off = off + size
+                if buf[mdat_off + 4:mdat_off + 8] != b"mdat":
+                    continue
+                mdat_size = int.from_bytes(buf[mdat_off:mdat_off + 4], "big")
+                if mdat_size < 8:
+                    continue
+                decode_time = info[0] * scale + self._latest_ts_offset if info is not None else 0.0
+                out_fast.append((off, mdat_off + mdat_size, decode_time))
+            if out_fast:
+                return out_fast
+
+        # ── ĐƯỜNG ĐẦY ĐỦ (dự phòng) ───────────────────────────────────────────────
+        by_offset: Dict[int, Tuple[float, int]] = {}
+        for off in scan_mp4_boundaries(buf):
+            info = scan_mp4_track_at(buf, off)
+            if info is not None:
+                by_offset[off] = info
+        out: List[Tuple[int, int, float]] = []
+        for off in scan_mp4_boundaries(buf):
+            size = int.from_bytes(buf[off:off + 4], "big")
+            if size < 8 or off + size + 8 > len(buf):
+                continue
+            info = by_offset.get(off)
+            if audio_track >= 0 and info is not None and info[1] != audio_track:
+                continue
+            mdat_off = off + size
+            if buf[mdat_off + 4:mdat_off + 8] != b"mdat":
+                continue
+            mdat_size = int.from_bytes(buf[mdat_off:mdat_off + 4], "big")
+            if mdat_size < 8:
+                continue
+            decode_time = info[0] * scale + self._latest_ts_offset if info is not None else 0.0
+            out.append((off, mdat_off + mdat_size, decode_time))
+        return out
+
+    def _dominant_audio_track(self, times: List[Tuple[float, int]]) -> int:
+        """`track_id` chiếm đa số trong các `moof` (track audio), -1 nếu chưa biết."""
+        if not times:
+            return -1
+        counts: Dict[int, int] = {}
+        for _d, t in times:
+            counts[t] = counts.get(t, 0) + 1
+        return max(counts, key=lambda k: counts[k])
+
+    def _first_offset_at_or_after(
+        self, target_sec: float, scale: float, audio_track: int,
+        times: List[Tuple[float, int]],
+    ) -> Optional[int]:
+        """Offset của `moof` audio ĐẦU TIÊN có mốc ≥ `target_sec` (None nếu không xác định được).
+
+        Dùng `self._offsets_cache` (offset của mọi `moof`) + tìm nhị phân trên `times` (đã sắp
+        theo thời gian) ⇒ không phải duyệt toàn bộ bộ đệm mỗi lượt.
+        """
+        offsets = self._offsets_cache
+        if not offsets or self._offsets_key != len(self._media) or not times:
+            buf = bytes(self._media)
+            offsets = scan_mp4_boundaries(buf)
+            self._offsets_cache = offsets
+            self._offsets_key = len(self._media)
+        # Chỉ ghép được offset với mốc thời gian khi HAI danh sách cùng độ dài (cùng một lần
+        # quét `moof`). Lệch độ dài ⇒ không suy ra được offset, để bên gọi dùng đường đầy đủ.
+        if not offsets or len(offsets) != len(times):
+            return None
+        target = target_sec if scale <= 0 else (target_sec - self._latest_ts_offset) / scale
+        idx = bisect.bisect_left([d for d, _t in times], target)
+        if idx <= 0:
+            return offsets[0]
+        if idx >= len(offsets):
+            return None
+        return offsets[idx]
+
+    def _audio_sample_rate(self) -> int:
+        """Sample rate của track audio (timescale của `tfdt`), 0 nếu chưa đọc được."""
+        if self._cached_sample_rate:
+            return self._cached_sample_rate
+        try:
+            container = av.open(io.BytesIO(self._init))
+            try:
+                if container.streams.audio:
+                    self._cached_sample_rate = int(
+                        container.streams.audio[0].codec_context.sample_rate or 0
+                    )
+            finally:
+                container.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return self._cached_sample_rate
+
+    def _audio_fragment_times(self) -> List[Tuple[float, int]]:
+        """[(tfdt, track_id)] của các fragment AUDIO (track chiếm đa số), có cache theo byte.
+
+        Cache theo `len(self._media)`: dữ liệu chỉ được THÊM vào nên chỉ cần quét lại khi độ
+        dài thay đổi — tránh quét lại toàn bộ mỗi lượt giải mã.
+        """
+        key = len(self._media)
+        if self._frag_times_cache is not None and self._frag_times_key == key:
+            return self._frag_times_cache
+        times: List[Tuple[float, int]] = []
+        try:
+            raw = scan_mp4_fragment_times(bytes(self._media))
+            if raw:
+                counts: Dict[int, int] = {}
+                for _d, t in raw:
+                    counts[t] = counts.get(t, 0) + 1
+                audio_track = max(counts, key=lambda k: counts[k])
+                times = [t for t in raw if t[1] == audio_track]
+        except Exception:  # noqa: BLE001
+            times = []
+        self._frag_times_cache = times
+        self._frag_times_key = key
+        return times
+
+    def _decode_raw_aac(self) -> List[StreamAudioChunk]:
+        """Dự phòng cho fMP4/AAC: giải mã TRỰC TIẾP các frame AAC trong `mdat`.
+
+        Vì sao cần: khi đường chuẩn (`container.decode()`) không lấy ra hết audio dù byte đã
+        liền mạch, ta vẫn còn nguyên payload trong `mdat`. Bóc `mdat` rồi bọc lại thành luồng
+        ADTS cho decoder AAC thô là đường KHÔNG phụ thuộc việc PyAV có đi hết được chuỗi
+        `moof` hay không.
+
+        PTS neo vào `tfdt.baseMediaDecodeTime` của fragment audio ĐẦU TIÊN (mốc media của mẫu
+        đầu trong bộ đệm) cộng `timestampOffset` — cùng trục thời gian với `_last_pts`.
+        """
+        raw = self._extract_mdat_payload()
+        if not raw:
+            return []
+        frames = _iter_adts_frames(raw)
+        if not frames:
+            return []
+        # ⚠️ CHỐNG BÁO ĐỘNG GIẢ: quét `0xFFF` trên AAC THÔ (không ADTS) sẽ khớp giả ở rất
+        # nhiều vị trí, tạo ra "frame" rác. Luồng ADTS thật phủ gần hết payload; nếu độ phủ
+        # thấp thì đây KHÔNG phải luồng ADTS ⇒ bỏ, tuyệt đối không đẩy PCM rác vào phụ đề.
+        covered = sum(len(f) for f in frames)
+        if covered < 0.9 * len(raw) or len(frames) < 4:
+            self._raw_fallback_rejected += 1
+            return []
+        payload = b"".join(frames)
+        try:
+            codec = av.CodecContext.create("aac", "r")
+            codec.sample_rate = 44100
+            codec.layout = "mono"
+            pcm_parts: List[np.ndarray] = []
+            resampler = av.AudioResampler(format="flt", layout="mono", rate=self.target_sample_rate)
+            for frame in codec.decode(av.Packet(payload)):
+                for rs in resampler.resample(frame):
+                    arr = rs.to_ndarray()
+                    arr = arr.reshape(-1) if arr.ndim > 1 else arr
+                    if arr.size:
+                        pcm_parts.append(arr.astype(np.float32, copy=True))
+            try:
+                for rs in resampler.resample(None):
+                    arr = rs.to_ndarray()
+                    arr = arr.reshape(-1) if arr.ndim > 1 else arr
+                    if arr.size:
+                        pcm_parts.append(arr.astype(np.float32, copy=True))
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Giải mã AAC thô thất bại: {exc}", extra={"module_tag": "WS"})
+            return []
+
+        if not pcm_parts:
+            return []
+        pcm = np.concatenate(pcm_parts) if len(pcm_parts) > 1 else pcm_parts[0]
+        if pcm.size <= 0:
+            return []
+        # Mốc neo: `tfdt` tính theo timescale của track (thường = sample_rate của AAC).
+        anchor = float(self._latest_ts_offset)
+        if self._first_audio_tfdt is not None and codec.sample_rate:
+            anchor += float(self._first_audio_tfdt) / float(codec.sample_rate)
+        return [StreamAudioChunk(
+            pts_start=anchor,
+            pts_end=anchor + pcm.size / float(self.target_sample_rate),
+            duration=pcm.size / float(self.target_sample_rate),
+            pcm=np.ascontiguousarray(pcm),
+        )]
+
+    def _extract_mdat_payload(self) -> bytes:
+        """Ghép payload của MỌI box `mdat` cấp cao nhất trong bộ đệm media."""
+        buf = bytes(self._media)
+        out: List[bytes] = []
+        pos = 0
+        n = len(buf)
+        while pos + 8 <= n:
+            size = int.from_bytes(buf[pos:pos + 4], "big")
+            box_type = buf[pos + 4:pos + 8]
+            header = 8
+            if size == 1:
+                if pos + 16 > n:
+                    break
+                size = int.from_bytes(buf[pos + 8:pos + 16], "big")
+                header = 16
+            elif size == 0:
+                size = n - pos
+            if size < header:
+                break
+            if box_type == b"mdat":
+                out.append(buf[pos + header:pos + size])
+            pos += size
+        return b"".join(out)
 
     @property
     def average_rtf(self) -> float:
         if self.decoded_seconds <= 0:
             return 0.0
         return self.decode_time_sec / self.decoded_seconds
+
+    def coverage_report(self) -> str:
+        """Chuỗi chẩn đoán: mốc đã phát, số frame bị lọc, số khe hở trong dữ liệu nhận được.
+
+        Dùng để phân biệt "mất audio do logic" (`frames_skipped` lớn) với "nguồn gửi thiếu
+        hoặc mảnh bị cắt" (`gaps_in_media` lớn) — hai nguyên nhân có cách xử lý hoàn toàn khác.
+        """
+        return (
+            f"emitted={self._emitted_sec:.1f}s, last_pts={self._last_pts:.2f}s, "
+            f"skipped_frames={self._frames_skipped}, gaps_in_media={self._gaps_in_media}, "
+            f"seek_fallbacks={self._seek_fallbacks}, aac_thô={self._raw_fallback_used}/"
+            f"{self._raw_fallback_rejected} (dùng/từ chối), "
+            f"giải_mã_từng_mảnh={self._frag_decode_used}"
+        )
+
+    def structure_report(self) -> str:
+        """Cấu trúc container THẬT của bộ đệm hiện tại (chẩn đoán nút cổ chai giải mã).
+
+        Trả lời ba câu hỏi không thể suy ra từ log thường:
+          * Container/codec gì, có **mấy stream audio** (nhiều stream ⇒ chỉ giải mã stream 0).
+          * Bao nhiêu frame audio trong bộ đệm byte hiện có và chúng trải tới mốc nào.
+          * Bộ đệm byte lớn nhưng frame ít ⇒ phần lớn byte KHÔNG phải audio (mảnh của
+            SourceBuffer khác lọt vào) — đúng loại lỗi làm decoder "dừng sớm" mỗi lượt.
+        """
+        payload = self._init + bytes(self._media)
+        info = (
+            f"container={self._container}, init={len(self._init)}B, media={len(self._media)}B"
+        )
+        if not payload:
+            return info
+        try:
+            container = av.open(io.BytesIO(payload))
+        except Exception as exc:  # noqa: BLE001
+            return f"{info}, MỞ LỖI: {exc}"
+        try:
+            audio_streams = list(container.streams.audio)
+            parts = [info, f"n_audio_streams={len(audio_streams)}"]
+            if not audio_streams:
+                parts.append("codec=KHÔNG CÓ STREAM AUDIO")
+                return ", ".join(parts)
+            stream = audio_streams[0]
+            n_frames = 0
+            first_pts: Optional[float] = None
+            last_pts: Optional[float] = None
+            sum_dur = 0.0
+            tb = float(stream.time_base or 0) or 1.0
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                pts = float(frame.pts) * tb
+                if first_pts is None:
+                    first_pts = pts
+                last_pts = pts
+                n_frames += 1
+                rate = float(getattr(frame, "sample_rate", 0) or 0)
+                if rate > 0 and frame.samples:
+                    sum_dur += float(frame.samples) / rate
+            span = 0.0 if (first_pts is None or last_pts is None) else (last_pts - first_pts)
+            parts.append(
+                f"codec={stream.codec_context.name}, rate={stream.codec_context.sample_rate}, "
+                f"time_base={tb:.6f}, frames={n_frames}, pts=[{first_pts}, {last_pts}], span={span:.1f}s"
+            )
+            # `duration/span > ~1,2` ⇒ dữ liệu nhận được có MẢNH TRÙNG (cùng đoạn media được
+            # append nhiều lần). Đây là dấu hiệu định lượng phân biệt "trùng lặp" với "mất
+            # audio" — hai nguyên nhân có cách xử lý ngược nhau.
+            if span > 0.5:
+                parts.append(f"duration/span={sum_dur / span:.2f}x (≈1.0 là bình thường)")
+            if first_pts is not None and self._last_pts > float("-inf"):
+                parts.append(f"chưa_giải_mã_tới={(last_pts or 0.0) + self._latest_ts_offset:.2f}s")
+            if self._container == "mp4":
+                parts.append(self._mp4_fragment_chain_report(stream.codec_context.sample_rate))
+            return ", ".join(parts)
+        except Exception as exc:  # noqa: BLE001
+            return f"{info}, QUÉT LỖI: {exc}"
+        finally:
+            try:
+                container.close()
+            except Exception:  # noqa: BLE001
+                pass

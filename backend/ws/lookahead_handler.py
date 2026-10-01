@@ -36,11 +36,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import bisect
+import hashlib
 import json
 import struct
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -59,6 +61,17 @@ logger = get_logger("ws.lookahead")
 
 #: Số mốc neo (sample → PTS) giữ lại. Mỗi mốc neo = một lần VAD mở đoạn nói mới.
 _MAX_ANCHORS = 256
+#: Cửa sổ (giây) coi một mảnh giống hệt là "gửi trùng". Rộng hơn mọi khoảng replay cache,
+#: nhưng đủ hẹp để mảnh nạp lại sau khi tua vẫn được chấp nhận.
+_DUP_WINDOW_SEC = 15.0
+#: Lệch quá ngần này giây giữa audio nhận được và vị trí phát ⇒ cảnh báo "đoạn đầu sẽ không
+#: có phụ đề" (dấu hiệu cache mảnh phía Extension không bám vị trí phát).
+_START_OFFSET_WARN_SEC = 20.0
+#: Xê dịch tối đa (giây) giữa mốc neo hiện tại và vị trí báo mới mà vẫn coi là CÙNG một mốc
+#: (không reset pipeline). Chống reset lặp khi `sync_state` gửi `seek_id` mới ở cùng vị trí.
+_REANCHOR_TOLERANCE_SEC = 1.5
+#: Giãn cách tối thiểu giữa hai lần yêu cầu client gửi lại mảnh (chống spam).
+_REPLAY_REQUEST_COOLDOWN_SEC = 4.0
 
 
 def _pack_binary_frame(header: Dict[str, Any], payload: bytes) -> bytes:
@@ -197,6 +210,45 @@ class LookaheadSessionState:
         self.chunks_decoded = 0
         self.utterances_sent = 0
         self.started_at = time.time()
+        # ── Chẩn đoán NĂNG LỰC GIẢI MÃ (2026-10-01) ──────────────────────────────
+        # Sự cố "trang khác chỉ hiện 1/3-5 câu": cần biết tầng nào là nút cổ chai —
+        # `decoder` (byte tới nhiều mà PCM giải mã ra ít) hay `VAD` (PCM có sẵn mà nạp chậm).
+        # `bytes_in` / `fed_seconds` cho tỷ lệ giải mã và tốc độ nạp tính bằng số THẬT.
+        self.bytes_in = 0
+        self.decode_seconds = 0.0          # tổng thời lượng PCM giải mã ra (đã lọc)
+        self.decode_wall_sec = 0.0         # tổng thời gian wall của các lời gọi demuxer.feed
+        self.media_seconds = 0.0           # tổng giây MEDIA giải mã ra (kể cả phần bị bỏ xa)
+        self.decode_delta_sec = 0.0        # giây media trong cửa sổ chẩn đoán hiện tại
+        self.decode_windows = 0            # số lượt feed CÓ sinh ra PCM
+        self.chunks_dropped_far = 0        # số đoạn PCM bị bỏ vì quá xa vị trí phát
+        self.start_offset_warned = 0       # số lần cảnh báo lệch đầu phiên (chỉ log vài lần)
+        self.replay_requests = 0           # số lần yêu cầu client gửi lại mảnh
+        self._last_replay_request_at = 0.0
+        #: Chẩn đoán sau khi tua (xem `handle_audio_fragment`).
+        self._seek_reset_at = 0.0
+        self._seek_diag_left = 0
+        self.fragments_deduped = 0         # số mảnh bị bỏ vì trùng nội dung
+        self._fragment_digests: Dict[bytes, float] = {}
+        self._fragment_digest_order: deque = deque()
+        self._max_decode_lead_sec = float(getattr(la, "max_decode_lead_sec", 240.0) or 240.0)
+        self._playhead_pts = 0.0
+        self.fed_seconds = 0.0             # tổng audio đã nạp vào VAD
+        self.feed_wall_sec = 0.0           # tổng thời gian wall của feed_chunk (đo VAD)
+        self._feed_wall_max = 0.0
+        self._last_decoded_at = 0.0        # lần cuối có PCM mới
+        self._starved_since: Optional[float] = None
+        self._starved_bytes = 0
+        self._starved_max_sec = 0.0
+        #: Mốc so sánh cho log chẩn đoán định kỳ (xem `_maybe_log_diagnostics`).
+        self._last_diag_at = time.perf_counter()
+        self._diag_bytes_in = 0
+        self._diag_decode_seconds = 0.0
+        self._diag_media_seconds = 0.0
+        self._diag_decode_wall = 0.0
+        self._diag_fed_seconds = 0.0
+        self._diag_feed_wall = 0.0
+        #: Lần cuối in cấu trúc container (thưa hơn log chẩn đoán vì tốn CPU).
+        self._last_struct_at = time.perf_counter()
 
     # ────────────────────────────────────────────────────────────── gửi tin
     async def send_json(self, payload: Dict[str, Any]) -> bool:
@@ -635,6 +687,30 @@ class LookaheadSessionState:
             base_pts = self._anchor_pts[idx]
         return base_pts + (int(sample_index) - base_sample) / 16000.0
 
+    async def _request_replay(self, reason: str) -> None:
+        """Yêu cầu client GỬI LẠI các mảnh quanh vị trí phát hiện tại.
+
+        Dùng khi audio nhận được lệch xa vị trí phát (thường sau khi tua): cache phía client
+        còn giữ mảnh của vị trí cũ nên pipeline không có gì để dịch. Có chốt thời gian để
+        không spam client mỗi mảnh.
+        """
+        now = time.perf_counter()
+        if now - self._last_replay_request_at < _REPLAY_REQUEST_COOLDOWN_SEC:
+            return
+        self._last_replay_request_at = now
+        self.replay_requests += 1
+        logger.info(
+            f"Yêu cầu client gửi lại mảnh quanh vị trí phát {self.current_time:.1f}s "
+            f"(lý do: {reason}, tổng {self.replay_requests} lần).",
+            extra={"module_tag": "WS"},
+        )
+        await self.send_json({
+            "type": "lookahead_request_replay",
+            "seek_id": self.active_seek_id,
+            "currentTime": round(self.current_time, 2),
+            "reason": reason,
+        })
+
     def _record_anchor(self, sample_index: int, pts: float) -> None:
         """Ghi mốc neo nếu PTS không nối tiếp tuyến tính với mốc trước."""
         with self._anchor_lock:
@@ -739,11 +815,17 @@ class LookaheadSessionState:
             pts, pcm = item
             if pcm.size == 0:
                 continue
+            t_feed = time.perf_counter()
             try:
                 await asyncio.to_thread(self._feed_block, pcm, pts)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Nạp khối audio vào VAD lỗi: {exc}", extra={"module_tag": "WS"})
                 break
+            _feed_wall = time.perf_counter() - t_feed
+            self.feed_wall_sec += _feed_wall
+            if _feed_wall > self._feed_wall_max:
+                self._feed_wall_max = _feed_wall
+            self.fed_seconds += pcm.size / 16000.0
             self._feed_pts = pts + pcm.size / 16000.0
             fed += 1
         if fed:
@@ -759,14 +841,60 @@ class LookaheadSessionState:
         seek_id: str,
         is_init: bool = False,
         epoch: Optional[int] = None,
+        refetched: bool = False,
     ) -> None:
-        """Nhận một mảnh MSE, ghép nối + giải mã rồi đưa vào timeline liên tục."""
+        """Nhận một mảnh MSE, ghép nối + giải mã rồi đưa vào timeline liên tục.
+
+        `refetched=True`: mảnh do extension TẢI LẠI cho vùng đã buffer sẵn. Byte của nó có thể
+        trùng mảnh đã nhận trước đó nên phải **miễn dedup** — nếu không, vùng video đã tải trước
+        sẽ không bao giờ có phụ đề (đo thật 2026-10-01: "Bỏ mảnh audio TRÙNG … 51 … 53" ngay
+        sau khi backend yêu cầu client gửi lại).
+        """
         if self._closed:
             return
         if seek_id and seek_id != self.active_seek_id:
             return
 
         self.fragments_received += 1
+        self.bytes_in += len(chunk_bytes)
+        #: Chẩn đoán tua: trong 3 giây đầu sau mỗi lần reset, ghi rõ mảnh đầu tiên nhận được
+        #: (mốc media, `timestampOffset`, cờ tải lại) để biết vì sao audio có thể vẫn lệch.
+        if (time.perf_counter() - self._seek_reset_at) < 3.0 and self._seek_diag_left > 0:
+            self._seek_diag_left -= 1
+            logger.warning(
+                f"CHẨN ĐOÁN TUA: mảnh {len(chunk_bytes)}B, ts_offset={timestamp_offset:.2f}, "
+                f"refetched={refetched}, epoch={epoch}, playhead={self.current_time:.2f}s, "
+                f"buffer={self.demuxer.buffered_bytes}B",
+                extra={"module_tag": "WS"},
+            )
+
+        # ── CHỐNG MẢNH TRÙNG (đo thật 2026-10-01) ────────────────────────────────
+        # Extension có thể gửi cùng một mảnh nhiều lần (replay cache qua nhiều đường gọi
+        # `REQUEST_INITIAL_CHUNKS`, cộng thêm `_pendingChunks`). Đo được: 15.851 frame AAC
+        # (368 s audio) chỉ trải trên 70 s timeline ⇒ decoder phải giải mã rồi lọc trùng gấp
+        # ~5 lần, đủ để làm đói cả pipeline.
+        #
+        # Chỉ bỏ mảnh trùng CÒN NÓNG (vừa gửi lại trong vài giây): mảnh giống hệt đến sau một
+        # khoảng dài là dữ liệu hợp lệ (trình phát nạp lại cùng phân đoạn sau khi tua).
+        now_perf = time.perf_counter()
+        digest = hashlib.blake2b(chunk_bytes, digest_size=16).digest()
+        last_seen = self._fragment_digests.get(digest)
+        if (not refetched) and last_seen is not None and (now_perf - last_seen) <= _DUP_WINDOW_SEC:
+            self.fragments_deduped += 1
+            if self.fragments_deduped % 50 == 1:
+                logger.warning(
+                    f"Bỏ mảnh audio TRÙNG (tổng đã bỏ: {self.fragments_deduped}) — extension "
+                    f"đang gửi lại cùng dữ liệu; xem lại đường replay cache.",
+                    extra={"module_tag": "WS"},
+                )
+            return
+        self._fragment_digests[digest] = now_perf
+        self._fragment_digest_order.append(digest)
+        while len(self._fragment_digest_order) > 512:
+            self._fragment_digests.pop(self._fragment_digest_order.popleft(), None)
+
+        self._playhead_pts = float(self.current_time or 0.0)
+        t_dec = time.perf_counter()
         try:
             decoded = await asyncio.to_thread(
                 self.demuxer.feed, chunk_bytes, timestamp_offset, mime_type, is_init, epoch
@@ -774,26 +902,108 @@ class LookaheadSessionState:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Lỗi ghép nối/giải mã mảnh audio: {exc}", extra={"module_tag": "WS"})
             return
+        self.decode_wall_sec += time.perf_counter() - t_dec
 
+        # Lọc PCM nằm quá xa phía trước vị trí phát (xem `lookahead.max_decode_lead_sec`).
+        # Không lọc thì timeline phải lấp hàng trăm giây im lặng để tới đoạn audio đó, và phụ
+        # đề sinh ra sẽ mang mốc ở tương lai ⇒ không bao giờ hiện.
+        dropped_ahead = 0
+        media_sec = 0.0
+        first_pts_here: Optional[float] = None
         for chunk in decoded:
+            media_sec += float(chunk.duration)
+            if first_pts_here is None:
+                first_pts_here = float(chunk.pts_start)
+            if chunk.pts_start > self._playhead_pts + self._max_decode_lead_sec:
+                dropped_ahead += 1
+                continue
             self.timeline.append(chunk.pts_start, chunk.pcm)
             self.chunks_decoded += 1
+            self.decode_seconds += float(chunk.duration)
             self._decoded_end_pts = max(self._decoded_end_pts, float(chunk.pts_end))
+        #: Giây MEDIA (audio thật) đã giải mã ra — khác `bytes_in` (byte thô, gồm cả mảnh
+        #: của SourceBuffer khác lọt vào). Tỷ lệ `decode/media` mới là thước đo độ phủ.
+        self.media_seconds += media_sec
+        self.decode_delta_sec += media_sec
 
-        if decoded:
-            logger.info(
-                f"Giải mã liên tục: +{sum(c.duration for c in decoded):.2f}s "
-                f"[{decoded[0].pts_start:.2f}s -> {decoded[-1].pts_end:.2f}s] "
-                f"(mảnh {len(chunk_bytes)}B, tổng {self.chunks_decoded} đoạn, "
-                f"buffer {self.demuxer.buffered_bytes} B)",
+        if dropped_ahead:
+            self.chunks_dropped_far += dropped_ahead
+            logger.warning(
+                f"Bỏ {dropped_ahead} đoạn PCM nằm >{self._max_decode_lead_sec:.0f}s trước vị trí "
+                f"phát ({self._playhead_pts:.1f}s) — cache mảnh của interceptor đang lệch khỏi "
+                f"vị trí phát; pipeline sẽ nhận mảnh mới đúng vị trí. "
+                f"(tổng đã bỏ: {self.chunks_dropped_far})",
                 extra={"module_tag": "ASR"},
             )
+            # Yêu cầu client gửi lại mảnh quanh vị trí phát. Đây là cách chữa đúng cho ca
+            # "seek tới 161,94 s nhưng cache chỉ có mảnh ở 372 s" (đo thật 2026-10-01).
+            await self._request_replay("audio-far-ahead")
+        elif (
+            first_pts_here is not None
+            and first_pts_here - self._playhead_pts > _START_OFFSET_WARN_SEC
+            and self.start_offset_warned < 1
+        ):
+            self.start_offset_warned += 1
+            logger.warning(
+                f"Audio nhận được bắt đầu ở {first_pts_here:.1f}s trong khi vị trí phát là "
+                f"{self._playhead_pts:.1f}s (lệch {first_pts_here - self._playhead_pts:.1f}s) — "
+                f"đoạn đầu video sẽ KHÔNG có phụ đề. Nguyên nhân: cache mảnh phía Extension "
+                f"chưa bám vị trí phát (nạp lại Extension rồi tải lại trang).",
+                extra={"module_tag": "ASR"},
+            )
+            await self._request_replay("audio-offset")
+
+        if decoded:
+            if not dropped_ahead:
+                # Hết "đói audio": tổng kết khoảng thời gian vừa qua không có PCM mới trong khi
+                # byte VẪN về (triệu chứng "không lấy đủ buffer để dịch sẵn").
+                if self._starved_since is not None:
+                    starved = time.perf_counter() - self._starved_since
+                    if starved > float(config.lookahead.decode_starve_warn_sec):
+                        self._starved_max_sec = max(self._starved_max_sec, starved)
+                        logger.warning(
+                            f"Giải mã ĐÓI AUDIO: {starved:.1f}s không sinh ra PCM mới trong khi "
+                            f"vẫn nhận {self._starved_bytes} B audio — nút cổ chai ở tầng GIẢI MÃ "
+                            f"(demuxer), không phải ở lookahead.",
+                            extra={"module_tag": "ASR"},
+                        )
+                    self._starved_since = None
+                    self._starved_bytes = 0
+            self._last_decoded_at = time.perf_counter()
+            self.decode_windows += 1
+            logger.info(
+                f"Giải mã liên tục: +{media_sec:.2f}s "
+                f"[{decoded[0].pts_start:.2f}s -> {decoded[-1].pts_end:.2f}s] "
+                f"(mảnh {len(chunk_bytes)}B, tổng {self.chunks_decoded} đoạn, "
+                f"buffer {self.demuxer.buffered_bytes} B, "
+                f"bỏ_xa={dropped_ahead}, bytes_in={self.bytes_in})",
+                extra={"module_tag": "ASR"},
+            )
+        else:
+            if self._starved_since is None:
+                self._starved_since = time.perf_counter()
+            self._starved_bytes += len(chunk_bytes)
 
         self._ingest_event.set()
 
     # ────────────────────────────────────────────────────────── xử lý tua video
     async def handle_seek(self, seek_id: str, target_time: float) -> None:
-        """Tua video: xoá sạch audio/commit cũ và neo lại mốc thời gian."""
+        """Tua video: xoá sạch audio/commit cũ và neo lại mốc thời gian.
+
+        ⚠️ Chống VÒNG LẶP RESET: `sync_state` được gửi 2 lần/giây và mang `seek_id` mới trong
+        lúc phát; nếu mỗi lần lại xoá sạch pipeline thì phụ đề "lúc hiện lúc không". Chỉ coi là
+        tua thật khi vị trí mới KHÁC ĐÁNG KỂ so với mốc neo hiện tại.
+        """
+        ref = self._session_start_pts if self._session_start_pts is not None else self.current_time
+        if ref is not None and abs(float(target_time) - float(ref)) <= _REANCHOR_TOLERANCE_SEC:
+            # Cùng một mốc (hoặc xê dịch trong sai số) ⇒ chỉ cập nhật vị trí phát và NHẬN
+            # seek_id mới, KHÔNG reset pipeline. Vẫn phải nhận seek_id mới, nếu không các mảnh
+            # gửi kèm seek_id đó sẽ bị bộ lọc "mảnh của seek cũ" bỏ sạch.
+            self.active_seek_id = seek_id
+            self.current_time = float(target_time)
+            self._ingest_event.set()
+            return
+
         self.active_seek_id = seek_id
         self.current_time = float(target_time)
         self._seek_seq += 1
@@ -832,9 +1042,25 @@ class LookaheadSessionState:
         self.tts_sent = 0
         self._recent_utterances.clear()
 
+        # Reset mốc chẩn đoán năng lực: nếu không, log sau khi tua sẽ so với số của đoạn cũ
+        # và báo sai tốc độ giải mã/nạp.
+        self._last_diag_at = time.perf_counter()
+        self._diag_bytes_in = self.bytes_in
+        self._diag_decode_seconds = self.decode_seconds
+        self._diag_media_seconds = self.media_seconds
+        self._diag_decode_wall = self.decode_wall_sec
+        self._diag_fed_seconds = self.fed_seconds
+        self._diag_feed_wall = self.feed_wall_sec
+        self._starved_since = None
+        self._starved_bytes = 0
+        # Bật chẩn đoán cho ~8 mảnh đầu sau khi tua.
+        self._seek_reset_at = time.perf_counter()
+        self._seek_diag_left = 8
         metrics_collector.increment_counter("lookahead.seek_reset")
         logger.info(
-            f"Seek reset seek_id={seek_id} target_time={target_time:.2f}s",
+            f"Seek reset seek_id={seek_id} target_time={target_time:.2f}s "
+            f"(đã xoá toàn bộ audio/commit/TTS; bộ đệm byte={self.demuxer.buffered_bytes}B, "
+            f"min_pts={self.demuxer.last_pts:.2f}s)",
             extra={"module_tag": "WS"},
         )
 
@@ -1255,6 +1481,8 @@ class LookaheadSessionState:
                 extra={"module_tag": "WS"},
             )
 
+        await self._maybe_log_diagnostics(buffered_ahead, ready_ahead, fed_ahead)
+
         await self.send_json({
             "type": "lookahead_status",
             "seek_id": self.active_seek_id,
@@ -1272,6 +1500,57 @@ class LookaheadSessionState:
             "decoded_chunks": self.chunks_decoded,
             "utterances": self.utterances_sent,
         })
+
+    async def _maybe_log_diagnostics(
+        self, buffered_ahead: float, ready_ahead: float, fed_ahead: float
+    ) -> None:
+        """Log NĂNG LỰC THẬT mỗi `diag_interval_sec`: byte vào, PCM ra, tốc độ nạp VAD.
+
+        Đây là thước đo để biết nút cổ chai nằm ở ĐÂU:
+          * ``PCM/byte`` thấp (byte về nhiều mà PCM ra ít)  ⇒ tầng giải mã (demuxer).
+          * ``nạp/VAD`` thấp (PCM có sẵn nhưng `feed_chunk` chậm) ⇒ tầng VAD/ASR.
+        """
+        interval = max(1.0, float(getattr(config.lookahead, "diag_interval_sec", 10.0) or 10.0))
+        now = time.perf_counter()
+        if now - self._last_diag_at < interval:
+            return
+        span = max(0.001, now - self._last_diag_at)
+        self._last_diag_at = now
+
+        d_bytes = self.bytes_in - self._diag_bytes_in
+        d_decode = self.decode_seconds - self._diag_decode_seconds
+        d_media = self.media_seconds - self._diag_media_seconds
+        d_decode_wall = self.decode_wall_sec - self._diag_decode_wall
+        d_fed = self.fed_seconds - self._diag_fed_seconds
+        d_feed_wall = self.feed_wall_sec - self._diag_feed_wall
+        self._diag_bytes_in = self.bytes_in
+        self._diag_decode_seconds = self.decode_seconds
+        self._diag_media_seconds = self.media_seconds
+        self._diag_decode_wall = self.decode_wall_sec
+        self._diag_fed_seconds = self.fed_seconds
+        self._diag_feed_wall = self.feed_wall_sec
+
+        logger.info(
+            f"CHẨN ĐOÁN NĂNG LỰC {span:.1f}s | audio vào {d_bytes / 1024.0:.0f} KB "
+            f"({d_bytes / span / 1000.0:.1f} KB/s) → media giải mã {d_media:.1f}s "
+            f"(nạp vào timeline {d_decode:.1f}s, {self.decode_windows} lượt có PCM) | "
+            f"nạp VAD {d_fed:.1f}s ({d_fed / span:.2f}x thời gian thực, wall {d_feed_wall:.1f}s, "
+            f"max {self._feed_wall_max * 1000.0:.0f}ms/khối) | "
+            f"đệm GIẢI MÃ {self._decoded_end_pts - self.current_time:.1f}s trước vị trí phát, "
+            f"đệm ĐÃ DỊCH {ready_ahead:.1f}s (fed {fed_ahead:.1f}s), "
+            f"bỏ_xa={self.chunks_dropped_far}, mảnh_trùng={self.fragments_deduped} | "
+            f"đói giải mã dài nhất {self._starved_max_sec:.1f}s | "
+            f"demuxer: {self.demuxer.coverage_report()}",
+            extra={"module_tag": "ASR"},
+        )
+
+        # Cấu trúc container chỉ cần in thưa (1 lần/phút): nó giải mã lại toàn bộ bộ đệm byte.
+        if now - self._last_struct_at >= 60.0:
+            self._last_struct_at = now
+            logger.info(
+                f"CẤU TRÚC NGUỒN: {self.demuxer.structure_report()}",
+                extra={"module_tag": "ASR"},
+            )
 
     # ────────────────────────────────────────────────────────── cấu hình phiên
     def apply_init(self, data: Dict[str, Any]) -> None:
@@ -1446,17 +1725,11 @@ async def handle_lookahead_ws(websocket: WebSocket) -> None:
                         if new_time > 0:
                             session.timeline.reset(new_time)
                             session.demuxer.set_min_pts(max(0.0, new_time - 0.5))
-                    elif new_time > 1.0 and (
-                        session.timeline.cursor_pts is not None
-                        and session.timeline.cursor_pts < (new_time - 3.0)
-                    ):
-                        logger.info(
-                            f"Phát hiện lệch timeline (video @{new_time:.2f}s, cursor @{session.timeline.cursor_pts:.2f}s) "
-                            f"— tự động neo lại vị trí mới.",
-                            extra={"module_tag": "WS"},
-                        )
-                        await session.handle_seek(session.active_seek_id, new_time)
                     else:
+                        # KHÔNG tự đoán "lệch timeline" rồi neo lại: mọi lần tua đều đi qua
+                        # `handle_seek` (seek_id mới hoặc `seek_reset`) và reset TOÀN BỘ pipeline
+                        # như phiên mới. Cơ chế tự đoán trước đây tạo vòng lặp reset mỗi 3 s vì
+                        # cursor chưa kịp tiêu thụ audio nào sau mỗi lần reset.
                         session.current_time = new_time
                     session._ingest_event.set()
 
@@ -1505,7 +1778,7 @@ async def handle_lookahead_ws(websocket: WebSocket) -> None:
             await safe_conn.close()
         except Exception:  # noqa: BLE001
             pass
-        logger.info(f"🛑 Đã đóng và giải phóng phiên lookahead: {session.session_id[:8]}", extra={"module_tag": "WS"})
+        logger.info(f"Đã đóng và giải phóng phiên lookahead: {session.session_id[:8]}", extra={"module_tag": "WS"})
 
 
 async def _handle_binary_fragment(session: LookaheadSessionState, bytes_data: bytes) -> None:
@@ -1531,4 +1804,6 @@ async def _handle_binary_fragment(session: LookaheadSessionState, bytes_data: by
         seek_id=str(header.get("seek_id") or session.active_seek_id),
         is_init=bool(header.get("is_init", False)),
         epoch=int(epoch) if epoch is not None else None,
+        # Mảnh tải lại cho vùng đã buffer sẵn: byte có thể trùng mảnh cũ nên phải MIỄN dedup.
+        refetched=bool(header.get("refetched", False)),
     )

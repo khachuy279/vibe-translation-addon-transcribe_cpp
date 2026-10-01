@@ -76,8 +76,10 @@
     if (cfg.translationModel) out.translationModel = cfg.translationModel;
     if (cfg.vadEngine) out.vadEngine = cfg.vadEngine;
     // Pipeline B: offset canh đồng bộ phụ đề/TTS (ms, người dùng chỉnh trong popup).
+    // Trần ±1500 ms khớp với backend (`LookaheadSessionState.apply_config`); ±600 ms cũ quá
+    // hẹp cho trường hợp phụ đề sớm ~1 s (đo thật 2026-10-01).
     const syncMs = parseInt(cfg.lookaheadSyncOffsetMs, 10);
-    if (!isNaN(syncMs)) out.lookaheadSyncOffsetMs = Math.max(-600, Math.min(600, syncMs));
+    if (!isNaN(syncMs)) out.lookaheadSyncOffsetMs = Math.max(-1500, Math.min(1500, syncMs));
     if (cfg.lookaheadLeadTimeSec !== undefined) {
       const lead = parseInt(cfg.lookaheadLeadTimeSec, 10);
       if (!isNaN(lead)) out.lookaheadLeadTimeSec = lead;
@@ -433,6 +435,65 @@
     }
   });
 
+  // ── PHÁT HIỆN ĐỔI VIDEO TRÊN TRANG SPA (YouTube) ────────────────────────────
+  // YouTube không tải lại trang khi người dùng bấm video khác; video cũ bị thay bằng video
+  // mới nhưng phiên Lookahead/WS vẫn sống ⇒ backend tiếp tục nhận mảnh của video CŨ (sai
+  // timeline) và phiên không bao giờ tự tắt (đo thật 2026-10-01: bấm video khác mà không
+  // Stop thì lỗi session cũ còn treo).
+  let _navWatchTimer = null;
+  let _watchedUrl = "";
+  let _watchedVideo = null;
+
+  function stopNavigationWatch() {
+    if (_navWatchTimer) {
+      clearInterval(_navWatchTimer);
+      _navWatchTimer = null;
+    }
+    _watchedUrl = "";
+    _watchedVideo = null;
+  }
+
+  function startNavigationWatch(video) {
+    stopNavigationWatch();
+    _watchedUrl = String(location.href || "");
+    _watchedVideo = video || null;
+    _navWatchTimer = setInterval(() => {
+      if (!isCapturing) {
+        stopNavigationWatch();
+        return;
+      }
+      const url = String(location.href || "");
+      const current = findVideo();
+      const urlChanged = url !== _watchedUrl;
+      const videoReplaced = !!(_watchedVideo && current && current !== _watchedVideo);
+      if (!urlChanged && !videoReplaced) {
+        if (current) _watchedVideo = current;
+        return;
+      }
+      // Với YouTube, chỉ đổi `t=`/`list=` trên CÙNG video thì KHÔNG phải video mới.
+      if (urlChanged && !videoReplaced && sameVideoId(_watchedUrl, url)) {
+        _watchedUrl = url;
+        if (current) _watchedVideo = current;
+        return;
+      }
+      console.warn(
+        `[BS] 🔄 Phát hiện ĐỔI VIDEO (${urlChanged ? "URL đổi" : "thẻ <video> bị thay"}) — ` +
+        `tự động dừng phiên cũ để tránh gửi audio sai timeline.`
+      );
+      stopNavigationWatch();
+      try { cleanup(); } catch (e) {}
+    }, 1000);
+  }
+
+  /** Hai URL YouTube có cùng video id? (đổi `t=`/`list=` không phải video mới). */
+  function sameVideoId(a, b) {
+    const id = (u) => {
+      const m = /[?&]v=([^&#]+)/.exec(u);
+      return m ? m[1] : u;
+    };
+    return id(a) === id(b);
+  }
+
   async function startCapture(msg) {
     // Thế hệ phiên: mỗi lần Start tăng lên, mỗi lần Stop/cleanup cũng tăng. Nhờ vậy một
     // tiến trình Start đang `await` (chờ kiểm tra buffer / chờ backend Lookahead) KHÔNG thể
@@ -512,6 +573,8 @@
       }
 
       isCapturing = true;
+      // Theo dõi đổi video (SPA) để tự tắt phiên cũ thay vì gửi audio sai timeline.
+      startNavigationWatch(video);
       console.log(`[BS] Capture started via Pipeline ${activePipeline}`);
       return result;
     } catch (e) {
@@ -689,6 +752,8 @@
     let resumeTimer = null;
     let lastResumeAt = 0;
     let firstTtsReceived = false;
+    //: Tiến triển nạp đệm gần nhất (để gia hạn chờ sau khi tua — xem `scheduleResume`).
+    let bufferProgress = { ready: 0, fed: 0, at: 0, extensions: 0 };
     const pauseForBuffering = (why) => {
       firstTtsReceived = false;
       if (!video.paused) {
@@ -702,15 +767,34 @@
           ? "Đang dịch trước đoạn vừa tua..."
           : (why === "tts_enable" ? "Đang chuẩn bị lồng tiếng TTS..." : "Đang nạp đệm và dịch trước...")
       );
-      // Chốt an toàn: tối đa 5.0s nếu bật TTS (cho OmniVoice tổng hợp), 3.5s nếu chỉ phụ đề
-      const timeoutMs = settings.ttsEnabled ? 5000 : 3500;
+      // Chốt an toàn (đồng hồ ĐỒNG HỒ THỰC). Với TUA, mục tiêu là "dịch xong ngay tại vị trí
+      // mới rồi mới phát" nên KHÔNG cắt cứng ở 3,5 s: nếu backend còn tiến triển thì gia hạn
+      // thêm, chỉ bỏ cuộc khi hết tiến triển (xem nhánh gia hạn bên dưới).
+      const timeoutMs = why === "seek"
+        ? (settings.ttsEnabled ? 6000 : 5000)
+        : (settings.ttsEnabled ? 5000 : 3500);
+      bufferProgress = { ready: 0, fed: 0, at: Date.now(), extensions: 0 };
       if (resumeTimer) clearTimeout(resumeTimer);
-      resumeTimer = setTimeout(() => {
-        if (lookaheadPausedVideo) {
+      const scheduleResume = (ms) => {
+        resumeTimer = setTimeout(() => {
+          if (!lookaheadPausedVideo) return;
+          const grew = bufferProgress.ready > 0
+            && Date.now() - bufferProgress.at < 1200
+            && bufferProgress.extensions < 3;
+          if (why === "seek" && grew) {
+            bufferProgress.extensions += 1;
+            console.log(
+              `[BS] Chờ thêm bản dịch tại vị trí vừa tua (ready ${bufferProgress.ready.toFixed(1)}s, ` +
+              `gia hạn ${bufferProgress.extensions}/3).`
+            );
+            scheduleResume(2000);
+            return;
+          }
           console.log("[BS] Đã nạp đệm ban đầu xong -> tiếp tục phát video.");
           resumePlayback("timeout");
-        }
-      }, timeoutMs);
+        }, ms);
+      };
+      scheduleResume(timeoutMs);
     };
     lookaheadPauseForBuffering = pauseForBuffering;
 
@@ -839,6 +923,10 @@
           const ready = Number(st.ready_ahead || 0);
           const fed = Number(st.fed_ahead || 0);
           const isTts = Boolean(settings.ttsEnabled);
+          // Ghi nhận tiến triển để quyết định có gia hạn chờ sau khi tua hay không.
+          if (lookaheadPausedVideo && (ready > bufferProgress.ready + 0.05 || fed > bufferProgress.fed + 0.05)) {
+            bufferProgress = { ...bufferProgress, ready, fed, at: Date.now() };
+          }
 
           if (lookaheadPausedVideo) {
             const target = Number(st.target_ahead || 0);
@@ -935,6 +1023,7 @@
 
   async function cleanup() {
     isCapturing = false;
+    stopNavigationWatch();
     // Vô hiệu hoá mọi tiến trình Start đang `await` (xem `startCapture`).
     captureGeneration++;
     stopBackpressureProbe();   // FIX-01: không để timer probe sống sót qua Stop

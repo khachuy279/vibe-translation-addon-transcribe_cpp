@@ -156,7 +156,19 @@ class LookaheadClient {
     this.sendJSON({ ...config, type: "set_config", action: "configure" });
   }
 
-  requestInitialChunks(currentTime) {
+  /**
+   * Yêu cầu injected script replay các mảnh đã đệm, CHỈ MỘT LẦN cho mỗi mốc (token).
+   *
+   * Sự cố thật 2026-10-01: hàm này bị gọi từ 3 nơi (`_handleConnected`, `lookahead_ready`,
+   * `seek_acknowledged`) nên cùng một cache bị append 2-3 lần; riêng lần đầu còn cộng thêm
+   * `_pendingChunks` ⇒ backend nhận ~5 bản sao của cùng đoạn audio. Đo được: 15.851 frame
+   * AAC (368 s audio) chỉ trải trên 70 s timeline ⇒ decoder phải giải mã và lọc trùng gấp 5,
+   * làm đói cả pipeline.
+   *
+   * `token`: "init" cho lần bắt đầu phiên (gửi bao nhiêu lần cũng chỉ replay 1 lần), và
+   * `seek_<id>` cho mỗi lần tua (mỗi mốc mới được replay đúng một lần).
+   */
+  requestInitialChunks(currentTime, token) {
     if (this._destroyed) return;
     try {
       const curTime = currentTime !== undefined
@@ -167,6 +179,7 @@ class LookaheadClient {
           source: "VIBE_LOOKAHEAD_CLIENT",
           type: "REQUEST_INITIAL_CHUNKS",
           currentTime: curTime,
+          replayToken: token || `init_${this.activeSeekId}`,
         }, "*");
       }
     } catch (e) {}
@@ -246,17 +259,32 @@ class LookaheadClient {
       seek_id: this.activeSeekId,
     });
 
-    // Flush các mảnh đã nhận TRƯỚC khi socket mở (đúng thứ tự append).
+    // Flush các mảnh đã nhận TRƯỚC khi socket mở — CHỈ những mảnh KHÔNG nằm trong cửa sổ
+    // cache sắp được replay (nếu không sẽ append trùng đúng đoạn đó 2 lần).
     if (this._pendingChunks.length > 0) {
-      console.log(`%c[Lookahead Client] 📤 Đang nạp ${this._pendingChunks.length} mảnh audio đệm sang backend...`, "color: #a78bfa;");
-      while (this._pendingChunks.length > 0) {
-        const item = this._pendingChunks.shift();
-        this._sendAudioBinaryFrame(item.rawBytes, item.payload);
+      const cur = this.videoElement ? Number(this.videoElement.currentTime) : 0;
+      const kept = [];
+      for (const item of this._pendingChunks) {
+        const pts = item.payload ? item.payload.videoPts : undefined;
+        const inCacheWindow = typeof pts === "number" && Number.isFinite(pts)
+          && pts >= cur - 8 && pts <= cur + 45;
+        if (!inCacheWindow) kept.push(item);
+      }
+      const skipped = this._pendingChunks.length - kept.length;
+      this._pendingChunks = [];
+      if (kept.length > 0) {
+        console.log(`%c[Lookahead Client] 📤 Nạp ${kept.length} mảnh audio đệm sang backend ` +
+          `(bỏ ${skipped} mảnh đã nằm trong cửa sổ cache).`, "color: #a78bfa;");
+        for (const item of kept) {
+          this._sendAudioBinaryFrame(item.rawBytes, item.payload);
+        }
+      } else if (skipped > 0) {
+        console.log(`[Lookahead Client] Bỏ ${skipped} mảnh đệm trùng với cửa sổ cache.`);
       }
     }
 
-    // Yêu cầu injected script replay init segment + các mảnh đã đệm.
-    this.requestInitialChunks(curTime);
+    // Yêu cầu injected script replay init segment + các mảnh đã đệm (1 lần cho mốc này).
+    this.requestInitialChunks(curTime, `init_${this.activeSeekId}`);
   }
 
   _initWebSocket() {
@@ -330,9 +358,9 @@ class LookaheadClient {
         this.isServerReady = true;
         if (this._readyTimer) { clearTimeout(this._readyTimer); this._readyTimer = null; }
         if (msg.lead_time) this.leadTime = msg.lead_time;
-        // Neo lại mốc thời gian rồi xin replay dữ liệu đệm.
+        // Neo lại mốc thời gian. KHÔNG xin replay ở đây: `_handleConnected` đã xin (cùng
+        // token) và interceptor dedup theo token ⇒ tránh append cache lần thứ hai.
         this._sendSyncNow();
-        this.requestInitialChunks();
         if (this.onReady) this.onReady();
         break;
       }
@@ -375,8 +403,22 @@ class LookaheadClient {
         break;
       }
       case "seek_acknowledged": {
-        // Sau khi backend xác nhận tua: xin lại dữ liệu vùng mới.
-        this.requestInitialChunks();
+        // Sau khi backend xác nhận tua: xin lại dữ liệu vùng mới. Token theo seek_id mới nên
+        // interceptor THỰC SỰ replay lại (khác với các lần gọi lặp của cùng một mốc).
+        this.requestInitialChunks(undefined, `seek_${this.activeSeekId}`);
+        break;
+      }
+      case "lookahead_request_replay": {
+        // Backend báo audio nhận được lệch xa vị trí phát (thường sau khi tua): yêu cầu
+        // interceptor gửi lại mảnh quanh vị trí phát. Token DUY NHẤT để không bị dedup chặn.
+        console.log(
+          `[Lookahead Client] 🔁 Backend xin gửi lại mảnh quanh ${msg.currentTime ?? "?"}s ` +
+          `(lý do: ${msg.reason || "?"})`
+        );
+        this.requestInitialChunks(
+          msg.currentTime !== undefined ? Number(msg.currentTime) : undefined,
+          `replay_${Date.now()}_${this.activeSeekId}`
+        );
         break;
       }
       default:
@@ -442,6 +484,9 @@ class LookaheadClient {
       is_init: !!meta?.isInit,
     };
     if (typeof meta?.epoch === "number") hdrObj.epoch = meta.epoch;
+    //: Mảnh TẢI LẠI cho vùng đã buffer sẵn: byte có thể trùng mảnh cũ nên backend phải MIỄN
+    //: dedup, nếu không nó bị bỏ và vùng đã tải trước không bao giờ có phụ đề.
+    if (meta?.refetched) hdrObj.refetched = true;
 
     const hdrBytes = new TextEncoder().encode(JSON.stringify(hdrObj));
     const hdrLen = hdrBytes.length;

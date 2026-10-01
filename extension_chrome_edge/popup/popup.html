@@ -181,10 +181,11 @@
           <label>Đồng bộ phụ đề / lồng tiếng</label>
           <span class="val-badge"><span id="valLookaheadSync">0</span> ms</span>
         </div>
-        <input type="range" id="rangeLookaheadSync" min="-600" max="600" step="50" value="0">
+        <input type="range" id="rangeLookaheadSync" min="-1500" max="1500" step="50" value="0">
         <div class="hint">
           Phụ đề/TTS hiện SỚM hơn tiếng nói thì tăng (+); hiện MUỘN thì giảm (−).
           Hệ thống đã tự bù phần VAD lùi mép câu, đây chỉ là tinh chỉnh.
+          Một số trang có độ lệch riêng tới ~1 s nên dải chỉnh nay là ±1500 ms.
         </div>
       </div>
 

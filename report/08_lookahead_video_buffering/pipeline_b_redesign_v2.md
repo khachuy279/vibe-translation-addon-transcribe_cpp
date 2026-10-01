@@ -392,6 +392,332 @@ Khắc phục:
 
 ---
 
+### 7.10. Lần thử thật thứ tư (2026-10-01 17:17) — trang NGOÀI YouTube chỉ hiện 1/3–5 câu
+
+**Triệu chứng**: Pipeline B chạy tốt trên YouTube, nhưng ở một trang khác phụ đề "chập chờn":
+khoảng 3–5 câu mới hiện được 1 câu, dù `lead_time` rất xa.
+
+**Chẩn đoán** (số đo thật, `[ASR] CHẨN ĐOÁN NĂNG LỰC` mới thêm):
+
+```text
+audio vào 913.9 KB/s → PCM giải mã 3.80x  (burst: replay cache của interceptor)
+audio vào  16.6 KB/s → PCM giải mã 0.40x  (trạng thái ổn định)
+Giải mã ĐÓI AUDIO: 20.0s không sinh ra PCM mới trong khi vẫn nhận 342036 B audio
+```
+
+16,6 KB/s audio tương đương đúng 1× thời gian thực ⇒ **342 KB ≈ 20 s audio đã về nhưng chỉ
+4,10 s được giải mã** (mất 80 %). Thời gian wall của mỗi lượt giải mã chỉ **0,1 s** ⇒ KHÔNG
+phải nghẽn tốc độ, mà là **mốc tiến độ (`_last_pts`) chạy vượt phần audio thực sự đã phát ra
+PCM**, khiến lượt sau lọc `pts < _last_pts` và bỏ vĩnh viễn đoạn chênh lệch. Đây cũng là lý do
+`fed_ahead` luôn đứng ở 21 s (đúng trần nạp) trong khi `ready_ahead` tụt về 0.
+
+**Nguyên nhân gốc trong `StreamDemuxer._decode_new()`** — hai lỗi trộn trục thời gian:
+
+| # | Lỗi | Hệ quả |
+| :--- | :--- | :--- |
+| 1 | `_last_pts` được cập nhật theo `pts + frame_dur` của **MỌI** frame, kể cả frame mà resampler chưa nhả mẫu PCM nào | Mốc tiến trước phần PCM thực có; lượt sau bỏ đúng phần bị vượt |
+| 2 | `container.seek()` dùng mốc trên trục **container**, còn việc lọc frame dùng mốc trên trục **media** (`pts + timestampOffset`) | Với SourceBuffer có `timestampOffset` ≠ 0 (trang ngoài YouTube hay dùng), seek vượt cuối container ⇒ mất gần hết audio |
+
+Thêm một lỗi phụ: chunk vừa tạo bị cắt theo `self._last_pts` **sau khi** đã cập nhật ⇒ tự cắt
+mất phần vừa giải mã (phát hiện ngay khi chạy test, đã sửa bằng cách cắt lúc `flush_run()`).
+
+**Khắc phục** (`backend/core/stream_demuxer.py`):
+
+* Mọi so sánh mốc nằm trên **một trục duy nhất** = `container_pts + timestampOffset`
+  (`_last_pts` cũng là mốc đã-phát trên trục đó); `container.seek()` trừ `bias` trước khi đổi
+  sang đơn vị `time_base`.
+* `_last_pts` **chỉ tiến khi PCM thực sự được phát ra** (`flush_run()`), kèm cắt phần chồng lấn
+  0,5 s ở mép đầu đoạn ⇒ không lặp 20 ms mỗi lượt mà cũng không bỏ sót frame nào.
+* Bộ đếm chẩn đoán mới: `coverage_report()` → `emitted`, `last_pts`, `skipped_frames`,
+  `gaps_in_media`, `seek_fallbacks`; in kèm mỗi dòng `CHẨN ĐOÁN NĂNG LỰC`.
+
+**Kiểm chứng**: 2 test mới trong `backend/tests/test_50_lookahead_demuxer.py`:
+
+* `test_stream_demuxer_pts_frontier_never_passes_emitted_audio` — mảnh 16 KB, khẳng định
+  `last_pts <= tổng audio đã phát + 1 frame`, các đoạn liền nhau không hở/chồng.
+* `test_stream_demuxer_uses_timestamp_offset_on_one_time_axis` — `timestamp_offset = 3600 s`
+  vẫn phải thu hồi ≥ 7,8/8,0 s và PTS nằm đúng trên trục video.
+
+Toàn bộ suite backend PASS sau khi sửa.
+
+### 7.11. Lần thử thật thứ năm (2026-10-01 17:25) — cache mảnh lệch khỏi vị trí phát
+
+**Triệu chứng**: phiên neo ở **đầu video** (`current_time = 1,35 s`) nhưng PCM giải mã ra lại
+nằm ở **144 s trở đi**:
+
+```text
+Lookahead init: neo vị trí phát hiện tại @1.35s
+Giải mã liên tục: +6.15s [144.10s -> 150.26s]
+Giải mã liên tục: +8.22s [152.04s -> 160.26s]
+CHẨN ĐOÁN NĂNG LỰC ... đệm ĐÃ DỊCH 0.0s (fed 21.0s) ... bỏ_xa=0
+```
+
+Lưu ý: `skipped_frames=0` và `gaps_in_media=0` ⇒ logic mốc của demuxer đã ĐÚNG (không còn bỏ
+audio trong bộ đệm); vấn đề nằm ở chỗ dữ liệu nhận được không thuộc vùng đang phát.
+
+**Nguyên nhân**: interceptor replay cache **120 mảnh gần nhất**. Ở trang tải trước rất sâu
+(video element báo `buffered_end = 278 s`), 120 mảnh đó chỉ phủ **đoạn cuối** của vùng đã tải
+(~144 s → ~399 s) — không có mảnh nào quanh vị trí phát. Hệ quả kép:
+
+1. `ContinuousAudioTimeline` phải **lấp hàng trăm giây im lặng** để đi từ 1,35 s tới 144 s ⇒
+   đốt CPU vô ích và `fed_ahead` luôn ở trần 21 s.
+2. Mọi câu nhận dạng được mang mốc **143 s TRONG TƯƠNG LAI** ⇒ `SubtitleTimelineQueue` không
+   bao giờ phát chúng ⇒ màn hình trống.
+
+**Khắc phục (hai lớp)**:
+
+* **Backend** (`lookahead.max_decode_lead_sec = 240 s`): PCM giải mã ra mà bắt đầu xa hơn ngưỡng
+  này phía trước vị trí phát thì **KHÔNG nạp vào timeline** (đếm ở `chunks_dropped_far`, log
+  WARNING). Pipeline chỉ chờ mảnh mới đúng vị trí phát — vẫn luôn có phụ đề.
+* **Extension** (`buffer_interceptor_poc.js`, cả Firefox và Chrome/Edge): mỗi mảnh cache được
+  gắn `videoPts` (mốc video lúc append); khi replay chỉ gửi mảnh trong cửa sổ
+  `[playhead − 8 s, playhead + 45 s]` và log rõ số mảnh bị bỏ. Nhờ vậy cache **luôn** liên quan
+  tới vị trí đang phát, không phụ thuộc việc trang tải trước bao xa.
+
+**Kiểm chứng**: `test_decoded_pcm_far_ahead_of_playhead_is_dropped` (media neo ở 1000 s, vị trí
+phát 1 s ⇒ bỏ hết, timeline rỗng; media quanh vị trí phát ⇒ nhận bình thường).
+
+**Số đo đã sửa cho đúng**: bỏ tỷ lệ `PCM/byte` — nó giả định 160 kbps nên gây hiểu sai (log cũ
+hiện `0.05x` trong khi bitrate thật chỉ ~17 KB/s). Thay bằng `media giải mã` (giây media thật),
+`bỏ_xa` và `lượt có PCM`, tách hẳn khỏi `bytes_in` là byte thô.
+
+### 7.12. Lần thử thật thứ sáu (2026-10-01 17:36) — mảnh bị replay TRÙNG nhiều lần
+
+Sau §7.11 phụ đề đã hiện lại (`ready_ahead` 15–20 s, `prebuffer_ready=True`), nhưng còn hai
+điều bất thường trong log:
+
+```text
+audio vào 1034.9 KB/s            ← 10 s đầu, gấp ~60x bitrate thật
+CẤU TRÚC NGUỒN: container=mp4, n_audio_streams=1, codec=aac, rate=44100,
+                frames=15851, pts=[291.22, 361.23], span=70.0s
+```
+
+15.851 frame AAC @ 44,1 kHz = **368 giây audio** nhưng chỉ trải trên **70 giây** timeline ⇒
+**dữ liệu nhận được có ~5,3 bản sao của cùng đoạn media**.
+
+**Nguyên nhân**: `LookaheadClient.requestInitialChunks()` được gọi từ **3 đường**
+(`_handleConnected`, `lookahead_ready`, `seek_acknowledged`) và mỗi lần interceptor lại
+`postMessage` **toàn bộ** cache; thêm nữa `_handleConnected` còn flush `_pendingChunks` (những
+mảnh đã nằm sẵn trong cache). Kết quả: một cache ~10 MB được append 2–3 lần ⇒ backend phải giải
+mã và lọc trùng gấp ~5 lần, làm đói cả pipeline (mỗi lượt chỉ ra 1,5–8 s PCM mới).
+
+**Khắc phục (ba lớp)**:
+
+* **Extension — dedup theo token**: `requestInitialChunks(currentTime, token)` gửi kèm
+  `replayToken`; interceptor bỏ qua yêu cầu nếu token trùng lần replay trước. Token là
+  `init_<seekId>` cho đầu phiên (gọi bao nhiêu lần cũng chỉ replay một lần) và `seek_<seekId>`
+  cho mỗi lần tua (mỗi mốc mới replay đúng một lần).
+* **Extension — không flush trùng**: `_pendingChunks` chỉ gửi những mảnh NẰM NGOÀI cửa sổ cache
+  sắp replay; đồng thời `lookahead_ready` không còn gọi `requestInitialChunks()` nữa.
+* **Backend — chốt an toàn**: `handle_audio_fragment` băm nội dung mảnh (`blake2b`, cửa sổ
+  15 s) và BỎ mảnh trùng; đếm ở `fragments_deduped`/`mảnh_trùng` (cảnh báo mỗi 50 mảnh). Cửa
+  sổ thời gian để mảnh nạp lại hợp lệ sau khi tua vẫn được chấp nhận.
+
+**Chẩn đoán bổ sung**: `structure_report()` nay in `duration/span` (≈1,0 là bình thường;
+>1,2 là có trùng lặp) — dấu hiệu định lượng phân biệt "trùng lặp" với "mất audio".
+
+**Kiểm chứng**: `test_duplicate_audio_fragments_are_ignored` (gửi lại y hệt 5 lần ⇒
+`fragments_deduped == 5`, bộ đệm ghép nối KHÔNG phình; mảnh khác vẫn được nhận).
+
+### 7.13. Lần thử thật thứ bảy (2026-10-01 18:12) — trùng lặp đã hết, còn "decoder dừng sớm"
+
+**Kết quả tốt**: `duration/span=1.00x` (hết trùng lặp), `mảnh_trùng=0`, phụ đề chạy với
+`ready_ahead` 7–19 s và mốc khớp video.
+
+**Còn lại**: mỗi lượt giải mã vẫn chỉ ra **1,5–8 s PCM** rồi ~20 s sau mới ra tiếp, dù
+`CẤU TRÚC NGUỒN` cho thấy bộ đệm ĐẶC (`duration/span = 1,00`, `gaps_in_media=0`,
+`skipped_frames=0`). Byte vào 67 KB/s gấp ~4× bitrate audio thật (16,5 KB/s).
+
+**Đã làm trong vòng này (đo được, không phải suy đoán)**:
+
+1. **Đo chuỗi fragment fMP4 thật** — `scan_mp4_fragment_times()` đọc `tfhd.track_ID` +
+   `tfdt.baseMediaDecodeTime` của từng `moof`; `_mp4_fragment_chain_report()` quy về giây và
+   tự chuẩn hoá theo bước fragment điển hình (vì `tfdt` là mốc BẮT ĐẦU nên hiệu hai mốc chính
+   là độ dài fragment — nếu so với ngưỡng 0,6 s sẽ báo khe hở GIẢ). Đây là phép đo phân biệt
+   dứt khoát "mảnh chưa bao giờ được append" với "decoder không lấy ra hết".
+2. **Đường dự phòng bóc AAC thô** (`_decode_raw_aac`): khi đường chuẩn không ra PCM mà bộ đệm
+   đã có byte media, bóc thẳng frame trong `mdat` → ADTS → decode. Có **chốt chống báo động
+   giả**: quét `0xFFF` trên AAC thô khớp giả rất nhiều (đo được 71 "frame" rác trên một file
+   thật), nên chỉ dùng khi độ phủ byte ≥ 90 % (`_raw_fallback_rejected` ghi số lần từ chối).
+3. **Sửa hai lỗi trong chính bộ đọc box** (phát hiện nhờ chạy trên fMP4 thật):
+   `tfdt`/`tfhd` nằm ở `data_start + 0` (không phải `+4`) vì `_find_box` đã trả offset NGAY SAU
+   header box.
+
+**Kiểm chứng**: `test_mp4_fragment_chain_report_on_real_fmp4` (fMP4 do PyAV ghi: `track_id`
+đúng, `tfdt` tăng dần, báo `LIỀN MẠCH`), `test_adts_frame_parser_roundtrip`,
+`test_raw_aac_fallback_refuses_false_positives`. Toàn bộ suite: **526 passed**.
+
+### 7.14. Lần thử thật thứ tám (2026-10-01 18:22) — cache mảnh vẫn lệch, và cách chữa tận gốc
+
+Log cho hai thông tin quyết định:
+
+```text
+Lookahead init: neo vị trí phát hiện tại @2.68s
+Giải mã liên tục: +5.02s [74.44s -> 79.46s]          ← mảnh ĐẦU TIÊN đã ở 74,44 s
+audio vào 4195 KB trong 4 giây (419 KB/s)            ← vẫn replay NGUYÊN cache
+CẤU TRÚC NGUỒN: tracks={2: 44}, tfdt_giây=[74.44, 276.22], KHE_HỞ=9 (thiếu ~46s),
+                duration/span=1.24x
+```
+
+Hệ quả đúng như người dùng báo: **74 giây đầu không có phụ đề** (audio của đoạn đó chưa bao
+giờ tới backend), rồi từ ~74 s phụ đề mới chạy (3 commit: 74,50–77,53 / 77,58–79,59 s).
+
+**Nguyên nhân gốc**: cache "120 mảnh gần nhất" của interceptor. Trang này tải trước tới ~279 s;
+khi prefetch nhảy xa, 120 mảnh **chỉ toàn đoạn ở tương lai** ⇒ mất audio quanh vị trí phát
+dù cache "đầy". Đây là lỗi thiết kế của trần đếm-mảnh, không phải lỗi parser.
+
+**Khắc phục**:
+
+1. **Extension — cache bám vị trí phát** (thay trần 120 mảnh): giữ
+   `[playhead − 30 s, playhead + 180 s]` + trần 12 MB, prune sau mỗi lần append
+   (`pruneCacheAroundPlayhead`). Cache KHÔNG THỂ trôi xa khỏi vị trí phát nữa.
+2. **Backend — giải mã TỪNG fragment** (`_decode_fragments_individually`): ghép `init` với
+   từng cặp `moof`+`mdat` rồi giải mã riêng, nên một mảnh hỏng chỉ mất chính nó thay vì chặn
+   toàn bộ phần sau. Chỉ chạy khi đường nối-liền chưa lấy hết audio (`_last_audio_tfdt_sec`)
+   và số mảnh ≤ 200 (chặn chi phí). Đo trên fMP4 thật: **12,0 s / 12,0 s qua 6 mảnh**.
+3. **Backend — cảnh báo lệch đầu phiên**: nếu PCM đầu tiên tới muộn hơn vị trí phát > 20 s thì
+   log WARNING nói rõ "đoạn đầu sẽ không có phụ đề" + nguyên nhân (cache chưa bám vị trí phát),
+   để không phải suy đoán ở lần sau.
+
+**Lưu ý vận hành**: cả ba lần thử gần đây đều cho thấy phần **extension chưa được nạp lại**
+(`audio vào` tăng vọt 4 MB trong 4 s = replay nguyên cache; mảnh đầu vẫn lệch hàng chục giây).
+Sửa ở extension chỉ có hiệu lực sau khi **Reload** trong `about:debugging` **và tải lại trang**.
+
+**Kiểm chứng**: `_decode_fragments_individually` đo trực tiếp 12/12 s; toàn bộ suite backend
+**526 passed**; JS extension **46/46** cho cả Firefox và Chrome/Edge.
+
+### 7.15. Lần thử thật thứ chín (2026-10-01 18:31) — đường "giải mã từng fragment" ĐÃ CHẠY
+
+Đây là lần đầu phụ đề hiện **liên tục** ngay từ giây thứ 2. Log xác nhận cơ chế mới hoạt động:
+
+```text
+Đường giải mã nối-liền không ra PCM — đã chuyển sang giải mã TỪNG fragment (8.3s)
+Giải mã liên tục: [1.70→10.03] [10.05→15.07] [15.07→20.06] [20.09→25.05] [25.05→30.07] …
+duration/span=1.00x          (hết trùng lặp)
+giải_mã_từng_mảnh=63         (đường dự phòng chạy liên tục)
+```
+
+Trước đây mỗi lượt chỉ ra 1,5–8 s rồi hụt 20 s; nay các đoạn **nối liền nhau** và phụ đề ra
+đều (`Stand please. Excuse me.`, `What happened?`, `I was diagnosed with anemia.`,
+`すごく嬉しかったです。お座りください。`, …).
+
+**Còn một lỗi trong chính đường dự phòng, đã sửa**: `_decode_fragments_individually` chỉ lấy
+**200 mảnh ĐẦU** bộ đệm, nên sau khi phát hết phần đầu nó giải mã lại mãi phần cũ và không bao
+giờ tới các mảnh xa hơn (bộ đệm 6 MB / 3000+ mảnh). Nay nó:
+
+* **nhắm đúng vùng cần**: chỉ lấy các mảnh có `tfdt ≥ _last_pts − 0,05` (ngân sách 200 mảnh);
+* **quét từ offset của mảnh cần** (`_first_offset_at_or_after` + tìm nhị phân trên mốc thời
+  gian đã cache) thay vì duyệt toàn bộ `moof` mỗi lượt;
+* **chỉ lấy mảnh của track AUDIO** (`scan_mp4_track_at` đọc `tfhd.track_ID` theo từng box), nên
+  không trộn lẫn khi dòng có nhiều track.
+
+**Kiểm chứng**: đo trực tiếp trên fMP4 do PyAV ghi — đặt `_last_pts = 14,14 s` (giữa bộ đệm)
+thì đường dự phòng trả đúng **15,86 s từ 14,14 s → 30,00 s** (bắt đầu ≥ mốc đã phát). Toàn bộ
+suite **526 passed**; JS **46/46**.
+
+**Còn tồn tại (không phải lỗi pipeline)**: ở phiên này site chỉ có audio từ ~10 s trở đi trong
+vùng đã tải, nên cảnh báo "Audio nhận được bắt đầu ở … lệch …" xuất hiện; pipeline vẫn chạy
+đúng phần audio mà nó có. Cảnh báo này là công cụ để phân biệt với lỗi logic.
+
+### 7.16. Lần thử thật thứ mười (2026-10-01 21:27) — hết mất câu, canh mốc và một lỗi trần RAM
+
+Người dùng xác nhận **phụ đề đã hiện đủ**, chỉ còn **sớm hơn tiếng nói ~0,5–1 s**.
+
+**Lỗi thật phát hiện trong log** (sẽ làm pipeline đứng sau ~4 phút):
+
+```text
+CẤU TRÚC NGUỒN: ... media=8014927B ... frames=0, pts=[None, None], n_moof=0
+demuxer: emitted=239.1s, last_pts=-infs
+```
+
+Chuỗi nhân–quả:
+
+1. Bộ đệm ghép nối vượt trần 8 MB. `_trim()` cũ, khi không đủ ranh giới cluster, **cắt thô
+   giữa cấu trúc** ⇒ dòng byte mất đồng bộ.
+2. `scan_mp4_boundaries` không còn tìm thấy `moof` nào (`n_moof=0`) ⇒ cả đường nối-liền lẫn
+   đường từng-mảnh đều không có gì để giải mã.
+3. `_last_pts` giữ `-inf` ⇒ mọi lượt sau lại bắt đầu lại từ mảnh đầu ⇒ `emitted` đứng yên
+   vĩnh viễn. Cảnh báo "Audio nhận được bắt đầu ở …" in mỗi lượt (nhiễu log).
+
+**Khắc phục**:
+
+* `_trim()` **không bao giờ cắt thô**: chỉ cắt tại ranh giới cluster/`moof` thật và luôn chừa
+  ít nhất một ranh giới; không tìm được ranh giới an toàn thì **giữ nguyên** + WARNING (thà
+  tốn RAM hơn hỏng luồng byte). Cache offset/mốc bị xoá sau mỗi lần cắt.
+* Nới trần quét `moof` (4096 → 100000) và chỉ ghép offset↔mốc khi **hai danh sách cùng độ dài**.
+* `_decode_fragments_individually` khi không ra PCM vẫn **ghi nhận mốc vùng đã xử lý** để lượt
+  sau tiến tiếp, không lặp lại 200 mảnh cũ.
+* Cảnh báo lệch đầu phiên chỉ in **một lần** mỗi phiên.
+
+**Kiểm chứng**: đo trực tiếp với trần bộ đệm nhỏ (120 KB) để buộc trim 4 lần trên file 24 s →
+thu hồi **24,01/24 s**, ranh giới `moof` còn nguyên (`test` cục bộ + toàn bộ suite 526 pass).
+
+**Canh mốc (sớm 0,5–1 s)**: nới dải thanh "Đồng bộ phụ đề / lồng tiếng" từ ±600 ms lên
+**±1500 ms** (khớp trần phía backend), cả `popup.html` và clamp trong `content-script.js`.
+Hệ thống đã tự bù 50 ms cho FireRed; phần lệch còn lại là đặc thù từng trang nên người dùng
+tinh chỉnh bằng thanh này (tăng `+` = hiện muộn hơn). Trị số gợi ý ban đầu cho trang này:
+**+500…+1000 ms**.
+
+### 7.17. ĐƠN GIẢN HOÁ: seek = phiên mới (theo đề xuất người dùng)
+
+Đề xuất: "mỗi lần tua thì xoá toàn bộ âm thanh/phụ đề/TTS và reset như phiên mới, tạm dừng
+video, đợi có bản dịch ngay tại vị trí đó (+TTS) rồi mới phát". Đây là thiết kế ĐÚNG và làm
+mất hẳn một lớp lỗi phức tạp. Đã áp dụng:
+
+* **XOÁ cơ chế tự đoán "lệch timeline"** (`sync_state` so cursor với `currentTime`): nó tạo
+  VÒNG LẶP reset mỗi 3 s vì sau mỗi lần reset cursor chưa kịp tiêu thụ audio nào (đo thật:
+  13 lần reset liên tiếp, mỗi lần xoá ASR ⇒ phụ đề "lúc hiện lúc không"). Nay **mọi lần tua
+  đi qua đúng một đường**: `handle_seek` (từ `seek_id` mới hoặc `seek_reset`) ⇒ reset toàn bộ
+  audio + commit + neo + hàng đợi TTS. Bớt hẳn `_cursor_stalled_sec`, `_STALL_RESYNC_SEC` và
+  hai trường theo dõi cursor.
+* **Client vẫn là bên quyết định "đã đủ để phát lại"**: `_onVideoSeeking` xoá queue phụ đề +
+  `ttsTimeline.clear()` + `pauseForBuffering("seek")`, và chỉ `resumePlayback()` khi
+  `prebuffer_ready` (hoặc TTS đầu tiên tới).
+* **Chờ sau khi tua thông minh hơn (không cắt cứng 3,5 s)**: hạn chờ 5 s (6 s nếu bật TTS) và
+  **gia hạn thêm 2 s (tối đa 3 lần) khi `ready_ahead`/`fed_ahead` còn tăng** — tức đợi tới khi
+  thật sự có bản dịch tại vị trí mới, nhưng vẫn có trần để không treo trình phát.
+
+**Điều đơn giản hoá này KHÔNG giải quyết được** (và cần nói rõ): nguồn audio. Nếu tua vào vùng
+trình phát ĐÃ tải sẵn, site không append lại ⇒ không có byte nào tới backend, nên không có gì
+để dịch dù reset sạch cỡ nào. Đó là lý do vẫn giữ cơ chế **tải lại phân đoạn media** ở
+`buffer_interceptor_poc.js` (ghi URL + `Range` qua hook `fetch`/`XHR`, tải lại khi cache không
+có mảnh quanh vị trí phát) — reset lo phần TRẠNG THÁI, tải lại lo phần DỮ LIỆU.
+
+**Kiểm chứng**: toàn bộ suite **526 passed**; JS **46/46** cả hai bản extension.
+
+### 7.18. Tua vào vùng YouTube ĐÃ tải sẵn — sửa hai lỗi trong cơ chế tải lại
+
+Log thật (2026-10-01 22:24) cho thấy cơ chế tải lại phân đoạn **bị chặn bởi chính bộ lọc trùng**:
+
+```text
+22:24:41.395  Yêu cầu client gửi lại mảnh quanh vị trí phát 4.3s     ← đã yêu cầu
+22:24:41.748  Bỏ mảnh audio TRÙNG (tổng đã bỏ: 1) … 51 … 53          ← dedup chặn chính nó
+22:24:51      Seek reset target_time=28.59s
+22:24:58.685  Giải mã liên tục: [60.00s -> 60.53s]                   ← vẫn 30 s SAU vị trí tua
+```
+
+Hai lỗi thiết kế:
+
+1. **Chọn sai khoảng byte**: mã cũ lấy `mediaRanges[last]` (range CUỐI đã tải) chứ không quy đổi
+   từ VỊ TRÍ TUA ⇒ tải lại đúng chỗ vô ích.
+2. **Mảnh tải lại bị dedup chặn**: byte của nó trùng mảnh đã nhận nên backend bỏ — cơ chế tải lại
+   không bao giờ cứu được vùng đã buffer.
+
+**Khắc phục**:
+
+* `refetchForPlayhead(playhead, bytesPerSec)`: quy đổi vị trí tua → byte ước lượng
+  (`playhead × bytesPerSec`, lùi 3 s cho chắc), chọn tối đa 8 range gần nhất, bỏ qua range đã
+  tải lại, và chặn trần `refetchMaxBytes` (6 MB).
+* Cờ `refetched` đi suốt chuỗi **interceptor → content script → header khung nhị phân →
+  `handle_audio_fragment(refetched=True)`**, và backend **miễn dedup** cho mảnh này
+  (`if (not refetched) and …`). Vì đây là dữ liệu do chính ta yêu cầu, trùng lặp là đúng ý.
+
+**Còn phụ thuộc dữ liệu thật** (chưa kiểm chứng cục bộ được): ước lượng byte/giây. Nếu sai
+nhiều, khoảng tải lại có thể lệch khỏi vị trí cần — log `⬇️ Tải lại … cho vùng quanh Xs` ở
+Console là chỗ kiểm tra đầu tiên.
+
+---
+
 ## 8. Giới hạn đã biết
 
 ### 7.9. Sự cố TRÀN VRAM: TTS synth 30 s làm mất cả phụ đề

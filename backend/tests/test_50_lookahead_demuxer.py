@@ -230,3 +230,156 @@ def test_stream_demuxer_rejects_garbage_without_crash():
     assert demux.feed(b"", timestamp_offset=0.0) == []
     assert demux.feed(b"\x00" * 1024, timestamp_offset=0.0) == []
 
+
+def test_stream_demuxer_pts_frontier_never_passes_emitted_audio(webm_opus_sample):
+    """REGRESSION (2026-10-01): mốc tiến độ KHÔNG được vượt phần audio đã phát ra PCM.
+
+    Sự cố thật: mỗi lượt giải mã chỉ thu được ~4,1 s trong khi ~20 s audio đã về (trang
+    ngoài YouTube), phụ đề chỉ hiện 1/3-5 câu. Nguyên nhân là `_last_pts` được cập nhật
+    theo `pts + frame_dur` của MỌI frame — kể cả frame mà resampler chưa nhả mẫu nào —
+    nên nó chạy trước phần PCM thực có; lượt sau lọc `pts < _last_pts` liền bỏ vĩnh viễn
+    đoạn chênh lệch đó.
+
+    Bất biến kiểm ở đây: mốc đã phát (`last_pts`) luôn ≤ tổng audio ĐÃ PHÁT + mép frame,
+    và tổng audio thu hồi được phải phủ gần hết file nguồn.
+    """
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.feed(init, timestamp_offset=0.0, is_init=True, epoch=0)
+
+    chunks = []
+    for i in range(0, len(body), 16384):   # mảnh nhỏ hơn 32 KB: nhiều lượt giải mã hơn
+        chunks.extend(demux.feed(body[i:i + 16384], timestamp_offset=0.0, epoch=0))
+
+    emitted = sum(c.duration for c in chunks)
+    assert emitted >= 7.8, f"Chỉ thu được {emitted:.2f}s / 8.00s audio"
+
+    # Mốc tiến độ không được vượt quá phần đã phát (cho phép đúng 1 frame Opus ở mép).
+    assert demux.last_pts <= emitted + 0.05, (
+        f"mốc tiến độ {demux.last_pts:.3f}s vượt phần đã phát {emitted:.3f}s "
+        f"=> audio sẽ bị bỏ ở lượt sau"
+    )
+    # Các đoạn phải liền nhau, không chồng lấn, không hở.
+    prev_end = None
+    for chunk in chunks:
+        if prev_end is not None:
+            assert chunk.pts_start >= prev_end - 0.02, "Các đoạn bị chồng lấn"
+            assert chunk.pts_start <= prev_end + 0.02, "Có khe hở giả giữa các đoạn"
+        prev_end = chunk.pts_end
+
+
+def test_stream_demuxer_uses_timestamp_offset_on_one_time_axis(webm_opus_sample):
+    """`timestampOffset` của SourceBuffer phải được áp NHẤT QUÁN (PTS ra = pts + offset).
+
+    Bản cũ seek theo `container_pts` nhưng lọc theo mốc đã cộng offset (hoặc ngược lại) —
+    với trang có offset lớn, mọi frame mới bị coi là "cũ" và bị bỏ sạch.
+    """
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+    offset = 3600.0  # kiểu `timestampOffset` để neo segment vào timeline video dài
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.feed(init, timestamp_offset=offset, is_init=True, epoch=0)
+
+    chunks = []
+    for i in range(0, len(body), 32768):
+        chunks.extend(demux.feed(body[i:i + 32768], timestamp_offset=offset, epoch=0))
+
+    assert chunks, "Không giải mã được gì khi có timestampOffset"
+    assert sum(c.duration for c in chunks) >= 7.8
+    assert chunks[0].pts_start >= offset - 0.1, (
+        f"PTS phải nằm trên trục video (>= {offset}s) nhưng nhận {chunks[0].pts_start:.2f}s"
+    )
+    assert chunks[-1].pts_end <= offset + 8.5
+
+
+def test_adts_frame_parser_roundtrip():
+    """Bộ tách frame ADTS phải đọc lại ĐÚNG các frame đã đóng gói (nền của đường dự phòng)."""
+    from backend.core.stream_demuxer import _iter_adts_frames
+
+    def hdr(frame_len: int, sr_index: int = 4, channels: int = 1) -> bytes:
+        b = bytearray(7)
+        b[0], b[1] = 0xFF, 0xF1
+        b[2] = ((1 & 0x3) << 6) | ((sr_index & 0xF) << 2) | ((channels >> 2) & 0x1)
+        b[3] = ((channels & 0x3) << 6) | ((frame_len >> 11) & 0x3)
+        b[4] = (frame_len >> 3) & 0xFF
+        b[5] = ((frame_len & 0x7) << 5) | 0x1F
+        b[6] = 0xFC
+        return bytes(b)
+
+    frames = [hdr(100 + i + 7) + bytes([i % 251]) * (100 + i) for i in range(50)]
+    assert _iter_adts_frames(b"".join(frames)) == frames
+
+
+def test_raw_aac_fallback_refuses_false_positives():
+    """Đường dự phòng AAC thô KHÔNG được đẩy PCM rác khi payload không phải luồng ADTS.
+
+    Quét `0xFFF` trên AAC thô (fMP4) khớp giả ở rất nhiều vị trí; nếu không chặn thì PCM rác
+    sẽ vào thẳng phụ đề. Độ phủ byte phải gần 100 % mới coi là luồng ADTS thật.
+    """
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux._container = "mp4"
+    # Byte "AAC thô" giả: có mẫu 0xFFF rải rác nhưng KHÔNG phải chuỗi frame ADTS hợp lệ
+    # (header khai frame dài hơn dữ liệu còn lại ⇒ không có frame nào hợp lệ).
+    demux._media = bytearray((b"\xff\xf1\x50\x80\x00\x1f\xfc" + b"\x11" * 9) * 2000)
+    assert demux._decode_raw_aac() == []
+    assert demux._raw_fallback_used == 0
+
+
+def test_mp4_fragment_chain_report_on_real_fmp4():
+    """Chuỗi fragment fMP4 THẬT: `track_id` và `tfdt` phải đọc đúng, và báo LIỀN MẠCH.
+
+    Dùng file do PyAV ghi ra (không tự đóng gói box bằng tay) — đây là dạng dữ liệu đúng như
+    trình duyệt append, nên test có giá trị hồi quy thực.
+    """
+    av = pytest.importorskip("av")
+    import io
+
+    buf = io.BytesIO()
+    out = av.open(
+        buf, mode="w", format="mp4",
+        options={"movflags": "frag_keyframe+empty_moov+default_base_moof",
+                 "frag_duration": "2000000"},
+    )
+    sr, duration = 44100, 20.0
+    st = out.add_stream("aac", rate=sr)
+    st.layout = "mono"
+    st.bit_rate = 128000
+    n = int(sr * duration)
+    t = np.linspace(0, duration, n, endpoint=False)
+    for i in range(0, n - 1024, 1024):
+        seg = (0.4 * np.sin(2 * np.pi * 300 * t[i:i + 1024])).astype(np.float32)
+        frame = av.AudioFrame.from_ndarray(seg.reshape(1, -1), format="fltp", layout="mono")
+        frame.sample_rate = sr
+        frame.pts = i
+        for pkt in st.encode(frame):
+            out.mux(pkt)
+    for pkt in st.encode(None):
+        out.mux(pkt)
+    out.close()
+    data = buf.getvalue()
+
+    pos = data.find(b"moof")
+    assert pos > 4
+    body = data[pos - 4:]
+
+    from backend.core.stream_demuxer import scan_mp4_boundaries, scan_mp4_fragment_times
+
+    assert len(scan_mp4_boundaries(body)) >= 5
+    times = scan_mp4_fragment_times(body)
+    assert times, "Không đọc được moof nào"
+    assert {t for _d, t in times} == {1}, f"track_id sai: {times}"
+    decode_times = [d for d, _t in times]
+    assert decode_times == sorted(decode_times), "tfdt phải tăng dần"
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux._container = "mp4"
+    demux._media = bytearray(body)
+    report = demux._mp4_fragment_chain_report(sr)
+    assert "LIỀN MẠCH" in report, report
+
+

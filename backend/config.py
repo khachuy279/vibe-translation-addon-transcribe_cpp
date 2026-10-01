@@ -523,6 +523,18 @@ class LookaheadConfig(BaseModel):
     status_interval_ms: int = 500
     #: Số đoạn audio tối đa gửi cho VAD mỗi vòng nạp (giây) — chia lô để nhường event loop.
     feed_block_sec: float = 0.5
+    #: Cảnh báo khi tầng GIẢI MÃ không sinh ra PCM mới trong ngần này giây dù byte audio vẫn
+    #: về (chẩn đoán nút cổ chai "không lấy đủ buffer để dịch sẵn").
+    decode_starve_warn_sec: float = 4.0
+    #: Nhịp log chẩn đoán năng lực (giải mã / nạp VAD) tính bằng số đo thật (giây).
+    diag_interval_sec: float = 10.0
+    #: PCM giải mã ra mà NẰM XA hơn ngần này giây phía trước vị trí phát thì KHÔNG nạp vào
+    #: timeline. Lý do (đo thật 2026-10-01): khi phiên bắt đầu ở đầu video, cache 120 mảnh của
+    #: interceptor có thể chỉ chứa media ở tận cuối vùng đã tải (cách vị trí phát >140 s) ⇒ vừa
+    #: đốt CPU lấp hàng trăm giây im lặng, vừa tạo phụ đề mang mốc ở TƯƠNG LAI (không bao giờ
+    #: hiện, hoặc hiện sai chỗ). Bỏ các đoạn đó thì pipeline chỉ chờ mảnh mới ở đúng vị trí
+    #: phát — vẫn luôn có phụ đề, chỉ là không "dịch trước" phần quá xa.
+    max_decode_lead_sec: float = 240.0
 
     # ── Lồng tiếng (TTS) cho Pipeline B ───────────────────────────────────────
     #: Hệ số nén thời gian TỐI ĐA khi câu đọc dài hơn cửa sổ phụ đề (giữ nguyên cao độ,
