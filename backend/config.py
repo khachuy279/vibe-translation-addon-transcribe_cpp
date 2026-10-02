@@ -508,6 +508,8 @@ class LookaheadConfig(BaseModel):
     keep_boundaries: int = 60
     #: Trần audio chờ đọc (giây) trong ContinuousAudioTimeline.
     max_pending_sec: float = 90.0
+    #: Dung lượng tối đa lưu trữ audio liên tục trong RAM (giây) — mặc định 3 tiếng (10800s ~690 MB float32).
+    max_storage_sec: float = 10800.0
 
     #: Preview vẫn cần thiết cho BẬC 3 (cắt khi text ổn định) ⇒ BẬT để giữ NGUYÊN chất lượng
     #: cắt câu của Pipeline A. Chi phí được chặn bằng `preview_min_new_audio_sec`.
@@ -529,12 +531,8 @@ class LookaheadConfig(BaseModel):
     #: Nhịp log chẩn đoán năng lực (giải mã / nạp VAD) tính bằng số đo thật (giây).
     diag_interval_sec: float = 10.0
     #: PCM giải mã ra mà NẰM XA hơn ngần này giây phía trước vị trí phát thì KHÔNG nạp vào
-    #: timeline. Lý do (đo thật 2026-10-01): khi phiên bắt đầu ở đầu video, cache 120 mảnh của
-    #: interceptor có thể chỉ chứa media ở tận cuối vùng đã tải (cách vị trí phát >140 s) ⇒ vừa
-    #: đốt CPU lấp hàng trăm giây im lặng, vừa tạo phụ đề mang mốc ở TƯƠNG LAI (không bao giờ
-    #: hiện, hoặc hiện sai chỗ). Bỏ các đoạn đó thì pipeline chỉ chờ mảnh mới ở đúng vị trí
-    #: phát — vẫn luôn có phụ đề, chỉ là không "dịch trước" phần quá xa.
-    max_decode_lead_sec: float = 240.0
+    #: timeline. Mặc định 10800s (3 tiếng) để nạp toàn bộ audio đệm vào RAM cho Pipeline B.
+    max_decode_lead_sec: float = 10800.0
 
     # ── Lồng tiếng (TTS) cho Pipeline B ───────────────────────────────────────
     #: Hệ số nén thời gian TỐI ĐA khi câu đọc dài hơn cửa sổ phụ đề (giữ nguyên cao độ,

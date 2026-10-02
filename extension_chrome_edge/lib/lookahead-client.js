@@ -34,15 +34,19 @@ class LookaheadClient {
     this.onClose = options.onClose || null;
     //: Nhận audio lồng tiếng đã tổng hợp: (header, arrayBufferWav) => void
     this.onTts = options.onTts || null;
+    //: Nhận danh sách phụ đề đã dịch: (items, seekId) => void
+    this.onSubtitles = options.onSubtitles || null;
 
     this.videoElement = null;
     this.ws = null;
     this.port = null;
     // Cho phép dùng Background Bridge để vượt qua CSP / CORS của các trang web ngoài.
-    // Nếu môi trường không có chrome.runtime.connect (vd Node test), tự fallback sang WebSocket trực tiếp.
+    // Chrome/Edge: service worker bị kill sau ~30s idle và Chromium service worker
+    // không kế thừa SSL exception của trang → bridge không ổn định.
+    // Dùng _initWebSocket() (WebSocket mở thẳng từ content script) tương tự ws-client.js.
     this.useBridge = (typeof options.useBridge === "boolean")
       ? options.useBridge
-      : (typeof chrome !== "undefined" && !!chrome.runtime?.connect);
+      : false;
 
     this.isConnected = false;
     this.isServerReady = false;
@@ -373,6 +377,9 @@ class LookaheadClient {
         const items = msg.items || [];
         if (this.timelineQueue && items.length) {
           this.timelineQueue.addSubtitles(items, msg.seek_id);
+        }
+        if (this.onSubtitles && items.length) {
+          this.onSubtitles(items, msg.seek_id);
         }
         break;
       }

@@ -1406,6 +1406,17 @@ class TranscribeEngine(BaseASREngine):
             metrics_collector.record_metric("asr", "commit_ms", infer_ms)
             metrics_collector.record_metric("asr", "commit_audio_sec", len(audio_slice) / 16000.0)
 
+        # F-44: Nếu video bị tua trong lúc inference đang chạy thì commit này thuộc đoạn CŨ -> BỎ.
+        if req_gen is not None and req_gen != self._stream_generation:
+            metrics_collector.increment_counter("asr.commit_dropped_stale")
+            logger.info(
+                f"[utt={utt_id}] Bỏ commit sau inference thuộc đoạn cũ (generation {req_gen} != "
+                f"{self._stream_generation}) — video đã tua.",
+                extra={"module_tag": "ASR_COMMIT"},
+            )
+            self._hypothesis_consensus.reset()
+            return
+
         # Ranh giới cắt giữa câu: nếu mảnh quá ngắn thì GỘP vào câu kế tiếp thay vì
         # để tầng trên lọc bỏ (tránh mất chữ — P2.1/P2.7).
         # P2.7: nếu câu này bắt đầu bằng audio chồng lấn của câu trước, phần từ lặp ở
@@ -1517,6 +1528,7 @@ class TranscribeEngine(BaseASREngine):
                 "language": self.language,
                 "inference_ms": infer_ms,
                 "commit_reason": reason,
+                "generation": req_gen,
                 # Khoảng mẫu TUYỆT ĐỐI trên `audio_buffer` của câu này. Pipeline realtime
                 # không cần (phụ đề hiện ngay khi tới), nhưng Pipeline B (Lookahead) PHẢI
                 # có để quy đổi sang mốc thời gian video chính xác.

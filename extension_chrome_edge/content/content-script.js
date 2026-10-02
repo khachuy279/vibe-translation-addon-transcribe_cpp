@@ -778,13 +778,13 @@
       const scheduleResume = (ms) => {
         resumeTimer = setTimeout(() => {
           if (!lookaheadPausedVideo) return;
-          const grew = bufferProgress.ready > 0
-            && Date.now() - bufferProgress.at < 1200
+          const grew = (bufferProgress.ready > 0 || bufferProgress.fed > 0)
+            && Date.now() - bufferProgress.at < 2000
             && bufferProgress.extensions < 3;
-          if (why === "seek" && grew) {
+          if ((why === "seek" || why === "start") && grew) {
             bufferProgress.extensions += 1;
             console.log(
-              `[BS] Chờ thêm bản dịch tại vị trí vừa tua (ready ${bufferProgress.ready.toFixed(1)}s, ` +
+              `[BS] Chờ thêm bản dịch tại vị trí hiện tại (ready ${bufferProgress.ready.toFixed(1)}s, ` +
               `gia hạn ${bufferProgress.extensions}/3).`
             );
             scheduleResume(2000);
@@ -810,12 +810,20 @@
             original_text: sub.original_text,
             translated_text: sub.translated_text,
             translated: sub.translated_text,
+            text: sub.translated_text || sub.original_text,
             status: "ok",
             is_final: true,
           });
         } else {
           if (overlayManager) {
             try { overlayManager.clear(); } catch (e) {}
+          }
+        }
+      },
+      onBufferingStateChange: (isBuffering) => {
+        if (!isBuffering && lookaheadPausedVideo) {
+          if (!settings.ttsEnabled || firstTtsReceived) {
+            resumePlayback("prebuffer_ready");
           }
         }
       },
@@ -886,6 +894,17 @@
         // Cấu hình ĐẦY ĐỦ từ popup (VAD engine/threshold/silence, model ASR, phân câu,
         // model dịch…) — Pipeline B phải chạy đúng thông số người dùng đã chọn.
         config: buildWsConfig(settings),
+        onSubtitles: (items) => {
+          if (lookaheadPausedVideo && items && items.length) {
+            const curTime = video ? video.currentTime : 0;
+            const hasMatching = items.some((it) => curTime >= Number(it.start_pts) - 0.5 && curTime <= Number(it.end_pts) + 0.5);
+            if (hasMatching) {
+              if (!settings.ttsEnabled || firstTtsReceived) {
+                resumePlayback("subtitle_arrived");
+              }
+            }
+          }
+        },
         onPrebufferReady: (st) => {
           // Nếu bật TTS nhưng chưa nhận câu TTS nào và đang có câu nói: chờ onTts kích hoạt
           if (settings.ttsEnabled && !firstTtsReceived && Number(st?.ready_ahead || 0) > 0) {

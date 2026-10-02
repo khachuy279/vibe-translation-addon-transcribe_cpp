@@ -406,6 +406,24 @@ def _prewarm_vad_others() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Khởi tạo và pre-warm trước (Pre-warm) song song toàn bộ các mô hình khi máy chủ khởi động."""
+    # Bỏ qua lỗi ngắt kết nối client đột ngột (WinError 10054) trên Windows
+    try:
+        loop = asyncio.get_running_loop()
+        _orig_handler = loop.get_exception_handler()
+
+        def _custom_exception_handler(current_loop, context):
+            exc = context.get("exception")
+            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+                return
+            if _orig_handler:
+                _orig_handler(current_loop, context)
+            else:
+                current_loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_custom_exception_handler)
+    except Exception:
+        pass
+
     logger.info("[STARTUP] Pre-warming pipeline: ASR, Translation, VAD...", extra={"module_tag": "MAIN"})
 
     _log_asr_backend_at_startup()

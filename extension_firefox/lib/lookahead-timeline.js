@@ -229,6 +229,24 @@ class SubtitleTimelineQueue {
     if (!this.videoElement) return;
     this.activeSubtitle = undefined;
     this._lastEmitAt = 0;
+    const curTime = this.videoElement.currentTime;
+    let matchedSub = this._findSubtitleAt(curTime);
+    if (!matchedSub) {
+      // Khi vừa resume sau khi nạp đệm / tua: cho phép dung sai sớm 0.25s để câu nói sát mép
+      // playhead hiển thị NGAY LẬP TỨC trên màn hình mà không bị trễ khung hình đầu.
+      for (const item of this.items) {
+        if (curTime >= item.start_pts - 0.25 && curTime < item.end_pts) {
+          matchedSub = item;
+          break;
+        }
+      }
+    }
+    if (matchedSub) {
+      this.activeSubtitle = matchedSub;
+      this._lastEmitAt = Date.now();
+      if (this.onSubtitleChange) this.onSubtitleChange(matchedSub);
+      return;
+    }
     this._tick();
   }
 

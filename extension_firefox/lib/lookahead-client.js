@@ -34,6 +34,8 @@ class LookaheadClient {
     this.onClose = options.onClose || null;
     //: Nhận audio lồng tiếng đã tổng hợp: (header, arrayBufferWav) => void
     this.onTts = options.onTts || null;
+    //: Nhận danh sách phụ đề đã dịch: (items, seekId) => void
+    this.onSubtitles = options.onSubtitles || null;
 
     this.videoElement = null;
     this.ws = null;
@@ -373,6 +375,9 @@ class LookaheadClient {
         const items = msg.items || [];
         if (this.timelineQueue && items.length) {
           this.timelineQueue.addSubtitles(items, msg.seek_id);
+        }
+        if (this.onSubtitles && items.length) {
+          this.onSubtitles(items, msg.seek_id);
         }
         break;
       }

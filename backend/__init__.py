@@ -58,5 +58,27 @@ if os.path.isfile(os.path.join(_LLAMA_LIB_DIR, "llama.dll")):
 from backend.config import config, load_config
 from backend.utils.logger import logger, get_logger
 
+# ── Vá lỗi ConnectionResetError (WinError 10054) của asyncio trên Windows ─────────
+# Khi client đóng kết nối (ví dụ extension popup đóng hoặc trình duyệt reset socket),
+# Windows ProactorEventLoop gọi `self._sock.shutdown(socket.SHUT_RDWR)` trong
+# `_call_connection_lost`. Do client đã đóng trước nên Windows văng lỗi WinError 10054
+# làm rác màn hình console với Exception in callback.
+if os.name == "nt":
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+
+        _orig_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+
+        def _call_connection_lost_safe(self, exc=None):
+            try:
+                _orig_call_connection_lost(self, exc)
+            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+
+        _ProactorBasePipeTransport._call_connection_lost = _call_connection_lost_safe
+    except Exception:
+        pass
+
 __version__ = "2.0.0"
 __all__ = ["config", "load_config", "logger", "get_logger", "apply_thread_limits"]
+
