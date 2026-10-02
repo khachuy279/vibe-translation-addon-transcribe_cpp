@@ -70,7 +70,12 @@ class TestLookaheadChunker:
         assert chunk.silence_gap_ms >= 350.0
 
     def test_continuous_speech_fallback_overlap(self, timeline):
-        """Kịch bản 2: Nói liên tục không có khoảng lặng nào -> fallback forced cut 18.0s kèm 1.0s overlap."""
+        """Kịch bản 2: Nói liên tục không có khoảng lặng nào -> cắt tại điểm TRŨNG NHẤT + 1.0s overlap.
+
+        SIẾT LẠI 2026-10-02: bản cũ cắt đúng tại MÉP dải (18.0s) — mép dải chắc chắn rơi vào giữa
+        từ đang nói, và 1.0s overlap bị phiên âm lại mà không ai trừ ⇒ "cuối câu này là đầu của
+        câu sau". Nay cắt tại frame ít năng lượng nhất trong dải (không phải mép dải).
+        """
         sr = 16000
         # 25s tiếng nói liên tục không có khoảng lặng
         part = make_tone(25.0, freq=350.0, sr=sr, amp=0.25)
@@ -90,13 +95,92 @@ class TestLookaheadChunker:
         assert chunk is not None
         assert chunk.pts_start == 0.0
         assert chunk.is_silence_boundary is False
-        assert chunk.fallback_mode in ("forced_overlap", "min_rms")
+        assert chunk.fallback_mode == "forced_overlap"
 
-        # Cắt tại trần max_window_sec (18.0s)
-        assert abs(chunk.pts_end - 18.0) <= 0.05
-        # Mốc đọc tiếp theo phải lùi 1.0s overlap
-        if chunk.fallback_mode == "forced_overlap":
-            assert abs(chunk.next_read_pts - 17.0) <= 0.05
+        # Không còn cắt cứng ở mép dải; vẫn nằm trong [min_window, search_max]
+        assert 12.0 <= chunk.pts_end <= 18.05
+        # Mốc đọc tiếp theo phải lùi 1.0s overlap (phía nhận BẮT BUỘC trừ ở tầng từ)
+        assert abs(chunk.next_read_pts - (chunk.pts_end - 1.0)) <= 0.05
+
+    def test_real_silence_found_beyond_old_ceiling(self, timeline):
+        """Khoảng lặng THẬT ở 24.3s (ngoài trần cũ 18s) ⇒ cắt ở đó, không cắt cứng ở 18s.
+
+        Đây là điều kiện để giữ mục tiêu của Pipeline B v3: khối DÀI HƠN = ASR có nhiều ngữ cảnh
+        hơn (CER/WER thấp hơn), mà mép khối vẫn sạch (không chẻ đôi từ).
+        """
+        sr = 16000
+        part1 = make_tone(24.0, freq=300.0, sr=sr)
+        gap = make_silence(0.6, sr=sr)
+        part2 = make_tone(8.0, freq=400.0, sr=sr)
+        timeline.append(pts_start=0.0, pcm=np.concatenate([part1, gap, part2]))
+
+        # (a) Có nới dải tìm kiếm ⇒ cắt tại khoảng lặng thật, khối dài hơn trần cũ
+        wide = LookaheadChunker(
+            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
+            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
+            search_max_sec=30.0,
+        )
+        chunk = wide.next_chunk(from_pts=0.0)
+        assert chunk is not None
+        assert chunk.fallback_mode == "silence_gap"
+        assert chunk.is_silence_boundary is True
+        assert abs(chunk.pts_end - 24.3) <= 0.15, chunk
+        assert chunk.duration > 18.5, "khối phải DÀI HƠN trần cũ để ASR có thêm ngữ cảnh"
+        assert chunk.boundary_strength == "strong"
+
+        # (b) Không nới dải (hành vi cũ) ⇒ không thấy khoảng lặng đó, phải cưỡng bức cắt
+        narrow = LookaheadChunker(
+            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
+            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
+        )
+        legacy = narrow.next_chunk(from_pts=0.0)
+        assert legacy is not None
+        assert legacy.fallback_mode == "forced_overlap"
+        assert legacy.pts_end <= 18.05
+
+    def test_quiet_audio_relative_silence_threshold(self, timeline):
+        """Ngưỡng lặng TƯƠNG ĐỐI: audio thu nhỏ (RMS ~0.007) vẫn tìm đúng khoảng lặng thật.
+
+        Ngưỡng tuyệt đối cũ (0.015) coi TOÀN BỘ vùng này là "im lặng" ⇒ không có ranh giới nào,
+        hoặc cắt ở giữa dải — tức là giữa câu.
+        """
+        sr = 16000
+        part1 = make_tone(14.0, freq=300.0, sr=sr, amp=0.01)   # RMS ~0.007 < 0.015
+        silence = make_silence(0.5, sr=sr)
+        part2 = make_tone(10.0, freq=400.0, sr=sr, amp=0.01)
+        timeline.append(pts_start=0.0, pcm=np.concatenate([part1, silence, part2]))
+
+        chunker = LookaheadChunker(
+            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
+            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
+        )
+        chunk = chunker.next_chunk(from_pts=0.0)
+        assert chunk is not None
+        assert chunk.fallback_mode == "silence_gap", chunk
+        assert 14.15 <= chunk.pts_end <= 14.35, chunk
+
+    def test_short_energy_dips_are_not_sentence_boundaries(self, timeline):
+        """Khe 60ms giữa hai từ KHÔNG được coi là ranh giới câu (bản cũ thì có).
+
+        Bản cũ chấp nhận `min_rms < 0.015 * 2 = 0.03` cho MỘT frame 50ms bất kỳ ⇒ cắt vào khe
+        giữa hai từ, tức là giữa câu. Nay khe phải kéo dài >= `min_rms_hold_ms` (120ms).
+        """
+        sr = 16000
+        pcm = make_tone(25.0, freq=350.0, sr=sr, amp=0.25)
+        for i in range(1, 6):
+            a = int(i * 3.0 * sr)
+            pcm[a : a + int(0.06 * sr)] = 0.001
+
+        timeline.append(pts_start=0.0, pcm=pcm)
+        chunker = LookaheadChunker(
+            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
+            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
+            min_rms_hold_ms=120.0,
+        )
+        chunk = chunker.next_chunk(from_pts=0.0)
+        assert chunk is not None
+        # Không có khe nào >= 120ms ⇒ không được coi là ranh giới mềm
+        assert chunk.fallback_mode == "forced_overlap", chunk
 
     def test_fast_bootstrap_after_seek(self, timeline):
         """Kịch bản 3: Sau khi Seek -> Fast Bootstrap trích xuất khối ngắn 3.0s - 4.0s."""

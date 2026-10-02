@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from backend.asr.forced_aligner import (
@@ -89,6 +90,76 @@ class TestForcedAlignerService:
         for s in subs:
             assert s.duration <= 4.0  # mỗi câu bị giới hạn thời lượng
 
+    def test_cap_defers_to_punctuation_instead_of_splitting_phrase(self):
+        """Chạm trần từ mà sắp có dấu kết câu ⇒ NỚI tới dấu câu, KHÔNG chẻ giữa cụm từ.
+
+        Sự cố 2026-10-02: `max_words = 10` cắt cứng nên "…to trick children" và "into loving him,"
+        thành hai phụ đề — đúng triệu chứng "cuối câu này là đầu của câu sau" NGAY TRONG một khối.
+        """
+        words = [
+            AlignedWord(text=f"w{i}", start_time=i * 0.4, end_time=i * 0.4 + 0.35)
+            for i in range(12)
+        ]
+        words[11] = AlignedWord(text="end.", start_time=11 * 0.4, end_time=11 * 0.4 + 0.35)
+
+        subs = ForcedAlignerService.group_words_to_subtitles(
+            words,
+            language="English",
+            max_words=10,
+            max_duration_sec=30.0,
+            max_chars=400,
+            defer_words=3,
+        )
+
+        assert len(subs) == 1, subs
+        assert subs[0].text.endswith("end.")
+        assert len(subs[0].words) == 12, "phải nới qua trần 10 từ để đóng trọn câu"
+
+    def test_lowercase_continuation_is_merged(self):
+        """Mảnh kết thúc KHÔNG có dấu câu + mảnh sau bắt đầu chữ thường ⇒ gộp lại thành một câu."""
+        tokens = "we went to the park and then home".split()
+        words = [
+            AlignedWord(text=t, start_time=i * 0.3, end_time=i * 0.3 + 0.25)
+            for i, t in enumerate(tokens)
+        ]
+
+        subs = ForcedAlignerService.group_words_to_subtitles(
+            words,
+            language="English",
+            max_words=6,
+            max_duration_sec=30.0,
+            max_chars=400,
+            defer_words=3,
+            min_words=2,
+        )
+
+        assert len(subs) == 1, [s.text for s in subs]
+        assert subs[0].text == "we went to the park and then home"
+
+    def test_sentence_boundary_still_splits_when_merged_would_be_too_big(self):
+        """Bước gộp có TRẦN CỨNG: không được biến nhiều câu thành một phụ đề khổng lồ."""
+        tokens = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
+                  "nu xi omicron pi rho sigma tau").split()
+        words = [
+            AlignedWord(text=t, start_time=i * 0.5, end_time=i * 0.5 + 0.4)
+            for i, t in enumerate(tokens)
+        ]
+
+        subs = ForcedAlignerService.group_words_to_subtitles(
+            words,
+            language="English",
+            max_words=6,
+            max_duration_sec=3.0,
+            max_chars=40,
+            defer_words=3,
+            min_words=2,
+        )
+
+        assert len(subs) > 1
+        # Trần cứng = max_words + defer_words = 9 từ
+        for s in subs:
+            assert len(s.words) <= 9, s.text
+
     def test_ensure_forced_aligner_model_local_path(self, tmp_path):
         """Kiểm tra ensure_forced_aligner_model luôn trả về đường dẫn cục bộ khi đã có file."""
         from backend.asr.forced_aligner import ensure_forced_aligner_model, ALIGNER_LOCAL_DIR
@@ -105,3 +176,122 @@ class TestForcedAlignerService:
         # 2. ForcedAlignerService mặc định trỏ vào backend/models/Qwen3-ForcedAligner-0.6B
         service = ForcedAlignerService()
         assert service.model_path == ALIGNER_LOCAL_DIR
+
+
+class TestSourcePunctuationReattachment:
+    """Sự cố 2026-10-02: aligner BỎ HẾT dấu câu khi tokenize ⇒ phụ đề phải gắn lại từ văn bản ASR.
+
+    Bằng chứng upstream: `qwen_asr/inference/qwen3_forced_aligner.py::is_kept_char` chỉ giữ category
+    Unicode L/N + dấu nháy đơn. Hệ quả thật (xem `report/09_lookahead_offline_batch/
+    phase1_poc_results.md`): ASR trả `"私の人生の中心で最も魅力的だ。"` nhưng item cuối là `"魅力的だ"`,
+    phụ đề gom ra mất hẳn `。`.
+    """
+
+    def test_reattach_english_punctuation(self):
+        """Từ không dấu câu + văn bản ASR có dấu câu ⇒ từng từ nhận đúng dấu của nó."""
+        items = [
+            AlignedWord("You", 0.0, 0.3),
+            AlignedWord("took", 0.3, 0.6),
+            AlignedWord("ballet", 0.6, 1.0),
+            AlignedWord("God", 1.2, 1.5),
+            AlignedWord("you", 1.5, 1.7),
+            AlignedWord("never", 1.7, 2.0),
+            AlignedWord("listen", 2.0, 2.4),
+        ]
+        merged = ForcedAlignerService.merge_source_text(
+            items, "You took ballet. God, you never listen."
+        )
+        assert [w.text for w in merged] == [
+            "You", "took", "ballet.", "God,", "you", "never", "listen.",
+        ]
+        # Mốc thời gian KHÔNG đổi
+        assert [w.start_time for w in merged] == [i.start_time for i in items]
+
+    def test_reattach_japanese_punctuation(self):
+        """CJK: ký tự cuối nhận dấu 。 — đúng ca đã đo trong POC Phase 1."""
+        items = [
+            AlignedWord("私", 0.48, 0.72),
+            AlignedWord("の", 0.72, 1.12),
+            AlignedWord("人生", 1.44, 1.76),
+            AlignedWord("だ", 1.84, 2.50),
+        ]
+        merged = ForcedAlignerService.merge_source_text(items, "私の人生だ。")
+        assert [w.text for w in merged] == ["私", "の", "人生", "だ。"]
+        # Nối lại đúng nguyên văn văn bản ASR
+        assert "".join(w.text for w in merged) == "私の人生だ。"
+
+    def test_reattach_keeps_inner_punctuation(self):
+        """Dấu nháy typographic BÊN TRONG từ cũng phải được giữ (upstream loại nó)."""
+        items = [AlignedWord("Its", 0.0, 0.3), AlignedWord("fine", 0.3, 0.6)]
+        merged = ForcedAlignerService.merge_source_text(items, "It’s fine.")
+        assert merged[0].text == "It’s"
+        assert merged[1].text == "fine."
+
+    def test_grouping_after_reattach_yields_whole_sentences(self):
+        """Đúng đề bài người dùng: đoạn ASR hoàn hảo ⇒ tách thành những CÂU hoàn hảo."""
+        asr_text = (
+            "I promise I'll be on my best behavior. You better be. "
+            "No jokes about how close I am with my dog, or the truth about how close I am with my dog. "
+            "You got it."
+        )
+        tokens = asr_text.split()
+        items = [
+            # Aligner: cùng thứ tự nhưng KHÔNG có dấu câu (giống hệt hành vi upstream)
+            AlignedWord(
+                "".join(ch for ch in tok if ch.isalnum() or ch == "'"),
+                i * 0.35,
+                i * 0.35 + 0.30,
+            )
+            for i, tok in enumerate(tokens)
+        ]
+        merged = ForcedAlignerService.merge_source_text(items, asr_text)
+        subs = ForcedAlignerService.group_words_to_subtitles(
+            merged,
+            language="English",
+            max_words=10,
+            max_duration_sec=4.5,
+            sentence_max_words=24,
+            sentence_max_duration_sec=8.0,
+        )
+        assert [s.text for s in subs] == [
+            "I promise I'll be on my best behavior.",
+            "You better be.",
+            "No jokes about how close I am with my dog, or the truth about how close I am with my dog.",
+            "You got it.",
+        ]
+
+    def test_align_service_attaches_punctuation_end_to_end(self, monkeypatch):
+        """`ForcedAlignerService.align()` phải tự gắn dấu câu (không cần model thật)."""
+        from backend.asr.forced_aligner import ForcedAlignerService as SVC
+
+        raw = [
+            ("You", 0.0, 0.3),
+            ("took", 0.3, 0.6),
+            ("ballet", 0.6, 1.0),
+            ("God", 1.2, 1.5),
+        ]
+
+        class _Item:
+            def __init__(self, text, start, end):
+                self.text, self.start_time, self.end_time = text, start, end
+
+        class _Result:
+            def __init__(self):
+                self.items = [_Item(*r) for r in raw]
+
+        class _StubAligner:
+            def align(self, audio, text, language):
+                return [_Result()]
+
+        svc = SVC()
+        monkeypatch.setattr(svc, "load_model", lambda: _StubAligner())
+        monkeypatch.setattr(svc, "_is_warmed", True, raising=False)
+        monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+        words = svc.align(
+            np.zeros(16000, dtype=np.float32),
+            "You took ballet. God, you never listen.",
+            "English",
+        )
+        assert [w.text for w in words] == ["You", "took", "ballet.", "God,"]
+        assert any(w.text.endswith(".") for w in words), "phải có dấu kết câu để tầng gom câu dùng"

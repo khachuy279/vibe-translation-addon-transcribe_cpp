@@ -80,10 +80,9 @@
     // hẹp cho trường hợp phụ đề sớm ~1 s (đo thật 2026-10-01).
     const syncMs = parseInt(cfg.lookaheadSyncOffsetMs, 10);
     if (!isNaN(syncMs)) out.lookaheadSyncOffsetMs = Math.max(-1500, Math.min(1500, syncMs));
-    if (cfg.lookaheadLeadTimeSec !== undefined) {
-      const lead = parseInt(cfg.lookaheadLeadTimeSec, 10);
-      if (!isNaN(lead)) out.lookaheadLeadTimeSec = lead;
-    }
+    // ⚠️ KHÔNG còn gửi `lookaheadLeadTimeSec`: ở tuyến OFFLINE_BATCH khoảng dịch trước do bộ cắt
+    // khối quyết định (12–30 s), nên popup đã bỏ slider này. Backend dùng mặc định
+    // `lookahead.lead_time_sec` (15 s) làm cổng throttle nội bộ.
     // stable_cut: nhận cả camelCase (getSettings) lẫn snake_case (settings cũ đã lưu).
     const stableMs = cfg.stability_duration_ms !== undefined
       ? cfg.stability_duration_ms
@@ -704,8 +703,10 @@
 
   // ── PIPELINE B: Lookahead Video Buffering (0.0s Zero Perceived Latency) ────
   async function startPipelineB(video, settings, signal) {
-    const leadTimeSec = parseInt(settings.lookaheadLeadTimeSec || 15, 10);
-    console.log(`%c[BS] 🚀 Khởi động Pipeline B: Lookahead Video Buffering (dịch trước ${leadTimeSec}s, 0.0s Lag)`, "color: #00ffcc; font-weight: bold;");
+    //: Khoảng "dịch trước" do BỘ CẮT KHỐI quyết định (12–30 s, xem `LookaheadChunker`); giá trị
+    //: dưới đây chỉ là cổng throttle nội bộ phía backend và không còn người dùng chỉnh trong popup.
+    const leadTimeSec = 15;
+    console.log(`%c[BS] 🚀 Khởi động Pipeline B: Lookahead OFFLINE_BATCH (0.0s Lag)`, "color: #00ffcc; font-weight: bold;");
     // Log THIẾT LẬP hiệu dụng: nếu TTS không kêu thì đây là chỗ đầu tiên cần xem.
     console.log("[BS] Lookahead settings:", {
       lookaheadEnabled: settings.lookaheadEnabled,
@@ -765,14 +766,22 @@
       showBufferingStatus(
         why === "seek"
           ? "Đang dịch trước đoạn vừa tua..."
-          : (why === "tts_enable" ? "Đang chuẩn bị lồng tiếng TTS..." : "Đang nạp đệm và dịch trước...")
+          : (why === "tts_enable"
+              ? "Đang chuẩn bị lồng tiếng TTS..."
+              : (why === "underrun"
+                  ? "Đang xử lý tiếp đoạn video..."
+                  : "Đang nạp đệm và dịch trước..."))
       );
       // Chốt an toàn (đồng hồ ĐỒNG HỒ THỰC). Với TUA, mục tiêu là "dịch xong ngay tại vị trí
       // mới rồi mới phát" nên KHÔNG cắt cứng ở 3,5 s: nếu backend còn tiến triển thì gia hạn
       // thêm, chỉ bỏ cuộc khi hết tiến triển (xem nhánh gia hạn bên dưới).
+      // `underrun` (playhead chạm mốc đã xử lý) cần chờ LÂU hơn vì backend phải ASR xong một khối
+      // 12-30 s audio mới đẩy được mốc lên.
       const timeoutMs = why === "seek"
         ? (settings.ttsEnabled ? 6000 : 5000)
-        : (settings.ttsEnabled ? 5000 : 3500);
+        : (why === "underrun"
+            ? (settings.ttsEnabled ? 12000 : 9000)
+            : (settings.ttsEnabled ? 5000 : 3500));
       bufferProgress = { ready: 0, fed: 0, at: Date.now(), extensions: 0 };
       if (resumeTimer) clearTimeout(resumeTimer);
       const scheduleResume = (ms) => {
@@ -821,7 +830,14 @@
         }
       },
       onBufferingStateChange: (isBuffering) => {
-        if (!isBuffering && lookaheadPausedVideo) {
+        if (isBuffering) {
+          // RÀNG BUỘC CỨNG: playhead đã chạm mốc backend xử lý xong (hoặc vừa tua) ⇒ TẠM DỪNG
+          // video. Nếu không, video sẽ phát qua vùng chưa có phụ đề/bản dịch — "vẫn phát video mà
+          // không có gì hoạt động" (sự cố 2026-10-02).
+          pauseForBuffering(currentBufferingWhy === "seek" ? "seek" : "underrun");
+          return;
+        }
+        if (lookaheadPausedVideo) {
           if (!settings.ttsEnabled || firstTtsReceived) {
             resumePlayback("prebuffer_ready");
           }
@@ -942,6 +958,11 @@
           const ready = Number(st.ready_ahead || 0);
           const fed = Number(st.fed_ahead || 0);
           const isTts = Boolean(settings.ttsEnabled);
+          // Nạp MỐC ĐÃ XỬ LÝ cho timeline queue: đây là ràng buộc cứng "playhead không được vượt
+          // qua vùng backend chưa xử lý" (kiểm tra mỗi khung hình trong `_tick`).
+          if (timelineQueue) {
+            try { timelineQueue.setReadyHorizon(st.ready_until_pts, st.seek_id); } catch (e) {}
+          }
           // Ghi nhận tiến triển để quyết định có gia hạn chờ sau khi tua hay không.
           if (lookaheadPausedVideo && (ready > bufferProgress.ready + 0.05 || fed > bufferProgress.fed + 0.05)) {
             bufferProgress = { ...bufferProgress, ready, fed, at: Date.now() };
@@ -986,8 +1007,9 @@
               resumePlayback(st.prebuffer_ready ? "prebuffer_ready" : "status_ready");
             }
           }
-          // ĐANG PHÁT: Tuyệt đối KHÔNG tạm dừng video giữa chừng ("tạm dừng để đuổi kịp").
-          // Người dùng cần trải nghiệm phát mượt mà, phụ đề & TTS cập nhật mốc thời gian khi có.
+          // ĐANG PHÁT: việc TẠM DỪNG giữa chừng do RÀNG BUỘC CỨNG ở `timelineQueue._tick()`
+          // quyết định (chỉ khi playhead chạm mốc backend đã xử lý — xem `setReadyHorizon`), chứ
+          // không dựa vào `ready_ahead` của status: `ready_ahead` có thể còn giá trị của vị trí cũ.
         },
       });
       lookaheadClient.connect(video);

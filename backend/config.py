@@ -486,21 +486,66 @@ class GpuConfig(BaseModel):
 class LookaheadConfig(BaseModel):
     """Cấu hình Pipeline B — Lookahead Video Buffering (Zero Perceived Latency).
 
-    Kiến trúc: mảnh audio tương lai từ MSE (`SourceBuffer.appendBuffer`) được ghép nối
-    liên tục -> VAD -> ASR -> Dịch, gắn mốc PTS tuyệt đối, rồi trả phụ đề về Extension
-    để hiện ĐÚNG lúc `video.currentTime` đi qua đoạn đó.
+    Pipeline B CHỈ có một chế độ: **OFFLINE_BATCH** (Qwen3-ASR + Qwen3-ForcedAligner-0.6B).
+    Mảnh audio tương lai từ MSE (`SourceBuffer.appendBuffer`) được ghép nối liên tục thành dòng
+    PCM trên RAM, cắt thành khối 12-30 s tại khoảng lặng thật, đưa TRỌN khối cho ASR (ngữ cảnh đầy
+    đủ ⇒ WER/CER thấp), rồi gắn mốc thời gian từng từ bằng Forced Aligner và cắt câu theo dấu câu.
+    Mốc PTS tuyệt đối được trả về Extension để phụ đề hiện ĐÚNG lúc `video.currentTime` đi qua.
+
+    Chế độ "streaming" (Pipeline B v2: VAD + CommitManager + preview) đã bị XOÁ ngày 2026-10-02.
+    Cần cơ chế cắt câu kiểu đó thì dùng Pipeline A (`/ws`) — extension tự chuyển sang Pipeline A
+    khi Lookahead không khả dụng hoặc người dùng tắt Lookahead trong popup.
     """
 
     enabled: bool = True
-    #: Chế độ xử lý của Pipeline B:
-    #:   "streaming"     — Pipeline B v2 (mặc định): nạp frame 0.5s qua VAD + CommitManager giả lập.
-    #:   "offline_batch" — Pipeline B v3: Cắt khối VAD silence 12-18s + Qwen3-ASR offline + Forced Aligner.
-    processing_mode: str = "offline_batch"
     batch_target_sec: float = 15.0
     batch_min_sec: float = 12.0
     batch_max_sec: float = 18.0
     batch_min_silence_ms: float = 250.0
     batch_overlap_sec: float = 1.0
+
+    # ── Siết lại NGẮT KHỐI + NGẮT CÂU 2026-10-02 ───────────────────────────────
+    # (chẩn đoán "cuối câu này là đầu của câu sau": xem
+    #  report/09_lookahead_offline_batch/phase5_chan_doan_ngat_cau.md)
+    #
+    #: Trần dải TÌM ranh giới thật. Qwen3-ASR cho chất lượng tốt nhất ở cửa sổ 15–30 s
+    #: (plan §2), nên khối được phép dài tới đây để đổi lấy một khoảng lặng THẬT thay vì
+    #: cắt cứng ở `batch_max_sec` (18 s) — cắt cứng chính là chỗ chẻ đôi câu.
+    batch_search_max_sec: float = 30.0
+    #: Khoảng lặng >= mức này là ranh giới MẠNH: cắt ngay dù xa mốc lý tưởng. 250 ms chỉ là
+    #: khoảng nghỉ giữa hai từ trong hội thoại phim, KHÔNG phải hết câu.
+    batch_strong_silence_ms: float = 450.0
+    #: Ngưỡng lặng TƯƠNG ĐỐI: p90(mức chương trình) − bao nhiêu dB. Thay cho hằng số tuyệt
+    #: đối 0.015 vốn không bao giờ đạt với audio có nhạc nền/room tone.
+    batch_silence_rel_db: float = 22.0
+    #: Sàn tuyệt đối của ngưỡng lặng (chống audio cực nhỏ bị coi là im lặng toàn bộ).
+    batch_silence_floor_rms: float = 0.004
+    #: Điểm trũng chỉ được coi là ranh giới mềm khi < tỉ lệ này × trung vị RMS vùng quét...
+    batch_min_rms_ratio: float = 0.35
+    #: ... và kéo dài tối thiểu ngần này ms (khe giữa hai từ thường chỉ 40–80 ms).
+    batch_min_rms_hold_ms: float = 120.0
+    #: Khi buộc phải cắt: chỉ tìm điểm trũng trong ± ngần này giây quanh độ dài lý tưởng, để
+    #: không rút ngắn khối (mất ngữ cảnh ASR) mà vẫn cắt vào chỗ ít năng lượng.
+    batch_dip_search_sec: float = 3.0
+    #: TRỪ phần chồng lấn ở ranh giới khối tại tầng TỪ trước khi gom câu (chống lặp từ).
+    #: TẮT = quay lại hành vi cũ (từ ở ranh giới bị phát hai lần).
+    batch_trim_boundary_overlap: bool = True
+
+    #: Trần gom câu phụ đề của tuyến batch (trước đây hard-code trong
+    #: `ForcedAlignerService.group_words_to_subtitles` nên popup không điều khiển được).
+    batch_sub_max_words: int = 10
+    batch_sub_max_duration_sec: float = 4.5
+    batch_sub_max_chars: int = 45
+    #: Số từ tối thiểu của một phụ đề; mảnh ngắn hơn được GỘP vào câu bên cạnh (không bỏ chữ).
+    batch_sub_min_words: int = 2
+    #: Số từ được phép nới thêm để đạt dấu câu khi vừa chạm trần (tránh chẻ giữa cụm từ).
+    batch_sub_defer_words: int = 3
+    #: Trần cho một CÂU TRỌN VẸN (ưu tiên số 1 của tầng gom câu): có dấu kết câu trong phạm vi này
+    #: thì cả câu là MỘT phụ đề — người xem thấy câu trọn vẹn và bản dịch nhận được câu trọn vẹn.
+    #: Chỉ khi câu dài hơn mức này mới phải cắt bên trong (theo dấu phẩy/khe âm học).
+    #: ⚠️ Dấu câu chỉ có sau khi gắn lại từ văn bản ASR (`ForcedAlignerService.merge_source_text`).
+    batch_sub_sentence_max_words: int = 24
+    batch_sub_sentence_max_duration_sec: float = 8.0
 
     #: Thời gian dịch trước (giây) — khoảng đệm phải sẵn sàng TRƯỚC vị trí phát.
     lead_time_sec: float = 15.0
@@ -508,8 +553,6 @@ class LookaheadConfig(BaseModel):
     max_lead_time_sec: float = 15.0
     #: Nạp audio tới `currentTime + lead_time + margin` rồi dừng (chặn đốt GPU vô ích).
     feed_margin_sec: float = 6.0
-    #: Lượng audio tối thiểu phải nạp trước khi cho video phát (khi buffer ngắn).
-    min_prebuffer_sec: float = 10.0
     #: Ngưỡng tối thiểu coi là "đã sẵn sàng phát" (tránh treo trình phát).
     min_ready_ahead_sec: float = 2.5
 
@@ -521,24 +564,9 @@ class LookaheadConfig(BaseModel):
     #: Dung lượng tối đa lưu trữ audio liên tục trong RAM (giây) — mặc định 3 tiếng (10800s ~690 MB float32).
     max_storage_sec: float = 10800.0
 
-    #: Preview vẫn cần thiết cho BẬC 3 (cắt khi text ổn định) ⇒ BẬT để giữ NGUYÊN chất lượng
-    #: cắt câu của Pipeline A. Chi phí được chặn bằng `preview_min_new_audio_sec`.
-    preview_enabled: bool = True
-    #: Chỉ preview khi có thêm ≥ ngần này giây audio mới (Lookahead nạp theo lô 0,5 s nên
-    #: không cần preview mỗi nhịp poll như realtime; nhịp thực tế còn bị `preview_adaptive_backoff`
-    #: giãn ra khi model chậm).
-    preview_min_new_audio_sec: float = 0.5
-    #: BẬC 4 (TIMEOUT_FORCE) của CommitManager dùng đồng hồ THỜI GIAN THỰC; trong Lookahead
-    #: audio tới theo lô nên đồng hồ này dễ chốt oan giữa câu. Nới trần cho phiên Lookahead.
-    inactivity_timeout_sec: float = 30.0
     #: Nhịp gửi `lookahead_status` về client (ms).
     status_interval_ms: int = 500
-    #: Số đoạn audio tối đa gửi cho VAD mỗi vòng nạp (giây) — chia lô để nhường event loop.
-    feed_block_sec: float = 0.5
-    #: Cảnh báo khi tầng GIẢI MÃ không sinh ra PCM mới trong ngần này giây dù byte audio vẫn
-    #: về (chẩn đoán nút cổ chai "không lấy đủ buffer để dịch sẵn").
-    decode_starve_warn_sec: float = 4.0
-    #: Nhịp log chẩn đoán năng lực (giải mã / nạp VAD) tính bằng số đo thật (giây).
+    #: Nhịp log chẩn đoán năng lực (giải mã / độ phủ phụ đề) tính bằng số đo thật (giây).
     diag_interval_sec: float = 10.0
     #: PCM giải mã ra mà NẰM XA hơn ngần này giây phía trước vị trí phát thì KHÔNG nạp vào
     #: timeline. Mặc định 10800s (3 tiếng) để nạp toàn bộ audio đệm vào RAM cho Pipeline B.

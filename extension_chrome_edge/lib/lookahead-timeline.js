@@ -40,6 +40,43 @@ class SubtitleTimelineQueue {
     //: (nạp đệm) ⇒ nếu không phát lại định kỳ thì câu đang đúng sẽ biến mất và không bao giờ
     //: được vẽ lại (vì `activeSubtitle` không đổi). Đây là nguyên nhân "câu đầu không hiện".
     this.keepAliveMs = options.keepAliveMs !== undefined ? options.keepAliveMs : 1200;
+    //: MỐC BACKEND ĐÃ XỬ LÝ XONG (ASR + dịch) cho thế hệ seek hiện tại — RÀNG BUỘC CỨNG: playhead
+    //: không được vượt qua mốc này, nếu không video sẽ phát qua vùng chưa hề được xử lý (không có
+    //: phụ đề, không có gì hoạt động). `0` = chưa biết (không ràng buộc).
+    this.readyUntilPts = 0;
+    //: `seek_id` mà `readyUntilPts` thuộc về. Marker của thế hệ cũ không được áp cho vị trí mới.
+    this.readyUntilSeekId = null;
+    //: Sai số cho phép trước khi coi là "đã chạm mốc đã xử lý" (giây).
+    this.underrunMarginSec = options.underrunMarginSec !== undefined ? options.underrunMarginSec : 0.35;
+    //: Thời gian chờ tối đa khi tạm dừng vì hết vùng đã xử lý (ms) — dài hơn lúc khởi động vì
+    //: backend cần ASR xong một khối (12-30 s audio) mới đẩy được mốc lên.
+    this.underrunPrebufferMs = options.underrunPrebufferMs !== undefined ? options.underrunPrebufferMs : 8000;
+    //: Callback báo "playhead đã chạm mốc đã xử lý" (chẩn đoán + cho phía content script biết lý do).
+    this.onUnderrun = options.onUnderrun || null;
+  }
+
+  /**
+   * Cập nhật MỐC ĐÃ XỬ LÝ từ `lookahead_status`.
+   *
+   * Chỉ nhận marker thuộc ĐÚNG thế hệ seek: sau khi tua, marker của vị trí cũ (có thể rất lớn) sẽ
+   * khiến client tưởng đã sẵn sàng và phát video qua vùng chưa xử lý.
+   */
+  setReadyHorizon(readyUntilPts, seekId) {
+    const pts = Number(readyUntilPts);
+    if (!Number.isFinite(pts) || pts <= 0) return;
+    if (seekId && this.activeSeekId && seekId !== this.activeSeekId) return;
+    // Mốc không được LÙI trong cùng một thế hệ (coverage chỉ tăng); nhưng nếu là thế hệ mới thì nhận.
+    if (this.readyUntilSeekId === seekId && pts < this.readyUntilPts) return;
+    this.readyUntilPts = pts;
+    this.readyUntilSeekId = seekId || this.activeSeekId || null;
+  }
+
+  /** Playhead đã chạm/vượt mốc đã xử lý chưa (⇒ cần tạm dừng chờ backend). */
+  isBehindHorizon(curTime) {
+    const cur = Number(curTime);
+    if (!Number.isFinite(cur)) return false;
+    if (!(this.readyUntilPts > 0)) return false;
+    return cur > this.readyUntilPts - this.underrunMarginSec;
   }
 
   /**
@@ -138,6 +175,10 @@ class SubtitleTimelineQueue {
     this.activeSubtitle = null;
     this._lastEmitAt = 0;
     this.items = [];
+    // Mốc đã xử lý của vị trí CŨ không còn giá trị cho vị trí mới (nếu không, video sẽ phát qua
+    // vùng chưa xử lý vì tưởng đã có phụ đề).
+    this.readyUntilPts = 0;
+    this.readyUntilSeekId = null;
     if (this.onSubtitleChange) this.onSubtitleChange(null);
 
     if (this.onSeekTriggered) this.onSeekTriggered(newSeekId, targetTime);
@@ -151,14 +192,15 @@ class SubtitleTimelineQueue {
     this._tick();
   }
 
-  _startPrebuffering() {
+  _startPrebuffering(timeoutMs) {
     if (this._isPrebuffering) return;
     this._isPrebuffering = true;
     if (this.onBufferingStateChange) this.onBufferingStateChange(true);
 
-    // Timeout an toàn: dù chưa có bản dịch cũng phải cho video chạy tiếp.
+    // Timeout an toàn: dù chưa có bản dịch cũng phải cho video chạy tiếp (không bao giờ treo cứng).
+    const waitMs = Number.isFinite(timeoutMs) ? timeoutMs : 3000;
     if (this._prebufferTimer) clearTimeout(this._prebufferTimer);
-    this._prebufferTimer = setTimeout(() => this._endPrebuffering(), 3000);
+    this._prebufferTimer = setTimeout(() => this._endPrebuffering(), waitMs);
   }
 
   _endPrebuffering() {
@@ -189,6 +231,20 @@ class SubtitleTimelineQueue {
   _tick() {
     if (!this.videoElement) return;
     const curTime = this.videoElement.currentTime;
+
+    // ── RÀNG BUỘC CỨNG: KHÔNG phát video qua vùng CHƯA được xử lý ────────────────────────────
+    // `readyUntilPts` là mốc cuối cùng backend đã ASR + dịch xong cho thế hệ seek hiện tại. Khi
+    // playhead chạm mốc đó, tạm dừng và chờ backend đẩy mốc lên. Nếu không có ràng buộc này, video
+    // vẫn chạy qua vùng backend chưa xử lý ⇒ "phát video mà không có gì hoạt động" (sự cố
+    // 2026-10-02: tua tới vùng chưa tải thì phụ đề lúc hiện lúc không, tua ngược về đầu thì không
+    // hiện gì).
+    if (!this._isPrebuffering && this.isBehindHorizon(curTime)) {
+      if (this.onUnderrun) {
+        try { this.onUnderrun(curTime, this.readyUntilPts); } catch (e) {}
+      }
+      this._startPrebuffering(this.underrunPrebufferMs);
+      return;
+    }
 
     let matchedSub = this._findSubtitleAt(curTime);
 
@@ -275,6 +331,8 @@ class SubtitleTimelineQueue {
   clear() {
     this.items = [];
     this.activeSubtitle = null;
+    this.readyUntilPts = 0;
+    this.readyUntilSeekId = null;
     this._endPrebuffering();
     if (this.onSubtitleChange) this.onSubtitleChange(null);
   }

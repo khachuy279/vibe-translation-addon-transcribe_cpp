@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -91,6 +92,19 @@ def resolve_aligner_language(lang_code: Optional[str]) -> Optional[str]:
         return None
     clean = str(lang_code).strip().lower()
     return _ALIGNER_LANG_MAP.get(clean)
+
+
+def is_aligner_kept_char(ch: str) -> bool:
+    """Ký tự mà `Qwen3ForcedAligner` GIỮ LẠI khi tokenize (xem `is_kept_char` của upstream).
+
+    Upstream (`qwen_asr/inference/qwen3_forced_aligner.py`) chỉ giữ category Unicode `L` (chữ) và
+    `N` (số), cộng thêm dấu nháy đơn `'`. **Mọi dấu câu bị loại bỏ** — đây là lý do `AlignedWord.text`
+    không bao giờ có `.`/`,`/`?`/`。` và tầng gom câu không thể ngắt theo dấu câu nếu không gắn lại.
+    """
+    if ch == "'":
+        return True
+    cat = unicodedata.category(ch)
+    return cat.startswith("L") or cat.startswith("N")
 
 
 @dataclass
@@ -260,14 +274,17 @@ class ForcedAlignerService:
         audio: Union[np.ndarray, Tuple[np.ndarray, int], str],
         text: str,
         language: str = "English",
+        attach_source_punctuation: bool = True,
     ) -> List[AlignedWord]:
         """Căn chỉnh thời gian từng từ.
-        
+
         Args:
             audio: numpy array 16kHz float32, hoặc tuple (pcm, sr), hoặc file path.
             text: Văn bản nhận dạng từ ASR.
             language: Ngôn ngữ (e.g. 'English', 'Japanese', 'Chinese'...).
-        
+            attach_source_punctuation: Gắn DẤU CÂU của `text` trở lại từng từ (MẶC ĐỊNH BẬT).
+                Bắt buộc bật nếu tầng trên ngắt câu theo dấu câu — xem `merge_source_text`.
+
         Returns:
             Danh sách AlignedWord(text, start_time, end_time).
         """
@@ -305,11 +322,93 @@ class ForcedAlignerService:
             )
             for item in raw_items
         ]
+        # ⚠️ BẮT BUỘC: model đã BỎ HẾT dấu câu khi tokenize (xem `is_aligner_kept_char`), nên nếu
+        # không gắn lại thì tầng gom câu không thấy dấu câu nào ⇒ phụ đề bị chẻ theo trần từ và
+        # thiếu cả dấu câu (sự cố 2026-10-02).
+        if attach_source_punctuation:
+            words = ForcedAlignerService.merge_source_text(words, clean_text)
         logger.debug(
             f"Forced alignment ({language}): {len(words)} từ trong {elapsed_ms:.1f}ms",
             extra={"module_tag": "ASR"},
         )
         return words
+
+    @staticmethod
+    def merge_source_text(
+        aligned_items: List[AlignedWord],
+        source_text: str,
+    ) -> List[AlignedWord]:
+        """Gắn lại DẤU CÂU (và chính tả gốc) của văn bản ASR vào từng từ đã căn chỉnh.
+
+        VÌ SAO CẦN: `Qwen3-ForcedAligner` loại bỏ mọi ký tự không phải chữ/số khi tokenize
+        (`is_kept_char` của upstream chỉ giữ category `L`/`N` + dấu nháy đơn) ⇒ `item.text` KHÔNG
+        BAO GIỜ có `.`/`,`/`?`/`。`. Bằng chứng: `report/09_lookahead_offline_batch/phase1_poc_results.md`
+        — ASR trả `"私の人生の中心で最も魅力的だ。"` nhưng item cuối là `"魅力的だ"` và phụ đề gom ra
+        `"私の人生の中心で最も魅力的だ"` (mất `。`).
+
+        Hệ quả nếu không gắn lại: tầng gom câu chỉ còn cách cắt theo trần `max_words`/`max_duration`
+        ⇒ chẻ giữa câu, phụ đề thiếu dấu câu, và **bản dịch nhận được mảnh vụn** thay vì câu trọn vẹn.
+
+        CÁCH LÀM: duyệt văn bản gốc và danh sách từ SONG SONG, tiêu thụ đúng số ký tự "được giữ" của
+        từng từ, rồi lấy ĐOẠN VĂN BẢN GỐC từ ký tự đầu của từ này tới ký tự đầu của từ kế tiếp. Nhờ
+        vậy: dấu câu dính sau từ được giữ, dấu nháy/gạch BÊN TRONG từ (`It’s`) cũng được giữ, và
+        từ/câu trả về khớp **nguyên văn** văn bản ASR.
+
+        Hoạt động cho cả tiếng Latin (tách theo khoảng trắng) lẫn CJK/Nhật/Hàn (tách theo ký tự/từ),
+        vì việc khớp chỉ dựa trên chuỗi ký tự "được giữ".
+        """
+        if not aligned_items or not source_text:
+            return aligned_items
+
+        kept_positions = [i for i, ch in enumerate(source_text) if is_aligner_kept_char(ch)]
+        if not kept_positions:
+            return aligned_items
+        kept_chars = [source_text[i] for i in kept_positions]
+
+        spans: List[Optional[Tuple[int, int]]] = []
+        pos = 0
+        for item in aligned_items:
+            need = "".join(ch for ch in (item.text or "") if is_aligner_kept_char(ch))
+            if not need:
+                spans.append(None)
+                continue
+            window_len = len(need) + 16  # cho phép aligner bỏ sót/thêm token
+            window = "".join(kept_chars[pos : pos + window_len])
+            found = window.find(need)
+            if found < 0:
+                spans.append(None)
+                continue
+            start_k = pos + found
+            end_k = start_k + len(need) - 1
+            if end_k >= len(kept_positions):
+                spans.append(None)
+                continue
+            spans.append((kept_positions[start_k], kept_positions[end_k]))
+            pos = end_k + 1
+
+        merged: List[AlignedWord] = []
+        total = len(source_text)
+        for i, item in enumerate(aligned_items):
+            span = spans[i]
+            if span is None:
+                merged.append(item)
+                continue
+            # Lấy ĐOẠN GỐC từ ký tự đầu của từ này tới hết các ký tự KHÔNG-được-giữ ngay sau ký tự
+            # cuối của chính nó (dấu câu + khoảng trắng). Dừng ngay khi gặp ký tự chữ/số kế tiếp ⇒
+            # KHÔNG nuốt các từ mà aligner bỏ sót (nếu nuốt, từ cuối sẽ ôm trọn phần văn bản còn lại
+            # trong khi mốc thời gian của nó chỉ phủ một từ).
+            end_char = span[1] + 1
+            while end_char < total and not is_aligner_kept_char(source_text[end_char]):
+                end_char += 1
+            text = source_text[span[0] : end_char].strip()
+            merged.append(
+                AlignedWord(
+                    text=text or item.text,
+                    start_time=item.start_time,
+                    end_time=item.end_time,
+                )
+            )
+        return merged
 
     @staticmethod
     def group_words_to_subtitles(
@@ -318,66 +417,197 @@ class ForcedAlignerService:
         max_duration_sec: float = 4.5,
         max_words: int = 10,
         max_chars: int = 45,
+        min_words: int = 2,
+        defer_words: int = 3,
+        merge_continuation: bool = True,
+        sentence_max_words: int = 24,
+        sentence_max_duration_sec: float = 8.0,
+        sentence_max_chars: int = 160,
     ) -> List[SubtitleSentence]:
-        """Gom danh sách từ/ký tự từ Forced Aligner thành các câu phụ đề ngắn vừa mắt."""
+        """Gom danh sách từ/ký tự từ Forced Aligner thành các câu phụ đề ngắn vừa mắt.
+
+        ĐÂY LÀ TẦNG NGẮT CÂU HIỂN THỊ của tuyến OFFLINE_BATCH — nó chạy TRÊN bản phiên âm đã có
+        trọn ngữ cảnh của cả khối (khác hẳn Pipeline A, nơi ranh giới câu quyết định luôn cửa sổ
+        audio đưa vào model). Vì vậy mọi quy tắc ở đây chỉ được ảnh hưởng tới việc CHIA HIỂN THỊ,
+        tuyệt đối không được cắt bớt ngữ cảnh âm học mà ASR đã nghe.
+
+        Quy tắc (theo thứ tự ưu tiên):
+          1. Dấu KẾT CÂU (`.?!。？！`) — **cả câu là một phụ đề**, miễn câu không vượt
+             `sentence_max_*` (24 từ / 8 s). Đây là mặc định mong muốn: người xem thấy câu trọn vẹn
+             và bản dịch cũng nhận được câu trọn vẹn.
+          2. Chỉ khi câu QUÁ DÀI mới cắt bên trong: ưu tiên dấu PHẨY cuối cùng trong cửa sổ
+             `max_words`/`max_duration_sec`, nếu không có thì tại KHE ÂM HỌC lớn nhất (>= 120 ms),
+             cuối cùng mới cắt tại trần.
+          3. GỘP các mảnh bị chẻ: mảnh kết thúc KHÔNG có dấu kết câu mà mảnh sau bắt đầu bằng chữ
+             thường (hoặc quá ngắn) ⇒ hai mảnh vốn là MỘT câu ⇒ gộp, miễn không vượt trần cứng.
+
+        ⚠️ ĐIỀU KIỆN TIÊN QUYẾT: dấu câu phải TỒN TẠI trong `aligned_items`. `Qwen3-ForcedAligner`
+        đã bỏ hết dấu câu khi tokenize, nên BẮT BUỘC gọi `ForcedAlignerService.merge_source_text`
+        (được `align()` gọi tự động) trước khi gom câu. Không có bước đó thì hàm này chỉ còn cách
+        cắt theo trần và phụ đề sẽ là những mảnh cụt không dấu câu — đúng sự cố 2026-10-02.
+        """
         if not aligned_items:
             return []
 
+        n = len(aligned_items)
         is_cjk = language.lower() in ("chinese", "japanese", "korean")
         sentence_end_punct = {".", "?", "!", "。", "？", "！", "\n"}
         clause_punct = {",", "、", ";", "；", "—", "-"}
 
-        subtitles: List[SubtitleSentence] = []
-        current_words: List[AlignedWord] = []
-        curr_start: Optional[float] = None
+        min_words = max(1, int(min_words))
+        defer = max(0, int(defer_words))
+        #: Trần cho một CÂU TRỌN VẸN (ưu tiên số 1). Chỉ khi câu dài hơn mức này mới phải cắt trong.
+        sentence_max_words = max(int(max_words), int(sentence_max_words))
+        sentence_max_duration_sec = max(float(max_duration_sec), float(sentence_max_duration_sec))
+        sentence_max_chars = max(int(max_chars), int(sentence_max_chars))
+        #: Trần CỨNG cho bước gộp: chỉ để CỨU một mảnh bị chẻ (không dựng lại "siêu câu" và không
+        #: phá ý định của caller khi họ đặt trần mềm nhỏ). Luôn <= trần câu.
+        hard_words = min(max_words + defer, sentence_max_words)
+        hard_chars = min(int(max_chars * 1.5), int(sentence_max_chars * 1.25))
+        hard_dur = min(max_duration_sec * 1.5, sentence_max_duration_sec * 1.25)
+        #: Khe âm học tối thiểu để coi là ranh giới tự nhiên khi buộc phải cắt.
+        min_acoustic_gap_sec = 0.12
 
-        for i, it in enumerate(aligned_items):
-            w_text = it.text
-            t0 = it.start_time
-            t1 = it.end_time
+        def _text_at(i: int) -> str:
+            return (aligned_items[i].text or "").strip()
 
-            if curr_start is None:
-                curr_start = t0
-            current_words.append(it)
+        def _last_char(i: int) -> str:
+            t = _text_at(i)
+            return t[-1] if t else ""
 
-            curr_dur = t1 - curr_start
-            clean_w = w_text.strip()
-            last_char = clean_w[-1] if clean_w else ""
+        def _is_sent_end(i: int) -> bool:
+            return _last_char(i) in sentence_end_punct
 
-            is_sent_end = last_char in sentence_end_punct
-            is_clause_end = (last_char in clause_punct) and (len(current_words) >= 4 or curr_dur >= 2.0)
-            is_over_length = (
-                curr_dur >= max_duration_sec
-                or (not is_cjk and len(current_words) >= max_words)
-                or (is_cjk and sum(len(w.text) for w in current_words) >= max_chars)
-            )
+        def _is_clause_end(i: int) -> bool:
+            return _last_char(i) in clause_punct
 
-            # Ưu tiên ngắt tại khoảng lặng âm học giữa 2 từ liên tiếp nếu đang quá dài
-            has_acoustic_gap = False
-            if i + 1 < len(aligned_items):
-                gap = aligned_items[i + 1].start_time - t1
-                if gap >= 0.18 and (len(current_words) >= 3 or curr_dur >= 1.8):
-                    has_acoustic_gap = True
+        def _gap_after(i: int) -> float:
+            """Khe âm học giữa từ `i` và từ `i + 1`."""
+            if i + 1 >= n:
+                return 0.0
+            return max(0.0, aligned_items[i + 1].start_time - aligned_items[i].end_time)
 
-            should_split = is_sent_end or is_clause_end or is_over_length or (has_acoustic_gap and curr_dur >= 2.5)
+        def _chars(lo: int, hi: int) -> int:
+            return sum(len(aligned_items[k].text) for k in range(lo, hi + 1))
 
-            if should_split or i == len(aligned_items) - 1:
-                if is_cjk:
-                    seg_text = "".join(w.text for w in current_words).strip()
+        def _count(lo: int, hi: int) -> int:
+            return hi - lo + 1
+
+        def _dur(lo: int, hi: int) -> float:
+            return max(0.0, aligned_items[hi].end_time - aligned_items[lo].start_time)
+
+        def _over(lo: int, hi: int) -> bool:
+            """Nhóm [lo, hi] đã vượt trần MỀM chưa (trần dùng khi phải cắt BÊN TRONG câu)."""
+            if _dur(lo, hi) >= max_duration_sec:
+                return True
+            if is_cjk:
+                return _chars(lo, hi) >= max_chars
+            return _count(lo, hi) >= max_words
+
+        def _over_sentence(lo: int, hi: int) -> bool:
+            """Nhóm [lo, hi] đã vượt trần của một CÂU TRỌN VẸN chưa."""
+            if _dur(lo, hi) >= sentence_max_duration_sec:
+                return True
+            if is_cjk:
+                return _chars(lo, hi) >= sentence_max_chars
+            return _count(lo, hi) >= sentence_max_words
+
+        def _too_big(lo: int, hi: int) -> bool:
+            """Nhóm [lo, hi] vượt trần CỨNG (dùng cho bước gộp) chưa."""
+            if _dur(lo, hi) > hard_dur:
+                return True
+            if is_cjk:
+                return _chars(lo, hi) > hard_chars
+            return _count(lo, hi) > hard_words
+
+        def _choose_cut(lo: int, cap_end: int) -> int:
+            """Chọn từ kết thúc nhóm khi không có dấu kết câu nào trong tầm với."""
+            floor = min(cap_end, lo + min_words - 1)
+            # (a) Dấu phẩy CUỐI CÙNG trong cửa sổ (giữ cụm từ dài nhất có thể mà vẫn dưới trần)
+            for k in range(cap_end, floor - 1, -1):
+                if _is_clause_end(k):
+                    return k
+            # (b) Khe âm học LỚN NHẤT (người nói lấy hơi) — không cắt giữa cụm từ
+            best_k: Optional[int] = None
+            best_gap = 0.0
+            for k in range(floor, cap_end):
+                gap = _gap_after(k)
+                if gap > best_gap:
+                    best_k, best_gap = k, gap
+            if best_k is not None and best_gap >= min_acoustic_gap_sec:
+                return best_k
+            # (c) Trần
+            return cap_end
+
+        # ── BƯỚC 1: chọn ranh giới từng nhóm
+        groups: List[Tuple[int, int]] = []
+        start = 0
+        while start < n:
+            hard_first: Optional[int] = None
+            for i in range(start, n):
+                if _is_sent_end(i):
+                    hard_first = i
+                    break
+
+            # Trần MỀM: mốc phải cắt nếu không tìm được dấu kết câu nào.
+            cap_end = n - 1
+            for i in range(start, n):
+                if _over(start, i):
+                    cap_end = i
+                    break
+
+            # Trần CÂU: một câu trọn vẹn được phép dài tới đây (ưu tiên số 1).
+            sentence_cap_end = n - 1
+            for i in range(start, n):
+                if _over_sentence(start, i):
+                    sentence_cap_end = i
+                    break
+
+            if hard_first is not None and hard_first <= sentence_cap_end:
+                # Có dấu kết câu trong phạm vi một câu bình thường ⇒ lấy TRỌN CÂU.
+                end = hard_first
+            elif hard_first is not None and hard_first <= min(n - 1, cap_end + defer):
+                # Câu hơi dài nhưng sắp có dấu kết câu ⇒ nới thêm cho trọn câu.
+                end = hard_first
+            else:
+                # Không có dấu câu (hoặc câu quá dài) ⇒ cắt bên trong câu tại điểm đẹp nhất.
+                end = _choose_cut(start, cap_end)
+            groups.append((start, end))
+            start = max(end + 1, start + 1)
+
+        # ── BƯỚC 2: gộp các mảnh bị chẻ (câu bị cắt làm hai phụ đề)
+        if merge_continuation and len(groups) > 1:
+            merged: List[Tuple[int, int]] = [groups[0]]
+            for lo, hi in groups[1:]:
+                p_lo, p_hi = merged[-1]
+                prev_open = not _is_sent_end(p_hi)
+                first_txt = _text_at(lo)
+                cur_short = _count(lo, hi) < min_words
+                cur_cont = cur_short or (not is_cjk and first_txt[:1].islower())
+                if prev_open and cur_cont and not _too_big(p_lo, hi):
+                    merged[-1] = (p_lo, hi)
                 else:
-                    seg_text = " ".join(w.text for w in current_words).strip()
+                    merged.append((lo, hi))
+            groups = merged
 
-                subtitles.append(
-                    SubtitleSentence(
-                        text=seg_text,
-                        start_time=curr_start,
-                        end_time=t1,
-                        words=list(current_words),
-                    )
+        # ── BƯỚC 3: dựng SubtitleSentence
+        subtitles: List[SubtitleSentence] = []
+        for lo, hi in groups:
+            words = list(aligned_items[lo : hi + 1])
+            if is_cjk:
+                seg_text = "".join(w.text for w in words).strip()
+            else:
+                seg_text = " ".join(w.text for w in words).strip()
+            if not seg_text:
+                continue
+            subtitles.append(
+                SubtitleSentence(
+                    text=seg_text,
+                    start_time=float(aligned_items[lo].start_time),
+                    end_time=float(aligned_items[hi].end_time),
+                    words=words,
                 )
-                current_words = []
-                curr_start = None
-
+            )
         return subtitles
 
     def unload_model(self) -> None:

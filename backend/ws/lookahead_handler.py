@@ -35,11 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import bisect
 import hashlib
 import json
 import struct
-import threading
 import time
 import uuid
 from collections import deque
@@ -49,12 +47,13 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from backend.config import config
-from backend.core.commit_manager import count_content_tokens
+from backend.core.dedup import CommitDeduplicator, normalize_for_dedup
 from backend.core.lookahead_chunker import LookaheadChunker
 from backend.core.lookahead_timeline import ContinuousAudioTimeline
 from backend.core.metrics import metrics_collector
 from backend.core.stream_demuxer import StreamDemuxer
 from backend.asr.forced_aligner import (
+    AlignedWord,
     ForcedAlignerService,
     SubtitleSentence,
     resolve_aligner_language,
@@ -65,10 +64,7 @@ from backend.utils.logger import get_logger
 
 logger = get_logger("ws.lookahead")
 
-#: Số mốc neo (sample → PTS) giữ lại. Mỗi mốc neo = một lần VAD mở đoạn nói mới.
-_MAX_ANCHORS = 256
-#: Cửa sổ (giây) coi một mảnh giống hệt là "gửi trùng". Rộng hơn mọi khoảng replay cache,
-#: nhưng đủ hẹp để mảnh nạp lại sau khi tua vẫn được chấp nhận.
+#: Cửa sổ (giây) coi một mảnh giống hệt là "gửi trùng" (mảnh nạp lại sau khi tua vẫn được nhận).
 _DUP_WINDOW_SEC = 15.0
 #: Lệch quá ngần này giây giữa audio nhận được và vị trí phát ⇒ cảnh báo "đoạn đầu sẽ không
 #: có phụ đề" (dấu hiệu cache mảnh phía Extension không bám vị trí phát).
@@ -76,8 +72,9 @@ _START_OFFSET_WARN_SEC = 20.0
 #: Xê dịch tối đa (giây) giữa mốc neo hiện tại và vị trí báo mới mà vẫn coi là CÙNG một mốc
 #: (không reset pipeline). Chống reset lặp khi `sync_state` gửi `seek_id` mới ở cùng vị trí.
 _REANCHOR_TOLERANCE_SEC = 1.5
-#: Giãn cách tối thiểu giữa hai lần yêu cầu client gửi lại mảnh (chống spam).
-_REPLAY_REQUEST_COOLDOWN_SEC = 4.0
+#: Con trỏ khối batch phải kẹt xa vị trí phát BỀN VỮNG ngần này giây mới neo lại (xem
+#: `_maybe_reanchor_batch_frontier`) — tránh neo nhầm khi playhead vừa nhảy bình thường.
+_FRONTIER_RESYNC_AFTER_SEC = 2.0
 
 
 def _pack_binary_frame(header: Dict[str, Any], payload: bytes) -> bytes:
@@ -97,6 +94,18 @@ def _clip_dubbing_text(text: str, max_chars: int) -> str:
     if space > max_chars // 2:
         cut = cut[:space]
     return cut.strip()
+
+
+#: Ký tự kết câu (Latin + CJK) — dùng để biết một phụ đề đã TRỌN CÂU hay chưa.
+_SENTENCE_END_CHARS = (".", "?", "!", "。", "？", "！", "…")
+#: Ký tự bao có thể nằm SAU dấu kết câu (`anh ấy nói "Đứng lại."`).
+_TRAILING_WRAPPERS = "\"'”’»)]}）】」』"
+
+
+def _ends_sentence(text: str) -> bool:
+    """`True` nếu văn bản kết thúc bằng dấu kết câu (bỏ qua ký tự bao phía sau)."""
+    clean = (text or "").strip().rstrip(_TRAILING_WRAPPERS).rstrip()
+    return bool(clean) and clean[-1] in _SENTENCE_END_CHARS
 
 
 def _free_vram_mb() -> Optional[float]:
@@ -166,8 +175,13 @@ class LookaheadSessionState:
         self.vad_processor = None
         self.unavailable_reason: str = ""
 
-        # Chế độ xử lý: "streaming" (v2 mặc định) hoặc "offline_batch" (v3)
-        self.processing_mode: str = str(getattr(la, "processing_mode", "streaming") or "streaming")
+        # Pipeline B CHỈ có một chế độ: OFFLINE_BATCH (Qwen3-ASR + Forced Aligner).
+        # v2 "streaming giả lập" (VAD + CommitManager + preview) đã bị XOÁ ngày 2026-10-02 — người
+        # dùng muốn cơ chế cắt câu kiểu đó thì chạy Pipeline A (`/ws`), hoặc tắt Lookahead trong
+        # popup để extension tự chuyển sang Pipeline A (xem report/09_lookahead_offline_batch).
+        # Bộ cắt khối: mốc lý tưởng 15 s nhưng dải TÌM ranh giới mở rộng tới `batch_search_max_sec`
+        # (30 s) — khối dài hơn cho ASR nhiều ngữ cảnh hơn (đúng mục tiêu CER/WER của v3), và mép
+        # khối chỉ là ranh giới GIẢI MÃ, không phải ranh giới câu (xem docstring lookahead_chunker).
         self.chunker = LookaheadChunker(
             timeline=self.timeline,
             sample_rate=16000,
@@ -176,7 +190,49 @@ class LookaheadSessionState:
             max_window_sec=float(getattr(la, "batch_max_sec", 18.0)),
             min_silence_ms=float(getattr(la, "batch_min_silence_ms", 250.0)),
             overlap_sec=float(getattr(la, "batch_overlap_sec", 1.0)),
+            search_max_sec=float(getattr(la, "batch_search_max_sec", 30.0)),
+            strong_silence_ms=float(getattr(la, "batch_strong_silence_ms", 450.0)),
+            silence_rel_db=float(getattr(la, "batch_silence_rel_db", 22.0)),
+            silence_floor_rms=float(getattr(la, "batch_silence_floor_rms", 0.004)),
+            min_rms_ratio=float(getattr(la, "batch_min_rms_ratio", 0.35)),
+            min_rms_hold_ms=float(getattr(la, "batch_min_rms_hold_ms", 120.0)),
+            dip_search_sec=float(getattr(la, "batch_dip_search_sec", 3.0)),
         )
+        #: Trần gom câu phụ đề của tuyến batch (popup có thể thu hẹp qua `min_words_to_commit`).
+        self._batch_sub_opts: Dict[str, Any] = {
+            "max_words": int(getattr(la, "batch_sub_max_words", 10)),
+            "max_duration_sec": float(getattr(la, "batch_sub_max_duration_sec", 4.5)),
+            "max_chars": int(getattr(la, "batch_sub_max_chars", 45)),
+            "min_words": max(1, int(getattr(la, "batch_sub_min_words", 2))),
+            "defer_words": max(0, int(getattr(la, "batch_sub_defer_words", 3))),
+            # Trần cho một CÂU TRỌN VẸN: có dấu kết câu trong phạm vi này ⇒ cả câu là một phụ đề.
+            "sentence_max_words": int(getattr(la, "batch_sub_sentence_max_words", 24)),
+            "sentence_max_duration_sec": float(
+                getattr(la, "batch_sub_sentence_max_duration_sec", 8.0)
+            ),
+        }
+        #: Mốc PTS (trong KHÔNG GIAN AUDIO, chưa cộng offset) của từ cuối ĐÃ PHÁT ở khối trước.
+        #: Dùng để trừ phần chồng lấn ở ranh giới khối — nếu không, từ ở ranh giới bị phát hai lần
+        #: ("cuối câu này là đầu của câu sau", sự cố 2026-10-02).
+        self._batch_prev_emitted_end_audio: Optional[float] = None
+        #: Đuôi TỪ (đã chuẩn hoá) của nội dung đã phát — trừ chồng lấn theo CHUỖI TỪ, bù sai số mốc
+        #: giữa hai lần forced-align (cùng một từ có thể lệch nhau 100–300 ms giữa hai khối).
+        self._batch_emitted_tail_norm: List[str] = []
+        #: Mảnh phụ đề CUỐI của khối trước chưa kết câu (khối bị cắt giữa câu) — giữ lại để ghép
+        #: với đầu khối sau, nhờ vậy câu không bao giờ bị chẻ làm hai phụ đề ở ranh giới khối.
+        #: Mốc thời gian ở KHÔNG GIAN AUDIO TUYỆT ĐỐI (chưa cộng offset người dùng).
+        self._batch_carry_words: List[AlignedWord] = []
+        #: THẾ HỆ SEEK của marker `_ready_until_pts`. Marker chỉ có giá trị cho đúng thế hệ này;
+        #: sau khi tua, marker cũ (thuộc vị trí cũ) KHÔNG được phép báo "đã sẵn sàng" — nếu không,
+        #: video phát qua vùng chưa hề được xử lý (sự cố 2026-10-02: "Đã dịch: 232.9s" trong khi
+        #: playhead ở 27s ⇒ seek ngược về đầu không hiện phụ đề).
+        self._ready_until_seq: int = 0
+        #: Mốc thời gian (perf_counter) bắt đầu thấy con trỏ khối KẸT xa vị trí phát — dùng cho
+        #: watchdog neo lại (xem `_maybe_reanchor_batch_frontier`).
+        self._frontier_stuck_since: Optional[float] = None
+        #: Fallback khi ForcedAligner lỗi: bộ lọc trùng của Pipeline A (cắt đuôi/đầu trùng nhau).
+        self._batch_dedup = CommitDeduplicator()
+        self._batch_trim_overlap: bool = bool(getattr(la, "batch_trim_boundary_overlap", True))
         self._aligner_service: ForcedAlignerService = ForcedAlignerService.get_instance()
         self._batch_from_pts: Optional[float] = None
         self._fast_bootstrap: bool = False
@@ -199,19 +255,13 @@ class LookaheadSessionState:
         self.tts_sent: int = 0
         self.tts_skipped: int = 0
 
-        # Ánh xạ sample ASR -> PTS tuyệt đối. Engine chỉ nhận frame ĐOẠN NÓI (VAD lọc),
-        # nên chỉ số mẫu trong `audio_buffer` KHÔNG tuyến tính với thời gian video. Ta ghi
-        # một "anchor" mỗi khi có điểm không liên tục (đầu mỗi đoạn nói / sau khi hụt audio).
-        self._anchor_lock = threading.RLock()
-        self._anchor_samples: List[int] = []
-        self._anchor_pts: List[float] = []
-
-        # Mốc PTS của mẫu kế tiếp sẽ nạp vào VAD
+        #: PTS của audio đã đưa qua ASR (offline block) — cập nhật bởi `_commit_batch_progress`.
+        #: Ở tuyến OFFLINE_BATCH, "đã nạp vào ASR" chính là mốc kết thúc khối vừa xử lý.
         self._feed_pts: Optional[float] = None
         self._session_start_pts: Optional[float] = None
-        #: Mốc kết thúc audio ĐÃ NHẬN & GIẢI MÃ (kể cả phần đã nạp vào VAD). Dùng để báo
-        #: `buffered_ahead` trung thực: nếu chỉ nhìn phần còn chờ trong timeline thì sau khi
-        #: nạp hết, buffer sẽ báo 0 dù trình duyệt vẫn còn cả chục giây audio phía trước.
+        #: Mốc kết thúc audio ĐÃ NHẬN & GIẢI MÃ. Dùng để báo `buffered_ahead` trung thực: nếu chỉ
+        #: nhìn phần còn chờ trong timeline thì sau khi nạp hết, buffer sẽ báo 0 dù trình duyệt vẫn
+        #: còn cả chục giây audio phía trước.
         self._decoded_end_pts: float = 0.0
         self._ready_until_pts: float = 0.0
         #: Lần cuối cùng `prebuffer_ready` đổi giá trị (để chỉ log khi có thay đổi).
@@ -236,8 +286,8 @@ class LookaheadSessionState:
         self.started_at = time.time()
         # ── Chẩn đoán NĂNG LỰC GIẢI MÃ (2026-10-01) ──────────────────────────────
         # Sự cố "trang khác chỉ hiện 1/3-5 câu": cần biết tầng nào là nút cổ chai —
-        # `decoder` (byte tới nhiều mà PCM giải mã ra ít) hay `VAD` (PCM có sẵn mà nạp chậm).
-        # `bytes_in` / `fed_seconds` cho tỷ lệ giải mã và tốc độ nạp tính bằng số THẬT.
+        # `decoder` (byte tới nhiều mà PCM giải mã ra ít) hay tầng xử lý khối (PCM có sẵn mà lâu
+        # mới có phụ đề). `bytes_in` / `fed_ahead` cho tỷ lệ giải mã và độ phủ tính bằng số THẬT.
         self.bytes_in = 0
         self.decode_seconds = 0.0          # tổng thời lượng PCM giải mã ra (đã lọc)
         self.decode_wall_sec = 0.0         # tổng thời gian wall của các lời gọi demuxer.feed
@@ -246,8 +296,6 @@ class LookaheadSessionState:
         self.decode_windows = 0            # số lượt feed CÓ sinh ra PCM
         self.chunks_dropped_far = 0        # số đoạn PCM bị bỏ vì quá xa vị trí phát
         self.start_offset_warned = 0       # số lần cảnh báo lệch đầu phiên (chỉ log vài lần)
-        self.replay_requests = 0           # số lần yêu cầu client gửi lại mảnh
-        self._last_replay_request_at = 0.0
         #: Chẩn đoán sau khi tua (xem `handle_audio_fragment`).
         self._seek_reset_at = 0.0
         self._seek_diag_left = 0
@@ -256,21 +304,13 @@ class LookaheadSessionState:
         self._fragment_digest_order: deque = deque()
         self._max_decode_lead_sec = float(getattr(la, "max_decode_lead_sec", 240.0) or 240.0)
         self._playhead_pts = 0.0
-        self.fed_seconds = 0.0             # tổng audio đã nạp vào VAD
-        self.feed_wall_sec = 0.0           # tổng thời gian wall của feed_chunk (đo VAD)
-        self._feed_wall_max = 0.0
         self._last_decoded_at = 0.0        # lần cuối có PCM mới
-        self._starved_since: Optional[float] = None
-        self._starved_bytes = 0
-        self._starved_max_sec = 0.0
         #: Mốc so sánh cho log chẩn đoán định kỳ (xem `_maybe_log_diagnostics`).
         self._last_diag_at = time.perf_counter()
         self._diag_bytes_in = 0
         self._diag_decode_seconds = 0.0
         self._diag_media_seconds = 0.0
         self._diag_decode_wall = 0.0
-        self._diag_fed_seconds = 0.0
-        self._diag_feed_wall = 0.0
         #: Lần cuối in cấu trúc container (thưa hơn log chẩn đoán vì tốn CPU).
         self._last_struct_at = time.perf_counter()
 
@@ -286,7 +326,11 @@ class LookaheadSessionState:
         vad_engine: Optional[str] = None,
         vad_engine_override: Any = None,
     ) -> None:
-        """Dựng VAD + ASR theo ĐÚNG cấu hình popup, giống `SessionState.init_components`.
+        """Dựng ASR (+ VAD chỉ để đọc phần bù mép-nói) theo ĐÚNG cấu hình popup.
+
+        ⚠️ Tuyến OFFLINE_BATCH **không chạy VAD** để cắt câu (việc đó do Qwen3-ForcedAligner lo).
+        VAD ở đây chỉ còn một nhiệm vụ: cho biết `start_pad_ms` — phần bù mà engine VAD vốn lùi mép
+        nói — để canh mốc phụ đề/TTS (xem `_refresh_start_pad`).
 
         `vad_engine_override` cho phép TIÊM engine VAD giả trong test tầng A
         (xem `backend/tests/fakes.py`).
@@ -301,20 +345,13 @@ class LookaheadSessionState:
                 language=self.source_lang or "auto",
             )
 
-        # Phân câu: bản SAO cấu hình để không đụng cấu hình toàn cục của Pipeline A.
-        try:
-            self.asr_engine.commit_manager.cfg = config.sentence.model_copy(deep=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Không tạo được bản cấu hình phân câu riêng: {exc}", extra={"module_tag": "WS"})
-
         # Ngôn ngữ nguồn: popup chọn gì thì ASR nhận đúng cái đó.
         try:
             self.asr_engine.set_language(self.source_lang or "auto")
         except Exception:  # noqa: BLE001
             pass
 
-        # VAD: dựng NGAY với thông số popup (engine/threshold/silence) để các chunk đầu
-        # tiên đã dùng đúng cấu hình, không phải chờ cơ chế đổi engine ở chunk kế tiếp.
+        # VAD: dựng với thông số popup (engine/threshold/silence) — chỉ dùng cho `start_pad_ms`.
         parsed = self._parsed_config
         vad_name = (parsed.vad_engine if parsed and parsed.vad_engine else None) \
             or vad_engine or config.vad.vad_engine
@@ -337,17 +374,12 @@ class LookaheadSessionState:
             threshold=vad_threshold,
             silence_duration_ms=vad_silence,
             enabled=vad_enabled,
-            on_speech_chunk=self._on_speech_chunk,
-            on_speech_start=self.asr_engine.on_speech_start,
-            on_speech_end=self.asr_engine.on_speech_end,
             engine_override=vad_engine_override,
         )
 
-        # Áp cấu hình popup (VAD/threshold/silence/phân câu/từ tối thiểu…) rồi mới chốt các
-        # override riêng của Lookahead (chúng phải thắng).
+        # Áp cấu hình popup (ngôn ngữ/TTS/trần gom câu…) rồi đọc phần bù mép nói.
         if self._parsed_config is not None:
             self._apply_config_sync(self._parsed_config)
-        self._apply_lookahead_overrides()
         self._refresh_start_pad()
 
     def _refresh_start_pad(self) -> None:
@@ -365,25 +397,6 @@ class LookaheadSessionState:
             )
 
     # ────────────────────────────────────────────────── cấu hình từ popup
-    def _apply_lookahead_overrides(self) -> None:
-        """Override RIÊNG của Lookahead (áp SAU cấu hình popup để luôn thắng)."""
-        la = config.lookahead
-        engine = self.asr_engine
-        if engine is None:
-            return
-        # BẬC 4 (TIMEOUT_FORCE) dùng đồng hồ thời gian thực; Lookahead nạp audio theo lô nên
-        # đồng hồ này dễ chốt oan giữa câu ⇒ nới trần.
-        try:
-            engine.commit_manager.cfg.inactivity_timeout_sec = float(la.inactivity_timeout_sec)
-        except Exception:  # noqa: BLE001
-            pass
-        # Preview vẫn BẬT (nguồn duy nhất của BẬC 3) nhưng chỉ chạy khi có audio mới.
-        engine.preview_enabled = bool(la.preview_enabled)
-        engine.preview_requires_new_audio = True
-        engine.preview_min_new_audio_sec = float(la.preview_min_new_audio_sec)
-        engine.poll_interval_ms = 100
-        engine._eff_poll_interval = 0.1
-
     def _apply_config_sync(self, parsed: "SessionConfigPayload") -> Dict[str, Any]:
         """Áp phần cấu hình KHÔNG cần nạp model (ngôn ngữ, VAD, phân câu, từ tối thiểu)."""
         applied: Dict[str, Any] = {}
@@ -438,48 +451,15 @@ class LookaheadSessionState:
             self.tts_speed = float(parsed.tts_speed)
             applied["tts_speed"] = self.tts_speed
 
-        engine = self.asr_engine
-        if engine is not None:
-            updates: Dict[str, Any] = {}
-            if parsed.split_on_stability is not None:
-                updates["split_on_stability"] = bool(parsed.split_on_stability)
-            elif parsed.enable_stability_split is not None:
-                updates["split_on_stability"] = bool(parsed.enable_stability_split)
-            if parsed.stability_duration_sec is not None:
-                updates["stability_duration_sec"] = float(parsed.stability_duration_sec)
-            if parsed.max_duration_sec is not None:
-                updates["max_duration_sec"] = float(parsed.max_duration_sec)
-            if parsed.max_chars is not None:
-                updates["max_chars"] = int(parsed.max_chars)
-            if parsed.min_words_to_commit is not None:
-                self._min_words_to_commit = max(0, int(parsed.min_words_to_commit))
-                updates["min_words_to_commit"] = self._min_words_to_commit
-                applied["min_words_to_commit"] = self._min_words_to_commit
-            if parsed.stability_min_duration_sec is not None:
-                updates["stability_min_duration_sec"] = float(parsed.stability_min_duration_sec)
-            if parsed.stability_min_words is not None:
-                updates["stability_min_words"] = int(parsed.stability_min_words)
-            if parsed.trace_stability is not None:
-                updates["trace_stability"] = bool(parsed.trace_stability)
-            if parsed.hold_short_sentence is not None:
-                updates["hold_short_sentence"] = bool(parsed.hold_short_sentence)
-            if updates:
-                try:
-                    engine.update_sentence_config(**updates)
-                    applied.update(updates)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Áp cấu hình phân câu Lookahead lỗi: {exc}", extra={"module_tag": "WS"})
-
-            # Cửa sổ preview: popup chỉnh được (P2.3).
-            if parsed.preview_window_sec is not None:
-                config.asr.preview_window_sec = float(parsed.preview_window_sec)
-                applied["preview_window_sec"] = config.asr.preview_window_sec
-            if parsed.poll_interval_ms is not None:
-                v = max(50, int(parsed.poll_interval_ms))
-                engine.poll_interval_ms = v
-                engine._eff_poll_interval = v / 1000.0
-                engine._preview_durations.clear()
-                applied["poll_interval_ms"] = v
+        # ── Trần GOM CÂU PHỤ ĐỀ của tuyến OFFLINE_BATCH ─────────────────────────
+        # Tuyến này KHÔNG dùng CommitManager/preview của Pipeline A (câu được cắt bằng dấu câu của
+        # bản phiên âm + mốc từ của Forced Aligner), nên các tham số phân câu kiểu A
+        # (`stability_*`, `max_duration_sec`, `max_chars`, `split_on_stability`…) KHÔNG được áp ở
+        # đây. Chỉ `min_words_to_commit` được dùng lại — với nghĩa GỘP mảnh cụt, không phải lọc bỏ.
+        if parsed.min_words_to_commit is not None:
+            self._min_words_to_commit = max(0, int(parsed.min_words_to_commit))
+            self._batch_sub_opts["min_words"] = max(1, self._min_words_to_commit)
+            applied["min_words_to_commit"] = self._min_words_to_commit
 
         if self.vad_processor is not None:
             vad_kwargs: Dict[str, Any] = {}
@@ -598,11 +578,6 @@ class LookaheadSessionState:
             except (TypeError, ValueError):
                 pass
 
-        proc_mode = raw.get("lookaheadProcessingMode", raw.get("processing_mode"))
-        if proc_mode in ("streaming", "offline_batch"):
-            self.processing_mode = str(proc_mode)
-            applied["processing_mode"] = self.processing_mode
-
         requested_asr = parsed.asr_model or parsed.asr_engine or parsed.model_id
         if requested_asr:
             clean = str(requested_asr).strip().lower()
@@ -631,27 +606,24 @@ class LookaheadSessionState:
             return None
 
     async def start_tasks(self) -> None:
-        """Khởi động các vòng lặp nền: nạp audio, tiêu thụ ASR, báo trạng thái (+TTS)."""
+        """Khởi động các vòng lặp nền: xử lý khối OFFLINE_BATCH, báo trạng thái (+TTS).
+
+        Tuyến OFFLINE_BATCH là tuyến DUY NHẤT của Pipeline B (v2 "streaming giả lập" đã bị xoá
+        ngày 2026-10-02): ASR chỉ nhận khối dài 12-30 s kèm ngữ cảnh đầy đủ, còn việc ngắt câu do
+        dấu câu của bản phiên âm + mốc từ của Forced Aligner quyết định.
+        """
         loop = asyncio.get_running_loop()
-        if self.processing_mode == "offline_batch":
-            self._tasks.append(loop.create_task(self._offline_batch_loop(), name=f"la_batch_{self.session_id[:8]}"))
-            self._tasks.append(loop.create_task(self._status_loop(), name=f"la_status_{self.session_id[:8]}"))
-            self._spawn(self._prewarm_aligner())
-            logger.info(
-                "Khởi động Lookahead Pipeline B ở chế độ: OFFLINE_BATCH (v3 Qwen3-ASR + Forced Aligner)",
-                extra={"module_tag": "WS"},
-            )
-        else:
-            base_tasks = [
-                loop.create_task(self._ingest_loop(), name=f"la_ingest_{self.session_id[:8]}"),
-                loop.create_task(self._asr_loop(), name=f"la_asr_{self.session_id[:8]}"),
-                loop.create_task(self._status_loop(), name=f"la_status_{self.session_id[:8]}"),
-            ]
-            self._tasks.extend(base_tasks)
-            logger.info(
-                "Khởi động Lookahead Pipeline B ở chế độ: STREAMING (v2 fallback/default)",
-                extra={"module_tag": "WS"},
-            )
+        self._tasks.append(
+            loop.create_task(self._offline_batch_loop(), name=f"la_batch_{self.session_id[:8]}")
+        )
+        self._tasks.append(
+            loop.create_task(self._status_loop(), name=f"la_status_{self.session_id[:8]}")
+        )
+        self._spawn(self._prewarm_aligner())
+        logger.info(
+            "Khởi động Lookahead Pipeline B ở chế độ: OFFLINE_BATCH (Qwen3-ASR + Forced Aligner)",
+            extra={"module_tag": "WS"},
+        )
         if self.tts_enabled:
             self._ensure_tts_worker()
 
@@ -716,172 +688,6 @@ class LookaheadSessionState:
 
         # Giải phóng bộ nhớ RAM audio của phiên
         self.timeline.clear()
-
-    # ────────────────────────────────────────────────────── ánh xạ sample → PTS
-    def _pts_at(self, sample_index: Optional[int]) -> Optional[float]:
-        """PTS tuyệt đối (giây) của `sample_index` trong bộ đệm ASR."""
-        if sample_index is None:
-            return None
-        with self._anchor_lock:
-            if not self._anchor_samples:
-                return None
-            idx = bisect.bisect_right(self._anchor_samples, int(sample_index)) - 1
-            if idx < 0:
-                idx = 0
-            base_sample = self._anchor_samples[idx]
-            base_pts = self._anchor_pts[idx]
-        return base_pts + (int(sample_index) - base_sample) / 16000.0
-
-    async def _request_replay(self, reason: str) -> None:
-        """Yêu cầu client GỬI LẠI các mảnh quanh vị trí phát hiện tại.
-
-        Dùng khi audio nhận được lệch xa vị trí phát (thường sau khi tua): cache phía client
-        còn giữ mảnh của vị trí cũ nên pipeline không có gì để dịch. Có chốt thời gian để
-        không spam client mỗi mảnh.
-        """
-        now = time.perf_counter()
-        if now - self._last_replay_request_at < _REPLAY_REQUEST_COOLDOWN_SEC:
-            return
-        self._last_replay_request_at = now
-        self.replay_requests += 1
-        logger.info(
-            f"Yêu cầu client gửi lại mảnh quanh vị trí phát {self.current_time:.1f}s "
-            f"(lý do: {reason}, tổng {self.replay_requests} lần).",
-            extra={"module_tag": "WS"},
-        )
-        await self.send_json({
-            "type": "lookahead_request_replay",
-            "seek_id": self.active_seek_id,
-            "currentTime": round(self.current_time, 2),
-            "reason": reason,
-        })
-
-    def _record_anchor(self, sample_index: int, pts: float) -> None:
-        """Ghi mốc neo nếu PTS không nối tiếp tuyến tính với mốc trước."""
-        with self._anchor_lock:
-            if self._anchor_samples:
-                expected = self._pts_at(sample_index)
-                if expected is not None and abs(expected - pts) <= 0.005:
-                    return
-            self._anchor_samples.append(int(sample_index))
-            self._anchor_pts.append(float(pts))
-            if len(self._anchor_samples) > _MAX_ANCHORS:
-                del self._anchor_samples[0]
-                del self._anchor_pts[0]
-
-    def _prune_anchors(self) -> None:
-        """Bỏ các mốc neo đã ra khỏi bộ đệm vòng của ASR (không còn commit nào dùng tới)."""
-        engine = self.asr_engine
-        if engine is None:
-            return
-        try:
-            total = int(engine.audio_buffer.total_written)
-            capacity = int(engine.audio_buffer.capacity_samples)
-        except Exception:
-            return
-        cutoff = total - int(capacity * 0.9)
-        with self._anchor_lock:
-            drop = 0
-            while (
-                drop + 1 < len(self._anchor_samples)
-                and self._anchor_samples[drop + 1] <= cutoff
-            ):
-                drop += 1
-            if drop > 0:
-                del self._anchor_samples[:drop]
-                del self._anchor_pts[:drop]
-
-    # ─────────────────────────────────────────────────────────────── nạp audio
-    def _on_speech_chunk(self, pcm_bytes: bytes, ts: float, vad_state: str = "") -> None:
-        """Callback VAD: ghi mốc neo rồi đẩy PCM NGUYÊN BẢN vào ASR (giống Pipeline A)."""
-        engine = self.asr_engine
-        if engine is None or not pcm_bytes:
-            return
-        try:
-            sample_index = int(engine.audio_buffer.total_written)
-            self._record_anchor(sample_index, float(ts))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Không ghi được mốc neo: {exc}", extra={"module_tag": "WS"})
-        engine.feed_audio(pcm_bytes, timestamp=float(ts), vad_state=vad_state)
-
-    def _feed_target_pts(self) -> float:
-        """Nạp audio tới mốc nào thì dừng (chặn đốt GPU vô ích)."""
-        la = config.lookahead
-        rate = max(1.0, float(self.playback_rate or 1.0))
-        target = self.current_time + float(self.lead_time) * rate + float(la.feed_margin_sec)
-        if self._session_start_pts is not None:
-            target = max(target, self._session_start_pts + float(la.min_prebuffer_sec))
-        return target
-
-    def _next_feed_pts(self) -> Optional[float]:
-        if self.timeline.cursor_pts is not None:
-            return self.timeline.cursor_pts
-        return self._feed_pts
-
-    def _feed_block(self, pcm: np.ndarray, pts: float) -> None:
-        """Đẩy một khối PCM vào VAD (chạy trên thread, KHÔNG block event loop)."""
-        if self.vad_processor is None:
-            return
-        self.vad_processor.feed_chunk(pcm, capture_timestamp=float(pts))
-
-    async def _ingest_loop(self) -> None:
-        """Vòng nạp: đọc dòng PCM liên tục và đẩy vào VAD theo đúng nhu cầu."""
-        while not self._closed:
-            try:
-                await asyncio.wait_for(self._ingest_event.wait(), timeout=0.2)
-            except asyncio.TimeoutError:
-                pass
-            self._ingest_event.clear()
-            try:
-                await self.ingest_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"Lỗi vòng nạp Lookahead: {exc}", exc_info=True, extra={"module_tag": "WS"})
-
-    async def ingest_once(self) -> int:
-        """Nạp tối đa tới mốc nhu cầu hiện tại. Trả về số khối đã nạp."""
-        if self._closed or self.vad_processor is None:
-            return 0
-        async with self._ingest_lock:
-            fed = 0
-            block_sec = float(config.lookahead.feed_block_sec)
-            seq = self._seek_seq
-            while not self._closed:
-                if seq != self._seek_seq:
-                    break
-                next_pts = self._next_feed_pts()
-                if next_pts is None:
-                    break
-                if self._session_start_pts is None:
-                    self._session_start_pts = float(next_pts)
-                remaining = self._feed_target_pts() - next_pts
-                if remaining <= 0.02:
-                    break
-                item = self.timeline.read(min(block_sec, remaining))
-                if item is None:
-                    break
-                pts, pcm = item
-                if pcm.size == 0:
-                    continue
-                t_feed = time.perf_counter()
-                try:
-                    await asyncio.to_thread(self._feed_block, pcm, pts)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Nạp khối audio vào VAD lỗi: {exc}", extra={"module_tag": "WS"})
-                    break
-                if seq != self._seek_seq or self._closed:
-                    break
-                _feed_wall = time.perf_counter() - t_feed
-                self.feed_wall_sec += _feed_wall
-                if _feed_wall > self._feed_wall_max:
-                    self._feed_wall_max = _feed_wall
-                self.fed_seconds += pcm.size / 16000.0
-                self._feed_pts = pts + pcm.size / 16000.0
-                fed += 1
-            if fed:
-                self._prune_anchors()
-            return fed
 
     # ────────────────────────────────────────────────────────── tiếp nhận mảnh
     async def handle_audio_fragment(
@@ -1005,13 +811,16 @@ class LookaheadSessionState:
             self.demuxer.reset(self.demuxer.epoch, min_pts=max(0.0, float(target_time) - 0.5))
             # Không xoá audio RAM khi tua: chỉ chuyển con trỏ đọc (read cursor) tới mốc mới
             self.timeline.seek(float(target_time))
-            with self._anchor_lock:
-                self._anchor_samples.clear()
-                self._anchor_pts.clear()
             self._feed_pts = float(target_time)
             self._session_start_pts = float(target_time)
             self._batch_from_pts = float(target_time)
             self._fast_bootstrap = True
+            # Ranh giới khối + lịch sử dedup của vị trí CŨ không còn dùng được: nếu giữ, khối đầu
+            # tiên của vị trí mới sẽ bị trừ oan phần chồng lấn.
+            self._batch_prev_emitted_end_audio = None
+            self._batch_emitted_tail_norm = []
+            self._batch_carry_words = []
+            self._batch_dedup.clear()
 
             # Kiểm tra xem RAM đã có sẵn audio cho vị trí mới chưa (ví dụ tua lùi hoặc tua trong vùng đã buffer)
             buffered_end = self.timeline.buffered_end_from(float(target_time))
@@ -1019,8 +828,12 @@ class LookaheadSessionState:
                 self._decoded_end_pts = float(buffered_end)
             else:
                 self._decoded_end_pts = float(target_time)
-            # Phụ đề cho vị trí tua MỚI chưa được dịch -> mốc ready_until luôn bắt đầu từ target_time
+            # Phụ đề cho vị trí tua MỚI chưa được dịch -> mốc ready_until luôn bắt đầu từ target_time.
+            # GẮN THẾ HỆ SEEK: marker cũ (thuộc vị trí vừa rời) không được phép báo "đã dịch" cho vị
+            # trí mới — nếu không, video sẽ phát qua vùng chưa hề được xử lý.
             self._ready_until_pts = float(target_time)
+            self._ready_until_seq = self._seek_seq
+            self._frontier_stuck_since = None
 
             self._sent_items.clear()
             if self.tts_queue is not None:
@@ -1038,8 +851,6 @@ class LookaheadSessionState:
             self._diag_decode_seconds = self.decode_seconds
             self._diag_media_seconds = self.media_seconds
             self._diag_decode_wall = self.decode_wall_sec
-            self._diag_fed_seconds = self.fed_seconds
-            self._diag_feed_wall = self.feed_wall_sec
             metrics_collector.increment_counter("lookahead.seek_reset")
             self._ingest_event.set()
             logger.info(
@@ -1064,17 +875,227 @@ class LookaheadSessionState:
             return self.asr_engine.transcribe_block(pcm, language=lang if lang != "auto" else None)
         return ""
 
+    def _trim_batch_leading_overlap(
+        self,
+        chunk: Any,
+        aligned_words: List[Any],
+    ) -> Tuple[List[Any], int, int]:
+        """Bỏ phần nội dung ĐÃ PHÁT nằm trong vùng chồng lấn ở đầu khối hiện tại.
+
+        Khối sau có thể bắt đầu TRƯỚC mốc kết thúc nội dung đã phát của khối trước (`overlap_sec`,
+        để không mất từ ở mép cắt). Phần chồng lấn đó phải bị bỏ, nếu không từ ở ranh giới bị phát
+        HAI LẦN ("cuối câu này là đầu của câu sau").
+
+        Dùng HAI lớp vì một lớp là không đủ:
+          1. **Theo MỐC THỜI GIAN** — bỏ từ có mốc bắt đầu trước ranh giới đã phát.
+          2. **Theo CHUỖI TỪ** — bù sai số mốc giữa hai lần forced-align: cùng một từ ở hai khối có
+             thể được căn lệch nhau 100–300 ms, nên lớp 1 để lọt vài từ. Lớp này khớp đuôi từ đã
+             phát với đầu từ của khối mới (giới hạn trong cửa sổ chồng lấn để không ăn nhầm cụm từ
+             lặp lại ở giữa khối). Đo thật 2026-10-02: lớp 1 bỏ 3 từ nhưng "In front of" vẫn lọt ra
+             phụ đề vì mốc align của khối mới muộn hơn.
+
+        Returns:
+            `(words_còn_lại, số_từ_bỏ_theo_mốc, số_từ_bỏ_theo_chuỗi)`.
+        """
+        boundary = self._batch_prev_emitted_end_audio
+        if boundary is None or chunk.pts_start >= boundary - 1e-3:
+            return aligned_words, 0, 0
+
+        kept = [
+            w for w in aligned_words
+            if chunk.pts_start + float(w.start_time) >= boundary - 0.05
+        ]
+        dropped_ts = len(aligned_words) - len(kept)
+
+        tail = self._batch_emitted_tail_norm
+        dropped_seq = 0
+        if tail and kept:
+            # Chỉ xét các từ còn nằm trong (hoặc sát) vùng chồng lấn — chặn ăn nhầm cụm lặp giữa khối.
+            window = sum(
+                1 for w in kept if chunk.pts_start + float(w.start_time) < boundary + 0.35
+            )
+            k_max = min(len(tail), len(kept), window + 1)
+            head_norm = [normalize_for_dedup(getattr(w, "text", "") or "") for w in kept]
+            # `slack`: câu cuối của khối trước có thể đã đi QUÁ vùng chồng lấn vài từ, nên khớp
+            # không nhất thiết phải kết thúc ở đúng đuôi — cho phép lùi lại tối đa 3 từ.
+            for k in range(k_max, 0, -1):
+                if not any(head_norm[:k]):
+                    continue
+                matched = False
+                for slack in range(0, 4):
+                    p = len(tail) - k - slack
+                    if p >= 0 and tail[p : p + k] == head_norm[:k]:
+                        matched = True
+                        break
+                if matched:
+                    dropped_seq = k
+                    kept = kept[k:]
+                    break
+        return kept, dropped_ts, dropped_seq
+
+    def _commit_batch_progress(
+        self,
+        seq: int,
+        next_read_pts: float,
+        chunk_end_pts: float,
+    ) -> bool:
+        """Ghi tiến độ khối batch — CHỈ khi CHƯA có seek mới hơn (chống race).
+
+        VÌ SAO CẦN: `_offline_batch_loop` có `await self.send_json(...)` ngay trước khi ghi tiến
+        độ. Trong lúc chờ `await` đó, cùng event loop có thể xử lý `sync_state`/`seek_reset` ⇒
+        `handle_seek()` đã reset `_batch_from_pts`/`_ready_until_pts` về mốc tua, rồi vòng lặp quay
+        lại GHI ĐÈ bằng mốc của khối CŨ. Đo thật 2026-10-02 (log thật):
+
+            [WS] Seek seek_id=…_7thc mốc=34.99s     ← reset pipeline về 34.99s
+            93 ms sau: prebuffer_ready=True (ready_ahead=7.42s ⇒ ready_until = 42.41s)
+            [ASR] Lookahead Batch ASR [42.41s -> 54.83s]   ← chạy tiếp từ mốc CŨ
+
+        ⇒ vùng [34.99s, 42.41s] **không bao giờ** được phiên âm ("lúc hiện phụ đề lúc không").
+
+        Returns:
+            True nếu tiến độ được ghi (cùng thế hệ seek), False nếu là iteration cũ (bỏ qua).
+        """
+        if self._closed or seq != self._seek_seq:
+            return False
+        self._batch_from_pts = float(next_read_pts)
+        #: "Đã đưa qua ASR" = mốc kết thúc khối vừa xử lý (ở tuyến batch không còn tầng nạp VAD
+        #: riêng) — nhờ vậy `fed_ahead` trong status/log phản ánh đúng độ phủ thật.
+        self._feed_pts = float(chunk_end_pts)
+        # Marker cũ thuộc THẾ HỆ KHÁC phải bị THAY, không được `max()` — nếu lấy max thì một marker
+        # quá lớn của vị trí cũ sẽ sống sót và được "hợp thức hoá" bằng thế hệ mới (đo thật: 260s
+        # của vị trí cũ ⇒ status báo đã dịch 232.9s trong khi playhead ở 27s).
+        if self._ready_until_seq == self._seek_seq:
+            self._ready_until_pts = max(self._ready_until_pts, float(chunk_end_pts))
+        else:
+            self._ready_until_pts = float(chunk_end_pts)
+        self._ready_until_seq = self._seek_seq
+        self._fast_bootstrap = False
+        self._frontier_stuck_since = None
+        return True
+
+    def _reanchor_batch(self, target_pts: float) -> None:
+        """Neo lại con trỏ khối batch về `target_pts` và xoá mọi trạng thái ranh giới của vị trí cũ."""
+        self._batch_from_pts = float(target_pts)
+        self._feed_pts = float(target_pts)
+        self._fast_bootstrap = True
+        self._ready_until_pts = float(target_pts)
+        self._ready_until_seq = self._seek_seq
+        self._batch_prev_emitted_end_audio = None
+        self._batch_emitted_tail_norm = []
+        self._batch_carry_words = []
+        self._batch_dedup.clear()
+        self._frontier_stuck_since = None
+
+    def _maybe_reanchor_batch_frontier(self, from_pts: float, max_ahead_pts: float) -> bool:
+        """RÀNG BUỘC CỨNG: con trỏ khối không được KẸT xa vị trí phát.
+
+        Vòng lặp batch bỏ qua (`continue`) khi con trỏ vượt tầm nhìn lookahead — đúng khi nó chỉ
+        nhô hơn `current_time + lead + margin` một khối (cơ chế throttle bình thường). Nhưng nếu vì
+        lý do nào đó (state lệch sau khi tua, seek ngược) con trỏ nằm CÁCH XA vị trí phát một cách
+        BỀN VỮNG thì vòng lặp sẽ `continue` mãi mãi: **video vẫn phát mà không có gì hoạt động**.
+        Đo thật 2026-10-02: sau khi tua ngược về 16.89s, `Đã dịch: 232.9s` và không có khối nào được
+        xử lý trong 30 s tiếp theo.
+
+        Ở đây chỉ phát hiện + neo lại (không tự ý bỏ qua khối đang xử lý). Ngưỡng gồm cả một khối
+        dài nhất (`batch_search_max_sec`) nên throttle bình thường không bao giờ kích hoạt; cần thêm
+        `_FRONTIER_RESYNC_AFTER_SEC` giây BỀN VỮNG để không rung khi playhead vừa nhảy.
+
+        Returns:
+            True nếu VỪA neo lại (vòng lặp nên `continue` để chạy lại từ mốc mới).
+        """
+        limit = float(max_ahead_pts) + float(getattr(config.lookahead, "batch_search_max_sec", 30.0)) + 1.0
+        if from_pts <= limit:
+            self._frontier_stuck_since = None
+            return False
+        now = time.perf_counter()
+        if self._frontier_stuck_since is None:
+            self._frontier_stuck_since = now
+            return False
+        if now - self._frontier_stuck_since < _FRONTIER_RESYNC_AFTER_SEC:
+            return False
+        logger.warning(
+            f"Con trỏ khối batch kẹt ở {from_pts:.2f}s trong khi vị trí phát chỉ {self.current_time:.2f}s "
+            f"(quá tầm nhìn {limit:.1f}s) — NEO LẠI về vị trí phát để không phát video mà không xử lý gì.",
+            extra={"module_tag": "WS"},
+        )
+        metrics_collector.increment_counter("lookahead.batch_frontier_reanchored")
+        self._reanchor_batch(self.current_time)
+        return True
+
+    def _hold_back_unfinished_tail(
+        self,
+        subtitles: List[SubtitleSentence],
+        chunk: Any,
+        stream_end_block: bool,
+    ) -> List[SubtitleSentence]:
+        """Bỏ mảnh phụ đề CUỐI nếu nó CHƯA KẾT CÂU và khối bị cắt giữa câu; cất vào carry.
+
+        Vì sao: khối audio bị cắt giữa câu thì mảnh cuối khối là một phụ đề cụt — đúng ảnh chụp
+        màn hình 2026-10-02: `"I promise I'll be on my best behavior You better"`. Giữ nó lại rồi
+        ghép vào đầu khối sau (bước 2D) thì câu ra TRỌN VẸN.
+
+        KHÔNG giữ lại khi:
+          * khối kết thúc ở KHOẢNG LẶNG THẬT (`is_silence_boundary`) — im lặng đã là ranh giới câu,
+            mảnh cuối là câu hợp lệ dù ASR không kịp thêm dấu;
+          * video đã hết (`stream_end_block`) — phải phát nốt, không được giữ lại rồi mất;
+          * mảnh cuối không có mốc từ (đường fallback aligner lỗi) — không thể ghép lại.
+        """
+        self._batch_carry_words = []
+        if not subtitles:
+            return subtitles
+        tail = subtitles[-1]
+        if stream_end_block or chunk.is_silence_boundary:
+            return subtitles
+        if _ends_sentence(tail.text) or not tail.words:
+            return subtitles
+
+        self._batch_carry_words = [
+            AlignedWord(
+                text=w.text,
+                start_time=chunk.pts_start + float(w.start_time),
+                end_time=chunk.pts_start + float(w.end_time),
+            )
+            for w in tail.words
+        ]
+        logger.info(
+            f"[SEG_BATCH] Giữ lại mảnh cuối CHƯA kết câu ({len(self._batch_carry_words)} từ, ranh "
+            f"giới khối {chunk.pts_end:.2f}s, mode={chunk.fallback_mode}): '{tail.text}' "
+            f"— sẽ ghép vào đầu khối sau.",
+            extra={"module_tag": "ASR"},
+        )
+        return subtitles[:-1]
+
+    def _batch_stream_end(self) -> bool:
+        """Video đã dừng/đã hết VÀ không còn audio chờ ⇒ cho phép cắt nốt phần đuôi (< min_window).
+        Extension không gửi bản tin "video ended" riêng, nên nhận biết bằng: trình phát đang DỪNG
+        và lượng audio còn lại phía trước ít hơn một cửa sổ chuẩn. Chỉ khi đó mới lấy khối ngắn làm
+        khối cuối — nếu không, một lần tạm dừng giữa video sẽ khiến phần còn lại bị cắt vụn thành
+        các khối cụt (mỗi khối cụt là một cơ hội chẻ đôi từ).
+        """
+        from_pts = self._batch_from_pts if self._batch_from_pts is not None else self.current_time
+        buffered_end = self.timeline.buffered_end_from(from_pts)
+        if buffered_end is None:
+            return False
+        return bool(self.is_paused and (buffered_end - from_pts) < self.chunker.min_window_sec)
+
     async def _offline_batch_loop(self) -> None:
         """Vòng lặp xử lý Offline Batch cho Pipeline B v3.
-        
+
         Quy trình:
         1. Đợi có audio mới trên ContinuousAudioTimeline qua `_ingest_event`.
-        2. Dùng LookaheadChunker cắt khối VAD silence (12s-18s) hoặc Fast-Bootstrap (3-4s khi seek).
-        3. ASR Offline block decoding qua transcribe.cpp.
-        4. Gióng hàng mốc từ siêu tốc qua ForcedAlignerService.
-        5. Gom từ thành các câu phụ đề SubtitleSentence theo dấu câu.
-        6. Dịch từng câu phụ đề và gửi lookahead_subtitles về Client (độ trễ hiển thị 0.0s).
-        7. Xếp vào hàng đợi TTS OmniVoice.
+        2. Dùng LookaheadChunker cắt khối (ưu tiên khoảng lặng THẬT trong dải tới
+           `batch_search_max_sec`) hoặc Fast-Bootstrap (3-4s khi seek).
+        3. ASR Offline block decoding qua transcribe.cpp (TRỌN khối — giữ ngữ cảnh dài).
+        4. Gióng hàng mốc từ siêu tốc qua ForcedAlignerService (+ gắn lại dấu câu từ văn bản ASR).
+        5. TRỪ phần chồng lấn ở ranh giới khối (theo mốc từ + theo chuỗi từ) — chống lặp từ.
+        6. Ghép mảnh cuối CHƯA KẾT CÂU của khối trước vào khối này (câu không bị chẻ ở ranh giới).
+        7. Gom từ thành các câu phụ đề SubtitleSentence theo dấu câu.
+        8. Dịch từng câu phụ đề và gửi lookahead_subtitles về Client (độ trễ hiển thị 0.0s).
+        9. Xếp vào hàng đợi TTS OmniVoice.
+
+        ⚠️ Bước 5 KHÔNG được bỏ: `LookaheadChunker` cố ý cho khối sau lấy lùi `overlap_sec` khi
+        ranh giới không phải khoảng lặng, để không mất từ. Không trừ thì từ ở ranh giới bị phát
+        hai lần — đúng sự cố "cuối câu này là đầu của câu sau".
         """
         la = config.lookahead
         while not self._closed:
@@ -1093,15 +1114,18 @@ class LookaheadSessionState:
             # Chặn nạp quá xa vị trí phát hiện tại (tránh đốt GPU vô ích)
             rate = max(1.0, float(self.playback_rate or 1.0))
             max_ahead_pts = self.current_time + float(self.lead_time) * rate + float(la.feed_margin_sec)
+            if self._maybe_reanchor_batch_frontier(from_pts, max_ahead_pts):
+                continue
             if from_pts > max_ahead_pts:
                 continue
 
+            stream_end_block = self._batch_stream_end()
             try:
                 chunk = await asyncio.to_thread(
                     self.chunker.next_chunk,
                     from_pts=from_pts,
                     fast_bootstrap=self._fast_bootstrap,
-                    is_stream_end=False,
+                    is_stream_end=stream_end_block,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Lỗi LookaheadChunker: {exc}", extra={"module_tag": "WS"})
@@ -1126,9 +1150,7 @@ class LookaheadSessionState:
 
             if not clean_text:
                 # Không nhận diện được tiếng nói (im lặng hoặc nhạc nền)
-                self._batch_from_pts = chunk.next_read_pts
-                self._ready_until_pts = max(self._ready_until_pts, chunk.pts_end)
-                self._fast_bootstrap = False
+                self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
                 await self.send_status()
                 continue
 
@@ -1139,6 +1161,7 @@ class LookaheadSessionState:
 
             # Bước 2B: Forced Alignment
             aligned_words = []
+            align_failed = False
             align_lang = resolve_aligner_language(self.source_lang) or "English"
             if self._aligner_service is not None:
                 try:
@@ -1151,13 +1174,82 @@ class LookaheadSessionState:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"Lỗi ForcedAligner (fallback sang câu đơn): {exc}", extra={"module_tag": "ASR"})
                     aligned_words = []
+                    align_failed = True
 
             if self._closed or seq != self._seek_seq:
                 continue
 
-            # Bước 2C: Gom từ thành các câu phụ đề vừa mắt
+            # Bước 2C: TRỪ PHẦN CHỒNG LẤN Ở RANH GIỚI KHỐI (sự cố 2026-10-02)
+            # Khối này có thể bắt đầu TRƯỚC mốc kết thúc nội dung đã phát của khối trước
+            # (`overlap_sec` để không mất từ ở mép cắt). Không trừ thì những từ đó được phiên âm và
+            # phát LẦN HAI ⇒ "cuối câu này là đầu của câu sau".
+            if self._batch_trim_overlap and aligned_words:
+                aligned_words, dropped_ts, dropped_seq = self._trim_batch_leading_overlap(
+                    chunk, aligned_words
+                )
+                if dropped_ts or dropped_seq:
+                    logger.info(
+                        f"Trừ chồng lấn ranh giới (khối bắt đầu {chunk.pts_start:.2f}s, mốc đã phát "
+                        f"{self._batch_prev_emitted_end_audio:.2f}s): bỏ {dropped_ts} từ theo mốc "
+                        f"+ {dropped_seq} từ theo chuỗi.",
+                        extra={"module_tag": "ASR"},
+                    )
+            elif self._batch_trim_overlap and clean_text and self._batch_prev_emitted_end_audio is not None \
+                    and chunk.pts_start < self._batch_prev_emitted_end_audio - 1e-3:
+                # Không có mốc từ (aligner lỗi) ⇒ dùng bộ trim của Pipeline A trên văn bản.
+                trimmed = self._batch_dedup.trim_boundary_overlap(clean_text)
+                if trimmed != clean_text:
+                    logger.info(
+                        f"Trim chồng lấn ranh giới (không có mốc từ): '{clean_text}' -> '{trimmed}'",
+                        extra={"module_tag": "ASR"},
+                    )
+                    clean_text = trimmed
+
+            # Bước 2D: GHÉP mảnh cuối CHƯA KẾT CÂU của khối trước vào đầu khối này.
+            # Vì sao: khối bị cắt giữa câu thì mảnh cuối khối là một phụ đề cụt ("... You better").
+            # Giữ nó lại rồi ghép với đầu khối sau ⇒ câu ra TRỌN VẸN, không bao giờ chẻ ở ranh giới.
+            if self._batch_carry_words:
+                carried_rel = [
+                    AlignedWord(
+                        text=w.text,
+                        start_time=w.start_time - chunk.pts_start,
+                        end_time=w.end_time - chunk.pts_start,
+                    )
+                    for w in self._batch_carry_words
+                ]
+                self._batch_carry_words = []
+                aligned_words = carried_rel + list(aligned_words)
+                logger.info(
+                    f"[SEG_BATCH] Ghép {len(carried_rel)} từ giữ lại từ khối trước vào khối "
+                    f"[{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s].",
+                    extra={"module_tag": "ASR"},
+                )
+
+            # Bước 2E: Gom từ thành các câu phụ đề vừa mắt.
+            # Trần từ/giây/ký tự lấy từ `LookaheadConfig`, và bộ gom câu ưu tiên CÂU TRỌN VẸN
+            # (dấu câu đến từ `merge_source_text` — aligner đã bỏ hết dấu câu khi tokenize).
             if aligned_words and self._aligner_service is not None:
-                subtitles = self._aligner_service.group_words_to_subtitles(aligned_words, language=align_lang)
+                try:
+                    subtitles = self._aligner_service.group_words_to_subtitles(
+                        aligned_words, language=align_lang, **self._batch_sub_opts
+                    )
+                except TypeError:
+                    # Triển khai aligner cũ không nhận tham số trần ⇒ gọi kiểu tối thiểu.
+                    subtitles = self._aligner_service.group_words_to_subtitles(
+                        aligned_words, language=align_lang
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"Gom câu phụ đề lỗi (dùng cả khối làm một câu): {exc}",
+                        extra={"module_tag": "ASR"},
+                    )
+                    subtitles = [
+                        SubtitleSentence(text=clean_text, start_time=0.0, end_time=chunk.duration)
+                    ]
+            elif self._aligner_service is not None and not align_failed:
+                # Aligner chạy bình thường nhưng KHÔNG còn từ nào sau khi trừ chồng lấn
+                # ⇒ toàn bộ nội dung khối này đã được phát ở khối trước.
+                subtitles = []
             else:
                 subtitles = [
                     SubtitleSentence(
@@ -1167,12 +1259,34 @@ class LookaheadSessionState:
                     )
                 ]
 
+            # Bước 2F: GIỮ LẠI mảnh cuối nếu nó CHƯA KẾT CÂU và khối bị cắt giữa câu.
+            # Mảnh này sẽ được ghép vào đầu khối sau (bước 2D) ⇒ người xem không bao giờ thấy phụ
+            # đề cụt ở ranh giới khối. Khi video đã hết (stream_end) thì KHÔNG giữ — phải phát nốt.
+            subtitles = self._hold_back_unfinished_tail(subtitles, chunk, stream_end_block)
+            carried_now = bool(self._batch_carry_words)
+
+            # CHẨN ĐOÁN: đây là text THẬT SỰ được gửi đi (khác `clean_text` của ASR). Không có log
+            # này thì không thể biết vì sao phụ đề hiển thị khác bản phiên âm offline — đúng sự cố
+            # 2026-10-02 (ASR log hoàn hảo mà phụ đề ra mảnh cụt không dấu câu).
+            if subtitles:
+                preview = " ⏐ ".join(f'"{s.text}"' for s in subtitles[:8])
+                if len(subtitles) > 8:
+                    preview += f" ⏐ …(+{len(subtitles) - 8})"
+                logger.info(
+                    f"[SEG_BATCH] Ngắt câu khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] "
+                    f"({len(subtitles)} phụ đề): {preview}",
+                    extra={"module_tag": "ASR"},
+                )
+
             # Bước 3 & 4: Dịch từng câu phụ đề và gửi về Client
             pad_sec = max(0.0, self._start_pad_ms) / 1000.0
             user_sec = float(self.sync_offset_ms) / 1000.0
             shift = pad_sec + user_sec
 
             items_to_send = []
+            #: Mốc kết thúc (KHÔNG GIAN AUDIO, chưa cộng offset) của nội dung đã phát ở khối này.
+            #: Khối sau sẽ trừ mọi từ nằm trước mốc này để không phát lặp ở vùng chồng lấn.
+            emitted_end_audio: Optional[float] = None
             for idx, sub in enumerate(subtitles):
                 if self._closed or seq != self._seek_seq:
                     break
@@ -1235,6 +1349,20 @@ class LookaheadSessionState:
                     "original_text": sub.text,
                     "translated_text": translated,
                 })
+                # Ghi mốc đã phát (audio space) + lịch sử cho bộ trim ranh giới dự phòng.
+                sub_end_audio = chunk.pts_start + sub.end_time
+                emitted_end_audio = (
+                    sub_end_audio if emitted_end_audio is None
+                    else max(emitted_end_audio, sub_end_audio)
+                )
+                # Đuôi TỪ đã phát (giữ ~40 từ) để trừ chồng lấn theo chuỗi ở khối kế tiếp.
+                for tok in (sub.text or "").split():
+                    norm_tok = normalize_for_dedup(tok)
+                    if norm_tok:
+                        self._batch_emitted_tail_norm.append(norm_tok)
+                if len(self._batch_emitted_tail_norm) > 40:
+                    del self._batch_emitted_tail_norm[:-40]
+                self._batch_dedup.record_commit(sub.text)
                 self._enqueue_tts(translated, pts_start, pts_end)
                 self.utterances_sent += 1
 
@@ -1245,148 +1373,19 @@ class LookaheadSessionState:
                     "items": items_to_send,
                 })
 
-            self._batch_from_pts = chunk.next_read_pts
-            self._ready_until_pts = max(self._ready_until_pts, chunk.pts_end)
-            self._fast_bootstrap = False
+            # Chỉ cập nhật ranh giới khi khối này THỰC SỰ phát câu: nếu không, khối sau sẽ bị trừ
+            # oan phần nội dung chưa từng được phát (mất chữ). Toàn bộ khối sách trạng thái này
+            # CHỈ có giá trị cho thế hệ seek hiện tại (xem `_commit_batch_progress`).
+            if seq == self._seek_seq and not self._closed:
+                if emitted_end_audio is not None:
+                    self._batch_prev_emitted_end_audio = emitted_end_audio
+                if carried_now:
+                    # Mảnh giữ lại sẽ được phát cùng khối sau ⇒ coi như khối này đã tiêu thụ hết nội
+                    # dung tới `pts_end`, để khối sau trừ ĐÚNG vùng chồng lấn (không lặp từ).
+                    self._batch_prev_emitted_end_audio = chunk.pts_end
+
+            self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
             await self.send_status()
-
-    # ────────────────────────────────────────────────────────── tiêu thụ ASR (Streaming v2)
-    async def _asr_loop(self) -> None:
-        engine = self.asr_engine
-        if engine is None:
-            return
-        try:
-            async for msg in engine.stream_tokens():
-                try:
-                    await self._handle_asr_message(msg)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Lỗi xử lý kết quả ASR Lookahead: {exc}", exc_info=True,
-                                   extra={"module_tag": "WS"})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Vòng ASR Lookahead dừng: {exc}", exc_info=True, extra={"module_tag": "ASR"})
-
-    async def _handle_asr_message(self, msg: Dict[str, Any]) -> None:
-        if not isinstance(msg, dict) or msg.get("type") != "utterance_update":
-            return
-        if not msg.get("is_final"):
-            return  # Lookahead KHÔNG hiện chữ chạy — chỉ hiện câu đã chốt.
-
-        # F-44: Bỏ các commit thuộc generation cũ trước khi tua
-        msg_gen = msg.get("generation")
-        if (
-            msg_gen is not None
-            and self.asr_engine is not None
-            and hasattr(self.asr_engine, "_stream_generation")
-            and msg_gen != self.asr_engine._stream_generation
-        ):
-            logger.info(
-                f"[utt={msg.get('utterance_id')}] Bỏ bản tin ASR thuộc generation cũ ({msg_gen} != {self.asr_engine._stream_generation}).",
-                extra={"module_tag": "WS"},
-            )
-            return
-
-        text = (msg.get("text") or "").strip()
-        if not text:
-            return
-
-        min_words = int(self._min_words_to_commit)
-        if count_content_tokens(text) < min_words:
-            logger.info(
-                f"Lọc bỏ câu quá ngắn (<{min_words} từ): '{text}'", extra={"module_tag": "WS"}
-            )
-            return
-
-        pts_start = self._pts_at(msg.get("start_sample"))
-        pts_end = self._pts_at(msg.get("end_sample"))
-        if pts_start is None or pts_end is None or pts_end <= pts_start:
-            logger.warning(
-                f"Không ánh xạ được mốc thời gian cho câu '{text}' "
-                f"(samples {msg.get('start_sample')}->{msg.get('end_sample')}) — bỏ qua.",
-                extra={"module_tag": "WS"},
-            )
-            return
-
-        if pts_end < self.current_time - 0.5:
-            logger.info(
-                f"[utt={msg.get('utterance_id')}] Bỏ câu thuộc quá khứ ({pts_end:.2f}s < playhead {self.current_time:.2f}s).",
-                extra={"module_tag": "WS"},
-            )
-            return
-
-        # ── CANH LẠI MỐC BẮT ĐẦU ──────────────────────────────────────────────
-        # VAD báo mép đoạn nói SỚM hơn thực tế (nó lùi lại để lấy ngữ cảnh: FireRed
-        # `pad_start_frame`, Silero `speech_pad_ms`, FSMN `lookback_time_start_point`).
-        # Nếu dùng thẳng mốc đó thì phụ đề hiện TRƯỚC tiếng nói và lồng tiếng cũng đọc
-        # trước. Cộng bù đúng phần đã lùi, kèm offset người dùng chỉnh trong popup.
-        pad_sec = max(0.0, self._start_pad_ms) / 1000.0
-        user_sec = float(self.sync_offset_ms) / 1000.0
-        shift = pad_sec + user_sec
-        if shift:
-            new_start = pts_start + shift
-            # Không để mốc bắt đầu vượt quá mốc kết thúc (câu cực ngắn).
-            if new_start < pts_end - 0.15:
-                pts_start = new_start
-            else:
-                pts_start = max(pts_start, pts_end - 0.15)
-        if pts_start < 0:
-            pts_start = 0.0
-
-        logger.info(
-            f"Lookahead ASR ({pts_start:.2f}s-{pts_end:.2f}s): '{text}'", extra={"module_tag": "ASR"}
-        )
-
-        seq = self._seek_seq
-        translated = await self._translate(text)
-        if translated is None:
-            return
-
-        logger.info(
-            f"Lookahead Dịch ({pts_start:.2f}s-{pts_end:.2f}s): '{translated}'",
-            extra={"module_tag": "TRANSLATE"},
-        )
-
-        # Nếu video bị tua trong lúc dịch thì kết quả này thuộc đoạn cũ ⇒ bỏ.
-        if seq != self._seek_seq:
-            logger.info(
-                f"Bỏ bản dịch thuộc đoạn cũ (đã tua video): '{text}'", extra={"module_tag": "WS"}
-            )
-            return
-
-        if self._is_duplicate(pts_start, pts_end, text):
-            return
-
-        self._sent_items.append((pts_start, pts_end, text))
-        if len(self._sent_items) > 512:
-            del self._sent_items[:128]
-        self._recent_utterances.append({
-            "pts_start": pts_start,
-            "pts_end": pts_end,
-            "text": text,
-            "translated": translated,
-        })
-        if len(self._recent_utterances) > 128:
-            del self._recent_utterances[:32]
-        self._ready_until_pts = max(self._ready_until_pts, pts_end)
-        self.utterances_sent += 1
-
-        await self.send_json({
-            "type": "lookahead_subtitles",
-            "seek_id": self.active_seek_id,
-            "items": [{
-                "start_pts": round(pts_start, 3),
-                "end_pts": round(pts_end, 3),
-                "original_text": text,
-                "translated_text": translated,
-            }],
-        })
-
-        self._enqueue_tts(translated, pts_start, pts_end)
-        # Báo trạng thái ngay cho client để prebuffer_ready không bị trễ theo chu kỳ poll
-        await self.send_status()
 
     # ────────────────────────────────────────────────────────── lồng tiếng (TTS)
     def _enqueue_tts(self, text: str, pts_start: float, pts_end: float) -> None:
@@ -1666,7 +1665,15 @@ class LookaheadSessionState:
         pending_end = self.timeline.buffered_end_pts()
         buffered_end = max(pending_end or 0.0, self._decoded_end_pts)
         buffered_ahead = max(0.0, buffered_end - self.current_time)
-        ready_ahead = max(0.0, self._ready_until_pts - self.current_time)
+        # MARKER PHẢI THUỘC ĐÚNG THẾ HỆ SEEK HIỆN TẠI. Sau khi tua, `_ready_until_pts` có thể còn
+        # giá trị của vị trí CŨ (do iteration đang chạy hoặc do race) — dùng nó sẽ báo "đã dịch
+        # 232.9s" trong khi playhead ở 27s và KHÔNG có gì được xử lý ở vị trí mới, khiến video phát
+        # mà không hoạt động gì (sự cố 2026-10-02). Thế hệ lệch ⇒ coi như chưa phủ gì.
+        if self._ready_until_seq != self._seek_seq:
+            ready_until = float(self.current_time)
+        else:
+            ready_until = float(self._ready_until_pts)
+        ready_ahead = max(0.0, ready_until - self.current_time)
 
         # Mục tiêu đệm: đủ `lead_time`, nhưng nếu buffer của trình duyệt ngắn hơn thì chỉ cần
         # phủ hết phần đã có (trừ 1 s an toàn) để KHÔNG bao giờ treo trình phát.
@@ -1705,7 +1712,8 @@ class LookaheadSessionState:
                 f"Lookahead prebuffer_ready={prebuffer_ready} "
                 f"(ready_ahead={ready_ahead:.2f}s, fed_ahead={fed_ahead:.2f}s, target={target:.2f}s, "
                 f"tts_ready={tts_ready}, tts_sent={self.tts_sent}, "
-                f"buffered_ahead={buffered_ahead:.2f}s, currentTime={self.current_time:.2f}s)",
+                f"buffered_ahead={buffered_ahead:.2f}s, currentTime={self.current_time:.2f}s, "
+                f"seek_seq={self._seek_seq})",
                 extra={"module_tag": "WS"},
             )
 
@@ -1717,7 +1725,9 @@ class LookaheadSessionState:
             "currentTime": round(self.current_time, 2),
             "buffered_ahead": round(buffered_ahead, 2),
             "buffered_end_pts": round(buffered_end, 2),
-            "ready_until_pts": round(self._ready_until_pts, 2),
+            # Mốc backend đã XỬ LÝ XONG (ASR + dịch) cho ĐÚNG thế hệ seek này. Client dùng mốc này
+            # làm RÀNG BUỘC CỨNG: playhead không được vượt qua nó.
+            "ready_until_pts": round(ready_until, 2),
             "ready_ahead": round(ready_ahead, 2),
             "fed_ahead": round(fed_ahead, 2),
             "target_ahead": round(target, 2),
@@ -1732,11 +1742,12 @@ class LookaheadSessionState:
     async def _maybe_log_diagnostics(
         self, buffered_ahead: float, ready_ahead: float, fed_ahead: float
     ) -> None:
-        """Log NĂNG LỰC THẬT mỗi `diag_interval_sec`: byte vào, PCM ra, tốc độ nạp VAD.
+        """Log NĂNG LỰC THẬT mỗi `diag_interval_sec`: byte vào, PCM ra, độ phủ phụ đề.
 
         Đây là thước đo để biết nút cổ chai nằm ở ĐÂU:
           * ``PCM/byte`` thấp (byte về nhiều mà PCM ra ít)  ⇒ tầng giải mã (demuxer).
-          * ``nạp/VAD`` thấp (PCM có sẵn nhưng `feed_chunk` chậm) ⇒ tầng VAD/ASR.
+          * ``giải mã`` chậm (PCM ra chậm) ⇒ tầng ghép nối/giải mã MSE.
+          * ``đã dịch`` không nhích dù PCM có sẵn ⇒ tầng ASR/Aligner/Dịch.
         """
         interval = max(1.0, float(getattr(config.lookahead, "diag_interval_sec", 10.0) or 10.0))
         now = time.perf_counter()
@@ -1749,20 +1760,17 @@ class LookaheadSessionState:
         d_decode = self.decode_seconds - self._diag_decode_seconds
         d_media = self.media_seconds - self._diag_media_seconds
         d_decode_wall = self.decode_wall_sec - self._diag_decode_wall
-        d_fed = self.fed_seconds - self._diag_fed_seconds
-        d_feed_wall = self.feed_wall_sec - self._diag_feed_wall
         self._diag_bytes_in = self.bytes_in
         self._diag_decode_seconds = self.decode_seconds
         self._diag_media_seconds = self.media_seconds
         self._diag_decode_wall = self.decode_wall_sec
-        self._diag_fed_seconds = self.fed_seconds
-        self._diag_feed_wall = self.feed_wall_sec
 
         logger.info(
             f"Trạng thái Lookahead | Playhead: {self.current_time:.1f}s | "
             f"Audio RAM: {self.timeline.total_stored_seconds():.1f}s | "
             f"Đệm trước: {buffered_ahead:.1f}s | "
-            f"Đã dịch: {ready_ahead:.1f}s (nạp VAD {fed_ahead:.1f}s, {d_fed / span:.2f}x)",
+            f"Đã dịch: {ready_ahead:.1f}s (đã qua ASR {fed_ahead:.1f}s, "
+            f"giải mã {d_decode / span:.2f}x, PCM/byte {d_decode / max(1, d_bytes):.3f})",
             extra={"module_tag": "ASR"},
         )
 
@@ -1800,6 +1808,7 @@ class LookaheadSessionState:
                 self._requested_asr_model = str(requested).strip().lower()
             if parsed.min_words_to_commit is not None:
                 self._min_words_to_commit = max(0, int(parsed.min_words_to_commit))
+                self._batch_sub_opts["min_words"] = max(1, self._min_words_to_commit)
 
         # Offset canh đồng bộ (ms) do người dùng chỉnh trong popup — trường riêng của
         # Lookahead nên không nằm trong `SessionConfigPayload`.
@@ -1809,10 +1818,6 @@ class LookaheadSessionState:
                 self.sync_offset_ms = max(-1500.0, min(1500.0, float(sync_raw)))
             except (TypeError, ValueError):
                 pass
-
-        proc_mode = data.get("lookaheadProcessingMode", data.get("processing_mode"))
-        if proc_mode in ("streaming", "offline_batch"):
-            self.processing_mode = str(proc_mode)
 
         # Vị trí phát hiện tại của video khi bắt đầu phiên
         cur_time_raw = data.get("current_time", data.get("currentTime"))

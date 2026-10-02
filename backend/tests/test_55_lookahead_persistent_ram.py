@@ -7,24 +7,103 @@ Mục tiêu kiểm thử:
 3. Khi Seek tới vùng đã buffer sẵn (vệt xám): Audio có sẵn ngay, không bị "đói audio".
 4. Chấp nhận các mảnh nạp bất kỳ thứ tự nào (out-of-order) khi người dùng nhảy cóc.
 5. Khi đóng phiên (`close()`), toàn bộ RAM audio được giải phóng sạch sẽ.
+
+GHI CHÚ (2026-10-02): Pipeline B v2 ("streaming": `ingest_once()` + `_asr_loop()`) đã bị XOÁ,
+nên bộ test này đọc audio qua ĐÚNG API còn sống của `ContinuousAudioTimeline` — thay vì đi qua
+tầng nạp VAD đã bị xoá. Đây vẫn là các bất biến "Kho RAM bền vững" chứ không phải test tầng nạp.
 """
 
 from __future__ import annotations
 
 import asyncio
+from typing import Any, Dict, List
+
 import numpy as np
 import pytest
 
-from backend.config import config
 from backend.core.lookahead_timeline import ContinuousAudioTimeline
-from backend.ws.lookahead_handler import LookaheadSessionState
-from backend.tests.test_54_lookahead_pipeline_v2 import (
+from backend.tests.fakes import (
     FakeInferenceEngine,
     FakeTranslator,
     FakeVADEngine,
-    MockSafeConnection,
-    _make_session,
 )
+from backend.ws.lookahead_handler import LookaheadSessionState
+
+
+class MockSafeConnection:
+    """Ghi nhận mọi bản tin JSON gửi về client."""
+
+    def __init__(self):
+        self.sent_messages: List[Dict[str, Any]] = []
+
+    async def send_json(self, payload: Dict[str, Any]) -> bool:
+        self.sent_messages.append(payload)
+        return True
+
+    def of_type(self, msg_type: str) -> List[Dict[str, Any]]:
+        return [m for m in self.sent_messages if m.get("type") == msg_type]
+
+
+def _make_session() -> LookaheadSessionState:
+    """Phiên Pipeline B tối thiểu: engine GIẢ (không nạp model), VAD giả.
+
+    `FakeVADEngine` ở đây chỉ để `init_components()` dựng được `vad_processor` (tuyến batch chỉ
+    đọc `start_pad_ms` của nó, không chạy VAD để cắt câu).
+    """
+    conn = MockSafeConnection()
+    session = LookaheadSessionState(
+        ws=conn,  # type: ignore[arg-type]
+        asr_engine=FakeInferenceEngine(text_fn=lambda n: "hello world from lookahead"),
+        translation_engine=FakeTranslator(),
+    )
+    session.conn = conn  # type: ignore[attr-defined]
+    session.init_components(vad_engine_override=FakeVADEngine())
+    return session
+
+
+def _drain_timeline(session: LookaheadSessionState, target_pts: float, block_sec: float = 0.5) -> int:
+    """Đọc timeline như tầng xử lý khối vẫn làm; trả về số khối đã đọc."""
+    fed = 0
+    while True:
+        if session.timeline.cursor_pts is None or session.timeline.cursor_pts >= target_pts:
+            break
+        item = session.timeline.read(block_sec)
+        if item is None:
+            break
+        pts, pcm = item
+        if pcm.size:
+            session._feed_pts = pts + pcm.size / 16000.0
+            fed += 1
+    return fed
+
+
+async def _drain_timeline_async(
+    session: LookaheadSessionState,
+    target_pts: float,
+    block_sec: float = 0.5,
+    seen: List[float] | None = None,
+) -> int:
+    """Bản bất đồng bộ của `_drain_timeline`, GHI LẠI mốc của từng khối đã đọc.
+
+    Vòng lặp batch thật đọc từng khối qua `asyncio.to_thread(...)` nên giữa hai khối LUÔN có điểm
+    nhường event loop — và seek có thể chen vào đúng lúc đó. Test mô phỏng đúng điểm nhường ấy bằng
+    `await asyncio.sleep(0)` sau mỗi khối.
+    """
+    fed = 0
+    while True:
+        if session.timeline.cursor_pts is None or session.timeline.cursor_pts >= target_pts:
+            break
+        item = session.timeline.read(block_sec)
+        if item is None:
+            break
+        pts, pcm = item
+        if pcm.size:
+            session._feed_pts = pts + pcm.size / 16000.0
+            fed += 1
+            if seen is not None:
+                seen.append(pts)
+        await asyncio.sleep(0)
+    return fed
 
 
 @pytest.mark.asyncio
@@ -37,11 +116,10 @@ async def test_pipeline_b_audio_persists_after_read():
 
     assert session.timeline.total_stored_seconds() == pytest.approx(10.0, abs=0.01)
 
-    # Đọc hết 10 giây qua ingest_once
-    session.current_time = 0.0
-    session.lead_time = 10.0
-    fed = await session.ingest_once()
+    # Đọc hết 10 giây qua API đọc của timeline (đúng cách tầng xử lý khối đọc audio)
+    fed = _drain_timeline(session, 10.0)
     assert fed > 0
+    assert session.timeline.cursor_pts == pytest.approx(10.0, abs=0.01)
 
     # Sau khi đọc: audio VẪN NGUYÊN VẸN trong RAM!
     assert session.timeline.total_stored_seconds() == pytest.approx(10.0, abs=0.01)
@@ -59,7 +137,7 @@ async def test_pipeline_b_seek_backward_instantly_available():
 
     session.current_time = 0.0
     session.lead_time = 5.0
-    await session.ingest_once()
+    _drain_timeline(session, session.current_time + session.lead_time)
     assert session.timeline.cursor_pts is not None
     assert session.timeline.cursor_pts > 0.0
 
@@ -74,7 +152,7 @@ async def test_pipeline_b_seek_backward_instantly_available():
     assert session.timeline.total_stored_seconds() == pytest.approx(150.0, abs=0.05)
 
     # Đọc thử tại phút 60
-    await session.ingest_once()
+    _drain_timeline(session, 3610.0)
 
     # 3. Người dùng TUA LÙI về giây thứ 30 (30.0s, thuộc đoạn đầu)
     await session.handle_seek("seek_back_30s", 30.0)
@@ -84,6 +162,7 @@ async def test_pipeline_b_seek_backward_instantly_available():
     # KIỂM TRA QUAN TRỌNG:
     # Tại 30.0s, RAM đã có sẵn audio tới tận 120s!
     assert session.timeline.has_audio_at(30.0) is True
+    assert session.timeline.buffered_end_from(30.0) == pytest.approx(120.0, abs=0.1)
     assert session._decoded_end_pts == pytest.approx(120.0, abs=0.1)
 
     # ASR đọc ngay lập tức được audio tại 30.0s
@@ -108,7 +187,7 @@ async def test_pipeline_b_seek_within_buffered_range_no_starvation():
 
     # Đang phát ở 5.0s
     session.current_time = 5.0
-    await session.ingest_once()
+    _drain_timeline(session, 20.0)
 
     # Người dùng bấm tua tới 40.0s (nằm trong vệt xám 0..60s đã nạp)
     await session.handle_seek("seek_to_40", 40.0)
@@ -120,7 +199,7 @@ async def test_pipeline_b_seek_within_buffered_range_no_starvation():
     assert buffered_ahead == pytest.approx(20.0, abs=0.05)
 
     # Nạp tiếp mượt mà mà không cần trình duyệt gửi thêm byte nào
-    fed = await session.ingest_once()
+    fed = _drain_timeline(session, 60.0)
     assert fed > 0
 
     await session.close()
@@ -190,8 +269,9 @@ async def test_pipeline_b_backward_seek_resets_ready_until_pts():
     ready_ahead = max(0.0, session._ready_until_pts - session.current_time)
     assert ready_ahead == pytest.approx(0.0)
 
-    # 3. Ingest phải nạp từ 5.0s trở đi
-    fed = await session.ingest_once()
+    # 3. Đọc tiếp phải bắt đầu từ 5.0s trở đi (con trỏ đọc không bị kẹt ở 70s)
+    assert session.timeline.cursor_pts == pytest.approx(5.0)
+    fed = _drain_timeline(session, 5.0 + session.lead_time)
     assert fed > 0
     assert session.timeline.cursor_pts is not None and session.timeline.cursor_pts > 5.0
     assert session._feed_pts is not None and session._feed_pts > 5.0
@@ -200,8 +280,13 @@ async def test_pipeline_b_backward_seek_resets_ready_until_pts():
 
 
 @pytest.mark.asyncio
-async def test_pipeline_b_seek_concurrency_race_condition():
-    """Kiểm tra tua video trong lúc ingest_once đang chạy trên thread không làm hỏng _feed_pts."""
+async def test_pipeline_b_seek_midway_through_read():
+    """Tua video trong lúc tầng xử lý khối ĐANG đọc timeline không được làm con trỏ đọc nhảy về tương lai.
+
+    Bất biến: audio trong RAM là bền vững nên seek chỉ được DỜI con trỏ đọc; lượt đọc đang chạy dở
+    không được "thắng" seek rồi để con trỏ ở mốc cũ (70s) — nếu không, phiên sẽ phiên âm lại đúng
+    đoạn vừa bị người dùng rời đi và bỏ qua vùng họ vừa tua tới.
+    """
     session = _make_session()
     session.timeline.append(0.0, np.full(16000 * 100, 0.5, dtype=np.float32))
 
@@ -210,32 +295,78 @@ async def test_pipeline_b_seek_concurrency_race_condition():
     session._session_start_pts = 70.0
     session.timeline.seek(70.0)
     session._feed_pts = 70.0
+    session._ready_until_pts = 85.0
 
-    # Giả lập VAD feed_block có độ trễ nhẹ trên worker thread
-    import time
-    def slow_feed_block(pcm, pts):
-        time.sleep(0.04)
+    # Tầng xử lý khối bắt đầu đọc (bất đồng bộ để nhường event loop, giống `asyncio.to_thread` của
+    # vòng lặp batch thật).
+    seen: List[float] = []
+    drain = asyncio.create_task(_drain_timeline_async(session, 75.0, seen=seen))
+    await asyncio.sleep(0)
 
-    session._feed_block = slow_feed_block
-
-    # Bắt đầu ingest_once cho đoạn 70s
-    task = asyncio.create_task(session.ingest_once())
-    await asyncio.sleep(0.01)
-
-    # Ngay lúc đó, người dùng tua lùi về 5.0s
+    # Ngay lúc đó, người dùng tua lùi về 5.0s.
     await session.handle_seek("seek_back_concurrency", 5.0)
-    await task
+    await drain
 
-    # Sau khi task cũ kết thúc: con trỏ và _feed_pts PHẢI ở mốc 5.0s, không được bị nhảy lên 70s!
-    assert session.timeline.cursor_pts == pytest.approx(5.0)
-    assert session._feed_pts == pytest.approx(5.0)
+    # 1. Lượt đọc đầu tiên phải thuộc mốc CŨ (trước khi tua) — chứng minh lượt đọc thật sự đang bay
+    #    khi seek ập tới, tức đây là race thật chứ không phải hai thao tác tuần tự.
+    assert seen, "lượt đọc không chạy"
+    assert seen[0] == pytest.approx(70.0, abs=1e-3)
+
+    # 2. NGAY SAU seek, mốc đọc phải nhảy về mốc tua rồi tiến dần từ đó — TUYỆT ĐỐI không đọc tiếp
+    #    vùng tương lai (70s) mà người dùng vừa rời đi.
     assert session.current_time == pytest.approx(5.0)
+    assert session._ready_until_pts == pytest.approx(5.0)
+    assert seen[1] == pytest.approx(5.0, abs=1e-3), (
+        f"lượt đọc ngay sau tua không bắt đầu ở mốc tua mà ở {seen[1]:.2f}s"
+    )
+    assert seen[1:] == sorted(seen[1:]), "mốc đọc bị nhảy lùi sau khi tua"
 
-    # Lượt ingest tiếp theo phải đọc được đoạn 5.0s bình thường
-    fed = await session.ingest_once()
-    assert fed > 0
-    assert session.timeline.cursor_pts > 5.0
-    assert session._feed_pts > 5.0
+    # 3. Con trỏ đọc không được để lại dấu vết "đã đọc tới tương lai trước khi tua": mọi mốc trong
+    #    khoảng (5s, 70s) chỉ được đọc SAU khi seek chạy, không có mốc nào nhảy cóc qua vùng tua.
+    between = [p for p in seen[1:] if 5.0 < p < 70.0]
+    assert not between or between[0] == pytest.approx(5.5, abs=1e-3)
+
+    # 4. Audio trong RAM vẫn nguyên vẹn (đọc không huỷ dữ liệu).
+    assert session.timeline.total_stored_seconds() == pytest.approx(100.0, abs=0.05)
 
     await session.close()
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bất biến của chính Kho RAM (đọc KHÔNG huỷ dữ liệu) — nền tảng cho các test trên
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_timeline_read_is_non_destructive():
+    """`read()` chỉ tiến con trỏ: seek lùi về vùng đã đọc phải đọc lại được y nguyên mẫu."""
+    tl = ContinuousAudioTimeline(sample_rate=16000)
+    tl.append(0.0, np.full(16000 * 4, 0.25, dtype=np.float32))
+
+    first = tl.read(2.0)
+    assert first is not None
+    pts_first, pcm_first = first
+    assert pts_first == pytest.approx(0.0)
+    assert len(pcm_first) == 16000 * 2
+
+    # Đã đọc hết 4s ⇒ RAM vẫn giữ đủ 4s.
+    tl.read(2.0)
+    assert tl.total_stored_seconds() == pytest.approx(4.0, abs=0.01)
+
+    # Tua lùi: đọc lại đúng dữ liệu cũ, không bị mất.
+    tl.seek(0.0)
+    again = tl.read(2.0)
+    assert again is not None
+    pts_again, pcm_again = again
+    assert pts_again == pytest.approx(0.0)
+    assert np.array_equal(pcm_again, pcm_first)
+
+
+def test_timeline_buffered_range_is_queryable_per_position() -> None:
+    """`buffered_end_from` / `has_audio_at` phải trả lời theo TỪNG mốc (không phụ thuộc con trỏ)."""
+    tl = ContinuousAudioTimeline(sample_rate=16000)
+    tl.append(0.0, np.full(16000 * 10, 0.5, dtype=np.float32))
+    tl.seek(6.0)
+
+    assert tl.has_audio_at(2.0) is True
+    assert tl.buffered_end_from(2.0) == pytest.approx(10.0, abs=0.05)
+    assert tl.pending_seconds() == pytest.approx(4.0, abs=0.05)
+    assert tl.has_audio_at(20.0) is False

@@ -21,80 +21,107 @@ Hệ thống hỗ trợ 2 chế độ xử lý linh hoạt tùy theo định d�
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ PIPELINE A: Real-time Audio Streaming (Live / Livestream / Họp trực tuyến)             │
-│   Audio Tab (Capture) ──> /ws ──> VAD & ASR Realtime ──> Cắt câu ──> Dịch ──> Live TTS │
-│   (Độ trễ thấp ~1.0s, thích ứng backpressure cho các luồng phát trực tiếp)             │
+│ PIPELINE A: Real-time Audio Streaming (Live / Fallback)                                 │
+│   Audio Tab (Capture) ──> /ws ──> VAD & ASR Realtime ──> Cắt câu 4 bậc ──> Dịch ──> TTS  │
+│   (Độ trễ ~1.0s; dùng cho livestream/họp online và làm FALLBACK của Pipeline B)         │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
-│ PIPELINE B: Lookahead Persistent Audio RAM (Video VoD / YouTube / Phim — Độ trễ 0.0s)  │
-│   MSE Interceptor ──> Ghi RAM timeline (tới 3h) ──> Dịch trước 10-15s ──> Timeline Sync│
-│   (Độ trễ 0.0s, lưu toàn bộ audio video vào RAM, tua tới/lui bất kỳ luôn có phụ đề/TTS)│
+│ PIPELINE B: Lookahead + OFFLINE_BATCH (Video VoD / YouTube / Phim — Độ trễ 0.0s)        │
+│   MSE Interceptor ──> RAM timeline (tới 3h) ──> Cắt khối 12-30s tại khoảng lặng THẬT    │
+│   ──> Qwen3-ASR (trọn khối) ──> ForcedAligner (mốc từng từ) ──> tách CÂU theo dấu câu    │
+│   ──> Dịch (ngữ cảnh 2 chiều) ──> Phụ đề 0.0s + TTS khớp cửa sổ                          │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### So sánh chi tiết
 
-| Đặc điểm | Pipeline A (Real-time Streaming) | Pipeline B (Lookahead Persistent Audio RAM) |
+| Đặc điểm | Pipeline A (Real-time Streaming) | Pipeline B (Lookahead OFFLINE_BATCH) |
 |---|---|---|
 | **Kịch bản phù hợp** | Livestream, họp online, video không nạp đệm | Video VoD, YouTube, phim dài tập, khoá học |
 | **Cơ chế thu âm** | Web Audio Capture từ tab thời gian thực | Chặn phân đoạn MediaSource (MSE) ghi vào RAM |
 | **Quản lý âm thanh** | Ring Buffer xoay vòng ngắn hạn | **Persistent RAM Timeline** (lưu trọn vẹn tới 3 giờ video) |
+| **Đầu vào ASR** | Cửa sổ nhỏ theo VAD (cắt câu theo CommitManager 4 bậc) | **Trọn khối 12–30 s** ⇒ ASR có ngữ cảnh đầy đủ (WER/CER thấp hơn) |
+| **Cách tách câu** | VAD Silence › Max Duration › Stable Prefix › Timeout Force | **Dấu câu của bản phiên âm + mốc từng từ của Forced Aligner** |
 | **Độ trễ phụ đề** | ~0.8s – 1.5s (chờ phát âm thanh thật) | **0.0s (Zero Latency)** — phụ đề hiện ngay lúc nói |
 | **Độ trễ lồng tiếng** | TTS đọc đuổi theo sau khi dịch xong | **0.0s** — giọng đọc khớp chuẩn xác mốc bắt đầu câu |
 | **Khớp thời lượng TTS**| Trực tiếp theo luồng âm thanh | Tự động nén thời gian (WSOLA) vừa vặn cửa sổ phụ đề |
-| **Xử lý khi tua (Seek)**| Xoá buffer, mất ngữ cảnh đã phát | **Lấy ngay âm thanh tại mốc tua từ RAM**, không mất audio |
-| **Cách chọn chế độ** | Tắt công tắc *Lookahead Video Buffering* | Bật công tắc *Lookahead Video Buffering* (mặc định) |
+| **Xử lý khi tua (Seek)**| Xoá buffer, mất ngữ cảnh đã phát | **Lấy ngay âm thanh tại mốc tua từ RAM**; đổi thế hệ seek nguyên tử, không phát qua vùng chưa xử lý |
+| **Cách chọn chế độ** | Tắt công tắc *Lookahead Video Buffering*, hoặc tự động khi Lookahead **không khả dụng** | Bật công tắc *Lookahead Video Buffering* (**mặc định**) |
+
+> **Tự động dự phòng (fallback):** extension luôn thử Pipeline B trước. Nếu trang không cho chặn
+> buffer MSE, không kết nối được `/ws/lookahead`, hoặc backend báo `lookahead_unavailable`
+> (thiếu model Qwen3-ASR / Forced Aligner), extension **tự chuyển sang Pipeline A** và ghi log lý do.
 
 ---
 
-### Cơ chế hoạt động của Pipeline B (Persistent Audio RAM)
+### Cơ chế hoạt động của Pipeline B — OFFLINE_BATCH (Qwen3-ASR + Forced Aligner)
 
-Pipeline B được thiết kế chuyên sâu cho trải nghiệm xem video mượt mà, khắc phục triệt để vấn đề mất phụ đề khi tua video:
+Pipeline B là tuyến **duy nhất** cho video VoD: nó lưu trọn audio vào RAM, dịch trước 10–15 s và
+nhờ vậy khắc phục triệt để vấn đề mất phụ đề khi tua video. Toàn bộ việc nhận dạng chạy ở chế độ
+**offline theo khối** (không phải streaming giả lập):
 
 ```text
 Trình duyệt Video (YouTube / MSE)
   │ (appendBuffer / fetch)
   ▼
-[Buffer Interceptor]
-  │  Mảnh audio gốc kèm mốc thời gian (videoPts)
-  ▼  (kết nối trực tiếp WebSocket /ws/lookahead)
-[Persistent Audio RAM] ──> Lưu trọn vẹn luồng âm thanh vào RAM theo timeline tuyệt đối (0s -> 3h)
+[Buffer Interceptor] ── mảnh audio gốc kèm mốc thời gian (videoPts) ──> WebSocket /ws/lookahead
+  ▼
+[Persistent Audio RAM] ── luồng PCM 16 kHz liên tục theo timeline tuyệt đối (0s → 3h)
   │
-  ├──> Khi Video đang phát bình thường:
-  │      Trích xuất audio phía trước [playhead -> playhead + 15s]
-  │      ──> VAD (FireRed) ──> ASR (transcribe.cpp) ──> Dịch (GGUF) ──> Lồng tiếng (OmniVoice)
-  │      ──> Phụ đề & TTS lên lịch sẵn, xuất hiện đúng 0.0s khi người nói cất tiếng!
-  │
-  └──> Khi người dùng TUA VIDEO (Seek trước / Seek sau):
-         1. Extension gửi tín hiệu `seek_reset` kèm mốc thời gian mới (`target_time`).
-         2. Backend huỷ các câu dịch dở dang, lập tức chọn âm thanh tại vị trí tua từ RAM.
-         3. Video tạm dừng trong tích tắc để nạp đệm (`prebuffer`).
-         4. Ngay khi phụ đề (hoặc TTS) đầu tiên tại mốc tua sẵn sàng, video tự động tiếp tục phát!
-         5. Toàn bộ audio đã lưu trong RAM được bảo toàn suốt phiên (chỉ giải phóng khi Stop/tắt tab).
+  ├── 1. CẮT KHỐI (12–30 s): quét khoảng lặng THẬT trong dải [playhead+12s, playhead+30s]
+  │        • ngưỡng lặng TƯƠNG ĐỐI (p90 − 22 dB) ⇒ đúng cho cả audio to/nhỏ
+  │        • ranh giới MẠNH ≥ 450 ms cắt ngay; nếu người nói không ngừng thì cắt tại
+  │          điểm trũng năng lượng gần độ dài lý tưởng + 1.0 s chồng lấn
+  ├── 2. Qwen3-ASR (transcribe.cpp) nhận TRỌN khối ⇒ ngữ cảnh đầy đủ + dấu câu chuẩn (WER/CER thấp)
+  ├── 3. Qwen3-ForcedAligner-0.6B gắn mốc TỪNG TỪ (~30–50 ms) và GẮN LẠI dấu câu từ văn bản ASR
+  │        (model aligner bỏ hết dấu câu khi tokenize — nếu không gắn lại, phụ đề sẽ cụt và mất dấu)
+  ├── 4. TÁCH CÂU: câu trọn vẹn (≤ 24 từ / 8 s) là MỘT phụ đề; câu quá dài cắt ở dấu phẩy/khe âm học;
+  │        mảnh cụt ở cuối khối được GIỮ LẠI ghép vào khối sau ⇒ không bao giờ chẻ câu ở ranh giới
+  ├── 5. DỊCH từng câu kèm ngữ cảnh 2 chiều (2 câu trước + 1 câu sau) ⇒ giữ ánh xạ 1:1 với mốc thời gian
+  └── 6. PHỤ ĐỀ 0.0 s + TTS (nén WSOLA vừa cửa sổ, auto-ducking); tua tới/lui bất kỳ luôn có sẵn audio
+
+Khi người dùng TUA VIDEO (Seek trước / Seek sau):
+  1. Extension gửi `seek_reset` kèm mốc mới; backend tăng "thế hệ seek" và reset con trỏ (nguyên tử).
+  2. Khối đầu tiên sau khi tua là Fast-Bootstrap 2.5–4 s ⇒ phụ đề hiện gần như tức thì.
+  3. RÀNG BUỘC CỨNG: backend chỉ báo `ready_until_pts` cho ĐÚNG thế hệ seek hiện tại; client TẠM DỪNG
+     video khi playhead chạm mốc đó ⇒ không bao giờ phát qua vùng chưa được ASR + dịch.
 ```
 
-1. **Khởi tạo & Ghi liên tục vào RAM**:
-   - Khi bắt đầu phiên, backend cấp phát bộ đệm timeline hỗ trợ tới 3 giờ audio (~350 MB RAM tại chuẩn 16kHz PCM 16-bit mono).
-   - Mọi phân đoạn audio trình duyệt nạp trước (kể cả khoảng lặng không có tiếng nói) đều được ghi nhận và sắp xếp đúng vị trí thời gian tuyệt đối.
-2. **Dịch trước thông minh (Lookahead 10–15s)**:
-   - Hệ thống quét trước 10–15 giây so với vị trí phát hiện tại.
-   - VAD phát hiện vùng có tiếng nói, ASR giải mã và model GGUF dịch thuật sẵn sàng từ trước.
-3. **Tua video tự do không lo mất âm thanh**:
-   - Dù nhảy cóc từ phút 02:00 lên 60:00, rồi tua ngược về 30:00, hệ thống luôn có sẵn âm thanh trong RAM để trích xuất và tạo phụ đề tức thì.
-   - Tự động bù đắp và đồng bộ lại nếu video tua vào vùng mạng chưa tải kịp.
-4. **Đồng bộ hiển thị & Lồng tiếng (TTS Alignment)**:
-   - Phụ đề tự động giữ trên màn hình cho tới khi câu lồng tiếng TTS đọc xong, tránh tình trạng phụ đề biến mất trước khi đọc dứt câu.
-   - Tự động thích ứng với tốc độ phát của video (1.0x, 1.25x, 1.5x, 2.0x).
+1. **Khối dài ⇒ nhận dạng tốt hơn**: ASR chỉ nhận khối 12–30 s liên tục thay vì từng mảnh 4 s, nên
+   model có trọn ngữ cảnh âm học và trả về dấu câu chuẩn — đây là lý do WER/CER giảm so với cắt theo VAD.
+2. **Mốc thời gian cấp TỪ**: Forced Aligner (NAR, ~35 ms cho 15 s audio, AAS 32–52 ms) gắn mốc từng
+   từ, nhờ đó phụ đề khớp khẩu hình và TTS đọc đúng nhịp.
+3. **Câu trọn vẹn**: phụ đề được cắt theo dấu câu của bản phiên âm, không cắt giữa cụm từ; phần chồng
+   lấn ở ranh giới khối được trừ theo mốc từ **và** theo chuỗi từ nên không lặp/lost chữ.
+4. **Dịch theo ngữ cảnh, giữ đúng mốc**: mỗi câu được dịch riêng nhưng prompt có 2 câu trước + 1 câu
+   sau ⇒ xưng hô và văn phong nhất quán mà vẫn gán được bản dịch về đúng mốc thời gian (TTS/canvas).
+5. **Tua an toàn tuyệt đối**: audio đã nằm trong RAM nên tua lùi/tới đều có ngay; con trỏ xử lý được
+   neo lại theo vị trí phát nếu state lệch, và có watchdog chống "kẹt con trỏ" (video chạy mà không
+   xử lý gì).
+6. **Popup tự khóa các tuỳ chỉnh của Pipeline A**: khi Lookahead đang bật, nhóm *VAD Engine, VAD
+   Silence, VAD Threshold, Hold cut, Min Words Filter* và cả mục *Segmentation* bị làm mờ + vô hiệu
+   (kèm ghi chú), vì Pipeline B không dùng VAD/CommitManager để cắt câu.
+
+**Model cần cho Pipeline B**: `Qwen3-ASR` (GGUF trong `backend/models/`, chọn ở popup) và
+`Qwen3-ForcedAligner-0.6B` (tự động tải về `backend/models/Qwen3-ForcedAligner-0.6B/` trong lần chạy
+đầu). Thiếu model ⇒ backend báo `lookahead_unavailable` và extension tự chuyển sang Pipeline A.
 
 ---
 
 ## Tính năng
 
-- **Phụ đề song ngữ**: preview dần, chốt khi hết câu, bản dịch hiện song song (hỗ trợ bật/tắt phụ đề gốc).
-- **Lookahead Persistent Audio RAM (0.0s Lag)**: lưu trọn vẹn audio video vào RAM, dịch trước 10–15s, loại bỏ hoàn toàn độ trễ nhận thức.
-- **Cắt câu 4 bậc**: `VAD_SILENCE` › `MAX_DURATION` › `STABLE_PREFIX` › `TIMEOUT_FORCE`.
+- **Phụ đề song ngữ**: bản dịch hiện song song, chốt theo **câu trọn vẹn** (hỗ trợ bật/tắt phụ đề gốc).
+- **Pipeline B — Lookahead OFFLINE_BATCH (0.0s Lag)**: Qwen3-ASR nhận trọn khối 12–30 s (ngữ cảnh đầy
+  đủ ⇒ WER/CER thấp), Qwen3-ForcedAligner gắn mốc từng từ, tách câu theo dấu câu — mặc định cho video VoD.
+- **Lookahead Persistent Audio RAM**: lưu trọn vẹn audio video vào RAM (tới 3 h), dịch trước 10–15 s.
+- **Tua an toàn tuyệt đối**: tua tới/lui bất kỳ vị trí nào đều lấy ngay audio từ RAM; đổi thế hệ seek
+  nguyên tử và **tạm dừng video khi chạm mốc chưa xử lý** ⇒ không bao giờ phát mà không có phụ đề.
+- **Dịch theo ngữ cảnh 2 chiều**: 2 câu trước + 1 câu sau cho mỗi câu, vẫn giữ ánh xạ 1:1 với mốc thời gian.
+- **Cắt câu 4 bậc (Pipeline A)**: `VAD_SILENCE` › `MAX_DURATION` › `STABLE_PREFIX` › `TIMEOUT_FORCE` —
+  dùng khi tắt Lookahead hoặc khi Lookahead không khả dụng.
 - **Đổi model nóng**: thay ASR / VAD / model dịch / giọng TTS ngay trong popup, không cần restart.
 - **Lồng tiếng (TTS)**: OmniVoice voice-cloning, nén âm thanh thông minh (WSOLA), auto-ducking âm lượng video gốc.
-- **Seek an toàn tuyệt đối**: tua tới/lui bất kỳ vị trí nào đều lập tức trích xuất âm thanh từ RAM để nạp đệm và phát lại mượt mà.
+- **Popup theo ngữ cảnh**: bật Lookahead thì các tuỳ chỉnh chỉ dành cho Pipeline A (VAD, Segmentation…)
+  tự động bị vô hiệu hoá; tắt Lookahead thì mở lại.
 - **Hoàn toàn offline**: không telemetry, không API bên ngoài sau khi tải model.
 
 ---

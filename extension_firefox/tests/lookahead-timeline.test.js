@@ -141,6 +141,62 @@ test("detach gỡ được listener (không rò rỉ)", () => {
   assert.equal(video.listeners.seeked.length, 0);
 });
 
+// ── RÀNG BUỘC CỨNG: không phát video qua vùng CHƯA được xử lý ────────────────
+// Sự cố 2026-10-02: tua tới vùng video chưa tải ⇒ "lúc hiện phụ đề lúc không"; tua ngược về đầu
+// ⇒ không hiện phụ đề gì. Nguyên nhân gồm việc client KHÔNG hề tạm dừng khi playhead vượt qua
+// vùng backend đã xử lý (comment cũ: "Tuyệt đối KHÔNG tạm dừng video giữa chừng").
+test("tạm dừng khi playhead chạm mốc backend đã xử lý", () => {
+  const video = makeVideo(0);
+  const buffering = [];
+  const queue = new SubtitleTimelineQueue({
+    onBufferingStateChange: (b) => buffering.push(b),
+    onSeekTriggered: () => {},
+  });
+  queue.attachVideo(video);
+
+  queue.addSubtitles([{ start_pts: 0, end_pts: 30, original_text: "A", translated_text: "a" }], "init_0");
+  queue.setReadyHorizon(10.0, "init_0");
+
+  // Còn trong vùng đã xử lý ⇒ KHÔNG tạm dừng (phát mượt)
+  assert.equal(queue.isBehindHorizon(7.0), false);
+  video.currentTime = 7.0;
+  queue._tick();
+  assert.deepEqual(buffering, []);
+
+  // Chạm mốc đã xử lý ⇒ TẠM DỪNG chờ backend
+  assert.equal(queue.isBehindHorizon(10.2), true);
+  video.currentTime = 10.2;
+  queue._tick();
+  assert.deepEqual(buffering, [true], "phải báo bắt đầu nạp đệm khi hết vùng đã xử lý");
+});
+
+test("mốc đã xử lý của thế hệ seek CŨ không áp cho vị trí mới", () => {
+  const video = makeVideo(0);
+  const queue = new SubtitleTimelineQueue({ onSeekTriggered: () => {} });
+  queue.attachVideo(video);
+
+  // Backend báo đã xử lý tới 260s cho thế hệ hiện tại
+  queue.setReadyHorizon(260.0, "init_0");
+  assert.equal(queue.readyUntilPts, 260.0);
+  assert.equal(queue.isBehindHorizon(27.0), false);
+
+  // Người dùng tua ngược về 16.9s ⇒ marker cũ phải bị bỏ NGAY (nếu không, video phát qua vùng
+  // chưa xử lý vì tưởng đã có phụ đề tới 260s)
+  video.currentTime = 16.9;
+  video.fire("seeking");
+  assert.equal(queue.readyUntilPts, 0);
+  assert.equal(queue.isBehindHorizon(16.9), false, "chưa biết mốc ⇒ không ràng buộc");
+
+  // Marker của thế hệ seek CŨ gửi tới muộn cũng không được nhận
+  queue.setReadyHorizon(260.0, "init_0");
+  assert.equal(queue.readyUntilPts, 0, "marker thế hệ cũ bị bỏ");
+
+  // Marker của thế hệ MỚI thì nhận
+  queue.setReadyHorizon(20.5, queue.activeSeekId);
+  assert.equal(queue.readyUntilPts, 20.5);
+  assert.equal(queue.isBehindHorizon(20.4), true);
+});
+
 // ── Hồi quy: "câu đầu tiên không được hiển thị" ─────────────────────────────
 test("giữ sống câu đang hiển thị bằng cách phát lại định kỳ", () => {
   // Renderer tự cho câu hết hạn theo ĐỒNG HỒ THỰC; khi video bị tạm dừng để nạp đệm, câu

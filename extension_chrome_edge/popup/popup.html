@@ -45,15 +45,42 @@
       <span class="model-info-label">MODEL</span>
       <span id="lblActiveModel" class="model-info-value" title="Mô hình ASR đang nạp trong VRAM">--</span>
     </div> -->
+    <!-- Section: Lookahead Video Buffering (0.0s Lag) -->
+    <div class="section-title">
+      <span>Lookahead Buffering (Pipeline B)</span>
+    </div>
+
+    <div class="setting-group">
+      <div class="toggle-row" id="lookaheadToggleRow">
+        <span class="toggle-label">
+          Lookahead Video Buffering
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="chkEnableLookahead" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
 
     <!-- Trạng thái buffer Lookahead thay cho HUD nổi trên trang -->
     <div class="setting-group">
       <div class="lookahead-status" id="lookaheadStatus">
         <span class="lookahead-status-dot" id="lookaheadStatusDot"></span>
-        <span id="lookaheadStatusText">Lookahead: chưa kiểm tra</span>
+        <span id="lookaheadStatusText">Lookahead: not yet checked</span>
       </div>
     </div>
-    
+
+    <div class="setting-group" id="lookaheadSyncGroup">
+      <div class="label-with-value">
+        <label>Synchronize subtitles / dubbing</label>
+        <span class="val-badge"><span id="valLookaheadSync">0</span> ms</span>
+      </div>
+      <input type="range" id="rangeLookaheadSync" min="-1500" max="1500" step="50" value="0">
+      <div class="hint">
+        If subtitles/TTS appear earlier than the speech, increase the value (+); if they appear later, decrease it (−).
+      </div>
+    </div>
+
     <!-- Main Settings Container -->
     <div class="settings">
 
@@ -73,11 +100,11 @@
           <option value="ru">Russian (ru)</option>
         </select>
       </div>
-
+      
       <div class="setting-group">
         <div class="toggle-row" id="showOriginalToggleRow">
           <span class="toggle-label">
-            Hiện phụ đề gốc
+            Show original subtitles
           </span>
           <label class="switch">
             <input type="checkbox" id="chkShowOriginal" checked>
@@ -99,7 +126,7 @@
             <option value="nemotron-3.5-streaming">Nemotron 3.5 Streaming</option>
           </select>
         </div>
-        <div class="setting-group flex-1">
+        <div class="setting-group flex-1" id="groupVadEngine">
           <label for="selVadEngine">VAD Engine</label>
           <select id="selVadEngine">
             <option value="firered-vad" selected>FireRed VAD</option>
@@ -109,7 +136,7 @@
         </div>
       </div>
 
-      <div class="setting-row">
+      <div class="setting-row" id="rowVadSliders">
         <div class="setting-group flex-1">
           <div class="label-with-value">
             <label>VAD Silence</label>
@@ -132,7 +159,7 @@
         </div>
       </div>
 
-      <div class="setting-group">
+      <div class="setting-group" id="groupStableMinSec">
         <div class="label-with-value">
           <label>Hold cut until (s)</label>
           <span class="val-badge"><span id="valStableMinSec">3</span> s</span>
@@ -142,7 +169,7 @@
         <input type="range" id="rangeStableMinSec" min="0" max="10" step="0.5" value="3">
       </div>
 
-      <div class="setting-group">
+      <div class="setting-group" id="groupMinWords">
         <div class="label-with-value">
           <label>Min Words Filter</label>
           <span class="val-badge"><span id="valMinWords">3</span> words</span>
@@ -150,43 +177,9 @@
         <input type="range" id="rangeMinWords" min="0" max="5" step="1" value="3">
       </div>
 
-      <!-- Section: Lookahead Video Buffering (0.0s Lag) -->
-      <div class="section-title">
-        <span>Lookahead Buffering (0.0s Lag)</span>
-      </div>
-
-      <div class="setting-group">
-        <div class="toggle-row" id="lookaheadToggleRow">
-          <span class="toggle-label">
-            Lookahead Video Buffering
-          </span>
-          <label class="switch">
-            <input type="checkbox" id="chkEnableLookahead" checked>
-            <span class="slider"></span>
-          </label>
-        </div>
-      </div>
-
-      <div class="setting-group" id="lookaheadLeadTimeGroup">
-        <div class="label-with-value">
-          <label>Thời gian dịch trước (Pre-buffer Ahead)</label>
-          <span class="val-badge"><span id="valLookaheadLeadTime">15</span> s</span>
-        </div>
-        <input type="range" id="rangeLookaheadLeadTime" min="10" max="15" step="1" value="15">
-        <div class="hint">Từ 10s đến 15s. Càng lớn càng dịch xa về trước nhưng chờ lâu hơn.</div>
-      </div>
-
-      <div class="setting-group" id="lookaheadSyncGroup">
-        <div class="label-with-value">
-          <label>Đồng bộ phụ đề / lồng tiếng</label>
-          <span class="val-badge"><span id="valLookaheadSync">0</span> ms</span>
-        </div>
-        <input type="range" id="rangeLookaheadSync" min="-1500" max="1500" step="50" value="0">
-        <div class="hint">
-          Phụ đề/TTS hiện SỚM hơn tiếng nói thì tăng (+); hiện MUỘN thì giảm (−).
-          Hệ thống đã tự bù phần VAD lùi mép câu, đây chỉ là tinh chỉnh.
-          Một số trang có độ lệch riêng tới ~1 s nên dải chỉnh nay là ±1500 ms.
-        </div>
+      <!-- Nhắc rõ: khối tuỳ chỉnh VAD/cắt câu phía trên CHỈ có tác dụng với Pipeline A -->
+      <div class="hint" id="pipelineAOnlyNote" style="display:none">
+        VAD Engine, VAD Silence, VAD Threshold, Hold cut &amp; Min Words Filter <b>applies only to Pipeline A</b>.
       </div>
 
       <!-- Section: Translation -->
@@ -212,12 +205,16 @@
         </select>
       </div>
     
-      <!-- Section: cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut) -->
-      <div class="section-title">
-        <span>Segmentation</span>
+      <!-- Section: cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut) — CHỈ dành cho Pipeline A -->
+      <div class="section-title" id="sectionSegmentation">
+        <span>Segmentation (Pipeline A)</span>
       </div>
 
-      <div class="setting-group">
+      <div class="hint" id="pipelineAOnlyNote2" style="display:none">
+        CommitManager <b>applies only to Pipeline A</b>.
+      </div>
+
+      <div class="setting-group" id="groupStableCut">
         <div class="toggle-row" id="stableToggleRow">
           <span class="toggle-label">
             Cut when the text stable.
@@ -229,7 +226,7 @@
         </div>
       </div>
 
-      <div class="setting-group">
+      <div class="setting-group" id="groupStableMs">
         <div class="label-with-value">
           <label>Stable for (ms)</label>
           <span class="val-badge"><span id="valStableMs">0</span> ms</span>
@@ -237,7 +234,7 @@
         <input type="range" id="rangeStableMs" min="0" max="500" step="50" value="0">
       </div>
 
-      <div class="setting-group">
+      <div class="setting-group" id="groupStableMinWords">
         <div class="label-with-value">
           <label>Stable min words</label>
           <span class="val-badge"><span id="valStableMinWords">4</span></span>
@@ -245,7 +242,7 @@
         <input type="range" id="rangeStableMinWords" min="0" max="10" step="1" value="4">
       </div>
 
-      <div class="setting-group">
+      <div class="setting-group" id="groupStableTrace">
         <div class="toggle-row" id="stableTraceToggleRow">
           <span class="toggle-label">
             Log each poll (SEG_TRACE)
@@ -366,7 +363,7 @@
       <div class="setting-group">
         <label for="selFontFamily">Font Family</label>
         <select id="selFontFamily">
-          <option value="default">Noto Sans + CJK (Mặc định)</option>
+          <option value="default">Noto Sans + CJK (default)</option>
           <option value="Noto Sans">Noto Sans (Latin / Vi / En)</option>
           <option value="Noto Sans JP">Noto Sans JP (Japanese)</option>
           <option value="Noto Sans SC">Noto Sans SC (Chinese)</option>

@@ -26,13 +26,39 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
   // Lookahead Video Buffering
   const chkEnableLookahead = document.getElementById("chkEnableLookahead");
-  const rangeLookaheadLeadTime = document.getElementById("rangeLookaheadLeadTime");
-  const valLookaheadLeadTime = document.getElementById("valLookaheadLeadTime");
-  const lookaheadLeadTimeGroup = document.getElementById("lookaheadLeadTimeGroup");
   const lookaheadStatusEl = document.getElementById("lookaheadStatus");
   const lookaheadStatusText = document.getElementById("lookaheadStatusText");
   const rangeLookaheadSync = document.getElementById("rangeLookaheadSync");
   const valLookaheadSync = document.getElementById("valLookaheadSync");
+  //: ── Tuỳ chỉnh CHỈ dành cho PIPELINE A ────────────────────────────────────────
+  //: Pipeline B (Lookahead OFFLINE_BATCH) KHÔNG dùng VAD để cắt câu và KHÔNG dùng CommitManager:
+  //: nó cắt câu bằng dấu câu của bản phiên âm + mốc từ của Qwen3-ForcedAligner. Vì vậy khi
+  //: Lookahead đang bật, các tuỳ chỉnh dưới đây bị VÔ HIỆU (disabled + làm mờ + ghi chú) để người
+  //: dùng không tưởng nhầm là chúng đang có tác dụng. Tắt Lookahead ⇒ mở lại bình thường.
+  const pipelineAOnlyControls = [
+    document.getElementById("selVadEngine"),
+    document.getElementById("rangeVadSilence"),
+    document.getElementById("rangeVadThreshold"),
+    document.getElementById("rangeStableMinSec"),
+    document.getElementById("rangeMinWords"),
+    document.getElementById("chkStableCut"),
+    document.getElementById("rangeStableMs"),
+    document.getElementById("rangeStableMinWords"),
+    document.getElementById("chkStableTrace"),
+  ].filter(Boolean);
+  const pipelineAOnlyGroups = [
+    "groupVadEngine",
+    "rowVadSliders",
+    "groupStableMinSec",
+    "groupMinWords",
+    "sectionSegmentation",
+    "groupStableCut",
+    "groupStableMs",
+    "groupStableMinWords",
+    "groupStableTrace",
+  ].map((id) => document.getElementById(id)).filter(Boolean);
+  const PIPELINE_A_ONLY_HINT =
+    "Chỉ áp dụng cho Pipeline A (Realtime Streaming). Tắt Lookahead Video Buffering để chỉnh.";
   //: Timer làm mới trạng thái Lookahead khi popup đang mở.
   let lookaheadStatusTimer = null;
   // Chẩn đoán: log mỗi nhịp preview ([SEG_TRACE]) — mặc định TẮT.
@@ -163,7 +189,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       maxLines: parseInt(rangeMaxLines ? rangeMaxLines.value : 3, 10) || 3,
       // Lookahead Video Buffering (Pipeline B vs Pipeline A)
       lookaheadEnabled: chkEnableLookahead ? chkEnableLookahead.checked : true,
-      lookaheadLeadTimeSec: rangeLookaheadLeadTime ? parseInt(rangeLookaheadLeadTime.value, 10) : 15,
+      //: ⚠️ ĐÃ BỎ "Thời gian dịch trước" (lead time) khỏi popup: ở tuyến OFFLINE_BATCH khoảng dịch
+      //: trước do BỘ CẮT KHỐI quyết định (12–30 s, xem `LookaheadChunker`), nên slider 10–15 s chỉ
+      //: còn tác dụng throttle nội bộ ⇒ gây hiểu nhầm. Backend dùng mặc định `lookahead.lead_time_sec`.
       lookaheadSyncOffsetMs: rangeLookaheadSync ? parseInt(rangeLookaheadSync.value, 10) : 0,
       // "Tắt chạy chữ": chỉ hiện bản dịch MỘT LẦN khi có bản dịch hoàn chỉnh.
       showTranslationOnce: chkTranslationOnce ? chkTranslationOnce.checked : true,
@@ -226,12 +254,33 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (valStableMinSec && rangeStableMinSec) valStableMinSec.textContent = rangeStableMinSec.value;
     if (valStableMinWords && rangeStableMinWords) valStableMinWords.textContent = rangeStableMinWords.value;
     // Lookahead Video Buffering
-    if (valLookaheadLeadTime && rangeLookaheadLeadTime) valLookaheadLeadTime.textContent = rangeLookaheadLeadTime.value;
     if (valLookaheadSync && rangeLookaheadSync) valLookaheadSync.textContent = rangeLookaheadSync.value;
-    if (lookaheadLeadTimeGroup && chkEnableLookahead) {
-      lookaheadLeadTimeGroup.style.opacity = (chkEnableLookahead.checked && !isCapturingNow) ? "1" : "0.5";
-      if (rangeLookaheadLeadTime) rangeLookaheadLeadTime.disabled = isCapturingNow || !chkEnableLookahead.checked;
-    }
+    // Vô hiệu/mở lại nhóm tuỳ chỉnh CHỈ dành cho Pipeline A theo trạng thái Lookahead.
+    updatePipelineAOnlyUi();
+  }
+
+  /**
+   * Vô hiệu hoá nhóm tuỳ chỉnh CHỈ dành cho PIPELINE A khi Lookahead Video Buffering đang bật.
+   *
+   * Phải gọi sau mọi chỗ ghi `disabled` cho các điều khiển này (chúng phụ thuộc `isCapturingNow`),
+   * nên hàm tự tính cả hai điều kiện thay vì ghi đè lẫn nhau.
+   */
+  function updatePipelineAOnlyUi() {
+    //: Lookahead coi như BẬT khi không bị tắt tường minh (cùng quy tắc với content-script).
+    const lookaheadOn = !chkEnableLookahead || chkEnableLookahead.checked !== false;
+    const editable = !lookaheadOn && !isCapturingNow;
+    pipelineAOnlyControls.forEach((el) => {
+      el.disabled = !editable;
+      el.title = lookaheadOn ? PIPELINE_A_ONLY_HINT : "";
+    });
+    pipelineAOnlyGroups.forEach((el) => {
+      el.style.opacity = editable ? "1" : "0.45";
+      el.title = lookaheadOn ? PIPELINE_A_ONLY_HINT : "";
+    });
+    ["pipelineAOnlyNote", "pipelineAOnlyNote2"].forEach((id) => {
+      const note = document.getElementById(id);
+      if (note) note.style.display = lookaheadOn ? "block" : "none";
+    });
   }
 
   async function fetchActiveTab() {
@@ -943,9 +992,6 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       if (s.lookaheadEnabled !== undefined && chkEnableLookahead) {
         chkEnableLookahead.checked = !!s.lookaheadEnabled;
       }
-      if (s.lookaheadLeadTimeSec !== undefined && rangeLookaheadLeadTime) {
-        rangeLookaheadLeadTime.value = s.lookaheadLeadTimeSec;
-      }
       if (s.lookaheadSyncOffsetMs !== undefined && rangeLookaheadSync) {
         rangeLookaheadSync.value = s.lookaheadSyncOffsetMs;
       }
@@ -1116,10 +1162,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       chkEnableLookahead.checked = !chkEnableLookahead.checked;
       return;
     }
+    // Bật Lookahead ⇒ vô hiệu nhóm tuỳ chỉnh Pipeline A (và ngược lại) NGAY khi bấm.
+    updatePipelineAOnlyUi();
     updateRangeLabels();
     onSettingChange(true);
   };
-  if (rangeLookaheadLeadTime) rangeLookaheadLeadTime.oninput = () => onSettingChange();
   if (rangeLookaheadSync) rangeLookaheadSync.oninput = () => onSettingChange();
   [rangeStableMs, rangeStableMinSec, rangeStableMinWords].forEach((el) => {
     if (el) {
@@ -1246,12 +1293,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         row.title = active ? "Không thể chuyển đổi Pipeline khi đang chạy session" : "";
       }
     }
-    if (rangeLookaheadLeadTime) {
-      rangeLookaheadLeadTime.disabled = active || !(chkEnableLookahead && chkEnableLookahead.checked);
-    }
-    if (lookaheadLeadTimeGroup && chkEnableLookahead) {
-      lookaheadLeadTimeGroup.style.opacity = (chkEnableLookahead.checked && !active) ? "1" : "0.5";
-    }
+    // Bật/tắt session thay đổi `isCapturingNow` ⇒ tính lại nhóm tuỳ chỉnh Pipeline A.
+    updatePipelineAOnlyUi();
     statusBadge.textContent = active ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
     statusBadge.className = active ? "badge badge-connected" : "badge badge-ready";
     statusBadge.title = active && currentAudioSampleRate ? `Đang thu âm thanh: ${currentAudioSampleRate} Hz` : "";

@@ -1,4 +1,8 @@
-"""E2E Stress & Edge Cases — Pipeline B (Lookahead Video Buffering) v2.
+"""E2E Stress & Edge Cases — Pipeline B (Lookahead Video Buffering).
+
+Pipeline B CHỈ còn tuyến OFFLINE_BATCH (v2 "streaming" đã bị xoá ngày 2026-10-02), nên các test
+dưới đây kiểm chứng bất biến qua những gì tuyến batch thật sự dùng: `ContinuousAudioTimeline`
+và `LookaheadSessionState.handle_seek()`.
 
 Kiểm thử:
 1. Tua video liên tục (10 lần) — không rò rỉ phụ đề của đoạn cũ.
@@ -15,6 +19,8 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.asr.forced_aligner import AlignedWord, SubtitleSentence
+from backend.config import config
 from backend.core.lookahead_timeline import ContinuousAudioTimeline
 from backend.main import app
 from backend.tests.fakes import (
@@ -28,6 +34,8 @@ from backend.ws.lookahead_handler import LookaheadSessionState
 
 
 class MockSafeConnection:
+    """Ghi nhận mọi bản tin JSON gửi về client."""
+
     def __init__(self):
         self.sent_messages: List[Dict[str, Any]] = []
 
@@ -39,16 +47,94 @@ class MockSafeConnection:
         return [m for m in self.sent_messages if m.get("type") == msg_type]
 
 
+class LocalForcedAligner:
+    """Aligner giả TỐI GIẢN cho test stress: không nạp model PyTorch.
+
+    Chia đều các từ của văn bản ASR trên độ dài khối rồi gom 4 từ thành một phụ đề — đủ để
+    tuyến batch phát ra `lookahead_subtitles` mà không phụ thuộc việc `Qwen3-ForcedAligner` có
+    nạp được trên máy chạy test hay không.
+    """
+
+    def __init__(self, group: int = 4):
+        self.group = max(1, int(group))
+
+    def prewarm(self):
+        pass
+
+    def align(self, audio: np.ndarray, text: str, language: str = "English") -> List[AlignedWord]:
+        tokens = [t for t in (text or "").split() if t]
+        if not tokens:
+            return []
+        dur = len(audio) / 16000.0
+        step = dur / len(tokens)
+        return [
+            AlignedWord(
+                text=tok,
+                start_time=round(i * step, 3),
+                end_time=round((i + 1) * step, 3),
+            )
+            for i, tok in enumerate(tokens)
+        ]
+
+    def group_words_to_subtitles(
+        self, words: List[AlignedWord], language: str = "English", **kwargs
+    ) -> List[SubtitleSentence]:
+        subs: List[SubtitleSentence] = []
+        for i in range(0, len(words), self.group):
+            grp = words[i : i + self.group]
+            if not grp:
+                continue
+            subs.append(
+                SubtitleSentence(
+                    text=" ".join(w.text for w in grp),
+                    start_time=grp[0].start_time,
+                    end_time=grp[-1].end_time,
+                )
+            )
+        return subs
+
+
 def _make_session() -> LookaheadSessionState:
     conn = MockSafeConnection()
     session = LookaheadSessionState(
-        ws=conn,
-        asr_engine=FakeInferenceEngine(text_fn=lambda n: "stress test sentence"),
+        ws=conn,  # type: ignore[arg-type]
+        # Câu CÓ dấu kết câu: tuyến batch GIỮ LẠI mảnh cuối chưa kết câu để ghép vào khối sau,
+        # nên text không dấu câu sẽ không bao giờ được phát ra phụ đề.
+        asr_engine=FakeInferenceEngine(text_fn=lambda n: "stress test sentence."),
         translation_engine=FakeTranslator(),
     )
     session.conn = conn  # type: ignore[attr-defined]
     session.init_components(vad_engine_override=FakeVADEngine())
+    session._aligner_service = LocalForcedAligner()
     return session
+
+
+def _feed_window_target_pts(session: LookaheadSessionState) -> float:
+    """Mốc nạp xa nhất mà vòng lặp batch chấp nhận: `currentTime + lead_time × rate + margin`.
+
+    Công thức này là của `_offline_batch_loop` (không còn hàm `_feed_target_pts()` riêng sau khi
+    v2 bị xoá) — test dùng lại đúng công thức để kiểm tra cửa sổ nạp co giãn theo tốc độ phát.
+    """
+    rate = max(1.0, float(session.playback_rate or 1.0))
+    return float(session.current_time) + float(session.lead_time) * rate + float(
+        config.lookahead.feed_margin_sec
+    )
+
+
+def _drain_timeline(session: LookaheadSessionState, target_pts: float, block_sec: float = 0.5) -> int:
+    """Đọc timeline như tầng xử lý khối vẫn làm; trả về số khối đã đọc."""
+    fed = 0
+    while True:
+        if session.timeline.cursor_pts is None or session.timeline.cursor_pts >= target_pts:
+            break
+        item = session.timeline.read(block_sec)
+        if item is None:
+            break
+        pts, pcm = item
+        if pcm.size:
+            session._feed_pts = pts + pcm.size / 16000.0
+            fed += 1
+    return fed
 
 
 @pytest.mark.asyncio
@@ -63,6 +149,9 @@ async def test_stress_rapid_seeking_race_condition():
         # Mỗi lần tua lại có dữ liệu mới ở vị trí mới.
         session.timeline.append(target, make_speech_pcm(2.0))
         session.timeline.append(target + 2.0, make_silence_pcm(1.0))
+        # Con trỏ đọc bám đúng mốc vừa tua, không giữ mốc của lần tua trước.
+        assert session.current_time == pytest.approx(target)
+        assert session.timeline.cursor_pts == pytest.approx(target)
 
     # Tua lần cuối tới vị trí đích và nạp dữ liệu "sạch" cho vị trí đó.
     await session.handle_seek("seek_final_target", 2500.0)
@@ -72,12 +161,16 @@ async def test_stress_rapid_seeking_race_condition():
     assert session.active_seek_id == "seek_final_target"
     assert session.current_time == pytest.approx(2500.0)
     assert session.timeline.cursor_pts == pytest.approx(2500.0)
-    assert session._anchor_samples == []
+    # Audio của các mốc tua trước đó vẫn nằm trong kho RAM (bền vững), nhưng ranh giới
+    # chống-trùng-lặp của khối đã bị xoá sạch ⇒ không có gì của đoạn cũ rò sang.
+    assert session._batch_prev_emitted_end_audio is None
+    assert session._batch_emitted_tail_norm == []
+    assert session._sent_items == []
 
     await session.start_tasks()
     try:
         for _ in range(60):
-            await session.ingest_once()
+            _drain_timeline(session, 2600.0)
             if session.conn.of_type("lookahead_subtitles"):  # type: ignore[attr-defined]
                 break
             await asyncio.sleep(0.05)
@@ -101,18 +194,23 @@ async def test_adaptive_playback_rate_window_scaling():
     await session.handle_seek("rate", 0.0)
 
     session.playback_rate = 1.0
-    target_1x = session._feed_target_pts()
+    target_1x = _feed_window_target_pts(session)
     session.playback_rate = 2.0
-    target_2x = session._feed_target_pts()
+    target_2x = _feed_window_target_pts(session)
 
     assert target_1x == pytest.approx(16.0, abs=0.01)
     assert target_2x == pytest.approx(26.0, abs=0.01)
     assert target_2x - target_1x == pytest.approx(10.0, abs=0.01)
 
-    # Ở 2x, lượng audio nạp vào cũng phải nhiều hơn hẳn.
+    # Ở 2x, lượng audio đọc vào cũng phải nhiều hơn hẳn.
     session.timeline.append(0.0, make_speech_pcm(40.0))
-    await session.ingest_once()
+    fed = _drain_timeline(session, target_2x)
+    assert fed > 0
+    assert session.timeline.cursor_pts is not None
+    assert session.timeline.cursor_pts == pytest.approx(target_2x, abs=1.0)
     assert session._feed_pts is not None and session._feed_pts >= 25.0
+
+    await session.close()
 
 
 def test_long_video_memory_stability_1_hour():

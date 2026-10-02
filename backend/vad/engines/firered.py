@@ -86,8 +86,9 @@ class FireRedVADEngine(BaseVADEngine):
         # các frame thuộc `pad_start_frame` + số frame cần để xác nhận (`min_speech_frame`).
         self.max_lookback_frames = max(0, int(cfg.pad_start_frame) + int(cfg.min_speech_frame))
         #: Mép đoạn nói được VAD báo SỚM hơn thực tế ngần này ms (`speech_start_frame` đã trừ
-        #: `pad_start_frame`). Pipeline Lookahead dùng con số này để phụ đề/lồng tiếng khớp
-        #: ĐÚNG lúc tiếng nói bắt đầu (xem `LookaheadSessionState._handle_asr_message`).
+        #: `pad_start_frame`). Pipeline B (OFFLINE_BATCH) KHÔNG chạy VAD để cắt câu, nhưng vẫn
+        #: dùng con số này để canh mốc phụ đề/lồng tiếng (xem
+        #: `LookaheadSessionState._refresh_start_pad`).
         self.start_pad_ms = int(round(int(cfg.pad_start_frame) * self.frame_samples / 16000.0 * 1000.0))
 
         logger.info(
