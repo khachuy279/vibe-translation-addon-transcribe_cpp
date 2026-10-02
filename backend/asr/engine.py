@@ -913,6 +913,21 @@ class TranscribeEngine(BaseASREngine):
                 )
             return cleaned
 
+    def transcribe_block(self, pcm_audio: np.ndarray, language: Optional[str] = None) -> str:
+        """Thực hiện nhận dạng offline nguyên khối cho mảng audio PCM (16kHz float32).
+
+        Chạy dưới `_infer_lock`, chuẩn hóa âm thanh, lọc text và gộp chuỗi lặp an toàn.
+        """
+        if pcm_audio is None or len(pcm_audio) == 0:
+            return ""
+        old_lang = self.language
+        if language and language != "auto":
+            self.language = language
+        try:
+            return self._run_inference_sync(pcm_audio)
+        finally:
+            self.language = old_lang
+
     # ------------------------------------------------------------------ commit
     def _pop_commit_request(self) -> Optional[Dict[str, Any]]:
         """Lấy commit request kế tiếp (VAD hoặc do BẬC 2/3/4 sinh ra)."""

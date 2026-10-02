@@ -492,6 +492,16 @@ class LookaheadConfig(BaseModel):
     """
 
     enabled: bool = True
+    #: Chế độ xử lý của Pipeline B:
+    #:   "streaming"     — Pipeline B v2 (mặc định): nạp frame 0.5s qua VAD + CommitManager giả lập.
+    #:   "offline_batch" — Pipeline B v3: Cắt khối VAD silence 12-18s + Qwen3-ASR offline + Forced Aligner.
+    processing_mode: str = "offline_batch"
+    batch_target_sec: float = 15.0
+    batch_min_sec: float = 12.0
+    batch_max_sec: float = 18.0
+    batch_min_silence_ms: float = 250.0
+    batch_overlap_sec: float = 1.0
+
     #: Thời gian dịch trước (giây) — khoảng đệm phải sẵn sàng TRƯỚC vị trí phát.
     lead_time_sec: float = 15.0
     min_lead_time_sec: float = 10.0

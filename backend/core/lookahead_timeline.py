@@ -320,3 +320,71 @@ class ContinuousAudioTimeline:
                     return float(start_pts), silence
 
             return None
+
+    def get_audio_range(
+        self,
+        start_pts: float,
+        duration_sec: float,
+    ) -> Optional[Tuple[float, np.ndarray]]:
+        """Lấy một khối audio liên tục từ `start_pts` với độ dài tối đa `duration_sec` mà KHÔNG di chuyển `_cursor`.
+
+        Tự động ghép nối qua nhiều chunk trong RAM và lấp các khe hở nhỏ (<= MAX_GAP_FILL_SEC) bằng silence.
+        
+        Returns:
+            (pts_start, pcm) hoặc None nếu không có audio tại `start_pts`.
+        """
+        if duration_sec <= 0:
+            return None
+
+        with self._lock:
+            if not self._chunks:
+                return None
+
+            target_start = float(start_pts)
+            target_end = target_start + float(duration_sec)
+            target_samples = int(round(duration_sec * self.sample_rate))
+
+            pieces: List[np.ndarray] = []
+            curr_pts = target_start
+
+            for chunk in self._chunks:
+                if chunk.pts_end <= curr_pts:
+                    continue
+                if chunk.pts_start >= target_end:
+                    break
+
+                # Nếu có khoảng trống giữa curr_pts và chunk.pts_start
+                if chunk.pts_start > curr_pts:
+                    gap_sec = chunk.pts_start - curr_pts
+                    if gap_sec > MAX_GAP_FILL_SEC:
+                        # Khe hở quá lớn (lỗ tua seek hole) -> dừng ở mép khe hở
+                        break
+                    gap_samples = int(round(gap_sec * self.sample_rate))
+                    if gap_samples > 0:
+                        pieces.append(np.zeros(gap_samples, dtype=np.float32))
+                        curr_pts += gap_sec
+
+                # Lấy phần PCM của chunk nằm trong [curr_pts, target_end]
+                offset_sec = max(0.0, curr_pts - chunk.pts_start)
+                offset_samples = int(round(offset_sec * self.sample_rate))
+                end_sec = min(chunk.pts_end, target_end)
+                take_sec = max(0.0, end_sec - (chunk.pts_start + offset_sec))
+                take_samples = int(round(take_sec * self.sample_rate))
+
+                if take_samples > 0 and offset_samples < len(chunk.pcm):
+                    actual_take = min(take_samples, len(chunk.pcm) - offset_samples)
+                    pieces.append(chunk.pcm[offset_samples : offset_samples + actual_take])
+                    curr_pts += actual_take / self.sample_rate
+
+                if curr_pts >= target_end - 1e-4:
+                    break
+
+            if not pieces:
+                return None
+
+            result_pcm = np.concatenate(pieces)
+            if len(result_pcm) > target_samples:
+                result_pcm = result_pcm[:target_samples]
+
+            return float(target_start), np.ascontiguousarray(result_pcm)
+

@@ -308,6 +308,23 @@ class SwitchModelRequest(BaseModel):
     tts_enabled: Optional[bool] = None
     tts_voice: Optional[str] = None
     tts_speed: Optional[float] = None
+    lookahead_enabled: Optional[bool] = None
+    lookahead_processing_mode: Optional[str] = None
+    processing_mode: Optional[str] = None
+
+
+def _prewarm_forced_aligner() -> None:
+    """Nạp + pre-warm ForcedAligner (blocking; gọi qua asyncio.to_thread)."""
+    try:
+        from backend.asr.forced_aligner import ForcedAlignerService
+
+        logger.info(
+            "[STARTUP] Pre-warming ForcedAligner (Qwen3-ForcedAligner-0.6B) cho Lookahead offline_batch...",
+            extra={"module_tag": "ASR"},
+        )
+        ForcedAlignerService.get_instance().prewarm()
+    except Exception as e:
+        logger.warning(f"[STARTUP] Cảnh báo pre-warm ForcedAligner: {e}", exc_info=True, extra={"module_tag": "ASR"})
 
 
 def _prewarm_asr() -> None:
@@ -429,10 +446,16 @@ async def lifespan(app: FastAPI):
     _log_asr_backend_at_startup()
     _log_torch_status_at_startup()
 
-    # Khôi phục trạng thái TTS từ cấu hình popup đã lưu (nếu có)
+    # Khôi phục trạng thái TTS & Lookahead từ cấu hình popup đã lưu (nếu có)
     saved_state = load_runtime_state()
     if "tts_enabled" in saved_state:
         config.tts.enabled = bool(saved_state["tts_enabled"])
+    if "lookahead_enabled" in saved_state:
+        config.lookahead.enabled = bool(saved_state["lookahead_enabled"])
+    if "lookahead_processing_mode" in saved_state:
+        config.lookahead.processing_mode = str(saved_state["lookahead_processing_mode"])
+    elif "processing_mode" in saved_state:
+        config.lookahead.processing_mode = str(saved_state["processing_mode"])
 
     prewarm_jobs = [
         asyncio.to_thread(_prewarm_asr),
@@ -444,6 +467,12 @@ async def lifespan(app: FastAPI):
     if bool(getattr(config.tts, "enabled", False)):
         logger.info("[STARTUP] Phát hiện TTS được bật trong popup/cấu hình => pre-warm OmniVoice TTS...", extra={"module_tag": "TTS"})
         prewarm_jobs.append(asyncio.to_thread(_prewarm_tts))
+
+    # Prewarm ForcedAligner nếu Lookahead đang bật và processing_mode là "offline_batch"
+    is_lookahead = bool(getattr(config.lookahead, "enabled", True))
+    is_offline_batch = getattr(config.lookahead, "processing_mode", "streaming") == "offline_batch"
+    if is_lookahead and is_offline_batch:
+        prewarm_jobs.append(asyncio.to_thread(_prewarm_forced_aligner))
 
     results = await asyncio.gather(*prewarm_jobs, return_exceptions=True)
     for res in results:
@@ -886,6 +915,22 @@ async def update_backend_config(req: SwitchModelRequest):
     if req.tts_speed is not None:
         config.tts.speed = req.tts_speed
         save_runtime_state({"tts_speed": req.tts_speed})
+
+    if req.lookahead_enabled is not None:
+        config.lookahead.enabled = bool(req.lookahead_enabled)
+        save_runtime_state({"lookahead_enabled": config.lookahead.enabled})
+
+    proc_mode = req.lookahead_processing_mode or req.processing_mode
+    if proc_mode is not None:
+        clean_mode = str(proc_mode).strip().lower()
+        if clean_mode in ("streaming", "offline_batch"):
+            config.lookahead.processing_mode = clean_mode
+            save_runtime_state({"lookahead_processing_mode": clean_mode})
+            if clean_mode == "offline_batch" and config.lookahead.enabled:
+                track_background_task(
+                    asyncio.to_thread(_prewarm_forced_aligner),
+                    name="forced_aligner_prewarm_post_config",
+                )
 
     # P1.10: đẩy các thay đổi vào phiên ĐANG CHẠY (trước đây REST chỉ đổi config toàn
     # cục, còn SessionState giữ snapshot cũ nên thay đổi không có hiệu lực).

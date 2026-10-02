@@ -50,9 +50,15 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from backend.config import config
 from backend.core.commit_manager import count_content_tokens
+from backend.core.lookahead_chunker import LookaheadChunker
 from backend.core.lookahead_timeline import ContinuousAudioTimeline
 from backend.core.metrics import metrics_collector
 from backend.core.stream_demuxer import StreamDemuxer
+from backend.asr.forced_aligner import (
+    ForcedAlignerService,
+    SubtitleSentence,
+    resolve_aligner_language,
+)
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import SessionConfigPayload
 from backend.utils.logger import get_logger
@@ -159,6 +165,21 @@ class LookaheadSessionState:
         self.translation_engine = translation_engine
         self.vad_processor = None
         self.unavailable_reason: str = ""
+
+        # Chế độ xử lý: "streaming" (v2 mặc định) hoặc "offline_batch" (v3)
+        self.processing_mode: str = str(getattr(la, "processing_mode", "streaming") or "streaming")
+        self.chunker = LookaheadChunker(
+            timeline=self.timeline,
+            sample_rate=16000,
+            target_window_sec=float(getattr(la, "batch_target_sec", 15.0)),
+            min_window_sec=float(getattr(la, "batch_min_sec", 12.0)),
+            max_window_sec=float(getattr(la, "batch_max_sec", 18.0)),
+            min_silence_ms=float(getattr(la, "batch_min_silence_ms", 250.0)),
+            overlap_sec=float(getattr(la, "batch_overlap_sec", 1.0)),
+        )
+        self._aligner_service: ForcedAlignerService = ForcedAlignerService.get_instance()
+        self._batch_from_pts: Optional[float] = None
+        self._fast_bootstrap: bool = False
 
         # Cấu hình phiên (từ popup). `_parsed_config` giữ payload đã validate để áp khi
         # dựng components; các thay đổi sau đó đi qua `apply_config()`.
@@ -577,6 +598,11 @@ class LookaheadSessionState:
             except (TypeError, ValueError):
                 pass
 
+        proc_mode = raw.get("lookaheadProcessingMode", raw.get("processing_mode"))
+        if proc_mode in ("streaming", "offline_batch"):
+            self.processing_mode = str(proc_mode)
+            applied["processing_mode"] = self.processing_mode
+
         requested_asr = parsed.asr_model or parsed.asr_engine or parsed.model_id
         if requested_asr:
             clean = str(requested_asr).strip().lower()
@@ -607,12 +633,25 @@ class LookaheadSessionState:
     async def start_tasks(self) -> None:
         """Khởi động các vòng lặp nền: nạp audio, tiêu thụ ASR, báo trạng thái (+TTS)."""
         loop = asyncio.get_running_loop()
-        base_tasks = [
-            loop.create_task(self._ingest_loop(), name=f"la_ingest_{self.session_id[:8]}"),
-            loop.create_task(self._asr_loop(), name=f"la_asr_{self.session_id[:8]}"),
-            loop.create_task(self._status_loop(), name=f"la_status_{self.session_id[:8]}"),
-        ]
-        self._tasks.extend(base_tasks)
+        if self.processing_mode == "offline_batch":
+            self._tasks.append(loop.create_task(self._offline_batch_loop(), name=f"la_batch_{self.session_id[:8]}"))
+            self._tasks.append(loop.create_task(self._status_loop(), name=f"la_status_{self.session_id[:8]}"))
+            self._spawn(self._prewarm_aligner())
+            logger.info(
+                "Khởi động Lookahead Pipeline B ở chế độ: OFFLINE_BATCH (v3 Qwen3-ASR + Forced Aligner)",
+                extra={"module_tag": "WS"},
+            )
+        else:
+            base_tasks = [
+                loop.create_task(self._ingest_loop(), name=f"la_ingest_{self.session_id[:8]}"),
+                loop.create_task(self._asr_loop(), name=f"la_asr_{self.session_id[:8]}"),
+                loop.create_task(self._status_loop(), name=f"la_status_{self.session_id[:8]}"),
+            ]
+            self._tasks.extend(base_tasks)
+            logger.info(
+                "Khởi động Lookahead Pipeline B ở chế độ: STREAMING (v2 fallback/default)",
+                extra={"module_tag": "WS"},
+            )
         if self.tts_enabled:
             self._ensure_tts_worker()
 
@@ -971,6 +1010,8 @@ class LookaheadSessionState:
                 self._anchor_pts.clear()
             self._feed_pts = float(target_time)
             self._session_start_pts = float(target_time)
+            self._batch_from_pts = float(target_time)
+            self._fast_bootstrap = True
 
             # Kiểm tra xem RAM đã có sẵn audio cho vị trí mới chưa (ví dụ tua lùi hoặc tua trong vùng đã buffer)
             buffered_end = self.timeline.buffered_end_from(float(target_time))
@@ -1008,7 +1049,208 @@ class LookaheadSessionState:
                 extra={"module_tag": "WS"},
             )
 
-    # ────────────────────────────────────────────────────────── tiêu thụ ASR
+    # ── OFFLINE BATCH PIPELINE (v3 Qwen3-ASR + Forced Aligner) ─────────────────
+    async def _prewarm_aligner(self) -> None:
+        try:
+            if self._aligner_service is not None:
+                await asyncio.to_thread(self._aligner_service.prewarm)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Prewarm Aligner lỗi (bỏ qua): {exc}", extra={"module_tag": "ASR"})
+
+    def _run_asr_block(self, pcm: np.ndarray, lang: str) -> str:
+        if self.asr_engine is None:
+            return ""
+        if hasattr(self.asr_engine, "transcribe_block"):
+            return self.asr_engine.transcribe_block(pcm, language=lang if lang != "auto" else None)
+        return ""
+
+    async def _offline_batch_loop(self) -> None:
+        """Vòng lặp xử lý Offline Batch cho Pipeline B v3.
+        
+        Quy trình:
+        1. Đợi có audio mới trên ContinuousAudioTimeline qua `_ingest_event`.
+        2. Dùng LookaheadChunker cắt khối VAD silence (12s-18s) hoặc Fast-Bootstrap (3-4s khi seek).
+        3. ASR Offline block decoding qua transcribe.cpp.
+        4. Gióng hàng mốc từ siêu tốc qua ForcedAlignerService.
+        5. Gom từ thành các câu phụ đề SubtitleSentence theo dấu câu.
+        6. Dịch từng câu phụ đề và gửi lookahead_subtitles về Client (độ trễ hiển thị 0.0s).
+        7. Xếp vào hàng đợi TTS OmniVoice.
+        """
+        la = config.lookahead
+        while not self._closed:
+            try:
+                await asyncio.wait_for(self._ingest_event.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+            self._ingest_event.clear()
+
+            if self._closed:
+                break
+
+            seq = self._seek_seq
+            from_pts = self._batch_from_pts if self._batch_from_pts is not None else self.current_time
+
+            # Chặn nạp quá xa vị trí phát hiện tại (tránh đốt GPU vô ích)
+            rate = max(1.0, float(self.playback_rate or 1.0))
+            max_ahead_pts = self.current_time + float(self.lead_time) * rate + float(la.feed_margin_sec)
+            if from_pts > max_ahead_pts:
+                continue
+
+            try:
+                chunk = await asyncio.to_thread(
+                    self.chunker.next_chunk,
+                    from_pts=from_pts,
+                    fast_bootstrap=self._fast_bootstrap,
+                    is_stream_end=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Lỗi LookaheadChunker: {exc}", extra={"module_tag": "WS"})
+                chunk = None
+
+            if chunk is None or self._closed or seq != self._seek_seq:
+                continue
+
+            # Bước 2A: ASR Offline Block Decoding
+            t_asr = time.perf_counter()
+            try:
+                raw_text = await asyncio.to_thread(self._run_asr_block, chunk.pcm, self.source_lang)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Lỗi ASR offline block: {exc}", extra={"module_tag": "ASR"})
+                raw_text = ""
+
+            if self._closed or seq != self._seek_seq:
+                continue
+
+            asr_ms = (time.perf_counter() - t_asr) * 1000.0
+            clean_text = (raw_text or "").strip()
+
+            if not clean_text:
+                # Không nhận diện được tiếng nói (im lặng hoặc nhạc nền)
+                self._batch_from_pts = chunk.next_read_pts
+                self._ready_until_pts = max(self._ready_until_pts, chunk.pts_end)
+                self._fast_bootstrap = False
+                await self.send_status()
+                continue
+
+            logger.info(
+                f"Lookahead Batch ASR [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] ({asr_ms:.0f}ms): '{clean_text}'",
+                extra={"module_tag": "ASR"},
+            )
+
+            # Bước 2B: Forced Alignment
+            aligned_words = []
+            align_lang = resolve_aligner_language(self.source_lang) or "English"
+            if self._aligner_service is not None:
+                try:
+                    aligned_words = await asyncio.to_thread(
+                        self._aligner_service.align,
+                        chunk.pcm,
+                        clean_text,
+                        align_lang,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Lỗi ForcedAligner (fallback sang câu đơn): {exc}", extra={"module_tag": "ASR"})
+                    aligned_words = []
+
+            if self._closed or seq != self._seek_seq:
+                continue
+
+            # Bước 2C: Gom từ thành các câu phụ đề vừa mắt
+            if aligned_words and self._aligner_service is not None:
+                subtitles = self._aligner_service.group_words_to_subtitles(aligned_words, language=align_lang)
+            else:
+                subtitles = [
+                    SubtitleSentence(
+                        text=clean_text,
+                        start_time=0.0,
+                        end_time=chunk.duration,
+                    )
+                ]
+
+            # Bước 3 & 4: Dịch từng câu phụ đề và gửi về Client
+            pad_sec = max(0.0, self._start_pad_ms) / 1000.0
+            user_sec = float(self.sync_offset_ms) / 1000.0
+            shift = pad_sec + user_sec
+
+            items_to_send = []
+            for idx, sub in enumerate(subtitles):
+                if self._closed or seq != self._seek_seq:
+                    break
+
+                pts_start = chunk.pts_start + sub.start_time + shift
+                pts_end = chunk.pts_start + sub.end_time + shift
+                if pts_start < 0:
+                    pts_start = 0.0
+                if pts_end <= pts_start:
+                    pts_end = pts_start + 0.5
+
+                if pts_end < self.current_time - 0.5:
+                    continue  # Bỏ câu thuộc quá khứ
+
+                # Phase 3: Xây dựng Bi-directional Context (2 câu trước + 1 câu tiếp theo)
+                context_parts = []
+                if self._recent_utterances:
+                    past_lines = []
+                    for utt in self._recent_utterances[-2:]:
+                        orig = (utt.get("text") or "").strip()
+                        trans = (utt.get("translated") or "").strip()
+                        if orig and trans:
+                            past_lines.append(f'- "{orig}" -> "{trans}"')
+                    if past_lines:
+                        context_parts.append("Previous context:\n" + "\n".join(past_lines))
+
+                if idx + 1 < len(subtitles):
+                    next_text = subtitles[idx + 1].text.strip()
+                    if next_text:
+                        context_parts.append(f'Next sentence:\n- "{next_text}"')
+
+                context_str = "\n\n".join(context_parts) if context_parts else ""
+
+                translated = await self._translate(sub.text, context=context_str)
+                if translated is None:
+                    translated = sub.text
+
+                if self._closed or seq != self._seek_seq:
+                    break
+
+                if self._is_duplicate(pts_start, pts_end, sub.text):
+                    continue
+
+                self._sent_items.append((pts_start, pts_end, sub.text))
+                if len(self._sent_items) > 512:
+                    del self._sent_items[:128]
+
+                self._recent_utterances.append({
+                    "pts_start": pts_start,
+                    "pts_end": pts_end,
+                    "text": sub.text,
+                    "translated": translated,
+                })
+                if len(self._recent_utterances) > 128:
+                    del self._recent_utterances[:32]
+
+                items_to_send.append({
+                    "start_pts": round(pts_start, 3),
+                    "end_pts": round(pts_end, 3),
+                    "original_text": sub.text,
+                    "translated_text": translated,
+                })
+                self._enqueue_tts(translated, pts_start, pts_end)
+                self.utterances_sent += 1
+
+            if items_to_send and not self._closed and seq == self._seek_seq:
+                await self.send_json({
+                    "type": "lookahead_subtitles",
+                    "seek_id": self.active_seek_id,
+                    "items": items_to_send,
+                })
+
+            self._batch_from_pts = chunk.next_read_pts
+            self._ready_until_pts = max(self._ready_until_pts, chunk.pts_end)
+            self._fast_bootstrap = False
+            await self.send_status()
+
+    # ────────────────────────────────────────────────────────── tiêu thụ ASR (Streaming v2)
     async def _asr_loop(self) -> None:
         engine = self.asr_engine
         if engine is None:
@@ -1373,13 +1615,23 @@ class LookaheadSessionState:
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def _translate(self, text: str) -> Optional[str]:
-        """Dịch câu gốc sang ngôn ngữ đích. None = không gửi (lỗi)."""
+    async def _translate(self, text: str, context: str = "") -> Optional[str]:
+        """Dịch câu gốc sang ngôn ngữ đích kèm ngữ cảnh (nếu có). None = không gửi (lỗi)."""
         engine = self.translation_engine
         if engine is None:
             return text
         try:
-            result = await engine.translate(text, self.source_lang, self.target_lang)
+            if hasattr(engine, "translate_sentence"):
+                result = await engine.translate_sentence(
+                    text, self.source_lang, self.target_lang, context=context
+                )
+            else:
+                try:
+                    result = await engine.translate(
+                        text, self.source_lang, self.target_lang, context=context
+                    )
+                except TypeError:
+                    result = await engine.translate(text, self.source_lang, self.target_lang)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Lỗi dịch Lookahead: {exc}", extra={"module_tag": "TRANSLATE"})
             return text
@@ -1557,6 +1809,10 @@ class LookaheadSessionState:
                 self.sync_offset_ms = max(-1500.0, min(1500.0, float(sync_raw)))
             except (TypeError, ValueError):
                 pass
+
+        proc_mode = data.get("lookaheadProcessingMode", data.get("processing_mode"))
+        if proc_mode in ("streaming", "offline_batch"):
+            self.processing_mode = str(proc_mode)
 
         # Vị trí phát hiện tại của video khi bắt đầu phiên
         cur_time_raw = data.get("current_time", data.get("currentTime"))
