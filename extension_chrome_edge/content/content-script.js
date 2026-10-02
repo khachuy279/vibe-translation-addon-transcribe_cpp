@@ -1089,6 +1089,14 @@
       try { lookaheadClient.disconnect(); } catch (e) {}
       lookaheadClient = null;
     }
+    if (typeof window !== "undefined" && typeof window.postMessage === "function") {
+      try {
+        window.postMessage({
+          source: "VIBE_LOOKAHEAD_CLIENT",
+          type: "RESET_REPLAY_TOKEN",
+        }, "*");
+      } catch (e) {}
+    }
     if (timelineQueue) {
       try { timelineQueue.detach(); } catch (e) {}
       timelineQueue = null;

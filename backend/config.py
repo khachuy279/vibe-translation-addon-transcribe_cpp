@@ -372,7 +372,7 @@ class SentenceConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "tencent"  # tencent, tencent-1.8b, xiaomi, gemmax
+    base: str = "index-mt-2b"  # tencent, tencent-1.8b, xiaomi, gemmax, index-mt-2b
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None

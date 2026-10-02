@@ -184,19 +184,6 @@ class OmniVoiceTTS(BaseTTSEngine):
                     return self._voice_prompt_cache[cache_key]
 
             actual_ref_audio = ref_audio_path
-            # Tự động cắt bớt nếu audio tham chiếu dài > 10 giây (OmniVoice khuyến nghị 3-10s)
-            try:
-                import soundfile as sf
-                info = sf.info(ref_audio_path)
-                if info.duration > 10.0:
-                    p = Path(ref_audio_path)
-                    trim_path = p.with_name(f"{p.stem}_trimmed10s.wav")
-                    if not trim_path.exists():
-                        data, sr = sf.read(ref_audio_path, stop=int(10.0 * info.samplerate))
-                        sf.write(str(trim_path), data, sr)
-                    actual_ref_audio = str(trim_path)
-            except Exception as e:
-                logger.debug(f"Không trim được ref_audio: {e}", extra={"module_tag": "TTS"})
 
             try:
                 prompt = self.model.create_voice_clone_prompt(ref_audio=actual_ref_audio, ref_text=ref_text)

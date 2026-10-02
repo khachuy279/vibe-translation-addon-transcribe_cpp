@@ -43,8 +43,12 @@ try:
 except Exception:
     pass
 
-# Đảm bảo đường dẫn tới qwen3-asr được nạp nếu cần
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+# Đảm bảo đường dẫn tới qwen_asr (nội bộ hoặc ngoài repo) được nạp
+CURRENT_DIR = Path(__file__).resolve().parent
+if (CURRENT_DIR / "qwen_asr").exists() and str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+REPO_ROOT = CURRENT_DIR.parent.parent
 QWEN_ASR_DIR = REPO_ROOT / "qwen3-asr" / "Qwen3-ASR"
 if QWEN_ASR_DIR.exists() and str(QWEN_ASR_DIR) not in sys.path:
     sys.path.insert(0, str(QWEN_ASR_DIR))
@@ -55,7 +59,13 @@ except ImportError:
     try:
         from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
     except ImportError:
-        Qwen3ForcedAligner = None
+        try:
+            from backend.asr.qwen_asr import Qwen3ForcedAligner
+        except ImportError:
+            try:
+                from backend.asr.qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
+            except ImportError:
+                Qwen3ForcedAligner = None
 
 _ALIGNER_LANG_MAP: Dict[str, str] = {
     "en": "English",

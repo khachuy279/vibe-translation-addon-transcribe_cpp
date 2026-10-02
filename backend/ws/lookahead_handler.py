@@ -567,7 +567,6 @@ class LookaheadSessionState:
 
         self._parsed_config = parsed
         applied = self._apply_config_sync(parsed)
-        self._apply_lookahead_overrides()
         self._refresh_start_pad()
 
         sync_raw = raw.get("lookaheadSyncOffsetMs", raw.get("lookahead_sync_offset_ms"))

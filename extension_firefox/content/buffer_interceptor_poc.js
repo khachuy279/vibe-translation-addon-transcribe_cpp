@@ -147,7 +147,8 @@
 
     if (event.data.source === 'VIBE_LOOKAHEAD_CLIENT' && event.data.type === 'REQUEST_INITIAL_CHUNKS') {
       const token = event.data.replayToken || null;
-      if (token && token === state.lastReplayToken) {
+      const force = Boolean(event.data.force);
+      if (!force && token && token === state.lastReplayToken) {
         // Cùng một mốc đã replay rồi ⇒ KHÔNG gửi lại (chống append trùng).
         return;
       }
@@ -210,6 +211,10 @@
       if (!cacheHasNearby && state.mediaRanges.length > 0) {
         void refetchForPlayhead(playhead, state.bytesPerSecHint);
       }
+    } else if (event.data.source === 'VIBE_LOOKAHEAD_CLIENT' && event.data.type === 'RESET_REPLAY_TOKEN') {
+      state.lastReplayToken = null;
+      state.refetchedRanges.clear();
+      console.log('%c[Lookahead] 🔄 Reset replay token & refetched ranges cho phiên mới.', 'color: #38bdf8;');
     } else if (event.data.source === 'VIBE_LOOKAHEAD_CLIENT' && event.data.type === 'CHECK_BUFFER_STATUS') {
       window.postMessage({
         source: 'VIBE_LOOKAHEAD_POC',
@@ -249,6 +254,8 @@
           state.bufferEpoch += 1;
           state.cachedAudioChunks = [];
           state.initSegmentPacket = null;
+          state.lastReplayToken = null;
+          state.refetchedRanges.clear();
           state.audioSourceBuffers.clear();
           state.audioSourceBuffers.add(sourceBuffer);
           state.lastMimeType = mimeType;
@@ -532,8 +539,62 @@
     if (state.recentChunks.length > 50) state.recentChunks.shift();
   }
 
-  // --- 3. TẦNG 3: VÒNG LẶP ĐỌC TRỰC TIẾP TỪ VIDEO ELEMENT ---
+  // --- 3. TẦNG 3: VÒNG LẶP ĐỌC TRỰC TIẾP TỪ VIDEO ELEMENT & THEO DÕI ĐỔI VIDEO ---
+  let lastWatchedUrl = typeof location !== 'undefined' ? location.href : '';
+  let lastWatchedVideoSrc = '';
+
+  function handleVideoOrUrlChange(reason) {
+    state.bufferEpoch += 1;
+    state.cachedAudioChunks = [];
+    state.initSegmentPacket = null;
+    state.lastReplayToken = null;
+    state.mediaRanges = [];
+    state.refetchedRanges.clear();
+    state.recentChunks = [];
+    state.lastAheadSeconds = 0;
+    console.log(`%c[Lookahead] 🔄 Đổi video (${reason}) ⇒ reset state interceptor (epoch ${state.bufferEpoch}).`, 'color: #38bdf8; font-weight: bold;');
+  }
+
+  function checkVideoOrUrlChange() {
+    if (typeof location !== 'undefined') {
+      const curUrl = location.href;
+      if (curUrl !== lastWatchedUrl) {
+        const getVid = (u) => {
+          try {
+            const parsed = new URL(u);
+            return parsed.searchParams.get('v') || parsed.pathname;
+          } catch (e) {
+            return u;
+          }
+        };
+        if (getVid(curUrl) !== getVid(lastWatchedUrl)) {
+          handleVideoOrUrlChange(`URL: ${getVid(lastWatchedUrl)} -> ${getVid(curUrl)}`);
+        }
+        lastWatchedUrl = curUrl;
+      }
+    }
+    const video = getActiveVideo();
+    if (video) {
+      const curSrc = video.currentSrc || video.src || '';
+      if (lastWatchedVideoSrc && curSrc && curSrc !== lastWatchedVideoSrc) {
+        handleVideoOrUrlChange('video src change');
+      }
+      lastWatchedVideoSrc = curSrc;
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('yt-navigate-finish', () => checkVideoOrUrlChange());
+    window.addEventListener('popstate', () => checkVideoOrUrlChange());
+    window.addEventListener('loadstart', (e) => {
+      if (e.target && e.target.tagName === 'VIDEO') {
+        checkVideoOrUrlChange();
+      }
+    }, true);
+  }
+
   window.__VIBE_LOOKAHEAD_INTERVAL__ = setInterval(() => {
+    checkVideoOrUrlChange();
     const video = getActiveVideo();
     if (!video) return;
     state.lastVideoTime = video.currentTime;

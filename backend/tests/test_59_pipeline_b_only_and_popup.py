@@ -157,3 +157,27 @@ def test_extension_mirrors_stay_in_sync():
         a = (ROOT / EXT_DIRS[0] / rel).read_text(encoding="utf-8")
         b = (ROOT / EXT_DIRS[1] / rel).read_text(encoding="utf-8")
         assert a == b, f"{rel} lệch nhau giữa {EXT_DIRS[0]} và {EXT_DIRS[1]}"
+
+
+@pytest.mark.asyncio
+async def test_lookahead_session_apply_config_runtime():
+    """`apply_config()` từ popup khi đổi source_lang / target_lang / sync_offset không được văng lỗi."""
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+    conn.is_closed = False
+    session = LookaheadSessionState(ws=conn, asr_engine=MagicMock(), translation_engine=MagicMock())
+
+    # Giả lập payload đổi SourceLang từ Extension Popup
+    payload = {
+        "type": "set_config",
+        "source_lang": "ja",
+        "target_lang": "vi",
+        "lookahead_sync_offset_ms": 150,
+    }
+    applied = await session.apply_config(payload)
+    assert session.source_lang == "ja"
+    assert session.target_lang == "vi"
+    assert session.sync_offset_ms == 150.0
+    assert applied.get("source_lang") == "ja"
+

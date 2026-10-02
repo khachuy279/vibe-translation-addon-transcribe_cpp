@@ -51,6 +51,7 @@ class LookaheadClient {
     this.isConnected = false;
     this.isServerReady = false;
     this.activeSeekId = "init_0";
+    this.clientSessionId = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
     //: Đã Stop/ngắt phiên ⇒ MỌI đường gửi/nhận phải là no-op (chống rò audio lên server
     //: sau khi người dùng bấm Stop, kể cả khi socket đang ở trạng thái CONNECTING).
@@ -70,6 +71,7 @@ class LookaheadClient {
     this.videoElement = video;
     this._pendingChunks = [];
     this.activeSeekId = "init_0";
+    this.clientSessionId = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     if (this.useBridge) {
       this._initBridge();
     } else {
@@ -103,6 +105,15 @@ class LookaheadClient {
     if (this._messageListener && typeof window !== "undefined" && typeof window.removeEventListener === "function") {
       window.removeEventListener("message", this._messageListener);
       this._messageListener = null;
+    }
+
+    if (typeof window !== "undefined" && typeof window.postMessage === "function") {
+      try {
+        window.postMessage({
+          source: "VIBE_LOOKAHEAD_CLIENT",
+          type: "RESET_REPLAY_TOKEN",
+        }, "*");
+      } catch (e) {}
     }
 
     // Dọn dẹp port Background Bridge nếu có
@@ -172,7 +183,7 @@ class LookaheadClient {
    * `token`: "init_<seekId>" cho lần bắt đầu phiên (gửi bao nhiêu lần cũng chỉ replay 1 lần),
    * và `seek_<id>` cho mỗi lần tua (mỗi mốc mới được replay đúng một lần).
    */
-  requestInitialChunks(currentTime, token) {
+  requestInitialChunks(currentTime, token, force = false) {
     if (this._destroyed) return;
     try {
       const curTime = currentTime !== undefined
@@ -183,7 +194,8 @@ class LookaheadClient {
           source: "VIBE_LOOKAHEAD_CLIENT",
           type: "REQUEST_INITIAL_CHUNKS",
           currentTime: curTime,
-          replayToken: token || `init_${this.activeSeekId}`,
+          replayToken: token || `init_${this.clientSessionId}_${this.activeSeekId}`,
+          force: Boolean(force),
         }, "*");
       }
     } catch (e) {}
@@ -288,7 +300,7 @@ class LookaheadClient {
     }
 
     // Yêu cầu injected script replay init segment + các mảnh đã đệm (1 lần cho mốc này).
-    this.requestInitialChunks(curTime, `init_${this.activeSeekId}`);
+    this.requestInitialChunks(curTime, `init_${this.clientSessionId}_${this.activeSeekId}`, true);
   }
 
   _initWebSocket() {
