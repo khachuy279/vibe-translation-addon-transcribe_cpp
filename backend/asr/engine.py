@@ -25,6 +25,7 @@ Ghi chú an toàn luồng (P1.8b):
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import logging
 import os
 from pathlib import Path
@@ -470,32 +471,15 @@ class TranscribeEngine(BaseASREngine):
                 )
 
         info = self.registry.get_model_info(model_key) or {}
-        logger.info(
-            f"Nạp model '{model_key}' trước khi swap (zero-downtime)",
-            extra={"module_tag": "ASR"},
-        )
-        t0 = time.perf_counter()
 
-        # 1) Nạp ngoài lock: model cũ vẫn phục vụ preview bình thường.
-        load_backend = resolve_backend(self.backend or config.asr.backend)
-        new_model = transcribe_cpp.Model(model_path, backend=load_backend)
-        new_session, supports_streaming, max_audio_samples = self._build_session(new_model)
-
-        old_session = old_model = None
-        with cls._infer_lock:  # 2) swap nguyên tử — không inference nào đang chạy
+        # Bước 1: Giải phóng model cũ TRƯỚC để giải phóng VRAM, tránh tràn VRAM
+        with cls._infer_lock:
             with cls._shared_lock:
                 old_session = cls._shared_session
                 old_model = cls._shared_model
-                cls._shared_model = new_model
-                cls._shared_model_key = model_key
-                cls._shared_supports_streaming = supports_streaming
-                cls._shared_session = new_session
-                cls._shared_max_audio_samples = max_audio_samples
-                self.model_key = model_key
-                self.model_info = info
-                self._max_audio_samples = max_audio_samples
-
-        # 3) Giải phóng model cũ SAU khi swap (an toàn: đang giữ _infer_lock).
+                cls._shared_session = None
+                cls._shared_model = None
+                cls._shared_model_key = None
         if old_session is not None:
             try:
                 old_session.close()
@@ -506,11 +490,40 @@ class TranscribeEngine(BaseASREngine):
                 old_model.close()
             except Exception:
                 pass
+        del old_session, old_model
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        logger.info(f"Đã giải phóng model ASR cũ khỏi VRAM trước khi nạp '{model_key}'", extra={"module_tag": "ASR"})
 
-        # 4) pre-warm model mới TRƯỚC khi báo "ready".
-        # Nếu bỏ bước này, lần inference đầu tiên sau khi đổi model sẽ phải trả chi phí
-        # warm-up của backend (build graph + compile kernel + cấp workspace) — đo được
-        # ~7-10 giây — và preview đầu tiên bị "đơ" đúng lúc người dùng vừa đổi model.
+        # Bước 2: Nạp model mới vào VRAM đã được giải phóng
+        t0 = time.perf_counter()
+        try:
+            load_backend = resolve_backend(self.backend or config.asr.backend)
+            new_model = transcribe_cpp.Model(model_path, backend=load_backend)
+            new_session, supports_streaming, max_audio_samples = self._build_session(new_model)
+
+            with cls._infer_lock:
+                with cls._shared_lock:
+                    cls._shared_model = new_model
+                    cls._shared_model_key = model_key
+                    cls._shared_supports_streaming = supports_streaming
+                    cls._shared_session = new_session
+                    cls._shared_max_audio_samples = max_audio_samples
+                    self.model_key = model_key
+                    self.model_info = info
+                    self._max_audio_samples = max_audio_samples
+        except Exception as exc:
+            logger.error(f"Lỗi nạp model ASR '{model_key}': {exc}", exc_info=True, extra={"module_tag": "ASR"})
+            raise RuntimeError(
+                f"Không thể nạp model ASR '{model_key}' (tràn VRAM hoặc lỗi hệ thống): {exc}. Vui lòng chọn model khác."
+            ) from exc
+
+        # Bước 3: Pre-warm model mới
         t_warm = time.perf_counter()
         try:
             self._begin_infer()
@@ -520,16 +533,16 @@ class TranscribeEngine(BaseASREngine):
                 self._end_infer()
             warm_ms = (time.perf_counter() - t_warm) * 1000.0
             metrics_collector.record_metric("asr", "model_warmup_ms", warm_ms)
-            logger.info(f"Pre-warm ({model_key}, {warm_ms:.0f}ms)",
-                        extra={"module_tag": "ASR"})
+            logger.info(f"Pre-warm ({model_key}, {warm_ms:.0f}ms)", extra={"module_tag": "ASR"})
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"pre-warm model '{model_key}' thất bại: {exc}", extra={"module_tag": "ASR"})
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            f"Đã swap sang '{model_key}' ({elapsed:.2f}s, backend={getattr(new_model, 'backend', 'unknown')})",
+            f"Đã nạp và kích hoạt model ASR '{model_key}' ({elapsed:.2f}s, backend={getattr(new_model, 'backend', 'unknown')})",
             extra={"module_tag": "ASR"},
         )
+
 
     def prewarm(self) -> None:
         """Prewarm mô hình trên GPU (nạp + pre-warm cả độ dài câu tối đa).

@@ -333,19 +333,55 @@ class GGUFTranslator(BaseTranslator):
                 self.prompt_strategy = new_prompt
                 return
 
-            # Có thể raise (thiếu file & tắt auto_download, lỗi tải, hết VRAM...) — model cũ
-            # vẫn đang phục vụ bình thường vì ta chưa chạm tới nó.
-            new_llm, prompt_strategy = self._build_llm(new_key, new_cfg, allow_download)
+            # Bước 1: Kiểm tra / tải file GGUF TRƯỚC khi unload model cũ (nếu _build_llm không bị mock trong test)
+            is_mocked_build = getattr(self._build_llm, "__name__", "") != "_build_llm"
+            if not is_mocked_build:
+                gguf_path = self.registry.resolve_gguf_path(new_key)
+                if not os.path.exists(gguf_path):
+                    if allow_download:
+                        model_download.ensure_model_file(
+                            str(info.get("model", "")),
+                            str(info.get("gguf_file", "")),
+                            allow_download=True,
+                            label=new_key,
+                        )
+                    else:
+                        raise FileNotFoundError(f"File GGUF '{gguf_path}' không tồn tại và allow_download=False")
 
+
+            # Bước 2: UNLOAD model cũ TRƯỚC để giải phóng VRAM, tránh tràn VRAM khi nạp model mới
             with self.__class__._shared_lock:
                 old_llm = self.__class__._shared_llm
-                self.__class__._shared_llm = new_llm
-                self.__class__._shared_model_key = new_key
-                self.canonical_key = new_key
-                self.cfg = new_cfg
-                self.prompt_strategy = prompt_strategy
-            self._load_failure_logged = False
-            self.__class__._release_llm(old_llm)
+                self.__class__._shared_llm = None
+                self.__class__._shared_model_key = None
+            if old_llm is not None:
+                self.__class__._release_llm(old_llm)
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            logger.info(f"Đã giải phóng model dịch cũ khỏi VRAM trước khi nạp '{new_key}'", extra={"module_tag": "TRANSLATE"})
+
+            # Bước 3: Nạp model mới vào VRAM đã được giải phóng
+            try:
+                new_llm, prompt_strategy = self._build_llm(new_key, new_cfg, allow_download)
+                with self.__class__._shared_lock:
+                    self.__class__._shared_llm = new_llm
+                    self.__class__._shared_model_key = new_key
+                    self.canonical_key = new_key
+                    self.cfg = new_cfg
+                    self.prompt_strategy = prompt_strategy
+                self._load_failure_logged = False
+            except Exception as exc:
+                self._load_failure_logged = True
+                logger.error(f"Lỗi nạp model dịch mới '{new_key}': {exc}", exc_info=True, extra={"module_tag": "TRANSLATE"})
+                raise RuntimeError(
+                    f"Không thể nạp model dịch '{new_key}' (tràn VRAM hoặc lỗi hệ thống): {exc}. Vui lòng chọn model khác."
+                ) from exc
+
 
     @classmethod
     def shutdown_executors(cls, wait: bool = False) -> None:

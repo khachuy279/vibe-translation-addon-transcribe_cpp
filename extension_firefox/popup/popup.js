@@ -102,9 +102,32 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   let isCapturingNow = false;
   let currentAudioSampleRate = null;
   let isSwitchingEngine = false;
+  let isSwitchingTranslationModel = false;
+  let isMonitoringAsr = false;
+  let isMonitoringTranslation = false;
+  let currentModelError = null;
   let lastActiveAsr = "sensevoice";
   let lastActiveVad = "auto";
   let lastActiveLang = "auto";
+
+  function updateStartButtonState() {
+    if (isCapturingNow) {
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      return;
+    }
+    btnStop.disabled = true;
+    if (isSwitchingEngine || isSwitchingTranslationModel) {
+      btnStart.disabled = true;
+      return;
+    }
+    if (currentModelError) {
+      btnStart.disabled = true;
+      return;
+    }
+    btnStart.disabled = false;
+  }
+
 
   function formatSampleRate(rate) {
     const numRate = Number(rate);
@@ -491,13 +514,6 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       updateRangeLabels();
     }
 
-    if (!isCapturingNow) {
-      statusBadge.textContent = `${activeAsr.toUpperCase()}`;
-      statusBadge.className = "badge badge-ready";
-      showMsg(`✅ Server Online (ASR: ${activeAsr.toUpperCase()} | VAD: ${data.resolved_vad || activeVad})`, "success");
-      btnStart.disabled = false;
-    }
-
     // Populate source languages
     if (data.supported_languages) {
       renderLanguageOptions(data.supported_languages, savedPreferredLang || selSourceLang.value);
@@ -517,26 +533,53 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       } else if (activeTrans && selTranslationModel) {
         selTranslationModel.value = activeTrans;
       }
-
-      // Backend có thể đang tải/nạp model dịch ở nền (F-51) ⇒ báo rõ để không tưởng là treo.
-      const dl = data.translation.download;
-      if (dl && dl.model && (dl.state === "downloading" || dl.state === "loading")) {
-        const verb = dl.state === "downloading" ? "tải" : "nạp";
-        const note = dl.state === "downloading" ? ` (${describeDownloadProgress(dl)})` : "";
-        showMsg(`⏳ Backend đang ${verb} model dịch '${dl.model}'${note} ở chế độ nền. Model hiện tại vẫn dịch bình thường.`, "info");
-      } else if (dl && dl.state === "error" && dl.error) {
-        showMsg(`❌ Model dịch '${dl.model || "?"}' lỗi: ${dl.error}`, "error");
-      }
     }
 
-    // Backend có thể đang tải/nạp model ASR ở nền ⇒ báo rõ để người dùng biết
+    // Backend có thể đang tải/nạp model Dịch ở nền ⇒ khoá ngay Start và theo dõi
+    const dl = data.translation ? data.translation.download : null;
+    const isDlActive = dl && dl.model && (dl.state === "downloading" || dl.state === "loading");
+    if (isDlActive) {
+      const verb = dl.state === "downloading" ? "tải" : "nạp";
+      const note = dl.state === "downloading" ? ` (${describeDownloadProgress(dl)})` : "";
+      statusBadge.textContent = `${verb === "tải" ? "Tải" : "Nạp"} dịch ${note}`.trim();
+      statusBadge.className = "badge badge-reconnecting";
+      showMsg(`⏳ Backend đang ${verb} model dịch '${dl.model}'${note}. Nút Bắt đầu bị khoá cho đến khi model sẵn sàng.`, "info");
+      monitorTranslationDownload(dl.model, dl.model);
+    } else if (dl && dl.state === "error" && dl.error) {
+      currentModelError = dl.error;
+      statusBadge.textContent = "LỖI DỊCH";
+      statusBadge.className = "badge badge-disconnected";
+      showMsg(`❌ Model dịch '${dl.model || "?"}' lỗi: ${dl.error}. Vui lòng chọn model khác!`, "error");
+    } else if (dl && dl.state === "ready" && currentModelError) {
+      currentModelError = null;
+    }
+
+    // Backend có thể đang tải/nạp model ASR ở nền ⇒ khoá ngay Start và theo dõi
     const asrDl = data.asr_download || (data.asr && data.asr.download);
-    if (asrDl && asrDl.model && (asrDl.state === "downloading" || asrDl.state === "loading")) {
+    const isAsrDlActive = asrDl && asrDl.model && (asrDl.state === "downloading" || asrDl.state === "loading");
+    if (isAsrDlActive) {
       const verb = asrDl.state === "downloading" ? "tải" : "nạp";
       const note = asrDl.state === "downloading" ? ` (${describeDownloadProgress(asrDl)})` : "";
-      showMsg(`⏳ Backend đang ${verb} model ASR '${asrDl.model}'${note} ở chế độ nền. Model hiện tại vẫn nhận diện bình thường.`, "info");
+      statusBadge.textContent = `${verb === "tải" ? "Tải" : "Nạp"} ASR ${note}`.trim();
+      statusBadge.className = "badge badge-reconnecting";
+      showMsg(`⏳ Backend đang ${verb} model ASR '${asrDl.model}'${note}. Nút Bắt đầu bị khoá cho đến khi model sẵn sàng.`, "info");
+      monitorAsrDownload(asrDl.model, asrDl.model);
     } else if (asrDl && asrDl.state === "error" && asrDl.error) {
-      showMsg(`❌ Model ASR '${asrDl.model || "?"}' lỗi: ${asrDl.error}`, "error");
+      currentModelError = asrDl.error;
+      statusBadge.textContent = "LỖI ASR";
+      statusBadge.className = "badge badge-disconnected";
+      showMsg(`❌ Model ASR '${asrDl.model || "?"}' lỗi: ${asrDl.error}. Vui lòng chọn model khác!`, "error");
+    } else if (asrDl && asrDl.state === "ready" && currentModelError) {
+      currentModelError = null;
+    }
+
+    if (!isCapturingNow) {
+      if (!isDlActive && !isAsrDlActive && !currentModelError && !isSwitchingEngine && !isSwitchingTranslationModel) {
+        statusBadge.textContent = `${activeAsr.toUpperCase()}`;
+        statusBadge.className = "badge badge-ready";
+        showMsg(`✅ Server Online (ASR: ${activeAsr.toUpperCase()} | VAD: ${data.resolved_vad || activeVad})`, "success");
+      }
+      updateStartButtonState();
     }
 
     return true;
@@ -544,6 +587,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
   // ── Hot-swap ASR / VAD Engine on Backend ───────────────────
   async function handleEngineSwitch(force = false) {
+    if (isCapturingNow) {
+      showMsg("⚠️ Không thể đổi model khi session đang chạy! Hãy dừng session trước.", "warning");
+      return;
+    }
     if (isSwitchingEngine) return;
 
     const newAsr = selAsrEngine ? selAsrEngine.value : lastActiveAsr;
@@ -553,9 +600,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (!force && newAsr === lastActiveAsr && newVad === lastActiveVad && (newAsr !== "whisper" || newLang === lastActiveLang)) return;
 
     isSwitchingEngine = true;
+    currentModelError = null;
+    updateStartButtonState(); // Vô hiệu hoá ngay nút Start
     if (selAsrEngine) selAsrEngine.disabled = true;
     if (selVadEngine) selVadEngine.disabled = true;
-    btnStart.disabled = true;
 
     const labelDesc = newAsr === "whisper" ? `Whisper (${newLang})` : newAsr.toUpperCase();
     statusBadge.textContent = `Nạp ${labelDesc}...`;
@@ -564,7 +612,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       lblActiveModel.textContent = `Đang nạp ${labelDesc}...`;
       lblActiveModel.title = `Đang nạp mô hình ${labelDesc}...`;
     }
-    showMsg(`⏳ Đang chuyển đổi sang ${labelDesc} & nạp model Finetunes... Vui lòng đợi.`, "info");
+    showMsg(`⏳ Đang kiểm tra, tải & giải phóng VRAM để nạp model ASR ${labelDesc}... Vui lòng đợi.`, "info");
 
     try {
       const payload = {
@@ -595,12 +643,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       });
 
       if (res && res.status === 202) {
-        // Backend chưa có file GGUF ⇒ trả 202 và tải trong nền (model cũ vẫn chạy).
+        // Backend chưa có file GGUF ⇒ trả 202 và tải trong nền
         const body = await res.json().catch(() => ({}));
-        showMsg(`⏳ ${body.detail || `Đang tải model ASR ${labelDesc} về máy (chạy nền).`}`, "info");
+        showMsg(`⏳ ${body.detail || `Đang tải model ASR ${labelDesc} về máy (chạy nền). Nút Bắt đầu đang được khoá.`}`, "info");
         await waitForAsrActivation(newAsr, labelDesc);
       } else if (!res || !res.ok) {
-        const errorDetail = res ? await res.text() : "Network error";
+        const errorDetail = res ? ((await res.json().catch(() => null))?.detail || await res.text()) : "Network error";
         throw new Error(errorDetail);
       }
 
@@ -623,36 +671,28 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const cfg = getSettings();
       api.storage.local.set({ bs_settings: cfg });
 
-      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
-      showMsg(`✅ Đã chuyển sang ASR: ${lastActiveAsr.toUpperCase()} (${lastActiveLang}) | VAD: ${result.resolved_vad || lastActiveVad}`, "success");
-
-      // Notify content script of active changes
-      const tab = await fetchActiveTab();
-      if (tab && isCapturingNow) {
-        await broadcastToFrames("update_settings", { settings: cfg });
-      }
+      currentModelError = null;
+      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = "badge badge-ready";
+      showMsg(`✅ Đã nạp thành công ASR: ${lastActiveAsr.toUpperCase()} (${lastActiveLang}) | VAD: ${result.resolved_vad || lastActiveVad}`, "success");
     } catch (err) {
       console.error("[Popup] Engine switch error:", err);
-      // Rollback dropdown selections
-      if (selAsrEngine) selAsrEngine.value = lastActiveAsr;
-      if (selVadEngine) selVadEngine.value = lastActiveVad;
-      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
-      showMsg(`❌ Lỗi nạp model: ${err.message || "Không thể chuyển engine"}`, "error");
+      currentModelError = err.message || "Không thể chuyển engine";
+      statusBadge.textContent = "LỖI ASR";
+      statusBadge.className = "badge badge-disconnected";
+      showMsg(`❌ Lỗi nạp model ASR: ${currentModelError}. Vui lòng chọn model khác!`, "error");
     } finally {
       isSwitchingEngine = false;
       if (selAsrEngine) selAsrEngine.disabled = isCapturingNow;
       if (selVadEngine) selVadEngine.disabled = isCapturingNow;
-      btnStart.disabled = isCapturingNow || isSwitchingTranslationModel;
+      updateStartButtonState();
     }
   }
 
   // ── Hot-swap Translation Model on Backend ─────────────────
-  let isSwitchingTranslationModel = false;
-
   const MODEL_DOWNLOAD_POLL_MS = 4000;
   const MODEL_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
+
 
   function describeDownloadProgress(dl) {
     if (dl.percent != null) return `${Math.round(dl.percent)}%`;
@@ -687,7 +727,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         if (note !== lastNote) {
           lastNote = note;
           if (statusBadge) statusBadge.textContent = `Tải ${shortDesc} ${note}`;
-          showMsg(`⏳ Đang tải model ASR ${shortDesc} về máy: ${note}. Model hiện tại vẫn nhận diện bình thường.`, "info");
+          showMsg(`⏳ Đang tải model ASR ${shortDesc} về máy: ${note}. Nút Bắt đầu đang được khoá.`, "info");
         }
         continue;
       }
@@ -695,7 +735,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         if (statusBadge) statusBadge.textContent = `Nạp ${shortDesc}...`;
         if (lastNote !== "loading") {
           lastNote = "loading";
-          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU...`, "info");
+          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU... Nút Bắt đầu đang được khoá.`, "info");
         }
         continue;
       }
@@ -736,7 +776,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         if (note !== lastNote) {
           lastNote = note;
           if (statusBadge) statusBadge.textContent = `Tải ${shortDesc} ${note}`;
-          showMsg(`⏳ Đang tải model dịch ${shortDesc} về máy: ${note}. Model hiện tại vẫn dịch bình thường.`, "info");
+          showMsg(`⏳ Đang tải model dịch ${shortDesc} về máy: ${note}. Nút Bắt đầu đang được khoá.`, "info");
         }
         continue;
       }
@@ -744,7 +784,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         if (statusBadge) statusBadge.textContent = `Nạp ${shortDesc}...`;
         if (lastNote !== "loading") {
           lastNote = "loading";
-          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU...`, "info");
+          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU... Nút Bắt đầu đang được khoá.`, "info");
         }
         continue;
       }
@@ -758,9 +798,63 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     throw new Error("Hết thời gian chờ tải model dịch (30 phút). Kiểm tra mạng rồi thử lại.");
   }
 
+  async function monitorTranslationDownload(modelId, shortDesc) {
+    if (isMonitoringTranslation || isSwitchingTranslationModel) return;
+    isMonitoringTranslation = true;
+    isSwitchingTranslationModel = true;
+    if (selTranslationModel) selTranslationModel.disabled = true;
+    updateStartButtonState();
+    try {
+      await waitForTranslationActivation(modelId, shortDesc);
+      currentModelError = null;
+      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = "badge badge-ready";
+      showMsg(`✅ Đã nạp thành công model dịch: ${shortDesc}`, "success");
+    } catch (err) {
+      console.error("[Popup] Translation activation error:", err);
+      currentModelError = err.message || "Không thể nạp model dịch";
+      statusBadge.textContent = "LỖI DỊCH";
+      statusBadge.className = "badge badge-disconnected";
+      showMsg(`❌ Lỗi nạp model dịch: ${currentModelError}. Vui lòng chọn model khác!`, "error");
+    } finally {
+      isMonitoringTranslation = false;
+      isSwitchingTranslationModel = false;
+      if (selTranslationModel) selTranslationModel.disabled = isCapturingNow;
+      updateStartButtonState();
+    }
+  }
+
+  async function monitorAsrDownload(modelId, shortDesc) {
+    if (isMonitoringAsr || isSwitchingEngine) return;
+    isMonitoringAsr = true;
+    isSwitchingEngine = true;
+    if (selAsrEngine) selAsrEngine.disabled = true;
+    if (selVadEngine) selVadEngine.disabled = true;
+    updateStartButtonState();
+    try {
+      await waitForAsrActivation(modelId, shortDesc);
+      currentModelError = null;
+      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = "badge badge-ready";
+      showMsg(`✅ Đã nạp thành công model ASR: ${shortDesc}`, "success");
+    } catch (err) {
+      console.error("[Popup] ASR activation error:", err);
+      currentModelError = err.message || "Không thể nạp model ASR";
+      statusBadge.textContent = "LỖI ASR";
+      statusBadge.className = "badge badge-disconnected";
+      showMsg(`❌ Lỗi nạp model ASR: ${currentModelError}. Vui lòng chọn model khác!`, "error");
+    } finally {
+      isMonitoringAsr = false;
+      isSwitchingEngine = false;
+      if (selAsrEngine) selAsrEngine.disabled = isCapturingNow;
+      if (selVadEngine) selVadEngine.disabled = isCapturingNow;
+      updateStartButtonState();
+    }
+  }
+
   async function handleTranslationModelSwitch() {
     if (isCapturingNow) {
-      showMsg("⚠️ Không thể đổi model dịch khi đang dịch! Hãy bấm 'Dừng dịch' trước.", "warning");
+      showMsg("⚠️ Không thể đổi model khi session đang chạy! Hãy dừng session trước.", "warning");
       return;
     }
     if (isSwitchingTranslationModel) return;
@@ -771,12 +865,13 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const shortDesc = modelDesc.split("(")[0].trim() || newModel;
 
     isSwitchingTranslationModel = true;
+    currentModelError = null;
+    updateStartButtonState(); // Vô hiệu hoá ngay nút Start
     if (selTranslationModel) selTranslationModel.disabled = true;
-    btnStart.disabled = true;
 
     statusBadge.textContent = `Nạp ${shortDesc}...`;
     statusBadge.className = "badge badge-reconnecting";
-    showMsg(`⏳ Đang chuyển đổi sang model dịch ${modelDesc}... (Nếu chưa có, model sẽ tự tải về)`, "info");
+    showMsg(`⏳ Đang kiểm tra, tải & giải phóng VRAM để nạp model dịch ${modelDesc}... Vui lòng đợi.`, "info");
 
     try {
       const res = await fetchBackend("/api/config", {
@@ -787,12 +882,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       });
 
       if (res && res.status === 202) {
-        // Backend chưa có file GGUF ⇒ trả 202 và tải trong nền (model cũ vẫn chạy).
+        // Backend chưa có file GGUF ⇒ trả 202 và tải trong nền
         const body = await res.json().catch(() => ({}));
-        showMsg(`⏳ ${body.detail || `Đang tải model dịch ${modelDesc} về máy (chạy nền).`}`, "info");
+        showMsg(`⏳ ${body.detail || `Đang tải model dịch ${modelDesc} về máy (chạy nền). Nút Bắt đầu đang được khoá.`}`, "info");
         await waitForTranslationActivation(newModel, shortDesc);
       } else if (!res || !res.ok) {
-        const errorDetail = res ? await res.text() : "Network error";
+        const errorDetail = res ? ((await res.json().catch(() => null))?.detail || await res.text()) : "Network error";
         throw new Error(errorDetail);
       }
 
@@ -800,18 +895,20 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       cfg.translationModel = newModel;
       await api.storage.local.set({ bs_settings: cfg });
 
-      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
-      showMsg(`✅ Đã chuyển sang model dịch: ${modelDesc}`, "success");
+      currentModelError = null;
+      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
+      statusBadge.className = "badge badge-ready";
+      showMsg(`✅ Đã nạp thành công model dịch: ${modelDesc}`, "success");
     } catch (err) {
       console.error("[Popup] Translation model switch error:", err);
-      showMsg(`❌ Lỗi nạp model dịch: ${err.message || "Không thể chuyển model"}`, "error");
-      statusBadge.textContent = isCapturingNow ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = isCapturingNow ? "badge badge-connected" : "badge badge-ready";
+      currentModelError = err.message || "Không thể chuyển model dịch";
+      statusBadge.textContent = "LỖI DỊCH";
+      statusBadge.className = "badge badge-disconnected";
+      showMsg(`❌ Lỗi nạp model dịch: ${currentModelError}. Vui lòng chọn model khác!`, "error");
     } finally {
       isSwitchingTranslationModel = false;
       if (selTranslationModel) selTranslationModel.disabled = isCapturingNow;
-      btnStart.disabled = isCapturingNow || isSwitchingEngine;
+      updateStartButtonState();
     }
   }
 
@@ -1031,6 +1128,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   })();
 
   btnStart.addEventListener("click", async () => {
+    if (isSwitchingEngine || isSwitchingTranslationModel || currentModelError) {
+      showMsg("⚠️ Không thể bắt đầu session khi model đang tải hoặc chưa sẵn sàng!", "warning");
+      return;
+    }
+
     const tab = await fetchActiveTab();
     if (!tab) { showMsg("No active tab found", "error"); return; }
     const cfg = getSettings();
@@ -1046,7 +1148,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       api.tabs.sendMessage(tab.id, payload, (r) => {
         if (api.runtime.lastError) {
           showMsg("⚠️ Hãy F5 lại trang và bấm Play video trước!", "error");
-          btnStart.disabled = false;
+          updateStartButtonState();
           return;
         }
         if (r?.success || r?.isCapturing) {
@@ -1054,7 +1156,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
           showMsg("✅ Đã tìm thấy video và bắt đầu dịch!", "success");
         } else {
           showMsg("❌ " + (r?.error || "Không tìm thấy video nào (Hãy bấm Play video trước)"), "error");
-          btnStart.disabled = false;
+          updateStartButtonState();
         }
       });
       return;
@@ -1069,7 +1171,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const specificError = results.find(r => r?.error && r.error !== "No video found");
       const errorMsg = specificError?.error || results.map(r => r?.error).filter(Boolean)[0] || "Không tìm thấy video nào (Hãy bấm Play video trước)";
       showMsg("❌ " + errorMsg, "error");
-      btnStart.disabled = false;
+      updateStartButtonState();
     }
   });
 
@@ -1274,8 +1376,32 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     } else {
       currentAudioSampleRate = null;
     }
-    btnStart.disabled = active || isSwitchingEngine || isSwitchingTranslationModel;
-    btnStop.disabled = !active;
+
+    // Ẩn/Hiện nhóm lựa chọn model theo trạng thái phiên
+    const rowModelEngine = document.getElementById("rowModelEngine");
+    const groupTranslationModel = document.getElementById("groupTranslationModel");
+    const activeModelSummary = document.getElementById("activeModelSummary");
+    const activeModelsText = document.getElementById("activeModelsText");
+
+    if (rowModelEngine) {
+      rowModelEngine.style.display = active ? "none" : "";
+    }
+    if (groupTranslationModel) {
+      groupTranslationModel.style.display = active ? "none" : "";
+    }
+    if (activeModelSummary) {
+      activeModelSummary.style.display = active ? "block" : "none";
+      if (active && activeModelsText) {
+        const asrText = selAsrEngine && selAsrEngine.selectedOptions && selAsrEngine.selectedOptions[0]
+          ? selAsrEngine.selectedOptions[0].textContent.replace("⚡", "").trim()
+          : (lastActiveAsr || "--");
+        const transText = selTranslationModel && selTranslationModel.selectedOptions && selTranslationModel.selectedOptions[0]
+          ? selTranslationModel.selectedOptions[0].textContent.replace("⚡", "").replace("🌟", "").replace("🎯", "").replace("🎌", "").trim()
+          : "Translation";
+        activeModelsText.textContent = `${asrText.split("(")[0].trim()} ⏐ ${transText.split("(")[0].trim()}`;
+      }
+    }
+
     if (selTranslationModel) {
       selTranslationModel.disabled = active || isSwitchingTranslationModel;
     }
@@ -1293,6 +1419,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         row.title = active ? "Không thể chuyển đổi Pipeline khi đang chạy session" : "";
       }
     }
+
+    updateStartButtonState();
+
     // Bật/tắt session thay đổi `isCapturingNow` ⇒ tính lại nhóm tuỳ chỉnh Pipeline A.
     updatePipelineAOnlyUi();
     statusBadge.textContent = active ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;

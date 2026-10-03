@@ -412,9 +412,16 @@ class SessionState:
             updates["target_lang"] = parsed.target_lang
             config.translation.target_lang = parsed.target_lang
 
-        # VAD settings
+        # VAD settings: không cho đổi VAD engine giữa phiên đang phát audio
         if parsed.vad_engine is not None:
-            updates["vad_engine"] = parsed.vad_engine
+            current_vad = self.config.get("vad_engine", config.vad.vad_engine)
+            if self.chunk_index > 0 and parsed.vad_engine.lower().strip() != str(current_vad).lower().strip():
+                logger.warning(
+                    f"Session {self.session_id[:8]}: Bỏ qua yêu cầu đổi VAD sang '{parsed.vad_engine}' khi session đang phát audio (chỉ được đổi trước khi bắt đầu session).",
+                    extra={"module_tag": "WS"},
+                )
+            else:
+                updates["vad_engine"] = parsed.vad_engine
         vad_th = parsed.vad_threshold if parsed.vad_threshold is not None else parsed.threshold
         if vad_th is not None:
             updates["vad_threshold"] = float(vad_th)
@@ -440,14 +447,17 @@ class SessionState:
         self.config.update(updates)
         applied.update(updates)
 
-        # ---- Hot-switch ASR Model (P1.8) ----
+        # ---- Không cho phép đổi ASR Model giữa phiên đang phát audio ----
         target_asr = parsed.asr_model or parsed.asr_engine or parsed.model_id
         if target_asr:
             target_asr = target_asr.lower().strip()
             registry = ModelRegistry.get_instance()
-            # LƯU Ý: dùng `has_model()` chứ KHÔNG dùng `registry.models` — thuộc tính đó
-            # từng không tồn tại và làm AttributeError sập cả phiên khi đổi model.
-            if registry.has_model(target_asr) and target_asr != registry.get_active_model_key():
+            if self.chunk_index > 0 and registry.has_model(target_asr) and target_asr != registry.get_active_model_key():
+                logger.warning(
+                    f"Session {self.session_id[:8]}: Bỏ qua yêu cầu đổi ASR sang '{target_asr}' khi session đang phát audio (chỉ được đổi trước khi bắt đầu session).",
+                    extra={"module_tag": "WS"},
+                )
+            elif registry.has_model(target_asr) and target_asr != registry.get_active_model_key():
                 registry.set_active_model_key(target_asr)
                 self.config["asr_engine"] = target_asr
                 applied["asr_engine"] = target_asr
@@ -459,16 +469,23 @@ class SessionState:
         if self.asr_engine and "source_lang" in self.config:
             self.asr_engine.set_language(self.config["source_lang"])
 
-        # ---- Hot-switch Translation Model (P1.7) ----
+        # ---- Không cho phép đổi Translation Model giữa phiên đang phát audio ----
         if parsed.translation_model is not None:
             requested = str(parsed.translation_model).strip().lower()
             from backend.translation.registry import TranslationModelRegistry
             canonical = TranslationModelRegistry.get_instance().resolve_key(requested)
-            if canonical != getattr(config.translation, "base", None):
+            if self.chunk_index > 0 and canonical != getattr(config.translation, "base", None):
+                logger.warning(
+                    f"Session {self.session_id[:8]}: Bỏ qua yêu cầu đổi model dịch sang '{canonical}' khi session đang phát audio (chỉ được đổi trước khi bắt đầu session).",
+                    extra={"module_tag": "WS"},
+                )
+            elif canonical != getattr(config.translation, "base", None):
                 self._schedule_translation_model_switch(requested)
                 applied["translation_model"] = canonical
             else:
                 self.config["translation_model"] = canonical
+
+
 
         # ---- Cập nhật phân câu (Sentence segmentation) ----
         if self.asr_engine:

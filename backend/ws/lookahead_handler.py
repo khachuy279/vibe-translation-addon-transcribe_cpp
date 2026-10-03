@@ -581,14 +581,22 @@ class LookaheadSessionState:
         requested_asr = parsed.asr_model or parsed.asr_engine or parsed.model_id
         if requested_asr:
             clean = str(requested_asr).strip().lower()
-            self._requested_asr_model = clean
             if self.asr_engine is not None and clean != getattr(self.asr_engine, "model_key", None):
-                self._schedule_asr_model_switch(clean)
-                applied["asr_model"] = clean
+                logger.warning(
+                    f"Lookahead: Bỏ qua yêu cầu đổi model ASR sang '{clean}' (chỉ được đổi trước khi bắt đầu session).",
+                    extra={"module_tag": "WS"},
+                )
 
         if parsed.translation_model is not None:
-            self._schedule_translation_model_switch(str(parsed.translation_model))
-            applied["translation_model"] = str(parsed.translation_model)
+            clean_tr = str(parsed.translation_model).strip().lower()
+            from backend.translation.registry import TranslationModelRegistry
+            canonical = TranslationModelRegistry.get_instance().resolve_key(clean_tr)
+            if canonical != getattr(config.translation, "base", None):
+                logger.warning(
+                    f"Lookahead: Bỏ qua yêu cầu đổi model dịch sang '{canonical}' (chỉ được đổi trước khi bắt đầu session).",
+                    extra={"module_tag": "WS"},
+                )
+
 
         if applied:
             logger.info(
