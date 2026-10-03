@@ -184,6 +184,54 @@ class RealisticForcedAligner:
         return ForcedAlignerService.group_words_to_subtitles(words, language=language, **kwargs)
 
 
+class UpstreamLikeAligner:
+    """Bắt chước ĐÚNG upstream `encode_timestamp()` để test hồi quy "không ngắt câu dài".
+
+    Upstream chỉ tách từ riêng cho `japanese` (`tokenize_japanese`) và `korean`; mọi ngôn ngữ khác
+    dùng `tokenize_space_lang`. Với văn bản tiếng Nhật (KHÔNG có khoảng trắng) mà truyền
+    `language="English"` thì cả câu thành MỘT token ⇒ một item ⇒ không thể ngắt câu — đúng sự cố
+    thật 2026-10-03: cả khối 3 câu hiện thành một phụ đề dài.
+    """
+
+    def __init__(self):
+        self.languages: List[str] = []
+
+    def prewarm(self):
+        pass
+
+    def align(self, audio: np.ndarray, text: str, language: str = "English") -> List[AlignedWord]:
+        self.languages.append(language)
+        dur = len(audio) / 16000.0
+        if str(language).strip().lower() == "japanese":
+            # Xấp xỉ `tokenize_japanese`: gom ~3 ký tự một token, dấu câu dính vào token trước.
+            tokens: List[str] = []
+            buf = ""
+            for ch in text:
+                buf += ch
+                if not ch.isalnum() or len(buf) >= 3:
+                    tokens.append(buf)
+                    buf = ""
+            if buf:
+                tokens.append(buf)
+        else:
+            tokens = [t for t in text.split() if t]
+        step = dur / max(1, len(tokens))
+        items = [
+            AlignedWord(
+                text="".join(c for c in tok if c.isalnum()),
+                start_time=round(i * step, 3),
+                end_time=round((i + 1) * step, 3),
+            )
+            for i, tok in enumerate(tokens)
+        ]
+        return ForcedAlignerService.merge_source_text(items, text)
+
+    def group_words_to_subtitles(
+        self, words: List[AlignedWord], language: str = "English", **kwargs
+    ) -> List[SubtitleSentence]:
+        return ForcedAlignerService.group_words_to_subtitles(words, language=language, **kwargs)
+
+
 class ContextAwareFakeTranslator(FakeTranslator):
     """Translator ghi nhận cả context được truyền vào."""
 
@@ -297,6 +345,62 @@ async def test_offline_batch_loop_end_to_end():
         ctx_call_1 = trans.context_calls[1]
         assert "Previous context:" in ctx_call_1
 
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_auto_source_language_splits_long_japanese_utterance():
+    """HỒI QUY 2026-10-03: `source_lang="auto"` + nội dung tiếng Nhật phải NGẮT CÂU.
+
+    Ảnh chụp thật của người dùng: cả câu dài 3 câu (ほら…？/ うわ…よ。/ ああ…きた。) hiện thành MỘT
+    phụ đề tràn 2 dòng và bản dịch cũng thành một khối dài. Nguyên nhân: với `auto`, aligner bị gọi
+    bằng `language="English"` ⇒ upstream `tokenize_space_lang` biến cả câu tiếng Nhật thành MỘT
+    token ⇒ một item ⇒ tầng gom câu không có gì để ngắt.
+    """
+    ja_text = (
+        "ほら、あれ温泉街じゃない？"
+        "うわ、なんかお土産屋とか書いてあるよ。"
+        "ああ、なんか温泉の香りしてきた。"
+    )
+    conn = MockSafeConnection()
+    aligner = UpstreamLikeAligner()
+    session = LookaheadSessionState(
+        ws=conn,
+        asr_engine=FakeInferenceEngine(text_fn=lambda n: ja_text),
+        translation_engine=FakeTranslator(),
+    )
+    session.apply_init({"source_lang": "auto", "target_lang": "vi"})
+    session.init_components(vad_engine_override=FakeVADEngine())
+    session._aligner_service = aligner
+
+    await session.start_tasks()
+    try:
+        session.timeline.append(0.0, make_speech_pcm(13.0))
+        session.timeline.append(13.0, make_silence_pcm(3.0))
+        session._ingest_event.set()
+
+        items: List[Dict[str, Any]] = []
+        for _ in range(60):
+            session._ingest_event.set()
+            items = _all_subtitle_items(conn)
+            if items:
+                break
+            await asyncio.sleep(0.05)
+
+        assert aligner.languages, "Aligner chưa được gọi"
+        assert aligner.languages[0] == "Japanese", (
+            f"`auto` phải đoán được tiếng Nhật từ văn bản ASR, nhận {aligner.languages[0]!r}"
+        )
+        texts = [it["original_text"] for it in items]
+        assert texts == [
+            "ほら、あれ温泉街じゃない？",
+            "うわ、なんかお土産屋とか書いてあるよ。",
+            "ああ、なんか温泉の香りしてきた。",
+        ], texts
+        # Mốc tăng dần và không chồng lấn.
+        for prev, nxt in zip(items, items[1:]):
+            assert float(nxt["start_pts"]) >= float(prev["end_pts"]) - 0.05, (prev, nxt)
     finally:
         await session.close()
 

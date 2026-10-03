@@ -104,6 +104,120 @@ def resolve_aligner_language(lang_code: Optional[str]) -> Optional[str]:
     return _ALIGNER_LANG_MAP.get(clean)
 
 
+def detect_aligner_language_from_text(text: str) -> Optional[str]:
+    """Đoán ngôn ngữ cho ForcedAligner từ CHÍNH văn bản ASR (dùng khi `source_lang = "auto"`).
+
+    VÌ SAO CẦN (sự cố thật 2026-10-03, "Pipeline B không ngắt câu dài" trên trang tiếng Nhật):
+    `source_lang = "auto"` ⇒ `resolve_aligner_language("auto")` trả `None` ⇒ tầng gọi rơi về
+    `"English"`. Upstream `encode_timestamp()` CHỈ tách từ riêng cho `japanese`
+    (`tokenize_japanese`) và `korean`; mọi ngôn ngữ khác dùng `tokenize_space_lang` — mà tiếng
+    Nhật/Trung **không có khoảng trắng**, nên CẢ CÂU thành **MỘT token** ⇒ aligner trả về một
+    item duy nhất ⇒ tầng gom câu không có gì để ngắt ⇒ **cả khối 3 câu hiện thành một phụ đề
+    dài**. YouTube tiếng Anh không dính lỗi này vì `tokenize_space_lang` đúng cho tiếng Anh.
+
+    Đây chỉ là phép đoán theo CHỮ VIẾT (đủ để chọn nhánh tokenize của aligner, không phải nhận
+    diện ngôn ngữ đầy đủ): có Hangul ⇒ Korean, có Kana ⇒ Japanese, chỉ có Hán tự ⇒ Chinese.
+    """
+    if not text:
+        return None
+    kana = hangul = han = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF:
+            kana += 1
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:
+            hangul += 1
+        elif 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF or 0xF900 <= cp <= 0xFAFF:
+            han += 1
+    if hangul:
+        return "Korean"
+    if kana:
+        return "Japanese"
+    if han:
+        return "Chinese"
+    return None
+
+
+#: Dấu KẾT CÂU dùng cho tầng ngắt phụ đề bằng VĂN BẢN (khớp `group_words_to_subtitles`).
+_SENTENCE_END_CHARS = "。！？!?…；;"
+#: Ký tự ĐÓNG đi liền sau dấu kết câu phải ở lại cùng câu (ngoặc/nháy Nhật–Trung–Latin).
+_SENTENCE_CLOSERS = "」』）)]}〉》\"'”’"
+#: Ngôn ngữ viết KHÔNG có khoảng trắng ⇒ đo độ dài bằng KÝ TỰ thay vì TỪ.
+_NO_SPACE_LANGS = ("japanese", "chinese", "korean", "cantonese")
+
+
+def _split_text_by_sentence(text: str) -> List[str]:
+    """Cắt văn bản thành các CÂU theo dấu kết câu (giữ dấu ở cuối mảnh, gộp ngoặc/nháy đóng)."""
+    if not text:
+        return []
+    pieces: List[str] = []
+    buf = ""
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        buf += ch
+        i += 1
+        if ch in _SENTENCE_END_CHARS:
+            while i < n and text[i] in _SENTENCE_CLOSERS:
+                buf += text[i]
+                i += 1
+            while i < n and text[i] in _SENTENCE_END_CHARS:
+                buf += text[i]
+                i += 1
+            if buf.strip():
+                pieces.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        pieces.append(buf.strip())
+    return pieces
+
+
+def _hard_split_piece(text: str, language: str, max_chars: int, max_words: int) -> List[str]:
+    """Cắt cứng một mảnh KHÔNG có dấu kết câu nào (ASR không sinh dấu câu)."""
+    if not text:
+        return []
+    if str(language or "").strip().lower() in _NO_SPACE_LANGS:
+        limit = int(max_chars or 0)
+        if limit <= 0 or len(text) <= limit:
+            return [text]
+        return [text[i:i + limit] for i in range(0, len(text), limit)]
+    limit = int(max_words or 0)
+    words = text.split()
+    if limit <= 0 or len(words) <= limit:
+        return [text]
+    return [" ".join(words[i:i + limit]) for i in range(0, len(words), limit)]
+
+
+def _allocate_spans(
+    pieces: List[str],
+    start_time: float,
+    end_time: float,
+) -> List[tuple]:
+    """Chia khoảng [start, end] cho các mảnh theo TỈ LỆ ĐỘ DÀI VĂN BẢN.
+
+    Tỉ lệ ký tự ≈ tỉ lệ thời gian nói (đủ tốt cho một lưới an toàn khi KHÔNG có mốc từ); mốc
+    cuối luôn đúng bằng `end_time` để không lệch dần.
+    """
+    weights = [max(1, len(p)) for p in pieces]
+    total = float(sum(weights)) or 1.0
+    base = float(start_time)
+    dur = float(end_time) - base
+    if dur <= 0.2 * len(pieces):
+        dur = 0.2 * len(pieces)
+    spans = []
+    t = base
+    acc = 0.0
+    for idx, (piece, w) in enumerate(zip(pieces, weights)):
+        acc += w
+        en = base + dur if idx == len(pieces) - 1 else base + dur * (acc / total)
+        if en <= t:
+            en = t + 0.2
+        spans.append((piece, t, en))
+        t = en
+    return spans
+
+
 def is_aligner_kept_char(ch: str) -> bool:
     """Ký tự mà `Qwen3ForcedAligner` GIỮ LẠI khi tokenize (xem `is_kept_char` của upstream).
 
@@ -619,6 +733,43 @@ class ForcedAlignerService:
                 )
             )
         return subtitles
+
+    @staticmethod
+    def split_oversized_sentences(
+        subtitles: List[SubtitleSentence],
+        language: str = "English",
+        max_chars: int = 0,
+        max_words: int = 0,
+    ) -> List[SubtitleSentence]:
+        """Lưới AN TOÀN: tách mọi phụ đề đang CHỨA NHIỀU CÂU thành từng câu.
+
+        VÌ SAO CẦN (sự cố thật 2026-10-03 — "Pipeline B không ngắt câu dài", trang tiếng Nhật):
+        tầng gom câu (`group_words_to_subtitles`) chỉ ngắt được theo dấu câu khi `aligned_items`
+        có NHIỀU item. Hai đường làm nó mất khả năng đó:
+          1. Aligner trả về ĐÚNG MỘT item cho cả khối (chọn sai ngôn ngữ — xem
+             `detect_aligner_language_from_text`), hoặc aligner LỖI ⇒ nhánh dự phòng lấy cả khối
+             làm một câu.
+          2. ASR không sinh dấu câu ⇒ không có ranh giới nào để ngắt.
+        Khi đó cả khối 3 câu hiện thành MỘT phụ đề dài, tràn 2 dòng và bản dịch cũng thành một
+        khối dài. Hàm này không cần mốc từ: ngắt theo dấu kết câu rồi phân bổ thời gian theo tỉ lệ
+        độ dài văn bản; mảnh nào vẫn quá dài (không có dấu câu) thì cắt cứng theo trần ký tự/từ.
+        """
+        if not subtitles:
+            return subtitles
+        out: List[SubtitleSentence] = []
+        for sub in subtitles:
+            text = (sub.text or "").strip()
+            if not text:
+                continue
+            expanded: List[str] = []
+            for piece in _split_text_by_sentence(text):
+                expanded.extend(_hard_split_piece(piece, language, max_chars, max_words))
+            if len(expanded) <= 1:
+                out.append(sub)
+                continue
+            for piece, st, en in _allocate_spans(expanded, sub.start_time, sub.end_time):
+                out.append(SubtitleSentence(text=piece, start_time=st, end_time=en))
+        return out
 
     def unload_model(self) -> None:
         """Giải phóng ForcedAligner khỏi GPU."""

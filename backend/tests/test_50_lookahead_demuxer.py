@@ -297,6 +297,123 @@ def test_stream_demuxer_uses_timestamp_offset_on_one_time_axis(webm_opus_sample)
     assert chunks[-1].pts_end <= offset + 8.5
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Neo trục theo `SourceBuffer.buffered` (browser media timeline)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_axis_anchor_follows_browser_hint_when_container_is_offset(webm_opus_sample):
+    """REGRESSION (2026-10-03, trang ngoài YouTube): PCM phải nằm trên TRỤC TRÌNH DUYỆT.
+
+    Sự cố thật: extension gửi mảnh audio 0→56,6 s (theo `SourceBuffer.buffered`) nhưng
+    backend giải mã ra PCM ở 250,0→306,8 s ⇒ `Đệm trước: 299,7 s`, `Đã dịch: 0,0 s`, video kẹt
+    ở 7,1 s. Nguyên nhân: `container_pts + timestampOffset` KHÔNG trùng trục media của trình
+    duyệt khi trang dùng `mode="sequence"`, `tfdt` tuyệt đối, hoặc đổi `timestampOffset` ngay
+    sau `appendBuffer`.
+
+    Ở đây container 0→8 s còn `media_start/media_end` (trục trình duyệt) = container + 250 s:
+    PCM phải được NEO về 250→258 s, không được giữ ở 0→8 s.
+    """
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+    shift = 250.0
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.feed(init, timestamp_offset=0.0, is_init=True, epoch=0, media_start=shift, media_end=shift)
+
+    chunks = []
+    for i in range(0, len(body), 32768):
+        start = i / float(len(body)) * 8.0 + shift      # trục trình duyệt = container + 250
+        chunks.extend(demux.feed(
+            body[i:i + 32768], timestamp_offset=0.0, epoch=0,
+            media_start=start, media_end=start + 32768 / float(len(body)) * 8.0 + 0.2,
+        ))
+
+    assert chunks, "Không giải mã được gì"
+    assert chunks[0].pts_start >= shift - 0.2, (
+        f"PCM phải nằm trên trục trình duyệt (~{shift}s) nhưng ở {chunks[0].pts_start:.2f}s"
+    )
+    assert chunks[-1].pts_end <= shift + 8.5
+    assert demux._browser_axis_bias is not None
+    assert abs(demux._browser_axis_bias - shift) < 0.75, (
+        f"Bias học được phải ≈ {shift}s, nhận {demux._browser_axis_bias}"
+    )
+
+
+def test_axis_anchor_keeps_container_axis_when_hints_match(webm_opus_sample):
+    """Trang "chuẩn" (YouTube): hint trùng trục container ⇒ KHÔNG dịch PCM, chỉ khoá trục."""
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.feed(init, timestamp_offset=0.0, is_init=True, epoch=0)
+
+    chunks = []
+    n = len(body)
+    for i in range(0, n, 32768):
+        end = (i + 32768) / float(n) * 8.0
+        chunks.extend(demux.feed(
+            body[i:i + 32768], timestamp_offset=0.0, epoch=0,
+            media_start=i / float(n) * 8.0, media_end=end,
+        ))
+
+    assert chunks
+    assert abs(chunks[0].pts_start) < 0.6, f"PCM bị dịch oan: {chunks[0].pts_start:.2f}s"
+    assert demux._browser_axis_bias == 0.0
+
+
+def test_axis_anchor_does_not_double_apply_timestamp_offset(webm_opus_sample):
+    """Hint khớp `timestampOffset` ⇒ neo KHÔNG được cộng offset lần thứ hai."""
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+    offset = 3600.0
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.feed(init, timestamp_offset=offset, is_init=True, epoch=0)
+
+    chunks = []
+    n = len(body)
+    for i in range(0, n, 32768):
+        end = (i + 32768) / float(n) * 8.0
+        chunks.extend(demux.feed(
+            body[i:i + 32768], timestamp_offset=offset, epoch=0,
+            media_start=offset + i / float(n) * 8.0, media_end=offset + end,
+        ))
+
+    assert chunks
+    assert chunks[0].pts_start >= offset - 0.6
+    assert chunks[-1].pts_end <= offset + 8.5
+    assert abs(demux._browser_axis_bias - offset) < 0.75
+
+
+def test_axis_anchor_defers_small_shift_until_confirmed(webm_opus_sample):
+    """Lệch nhỏ (≤ 5 s) chỉ sửa sau khi có quan sát thứ hai khớp — tránh mảnh hỏng mép cuối."""
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+    shift = 3.0
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.feed(init, timestamp_offset=0.0, is_init=True, epoch=0)
+
+    first = demux.feed(
+        body[:32768], timestamp_offset=0.0, epoch=0,
+        media_start=shift, media_end=shift + 32768 / float(len(body)) * 8.0,
+    )
+    assert first, "Lượt đầu vẫn phải trả PCM (chỉ chưa neo trục)"
+    assert first[0].pts_start < shift - 1.0, "Lượt đầu KHÔNG được sửa trục"
+    assert demux._axis_shift_obs is not None
+
+    demux.feed(
+        body[32768:65536], timestamp_offset=0.0, epoch=0,
+        media_start=shift + 32768 / float(len(body)) * 8.0,
+        media_end=shift + 65536 / float(len(body)) * 8.0,
+    )
+    assert demux._browser_axis_bias is not None, "Quan sát thứ hai khớp ⇒ phải neo trục"
+
+
 def test_adts_frame_parser_roundtrip():
     """Bộ tách frame ADTS phải đọc lại ĐÚNG các frame đã đóng gói (nền của đường dự phòng)."""
     from backend.core.stream_demuxer import _iter_adts_frames

@@ -279,9 +279,7 @@ class LookaheadClient {
       const cur = this.videoElement ? Number(this.videoElement.currentTime) : 0;
       const kept = [];
       for (const item of this._pendingChunks) {
-        const pts = item.payload ? item.payload.videoPts : undefined;
-        const inCacheWindow = typeof pts === "number" && Number.isFinite(pts)
-          && pts >= cur - 8 && pts <= cur + 45;
+        const inCacheWindow = payloadInReplayWindow(item.payload, cur - 8, cur + 45);
         if (!inCacheWindow) kept.push(item);
       }
       const skipped = this._pendingChunks.length - kept.length;
@@ -501,6 +499,17 @@ class LookaheadClient {
       is_init: !!meta?.isInit,
     };
     if (typeof meta?.epoch === "number") hdrObj.epoch = meta.epoch;
+    //: Khoảng media THẬT trong `SourceBuffer.buffered` mà mảnh này chiếm (trục thời gian của
+    //: TRÌNH DUYỆT). Backend dùng nó để NEO PCM đã giải mã về đúng trục của trình duyệt: với
+    //: trang dùng `SourceBuffer.mode = "sequence"`, `tfdt` tuyệt đối, hoặc đổi `timestampOffset`
+    //: ngay sau `appendBuffer`, mốc container KHÔNG khớp `video.currentTime` (đo thật
+    //: 2026-10-03: PCM lệch +250s ⇒ Đã dịch 0,0s dù cache có audio).
+    const mediaStart = Number(meta?.mediaStart);
+    const mediaEnd = Number(meta?.mediaEnd);
+    if (Number.isFinite(mediaStart) && Number.isFinite(mediaEnd) && mediaEnd > mediaStart) {
+      hdrObj.media_start = mediaStart;
+      hdrObj.media_end = mediaEnd;
+    }
     //: Mảnh TẢI LẠI cho vùng đã buffer sẵn: byte có thể trùng mảnh cũ nên backend phải MIỄN
     //: dedup, nếu không nó bị bỏ và vùng đã tải trước không bao giờ có phụ đề.
     if (meta?.refetched) hdrObj.refetched = true;
@@ -601,6 +610,27 @@ function jsonParseSafe(str) {
   }
 }
 
+/**
+ * Mảnh audio có nằm trong cửa sổ replay [from, to] không?
+ *
+ * Ưu tiên MỐC MEDIA THẬT (`mediaStart`/`mediaEnd` — interceptor lấy từ `SourceBuffer.buffered`).
+ * `videoPts` chỉ là vị trí phát TẠI LÚC append, không nói lên nội dung mảnh: trình phát tải
+ * trước nên mảnh append lúc đang phát 5 s thường chứa media ở 30–60 s (xem
+ * `content/buffer_interceptor_poc.js`). Chưa biết mốc ⇒ trả `false` (KHÔNG coi là "sẽ được
+ * replay") để mảnh vẫn được gửi — thà gửi thừa còn hơn mất audio.
+ */
+function payloadInReplayWindow(payload, from, to) {
+  if (!payload) return false;
+  const start = Number(payload.mediaStart);
+  const end = Number(payload.mediaEnd);
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+    return end > from && start < to;
+  }
+  const pts = Number(payload.videoPts);
+  if (Number.isFinite(pts)) return pts >= from && pts <= to;
+  return false;
+}
+
 /** Giải mã base64 (audio WAV của TTS) thành ArrayBuffer. */
 function base64ToArrayBuffer(b64) {
   try {
@@ -617,5 +647,5 @@ function base64ToArrayBuffer(b64) {
 
 // Xuất module cho Extension
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { LookaheadClient };
+  module.exports = { LookaheadClient, payloadInReplayWindow };
 }

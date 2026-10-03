@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import bisect
 import io
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -49,6 +50,13 @@ DEFAULT_MAX_MEDIA_BYTES = 8 * 1024 * 1024
 DEFAULT_KEEP_BOUNDARIES = 60
 #: Lùi lại bao nhiêu giây trước mốc cuối khi seek (bù preroll của codec).
 _SEEK_BACKOFF_SEC = 0.5
+#: Neo trục PCM theo `SourceBuffer.buffered` (xem `_anchor_to_browser_axis`):
+#:   * ≤ MIN: coi là mép frame, KHÔNG sửa (chỉ khoá trục).
+#:   * > STRONG: lệch trục thật, sửa NGAY (không chờ xác nhận).
+#:   * ở giữa: chờ quan sát thứ hai khớp trong CONFIRM giây (tránh mảnh hỏng ở mép cuối).
+_AXIS_ANCHOR_MIN_SEC = 0.5
+_AXIS_ANCHOR_CONFIRM_SEC = 0.6
+_AXIS_ANCHOR_STRONG_SEC = 5.0
 
 
 @dataclass
@@ -342,6 +350,14 @@ class StreamDemuxer:
         self._min_pts: Optional[float] = None
         self._last_pts: float = float("-inf")
         self._latest_ts_offset: float = 0.0
+        #: `timestampOffset` suy ra từ `SourceBuffer.buffered` (extension gửi kèm) — xem
+        #: `_anchor_to_browser_axis`. Khi đã có, nó THAY THẾ `_latest_ts_offset` làm trục giải mã
+        #: vì đây mới là trục thật của trình duyệt.
+        self._browser_axis_bias: Optional[float] = None
+        #: Quan sát lệch trục gần nhất (chờ xác nhận lần 2 trước khi sửa) — xem
+        #: `_anchor_to_browser_axis`.
+        self._axis_shift_obs: Optional[float] = None
+        self._axis_shift_logged: bool = False
         self._lock = threading.RLock()
 
         # Thống kê
@@ -386,6 +402,16 @@ class StreamDemuxer:
     def last_pts(self) -> float:
         return self._last_pts
 
+    def _axis_offset(self) -> float:
+        """Bias đang dùng để đưa PTS container về trục thời gian của TRÌNH DUYỆT.
+
+        Ưu tiên bias HỌC ĐƯỢC từ `SourceBuffer.buffered` (`_anchor_to_browser_axis`); chỉ khi
+        chưa học được mới dùng `timestampOffset` do extension báo.
+        """
+        if self._browser_axis_bias is not None:
+            return float(self._browser_axis_bias)
+        return float(self._latest_ts_offset)
+
     def reset(self, epoch: Optional[int] = None, min_pts: Optional[float] = None) -> None:
         """Xoá sạch trạng thái (tua video / đổi SourceBuffer / init segment mới)."""
         with self._lock:
@@ -394,6 +420,11 @@ class StreamDemuxer:
                 self._min_pts = float(min_pts)
             self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
             self._latest_ts_offset = 0.0
+            if epoch is not None and int(epoch) != self._epoch:
+                # SourceBuffer MỚI ⇒ luồng mới ⇒ mọi neo trục cũ không còn giá trị.
+                self._browser_axis_bias = None
+                self._axis_shift_obs = None
+                self._axis_shift_logged = False
             if epoch is not None:
                 self._epoch = int(epoch)
             else:
@@ -430,6 +461,8 @@ class StreamDemuxer:
         mime_type: str = "auto",
         is_init: bool = False,
         epoch: Optional[int] = None,
+        media_start: Optional[float] = None,
+        media_end: Optional[float] = None,
     ) -> List[StreamAudioChunk]:
         """Nạp một mảnh MSE và trả về các đoạn PCM MỚI đã giải mã được.
 
@@ -439,6 +472,9 @@ class StreamDemuxer:
             mime_type: gợi ý định dạng (chỉ dùng cho log).
             is_init: client khẳng định đây là init segment.
             epoch: số thứ tự SourceBuffer; đổi epoch ⇒ reset bộ đệm ghép nối.
+            media_start/media_end: khoảng THẬT (giây, trục thời gian của trình duyệt) mà mảnh
+                này chiếm trong `SourceBuffer.buffered`. Dùng để NEO lại PCM khi mốc container
+                không khớp `video.currentTime` — xem `_anchor_to_browser_axis`.
         """
         if not raw_bytes:
             return []
@@ -448,6 +484,9 @@ class StreamDemuxer:
                 self._media.clear()
                 self._epoch = int(epoch)
                 self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
+                self._browser_axis_bias = None
+                self._axis_shift_obs = None
+                self._axis_shift_logged = False
                 logger.info(
                     f"StreamDemuxer: SourceBuffer epoch mới = {self._epoch} (min_pts={self._min_pts}) — xoá bộ đệm ghép nối",
                     extra={"module_tag": "WS"},
@@ -470,7 +509,11 @@ class StreamDemuxer:
             # Định dạng TỰ CHỨA (WAV/MP3/…): không ghép vào bộ đệm byte — mỗi mảnh là một
             # file hoàn chỉnh, ghép lại sẽ hỏng header. Giải mã độc lập.
             if container == "unknown" and not self._media and not self._init:
-                return self._decode_standalone(raw_bytes, self._latest_ts_offset)
+                return self._anchor_to_browser_axis(
+                    self._decode_standalone(raw_bytes, self._axis_offset()),
+                    media_start,
+                    media_end,
+                )
 
             treat_as_init = bool(is_init) or looks_like_init_segment(raw_bytes)
             if treat_as_init and self._init != raw_bytes:
@@ -496,7 +539,87 @@ class StreamDemuxer:
             if not self._init and not self._media:
                 return []
 
-            return self._decode_new()
+            chunks = self._decode_new()
+            if (
+                not chunks
+                and media_end is not None
+                and self._browser_axis_bias is not None
+            ):
+                # Có byte mới mà KHÔNG ra PCM nào: neo trục đã học không còn đúng (đổi
+                # base/period của luồng). Bỏ neo và giải mã lại một lần — nếu không, frontier
+                # lọc sạch mọi frame và pipeline đứng vĩnh viễn.
+                self._browser_axis_bias = None
+                self._axis_shift_obs = None
+                self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
+                chunks = self._decode_new()
+            return self._anchor_to_browser_axis(chunks, media_start, media_end)
+
+    def _anchor_to_browser_axis(
+        self,
+        chunks: List[StreamAudioChunk],
+        media_start: Optional[float],
+        media_end: Optional[float],
+    ) -> List[StreamAudioChunk]:
+        """Neo PCM vào TRỤC THỜI GIAN CỦA TRÌNH DUYỆT (`SourceBuffer.buffered`).
+
+        Vì sao cần: `container_pts + timestampOffset` chỉ trùng trục media của trình duyệt khi
+        trang dùng `SourceBuffer.mode = "segments"` VÀ báo đúng `timestampOffset`. Rất nhiều
+        trang khác:
+          * chèn segment có `tfdt`/timecode TUYỆT ĐỐI (mốc chương trình) trong khi timeline
+            trình duyệt bắt đầu từ 0 (chế độ `"sequence"`, hoặc `timestampOffset` âm),
+          * hoặc đổi `timestampOffset` NGAY SAU `appendBuffer` (extension đọc được giá trị cũ).
+        Khi đó PCM rơi lệch ĐÚNG BẰNG offset đó. Đo thật 2026-10-03 (trang ngoài YouTube):
+        PCM giải mã ra ở 250,0→306,8 s trong khi playhead ở 7,1 s ⇒ `Đệm trước: 299,7 s`,
+        `Đã dịch: 0,0 s`, video kẹt ở mốc cũ dù cache interceptor đã có đủ audio 0→56,6 s.
+
+        Cách làm: extension gửi kèm `media_start`/`media_end` = khoảng THẬT trong `buffered`
+        sau khi append. Hiệu `media_end − pts_end(PCM cuối)` là một HẰNG SỐ cho cả một
+        SourceBuffer (một epoch) nên chỉ cần học một lần; nếu luồng đổi base giữa chừng thì
+        hiệu số đó lại xuất hiện và được học lại. Lệch nhỏ (≤ 0,5 s) coi là mép frame.
+        """
+        if media_end is None or not chunks:
+            return chunks
+        try:
+            observed = float(media_end) - float(chunks[-1].pts_end)
+        except (TypeError, ValueError):
+            return chunks
+        if not math.isfinite(observed):
+            return chunks
+
+        if abs(observed) <= _AXIS_ANCHOR_MIN_SEC:
+            if self._browser_axis_bias is None:
+                # Trục container đã đúng ⇒ khoá lại để các fragment sau không đổi trục.
+                self._browser_axis_bias = self._latest_ts_offset
+                logger.info(
+                    f"Trục PCM khớp trục media của trình duyệt (lệch {observed:+.2f}s) — khoá trục.",
+                    extra={"module_tag": "WS"},
+                )
+            self._axis_shift_obs = None
+            return chunks
+
+        previous = self._axis_shift_obs
+        confirmed = previous is not None and abs(observed - previous) <= _AXIS_ANCHOR_CONFIRM_SEC
+        # Lệch LỚN (> _AXIS_ANCHOR_STRONG_SEC) là lỗi trục thật, sửa ngay; lệch vừa phải chờ
+        # xác nhận lần 2 để không sửa oan vì một mảnh hỏng ở mép cuối.
+        if not confirmed and abs(observed) <= _AXIS_ANCHOR_STRONG_SEC:
+            self._axis_shift_obs = observed
+            return chunks
+
+        used = self._axis_offset()
+        self._browser_axis_bias = used + observed
+        for chunk in chunks:
+            chunk.pts_start += observed
+            chunk.pts_end += observed
+        self._last_pts += observed
+        self._axis_shift_obs = None
+        logger.warning(
+            f"LỆCH TRỤC THỜI GIAN: PCM giải mã lệch {observed:+.2f}s so với timeline trình duyệt "
+            f"— đã neo lại theo `SourceBuffer.buffered` (trục mới = container + "
+            f"{self._browser_axis_bias:+.2f}s).",
+            extra={"module_tag": "WS"},
+        )
+        self._axis_shift_logged = True
+        return chunks
 
     # ------------------------------------------------------------------ nội bộ
     def _trim(self) -> None:
@@ -633,7 +756,7 @@ class StreamDemuxer:
             #: (đúng đặc tả MSE). `container_pts` MỘT MÌNH chỉ đúng khi `timestampOffset = 0`
             #: (YouTube); với SourceBuffer có offset, trộn hai trục sẽ tạo khoảng lệch đúng
             #: bằng offset ⇒ mọi frame mới bị coi là cũ và bị bỏ.
-            bias = float(self._latest_ts_offset)
+            bias = self._axis_offset()
             frontier = self._last_pts
 
             if frontier > float("-inf"):
@@ -875,7 +998,7 @@ class StreamDemuxer:
         except Exception:  # noqa: BLE001
             sr = 0
         scale = 1.0 / float(sr) if sr > 0 else 1.0
-        return max(d for d, _t in times) * scale + self._latest_ts_offset
+        return max(d for d, _t in times) * scale + self._axis_offset()
 
     def _decode_fragments_individually(self) -> List[StreamAudioChunk]:
         """Giải mã RIÊNG từng cặp `moof`+`mdat` (ghép với init), bỏ qua fragment hỏng.
@@ -932,7 +1055,7 @@ class StreamDemuxer:
                 for frame in container.decode(stream):
                     if frame.pts is None:
                         continue
-                    pts = float(frame.pts) * tb + self._latest_ts_offset
+                    pts = float(frame.pts) * tb + self._axis_offset()
                     if pts < frontier - 1e-6:
                         continue
                     if first_pts is None:
@@ -1013,7 +1136,7 @@ class StreamDemuxer:
                 mdat_size = int.from_bytes(buf[mdat_off:mdat_off + 4], "big")
                 if mdat_size < 8:
                     continue
-                decode_time = info[0] * scale + self._latest_ts_offset if info is not None else 0.0
+                decode_time = info[0] * scale + self._axis_offset() if info is not None else 0.0
                 out_fast.append((off, mdat_off + mdat_size, decode_time))
             if out_fast:
                 return out_fast
@@ -1038,7 +1161,7 @@ class StreamDemuxer:
             mdat_size = int.from_bytes(buf[mdat_off:mdat_off + 4], "big")
             if mdat_size < 8:
                 continue
-            decode_time = info[0] * scale + self._latest_ts_offset if info is not None else 0.0
+            decode_time = info[0] * scale + self._axis_offset() if info is not None else 0.0
             out.append((off, mdat_off + mdat_size, decode_time))
         return out
 
@@ -1070,7 +1193,7 @@ class StreamDemuxer:
         # quét `moof`). Lệch độ dài ⇒ không suy ra được offset, để bên gọi dùng đường đầy đủ.
         if not offsets or len(offsets) != len(times):
             return None
-        target = target_sec if scale <= 0 else (target_sec - self._latest_ts_offset) / scale
+        target = target_sec if scale <= 0 else (target_sec - self._axis_offset()) / scale
         idx = bisect.bisect_left([d for d, _t in times], target)
         if idx <= 0:
             return offsets[0]
@@ -1174,7 +1297,7 @@ class StreamDemuxer:
         if pcm.size <= 0:
             return []
         # Mốc neo: `tfdt` tính theo timescale của track (thường = sample_rate của AAC).
-        anchor = float(self._latest_ts_offset)
+        anchor = float(self._axis_offset())
         if self._first_audio_tfdt is not None and codec.sample_rate:
             anchor += float(self._first_audio_tfdt) / float(codec.sample_rate)
         return [StreamAudioChunk(
@@ -1281,7 +1404,7 @@ class StreamDemuxer:
             if span > 0.5:
                 parts.append(f"duration/span={sum_dur / span:.2f}x (≈1.0 là bình thường)")
             if first_pts is not None and self._last_pts > float("-inf"):
-                parts.append(f"chưa_giải_mã_tới={(last_pts or 0.0) + self._latest_ts_offset:.2f}s")
+                parts.append(f"chưa_giải_mã_tới={(last_pts or 0.0) + self._axis_offset():.2f}s")
             if self._container == "mp4":
                 parts.append(self._mp4_fragment_chain_report(stream.codec_context.sample_rate))
             return ", ".join(parts)

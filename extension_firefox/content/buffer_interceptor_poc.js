@@ -13,10 +13,18 @@
 (function () {
   'use strict';
 
-  // Cho phép chạy lại script khi paste mới vào Console
-  if (window.__VIBE_LOOKAHEAD_INTERVAL__) {
-    clearInterval(window.__VIBE_LOOKAHEAD_INTERVAL__);
+  // ── CHỐNG TIÊM LẶP (bắt buộc) ───────────────────────────────────────────────
+  // Cùng một file được tiêm từ HAI đường (content script tạo `<script src>`, và background
+  // `scripting.executeScript({allFrames: true, world: "MAIN"})`) nên MỘT frame có thể chạy
+  // script này nhiều lần. Bản 1.3 chỉ `clearInterval` rồi chạy lại ⇒ mỗi lần tiêm thêm một
+  // listener `message`, trong khi các hook (chỉ gắn được MỘT lần) vẫn trỏ vào `state` của lần
+  // tiêm ĐẦU ⇒ vòng lặp định kỳ của state đó bị giết (mốc buffer đóng băng, không còn phát
+  // hiện đổi video) và mỗi bản tin RESET bị log N lần (đo thật 2026-10-03: 20 dòng cho 1 Stop).
+  if (window.__VIBE_LOOKAHEAD_INTERCEPTOR__) {
+    console.log('%c[Lookahead] ♻️ Interceptor đã hoạt động — bỏ qua lần tiêm lặp.', 'color: #94a3b8;');
+    return;
   }
+  window.__VIBE_LOOKAHEAD_INTERCEPTOR__ = true;
 
   console.log('%c[Lookahead] 🚀 Multi-Layer Interceptor đang hoạt động.', 'color: #00ffcc; font-weight: bold; font-size: 13px;');
 
@@ -68,24 +76,119 @@
     mediaRanges: [],
     refetchedRanges: new Set(),
     refetchMaxBytes: 6 * 1024 * 1024,
-    //: Ước lượng byte/giây của luồng audio (từ lần tải lại thành công) — dùng để quy đổi
-    //: "cần audio quanh giây X" thành "khoảng byte nào". Mặc định ~27 KB/s (Opus 128–160k).
-    bytesPerSecHint: 0
+    //: Byte/giây THẬT của luồng audio, HỌC từ chính các mảnh đã append (số byte append ÷ số
+    //: giây media mà `SourceBuffer.buffered` tăng thêm). Trường này trước đây KHÔNG BAO GIỜ
+    //: được gán ⇒ việc tải lại luôn dùng hằng số 27 KB/s, sai với AAC 128k (~16 KB/s) nên
+    //: vùng tải lại bị lệch về tương lai. Chỉ chốt lại khi đã tích luỹ ≥ 5 s mẫu.
+    bytesPerSecHint: 0,
+    bytesSampleBytes: 0,
+    bytesSampleSec: 0
   };
+
+  //: Có tự ÉP TRÌNH PHÁT tải lại (xoá một khoảng khỏi SourceBuffer audio để nó phải fetch và
+  //: append lại) khi cache không phủ nổi vị trí phát và không có URL nào để tự tải lại không?
+  //: Mặc định TẮT: thao tác này làm trình phát khựng/rebuffer. Bật sau khi đã thử tay bằng
+  //: `window.__VIBE_LOOKAHEAD_DEBUG__.nudgeRefetch(12)` trong Console của trang.
+  const AUTO_NUDGE_ON_STARVATION = false;
+
+  // ── MỐC MEDIA THẬT CỦA TỪNG MẢNH ─────────────────────────────────────────────
+  // `video.currentTime` tại thời điểm append KHÔNG phải mốc của dữ liệu vừa append: trình phát
+  // luôn TẢI TRƯỚC, nên một mảnh append lúc đang phát 5s thường chứa media ở 30–60s. Bản 1.3
+  // dùng chính `videoPts` làm khoá chọn mảnh replay nên chọn SAI: phiên mới mở GIỮA video nhận
+  // được toàn audio ở TƯƠNG LAI (đo thật 2026-10-03: phiên 2 neo @38,46s, backend giải mã ra
+  // PCM kết thúc 110s mà RAM chỉ 20s ⇒ LỖ HỔNG ngay tại playhead, "Đã dịch: 0.0s", video kẹt
+  // ở 38,5s trong vòng lặp pause/resume). Nguồn sự thật duy nhất cho mốc media là
+  // `SourceBuffer.buffered`: hiệu số trước/sau khi append cho đúng khoảng [start, end] vừa thêm.
+  function snapshotBuffered(sourceBuffer) {
+    const out = [];
+    try {
+      const ranges = sourceBuffer.buffered;
+      if (!ranges) return out;
+      for (let i = 0; i < ranges.length; i++) out.push([ranges.start(i), ranges.end(i)]);
+    } catch (e) {}
+    return out;
+  }
+
+  /** Các khoảng có trong `after` mà KHÔNG có trong `before` (đã trừ giao từng khoảng). */
+  function subtractRanges(after, before) {
+    let segs = after.map((r) => [r[0], r[1]]);
+    for (const b of before) {
+      const next = [];
+      for (const s of segs) {
+        if (b[1] <= s[0] || b[0] >= s[1]) { next.push(s); continue; }
+        if (b[0] > s[0]) next.push([s[0], Math.min(b[0], s[1])]);
+        if (b[1] < s[1]) next.push([Math.max(b[1], s[0]), s[1]]);
+      }
+      segs = next;
+      if (!segs.length) break;
+    }
+    return segs.filter((s) => s[1] - s[0] > 0.001);
+  }
+
+  /** Khoảng media mà mảnh vừa append thêm vào buffer (null nếu không xác định được). */
+  function addedMediaRange(before, after) {
+    const segs = subtractRanges(after, before);
+    if (!segs.length) return null;
+    // Mảnh media thường liền một khúc; nếu vì lý do nào đó có nhiều khúc thì lấy khúc dài nhất.
+    segs.sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]));
+    return { start: segs[0][0], end: segs[0][1] };
+  }
+
+  /** [start, end] media của một packet đã bắt — null nếu chưa biết mốc. */
+  function packetMediaRange(pkt) {
+    const p = pkt && pkt.payload ? pkt.payload : null;
+    if (!p) return null;
+    const start = Number(p.mediaStart);
+    const end = Number(p.mediaEnd);
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start) return [start, end];
+    return null;
+  }
+
+  /**
+   * Mảnh có liên quan tới cửa sổ [from, to] không?
+   * - Biết mốc media ⇒ xét GIAO NHAU với cửa sổ (nguồn sự thật).
+   * - Chưa biết ⇒ lùi về `videoPts` (hành vi cũ), cuối cùng là gửi (không để mất dữ liệu).
+   */
+  function packetInWindow(pkt, from, to) {
+    const media = packetMediaRange(pkt);
+    if (media) return media[1] > from && media[0] < to;
+    const pts = Number(pkt && pkt.payload ? pkt.payload.videoPts : NaN);
+    if (Number.isFinite(pts)) return pts >= from && pts <= to;
+    return true;
+  }
+
+  /** Khoảng media mà TRÌNH PHÁT đang giữ quanh vị trí phát (theo `video.buffered`). */
+  function playerBufferedSpan() {
+    const video = getActiveVideo();
+    if (!video || !video.buffered || !video.buffered.length) return null;
+    const cur = Number(video.currentTime) || 0;
+    for (let i = 0; i < video.buffered.length; i++) {
+      if (cur >= video.buffered.start(i) - 0.5 && cur <= video.buffered.end(i) + 0.5) {
+        return [video.buffered.start(i), video.buffered.end(i)];
+      }
+    }
+    const last = video.buffered.length - 1;
+    return [video.buffered.start(last), video.buffered.end(last)];
+  }
 
   /**
    * Giữ cache bám theo VỊ TRÍ PHÁT: bỏ mảnh cũ hơn `cacheBehindSec` và mảnh xa hơn
    * `cacheAheadSec`, đồng thời chặn trần byte. Nhờ vậy cache luôn chứa audio quanh playhead
    * kể cả khi trang tải trước hàng trăm giây (đo thật 2026-10-01).
+   *
+   * Mảnh NẰM TRONG vùng đệm của trình phát luôn được giữ, kể cả khi mốc `videoPts` dùng làm
+   * tâm cửa sổ bị sai (trang có nhiều thẻ `<video>`, `getActiveVideo()` có thể trả về thẻ khác
+   * với `currentTime` ở tận đâu — đo thật 2026-10-03).
    */
   function pruneCacheAroundPlayhead(playhead) {
     if (!Number.isFinite(playhead) || playhead <= 0) return;
     const from = playhead - state.cacheBehindSec;
     const to = playhead + state.cacheAheadSec;
+    const span = playerBufferedSpan();
     state.cachedAudioChunks = state.cachedAudioChunks.filter((pkt) => {
-      const pts = pkt.payload ? pkt.payload.videoPts : undefined;
-      if (typeof pts !== 'number' || !Number.isFinite(pts)) return true;
-      return pts >= from && pts <= to;
+      const media = packetMediaRange(pkt);
+      if (media && span && media[1] > span[0] && media[0] < span[1]) return true;
+      return packetInWindow(pkt, from, to);
     });
     let bytes = 0;
     for (const pkt of state.cachedAudioChunks) {
@@ -132,6 +235,10 @@
       chunkCount: state.chunkCount + state.networkAudioChunks,
       aheadSeconds: Number(state.lastAheadSeconds.toFixed(2)),
       cachedChunksCount: state.cachedAudioChunks.length,
+      //: Số mảnh có MỐC MEDIA THẬT (lấy từ `SourceBuffer.buffered`) — chỉ những mảnh này mới
+      //: được chọn chính xác khi replay. 0 = interceptor chưa đọc được `buffered`.
+      mediaTaggedChunks: state.cachedAudioChunks.filter((pkt) => !!packetMediaRange(pkt)).length,
+      bytesPerSecHint: Number(state.bytesPerSecHint.toFixed(1)),
       hasInitSegment: !!state.initSegmentPacket,
       epoch: state.bufferEpoch,
       mimeType: state.lastMimeType,
@@ -162,15 +269,12 @@
       const playhead = Number.isFinite(curTime) && curTime > 0
         ? curTime
         : (video ? video.currentTime : 0);
-      // Chỉ replay mảnh LIÊN QUAN tới vị trí phát hiện tại. Mảnh chưa biết mốc (append
-      // trước khi đọc được video) được gửi như cũ để không mất dữ liệu.
+      // Chỉ replay mảnh LIÊN QUAN tới vị trí phát hiện tại — theo MỐC MEDIA THẬT (xem
+      // `packetInWindow`). Mảnh chưa biết mốc (append trước khi đọc được video) được gửi như
+      // cũ để không mất dữ liệu.
       const from = playhead - state.replayBehindSec;
       const to = playhead + state.replayAheadSec;
-      const selected = state.cachedAudioChunks.filter((pkt) => {
-        const pts = pkt.payload ? pkt.payload.videoPts : undefined;
-        if (typeof pts !== 'number' || !Number.isFinite(pts)) return true;
-        return pts >= from && pts <= to;
-      });
+      const selected = state.cachedAudioChunks.filter((pkt) => packetInWindow(pkt, from, to));
       const skipped = state.cachedAudioChunks.length - selected.length;
       // Dedup nội bộ: cache có thể chứa nhiều mảnh giống hệt nhau (trang append lại cùng
       // đoạn, hoặc init segment bị coi là media).
@@ -186,11 +290,26 @@
         unique.push(pkt);
       }
       const dupInCache = selected.length - unique.length;
+      // Độ phủ THẬT của tập mảnh sắp gửi: backend cần audio NGAY TẠI playhead, không phải audio
+      // ở tương lai (đó chính là lỗi phiên 2 mở giữa video).
+      let covStart = Infinity;
+      let covEnd = -Infinity;
+      let covAtPlayhead = false;
+      for (const pkt of unique) {
+        const media = packetMediaRange(pkt);
+        if (!media) continue;
+        covStart = Math.min(covStart, media[0]);
+        covEnd = Math.max(covEnd, media[1]);
+        if (media[0] <= playhead + 1 && media[1] >= playhead) covAtPlayhead = true;
+      }
       if (unique.length > 0) {
+        const spanTxt = Number.isFinite(covStart)
+          ? `phủ ${covStart.toFixed(1)}s→${covEnd.toFixed(1)}s, ${covAtPlayhead ? 'CÓ' : 'KHÔNG'} audio tại playhead`
+          : 'mảnh chưa rõ mốc media';
         console.log(
           `%c[Lookahead] 📦 Replay ${unique.length} mảnh audio quanh vị trí phát ` +
-          `(${playhead.toFixed(1)}s; bỏ ${skipped} mảnh ngoài cửa sổ, ${dupInCache} mảnh trùng).`,
-          'color: #a78bfa;');
+          `(${playhead.toFixed(1)}s; ${spanTxt}; bỏ ${skipped} mảnh ngoài cửa sổ, ${dupInCache} mảnh trùng).`,
+          covAtPlayhead ? 'color: #a78bfa;' : 'color: #fbbf24;');
         for (const pkt of unique) {
           window.postMessage(pkt, '*');
         }
@@ -200,16 +319,19 @@
           `vị trí phát ${playhead.toFixed(1)}s — chờ mảnh mới (tránh dịch trước phần quá xa).`);
       }
       // ── VÙNG ĐÃ BUFFER SẴN ──────────────────────────────────────────────────
-      // Nếu token là yêu cầu replay từ backend (hoặc cache không có gì quanh vị trí phát) thì
-      // TẢI LẠI phân đoạn media cho vùng đó — YouTube không append lại nên đây là cách duy
-      // nhất để có audio cho đoạn đã tải trước (đo thật: tua tới 80,5 s mà không có phụ đề).
-      const cacheHasNearby = state.cachedAudioChunks.some((pkt) => {
-        const pts = pkt.payload ? pkt.payload.videoPts : undefined;
-        return typeof pts === 'number' && pts >= playhead - state.replayBehindSec
-          && pts <= playhead + state.replayAheadSec;
+      // Tải lại phân đoạn media khi cache KHÔNG PHỦ vị trí phát. Bản 1.3 chỉ kiểm tra "có mảnh
+      // nào gần đó không" theo `videoPts` — sai cả hai đầu: vừa bỏ sót trường hợp mảnh có nhưng
+      // ở tương lai (lỗi phiên 2), vừa tải lại vô ích. Nay xét ĐÚNG độ phủ mốc media.
+      const covered = state.cachedAudioChunks.some((pkt) => {
+        const media = packetMediaRange(pkt);
+        return media ? (media[0] <= playhead + 1 && media[1] >= playhead) : false;
       });
-      if (!cacheHasNearby && state.mediaRanges.length > 0) {
-        void refetchForPlayhead(playhead, state.bytesPerSecHint);
+      if (!covered) {
+        if (state.mediaRanges.length > 0) {
+          void refetchForPlayhead(playhead, state.bytesPerSecHint);
+        } else if (AUTO_NUDGE_ON_STARVATION) {
+          nudgePlayerRefetch(state.replayAheadSec);
+        }
       }
     } else if (event.data.source === 'VIBE_LOOKAHEAD_CLIENT' && event.data.type === 'RESET_REPLAY_TOKEN') {
       state.lastReplayToken = null;
@@ -295,8 +417,8 @@
           if (rawBytes) {
             const isInit = isInitSegment(rawBytes);
             const video = getActiveVideo();
-            //: Mốc video tại thời điểm append — quyết định mảnh này có còn liên quan tới vị
-            //: trí phát hay không khi replay (xem `state.replayAheadSec`).
+            //: Mốc video tại thời điểm append — CHỈ còn dùng làm tâm cửa sổ prune và làm dự
+            //: phòng khi không đọc được `buffered`; mốc để CHỌN mảnh là `mediaStart/mediaEnd`.
             const videoPts = video ? Number(video.currentTime) : undefined;
             const chunkPacket = {
               source: 'VIBE_LOOKAHEAD_POC',
@@ -314,13 +436,67 @@
             if (isInit) {
               // Init segment: giữ RIÊNG, KHÔNG bao giờ bị đẩy khỏi cache.
               state.initSegmentPacket = chunkPacket;
+              window.postMessage(chunkPacket, '*');
             } else {
-              // Cache bám theo vị trí phát (không phải "120 mảnh gần nhất").
-              state.cachedAudioChunks.push(chunkPacket);
-              pruneCacheAroundPlayhead(typeof videoPts === 'number' ? videoPts : 0);
+              // MỐC MEDIA THẬT: chờ `updateend` rồi lấy hiệu số `buffered` trước/sau khi append.
+              // `appendBuffer` bị trình duyệt tuần tự hoá (append trong lúc `updating` sẽ ném
+              // InvalidStateError) nên mỗi lần append có đúng một `updateend` ⇒ không lẫn mảnh.
+              const before = snapshotBuffered(this);
+              let posted = false;
+              const finish = (mediaRange) => {
+                if (posted) return;
+                posted = true;
+                try {
+                  this.removeEventListener('updateend', onDone);
+                  this.removeEventListener('error', onDone);
+                } catch (e) {}
+                // `timestampOffset` phải đọc ở THỜI ĐIỂM DỮ LIỆU ĐƯỢC ĐẶT VÀO BUFFER
+                // (`updateend`), không phải lúc gọi `appendBuffer`: nhiều trình phát gọi
+                // `appendBuffer()` rồi mới chỉnh `timestampOffset` cho khớp video, và trình
+                // duyệt áp giá trị CUỐI cho chính mảnh đang chờ. Đọc sớm ⇒ backend nhận
+                // offset 0 trong khi dữ liệu nằm ở mốc khác hẳn (đo thật 2026-10-03: PCM
+                // 250,0→306,8s trong khi playhead 7,1s ⇒ "Đệm trước: 299,7s", Đã dịch 0,0s).
+                chunkPacket.payload.timestampOffset = Number(this.timestampOffset) || 0;
+                if (mediaRange) {
+                  chunkPacket.payload.mediaStart = Number(mediaRange.start.toFixed(3));
+                  chunkPacket.payload.mediaEnd = Number(mediaRange.end.toFixed(3));
+                  // Học byte/giây THẬT của luồng audio (mảnh append chính là byte của luồng
+                  // audio) — dùng để quy đổi "cần audio ở giây X" thành "khoảng byte nào".
+                  const dur = mediaRange.end - mediaRange.start;
+                  if (dur > 0.02 && rawBytes.byteLength > 0) {
+                    state.bytesSampleBytes += rawBytes.byteLength;
+                    state.bytesSampleSec += dur;
+                    if (state.bytesSampleSec >= 5) {
+                      state.bytesPerSecHint = state.bytesSampleBytes / state.bytesSampleSec;
+                      state.bytesSampleBytes = 0;
+                      state.bytesSampleSec = 0;
+                    }
+                  }
+                }
+                // Cache bám theo vị trí phát (không phải "120 mảnh gần nhất").
+                state.cachedAudioChunks.push(chunkPacket);
+                const ref = Number.isFinite(videoPts) && videoPts > 0
+                  ? videoPts
+                  : (mediaRange ? mediaRange.end : 0);
+                pruneCacheAroundPlayhead(ref);
+                window.postMessage(chunkPacket, '*');
+              };
+              const onDone = () => finish(addedMediaRange(before, snapshotBuffered(this)));
+              try {
+                this.addEventListener('updateend', onDone);
+                this.addEventListener('error', onDone);
+              } catch (e) {
+                finish(null);
+                return this.__vibe_orig_appendBuffer(data);
+              }
+              try {
+                return this.__vibe_orig_appendBuffer(data);
+              } catch (e) {
+                // Append lỗi (QuotaExceededError…): vẫn gửi mảnh như bản cũ rồi ném tiếp.
+                finish(null);
+                throw e;
+              }
             }
-
-            window.postMessage(chunkPacket, '*');
           }
         }
         return this.__vibe_orig_appendBuffer(data);
@@ -342,6 +518,15 @@
     return isYtAudio || isBiliAudio;
   }
 
+  /**
+   * URL là luồng AUDIO-ONLY (không muxed)? Chỉ luồng audio-only mới có quan hệ byte ↔ thời
+   * gian đủ tuyến tính để TẢI LẠI theo khoảng byte (`.m4s` của Bilibili có thể là video muxed).
+   */
+  function isAudioOnlyUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    return url.includes('mime=audio') || /itag=(139|140|141|249|250|251)(\D|$)/.test(url);
+  }
+
   // ── GHI LẠI KHOẢNG BYTE CỦA TỪNG PHÂN ĐOẠN MEDIA (để TẢI LẠI khi cần) ──────
   // Vì sao cần: khi người dùng tua vào vùng YouTube ĐÃ tải sẵn, trình phát KHÔNG gọi
   // `appendBuffer` lần nữa ⇒ interceptor không có mảnh nào để gửi, backend không có audio
@@ -360,9 +545,60 @@
   function recordMediaRange(url, rangeHeader) {
     const range = parseRange(rangeHeader);
     if (!url || !range || !isAudioUrl(url)) return;
-    state.mediaRanges.push({ url: url, start: range[0], end: range[1] });
+    state.mediaRanges.push({
+      url: url,
+      start: range[0],
+      end: range[1],
+      audioOnly: isAudioOnlyUrl(url)
+    });
     if (state.mediaRanges.length > 200) {
       state.mediaRanges.splice(0, state.mediaRanges.length - 200);
+    }
+  }
+
+  /** SourceBuffer audio đang dùng (để ép trình phát tải lại — xem `nudgePlayerRefetch`). */
+  function firstAudioSourceBuffer() {
+    for (const sb of state.audioSourceBuffers) return sb;
+    return null;
+  }
+
+  /**
+   * ÉP TRÌNH PHÁT TẢI LẠI một khoảng phía trước playhead: xoá khoảng đó khỏi SourceBuffer
+   * audio ⇒ trình phát buộc phải fetch và `appendBuffer` lại ⇒ interceptor bắt được mảnh mới.
+   *
+   * Đây là phương án CUỐI (đúng như đề xuất "xoá buffer của video rồi để trang gửi lại"):
+   * nó can thiệp vào chính bộ đệm của trình phát nên có thể gây khựng tiếng/hình vài trăm ms,
+   * và không phải trang nào cũng chịu tải lại (một số trình phát bỏ qua khoảng bị thiếu).
+   * Vì vậy mặc định KHÔNG tự chạy — chỉ gọi tay qua `__VIBE_LOOKAHEAD_DEBUG__.nudgeRefetch()`.
+   */
+  function nudgePlayerRefetch(secondsAhead) {
+    const sb = firstAudioSourceBuffer();
+    const video = getActiveVideo();
+    if (!sb || !video || sb.updating) return 0;
+    const t = Number(video.currentTime) || 0;
+    const want = Math.max(2, Math.min(60, Number(secondsAhead) || 12));
+    let end = t + want;
+    try {
+      if (sb.buffered && sb.buffered.length) {
+        let bufferedEnd = 0;
+        for (let i = 0; i < sb.buffered.length; i++) {
+          if (sb.buffered.start(i) - 0.5 <= t && t <= sb.buffered.end(i) + 0.5) {
+            bufferedEnd = sb.buffered.end(i);
+            break;
+          }
+        }
+        if (!bufferedEnd) bufferedEnd = sb.buffered.end(sb.buffered.length - 1);
+        if (bufferedEnd > t) end = Math.min(end, bufferedEnd);
+      }
+      if (end - t < 1) return 0;
+      sb.remove(t, end);
+      console.log(
+        `%c[Lookahead] 🩹 Ép tải lại audio [${t.toFixed(1)}s → ${end.toFixed(1)}s]: đã xoá khỏi ` +
+        `SourceBuffer để trình phát fetch + append lại.`, 'color: #fbbf24; font-weight: bold;');
+      return end - t;
+    } catch (e) {
+      console.warn('[Lookahead] Ép tải lại thất bại:', e);
+      return 0;
     }
   }
 
@@ -378,8 +614,12 @@
     const bps = Number.isFinite(bytesPerSec) && bytesPerSec > 2000 ? bytesPerSec : 27000;
     // Byte ước lượng cho vị trí phát, và lùi lại một đoạn để chắc chắn phủ đầu câu.
     const center = Math.max(0, Math.round(playhead * bps) - Math.round(3 * bps));
+    // Ưu tiên luồng AUDIO-ONLY: chỉ luồng này mới có quan hệ byte ↔ thời gian tuyến tính đủ
+    // tin cậy (`.m4s` của Bilibili có thể là video muxed ⇒ quy đổi byte sẽ sai hoàn toàn).
+    const audioOnly = state.mediaRanges.filter((r) => r.audioOnly);
+    const pool = audioOnly.length ? audioOnly : state.mediaRanges;
     // Chọn các range quanh byte đó, ưu tiên range CHƯA tải lại.
-    const sorted = state.mediaRanges.slice().sort(
+    const sorted = pool.slice().sort(
       (a, b) => Math.abs(a.start - center) - Math.abs(b.start - center)
     );
     const picked = [];
@@ -622,6 +862,13 @@
   window.__VIBE_LOOKAHEAD_DEBUG__ = {
     getState: () => state,
     getStatus: () => buildStatusPayload(),
+    //: Số mảnh trong cache ĐÃ biết mốc media thật (mảnh mù mốc sẽ được gửi bừa khi replay).
+    taggedChunks: () => state.cachedAudioChunks.filter((pkt) => !!packetMediaRange(pkt)).length,
+    //: Byte/giây học được từ chính luồng audio (0 = chưa đủ mẫu, đang dùng mặc định 27 KB/s).
+    bytesPerSec: () => state.bytesPerSecHint,
+    //: Ép trình phát tải lại `seconds` giây phía trước playhead (phương án cuối — xem
+    //: `nudgePlayerRefetch`). Dùng tay khi Log báo "KHÔNG audio tại playhead".
+    nudgeRefetch: (seconds) => nudgePlayerRefetch(seconds),
     printReport: () => {
       const s = buildStatusPayload();
       console.group('%c📊 [Lookahead Buffer Report]', 'color: #38bdf8; font-weight: bold; font-size: 14px;');
@@ -631,6 +878,8 @@
       console.log(`Buffer Ahead (Lead Time): +${s.aheadSeconds.toFixed(2)}s`);
       console.log(`Total Chunks: ${s.chunkCount} (${s.megabytes.toFixed(2)} MB)`);
       console.log(`Init segment: ${s.hasInitSegment ? 'có' : 'chưa'} | epoch ${s.epoch}`);
+      console.log(`Cache: ${s.cachedChunksCount} mảnh, trong đó ${s.mediaTaggedChunks} mảnh có mốc media thật`
+        + ` | byte/giây học được: ${s.bytesPerSecHint ? Math.round(s.bytesPerSecHint) : 'chưa đủ mẫu (dùng 27000)'}`);
       console.table(state.recentChunks.slice(-10));
       console.groupEnd();
     }

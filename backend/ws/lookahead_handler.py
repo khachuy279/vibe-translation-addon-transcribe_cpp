@@ -56,6 +56,7 @@ from backend.asr.forced_aligner import (
     AlignedWord,
     ForcedAlignerService,
     SubtitleSentence,
+    detect_aligner_language_from_text,
     resolve_aligner_language,
 )
 from backend.ws.connection import SafeWebSocketConnection
@@ -698,13 +699,19 @@ class LookaheadSessionState:
         is_init: bool = False,
         epoch: Optional[int] = None,
         refetched: bool = False,
+        media_start: Optional[float] = None,
+        media_end: Optional[float] = None,
     ) -> None:
         """Nhận một mảnh MSE, ghép nối + giải mã rồi đưa vào timeline liên tục.
 
         `refetched=True`: mảnh do extension TẢI LẠI cho vùng đã buffer sẵn. Byte của nó có thể
         trùng mảnh đã nhận trước đó nên phải **miễn dedup** — nếu không, vùng video đã tải trước
         sẽ không bao giờ có phụ đề (đo thật 2026-10-01: "Bỏ mảnh audio TRÙNG … 51 … 53" ngay
-        sau khi backend yêu cầu client gửi lại).
+        sau khi client gửi lại).
+
+        `media_start`/`media_end`: khoảng THẬT (trục thời gian trình duyệt) của mảnh trong
+        `SourceBuffer.buffered` — demuxer dùng để neo PCM khi mốc container lệch trục video
+        (trang dùng `mode = "sequence"` / `tfdt` tuyệt đối / đổi `timestampOffset` sau append).
         """
         if self._closed:
             return
@@ -730,7 +737,14 @@ class LookaheadSessionState:
         t_dec = time.perf_counter()
         try:
             decoded = await asyncio.to_thread(
-                self.demuxer.feed, chunk_bytes, timestamp_offset, mime_type, is_init, epoch
+                self.demuxer.feed,
+                chunk_bytes,
+                timestamp_offset,
+                mime_type,
+                is_init,
+                epoch,
+                media_start,
+                media_end,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Lỗi ghép nối/giải mã mảnh audio: {exc}", extra={"module_tag": "WS"})
@@ -1161,7 +1175,16 @@ class LookaheadSessionState:
             # Bước 2B: Forced Alignment
             aligned_words = []
             align_failed = False
-            align_lang = resolve_aligner_language(self.source_lang) or "English"
+            # NGÔN NGỮ CHO ALIGNER: ưu tiên người dùng chọn; với `auto` thì ĐOÁN TỪ VĂN BẢN ASR.
+            # ⚠️ Rơi về "English" khi văn bản là tiếng Nhật/Trung sẽ khiến upstream dùng
+            # `tokenize_space_lang` ⇒ cả câu (không có khoảng trắng) thành MỘT token ⇒ aligner trả
+            # một item duy nhất ⇒ KHÔNG ngắt được câu (sự cố thật 2026-10-03: cả khối 3 câu thành
+            # một phụ đề dài trên trang tiếng Nhật, trong khi YouTube tiếng Anh vẫn đúng).
+            align_lang = (
+                resolve_aligner_language(self.source_lang)
+                or detect_aligner_language_from_text(clean_text)
+                or "English"
+            )
             if self._aligner_service is not None:
                 try:
                     aligned_words = await asyncio.to_thread(
@@ -1258,6 +1281,18 @@ class LookaheadSessionState:
                     )
                 ]
 
+            # Bước 2E-bis: LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN.
+            # Nhánh dự phòng ở trên (aligner lỗi) tạo ĐÚNG MỘT câu cho cả khối; nếu aligner trả
+            # một item duy nhất (chọn sai ngôn ngữ) thì tầng gom câu cũng chỉ ra một phụ đề. Cả hai
+            # trường hợp đều bị hàm này tách lại theo dấu kết câu ⇒ không bao giờ còn "cả khối 3 câu
+            # thành một phụ đề dài" (sự cố thật 2026-10-03).
+            subtitles = ForcedAlignerService.split_oversized_sentences(
+                subtitles,
+                language=align_lang,
+                max_chars=int(self._batch_sub_opts.get("max_chars", 0) or 0),
+                max_words=int(self._batch_sub_opts.get("max_words", 0) or 0),
+            )
+
             # Bước 2F: GIỮ LẠI mảnh cuối nếu nó CHƯA KẾT CÂU và khối bị cắt giữa câu.
             # Mảnh này sẽ được ghép vào đầu khối sau (bước 2D) ⇒ người xem không bao giờ thấy phụ
             # đề cụt ở ranh giới khối. Khi video đã hết (stream_end) thì KHÔNG giữ — phải phát nốt.
@@ -1273,7 +1308,7 @@ class LookaheadSessionState:
                     preview += f" ⏐ …(+{len(subtitles) - 8})"
                 logger.info(
                     f"[SEG_BATCH] Ngắt câu khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] "
-                    f"({len(subtitles)} phụ đề): {preview}",
+                    f"({len(subtitles)} phụ đề, align={align_lang}): {preview}",
                     extra={"module_tag": "ASR"},
                 )
 
@@ -2026,6 +2061,8 @@ async def _handle_binary_fragment(session: LookaheadSessionState, bytes_data: by
 
     chunk_bytes = bytes_data[4 + header_len:]
     epoch = header.get("epoch")
+    media_start = header.get("media_start")
+    media_end = header.get("media_end")
     await session.handle_audio_fragment(
         chunk_bytes=chunk_bytes,
         timestamp_offset=float(header.get("timestamp_offset", 0.0) or 0.0),
@@ -2035,4 +2072,7 @@ async def _handle_binary_fragment(session: LookaheadSessionState, bytes_data: by
         epoch=int(epoch) if epoch is not None else None,
         # Mảnh tải lại cho vùng đã buffer sẵn: byte có thể trùng mảnh cũ nên phải MIỄN dedup.
         refetched=bool(header.get("refetched", False)),
+        #: Khoảng media THẬT trong `SourceBuffer.buffered` (trục trình duyệt) — dùng để neo PCM.
+        media_start=float(media_start) if media_start is not None else None,
+        media_end=float(media_end) if media_end is not None else None,
     )

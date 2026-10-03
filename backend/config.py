@@ -188,7 +188,7 @@ class VADConfig(BaseModel):
 
 class ASRConfig(BaseModel):
     """Cấu hình nhận dạng giọng nói ASR qua transcribe.cpp."""
-    active_model: str = "qwen3-asr-0.6b"
+    active_model: str = "qwen3-asr-1.7b"
     # Backend cho transcribe.cpp. Giá trị hợp lệ:
     #   "auto"   — CUDA nếu có, không thì Vulkan (mặc định).
     #   "cuda"   — ưu tiên CUDA; KHÔNG có thì fallback về Vulkan (xem `backend_fallback`).

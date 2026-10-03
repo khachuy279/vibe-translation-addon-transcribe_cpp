@@ -62,7 +62,7 @@ models:
 
   index-translate:
     name: Index-Translate-2B (Bilibili IndexTeam)
-    model: mradermacher/Index-Translate-2B-GGUF
+    model: IndexTeam/Index-Translate-2B-GGUF
     gguf_file: Index-Translate-2B.Q8_0.gguf
     temperature: 0.0
     top_p: 1.0
@@ -74,3 +74,19 @@ models:
       - index-mt-2b
       - index2b
     description: Siêu nhẹ 2B (en/ja/zh互译, ~2.2GB Q8_0)
+
+  index-translate-9b:
+    name: Index-Translate-9B (Bilibili IndexTeam)
+    model: IndexTeam/Index-Translate-9B-GGUF
+    gguf_file: Index-Translate-9B.Q4_K_M.gguf
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 1
+    repetition_penalty: 1.0
+    prompt_style: index
+    aliases:
+      - index-9b
+      - index-mt-9b
+      - index9b
+    description: Chất lượng cao 9B (en/ja/zh/..., ~5.5GB Q4_K_M)
+

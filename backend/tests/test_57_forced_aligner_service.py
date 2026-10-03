@@ -260,6 +260,130 @@ class TestSourcePunctuationReattachment:
             "You got it.",
         ]
 
+    # ── Hồi quy 2026-10-03: "Pipeline B không ngắt câu dài" trên trang tiếng Nhật ──────────
+
+    def test_detect_aligner_language_from_text(self):
+        """`source_lang="auto"` ⇒ phải ĐOÁN ngôn ngữ từ văn bản ASR (nếu không sẽ rơi về English)."""
+        from backend.asr.forced_aligner import detect_aligner_language_from_text as detect
+        from backend.asr.forced_aligner import resolve_aligner_language
+
+        assert resolve_aligner_language("auto") is None
+        assert detect("ほら、あれ温泉街じゃない？") == "Japanese"
+        assert detect("こんにちは") == "Japanese"
+        assert detect("カタカナです") == "Japanese"
+        assert detect("今天天气很好。") == "Chinese"
+        assert detect("안녕하세요 반갑습니다") == "Korean"
+        assert detect("We're not getting divorced.") is None
+        assert detect("") is None
+        # Người dùng chọn tay thì luôn thắng phép đoán.
+        assert resolve_aligner_language("ja") == "Japanese"
+
+    def test_wrong_aligner_language_collapses_whole_sentence_into_one_item(self):
+        """GỐC RỄ: tiếng Nhật + `language="English"` ⇒ upstream tách theo KHOẢNG TRẮNG.
+
+        Tiếng Nhật không có khoảng trắng ⇒ cả câu thành MỘT token ⇒ aligner trả một item ⇒ tầng
+        gom câu không thể ngắt ⇒ 3 câu hiện thành 1 phụ đề dài (đúng ảnh chụp của người dùng).
+        """
+        text = "ほら、あれ温泉街じゃない？うわ、なんかお土産屋とか書いてあるよ。ああ、なんか温泉の香りしてきた。"
+        # Mô phỏng `tokenize_space_lang` (language="English"): cả chuỗi là 1 token.
+        one_item = [AlignedWord(text=text, start_time=0.0, end_time=6.4)]
+        merged = ForcedAlignerService.merge_source_text(one_item, text)
+        subs = ForcedAlignerService.group_words_to_subtitles(
+            merged, language="English", max_words=10, max_duration_sec=4.5
+        )
+        assert len(subs) == 1, "Bản cũ: cả khối thành một phụ đề (đây là lỗi)"
+        assert subs[0].text == text
+
+    def test_safety_net_splits_sentence_carrying_many_sentences(self):
+        """Lưới AN TOÀN: một phụ đề chứa nhiều câu phải bị tách theo dấu kết câu."""
+        text = "ほら、あれ温泉街じゃない？うわ、なんかお土産屋とか書いてあるよ。ああ、なんか温泉の香りしてきた。"
+        subs = [SubtitleSentence(text=text, start_time=10.0, end_time=16.4)]
+
+        fixed = ForcedAlignerService.split_oversized_sentences(
+            subs, language="Japanese", max_chars=45
+        )
+
+        assert [s.text for s in fixed] == [
+            "ほら、あれ温泉街じゃない？",
+            "うわ、なんかお土産屋とか書いてあるよ。",
+            "ああ、なんか温泉の香りしてきた。",
+        ]
+        # Thời gian: tăng dần, phủ đúng khoảng gốc, không chồng lấn.
+        assert fixed[0].start_time == 10.0
+        assert fixed[-1].end_time == pytest.approx(16.4, abs=1e-6)
+        prev_end = None
+        for s in fixed:
+            assert s.end_time > s.start_time
+            if prev_end is not None:
+                assert s.start_time == pytest.approx(prev_end, abs=1e-6)
+            prev_end = s.end_time
+
+    def test_safety_net_hard_splits_when_no_punctuation(self):
+        """ASR không sinh dấu câu ⇒ vẫn phải cắt theo trần ký tự (CJK), không để một dòng dài."""
+        text = "あ" * 100  # 100 ký tự, không dấu câu
+        subs = [SubtitleSentence(text=text, start_time=0.0, end_time=20.0)]
+        fixed = ForcedAlignerService.split_oversized_sentences(
+            subs, language="Japanese", max_chars=45
+        )
+        assert [len(s.text) for s in fixed] == [45, 45, 10]
+        assert "".join(s.text for s in fixed) == text
+
+    def test_safety_net_leaves_normal_subtitles_untouched(self):
+        """Không được đụng vào phụ đề vốn đã đúng (mỗi phụ đề một câu)."""
+        subs = [
+            SubtitleSentence(text="You better be.", start_time=0.0, end_time=1.0),
+            SubtitleSentence(text="You got it.", start_time=1.0, end_time=2.0),
+        ]
+        fixed = ForcedAlignerService.split_oversized_sentences(
+            subs, language="English", max_words=10
+        )
+        assert fixed == subs
+
+    def test_real_upstream_tokenizer_explains_single_long_subtitle(self):
+        """GỐC RỄ, đo bằng TOKENIZER THẬT của upstream (không cần model).
+
+        `language="English"` ⇒ `tokenize_space_lang` + `split_segment_with_chinese` gộp cả cụm
+        kana thành token, nên dấu `？`/`。` rơi vào GIỮA token ⇒ tầng gom câu KHÔNG thấy dấu kết
+        câu ở cuối token nào ⇒ không ngắt được; bước gộp mảnh cuối (rule 3) lại gộp về một ⇒ cả
+        khối 3 câu thành MỘT phụ đề dài (đúng ảnh chụp của người dùng).
+        `language="Japanese"` (nagisa) cho 28 từ đúng ⇒ 3 phụ đề.
+        """
+        pytest.importorskip("nagisa")
+        proc_mod = pytest.importorskip(
+            "backend.asr.qwen_asr.inference.qwen3_forced_aligner"
+        )
+        processor = proc_mod.Qwen3ForceAlignProcessor()
+        text = (
+            "ほら、あれ温泉街じゃない？"
+            "うわ、なんかお土産屋とか書いてあるよ。"
+            "ああ、なんか温泉の香りしてきた。"
+        )
+
+        def group_with(language: str):
+            words, _ = processor.encode_timestamp(text, language)
+            step = 6.4 / max(1, len(words))
+            items = [
+                AlignedWord(text=w, start_time=i * step, end_time=(i + 1) * step)
+                for i, w in enumerate(words)
+            ]
+            merged = ForcedAlignerService.merge_source_text(items, text)
+            return ForcedAlignerService.group_words_to_subtitles(
+                merged, language=language, max_words=10, max_duration_sec=4.5,
+                max_chars=45, min_words=2, defer_words=3,
+                sentence_max_words=24, sentence_max_duration_sec=8.0,
+            )
+
+        wrong = group_with("English")
+        assert len(wrong) == 1, "Bản CŨ: cả khối thành một phụ đề (đây là lỗi)"
+        assert " " in wrong[0].text, "chọn sai ngôn ngữ ⇒ text còn bị nối bằng KHOẢNG TRẮNG"
+
+        right = group_with("Japanese")
+        assert [s.text for s in right] == [
+            "ほら、あれ温泉街じゃない？",
+            "うわ、なんかお土産屋とか書いてあるよ。",
+            "ああ、なんか温泉の香りしてきた。",
+        ], [s.text for s in right]
+
     def test_align_service_attaches_punctuation_end_to_end(self, monkeypatch):
         """`ForcedAlignerService.align()` phải tự gắn dấu câu (không cần model thật)."""
         from backend.asr.forced_aligner import ForcedAlignerService as SVC
