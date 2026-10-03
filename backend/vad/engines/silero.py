@@ -109,17 +109,19 @@ class SileroVADEngine(BaseVADEngine):
             return Path(explicit_path)
         return MODELS_DIR / "silero_vad.jit"
 
-    def _ensure_model_file(self) -> None:
+    @classmethod
+    def prepare_files(cls) -> None:
         """Đảm bảo file `silero_vad.jit` có trong `backend/models` (ưu tiên offline)."""
-        if self.model_path.exists():
+        target = MODELS_DIR / "silero_vad.jit"
+        if target.exists():
             return
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             import importlib.resources as impresources
 
             src = str(impresources.files("silero_vad.data").joinpath("silero_vad.jit"))
-            shutil.copy(src, self.model_path)
-            logger.info(f"Đã sao chép silero_vad.jit từ package vào {self.model_path}",
+            shutil.copy(src, target)
+            logger.info(f"Đã sao chép silero_vad.jit từ package vào {target}",
                         extra={"module_tag": "VAD"})
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -127,15 +129,24 @@ class SileroVADEngine(BaseVADEngine):
                 extra={"module_tag": "VAD"},
             )
 
+    def _ensure_model_file(self) -> None:
+        """Đảm bảo file `silero_vad.jit` có trong `backend/models` (ưu tiên offline)."""
+        self.prepare_files()
+
     def _load_model(self) -> Any:
-        """Nạp model JIT: dùng file cục bộ nếu có, ngược lại dùng loader chuẩn của docs."""
+        """Nạp model JIT: CHỈ nạp từ file cục bộ trong backend/models."""
         from silero_vad.utils_vad import init_jit_model
+
+        if not self.model_path.exists():
+            self._ensure_model_file()
 
         if self.model_path.exists():
             return init_jit_model(str(self.model_path))
-        from silero_vad import load_silero_vad
 
-        return load_silero_vad()
+        raise FileNotFoundError(
+            f"Không tìm thấy file model silero_vad.jit tại {self.model_path}! "
+            "Hãy đảm bảo file nằm trong backend/models."
+        )
 
     # ------------------------------------------------------------------ config
     def _resolve_effective(self, threshold: Optional[float], silence_ms: Optional[int]):

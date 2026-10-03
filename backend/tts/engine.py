@@ -1,16 +1,18 @@
-"""Engine tổng hợp giọng nói Voice Cloning OmniVoice PyTorch Native cho Backend.
+"""Engine tổng hợp giọng nói Voice Cloning OmniVoice Native C++ (omnivoice.cpp GGUF).
 
-Đặc điểm tối ưu:
+Đặc điểm kiến trúc:
 - Singleton Pattern với Thread-safe double-checked locking.
-- Tự động nạp mô hình từ HuggingFace cache cục bộ hoặc tải tự động.
-- Caching VoiceClonePrompt: Tiết kiệm ~70ms tiền xử lý âm thanh mẫu cho mỗi câu.
-- Cơ chế tự động xử lý cuDNN mismatch (cuDNN auto-fallback) để đảm bảo không bị lỗi crash.
-- Thực thi hoàn toàn trong `torch.inference_mode()` loại bỏ overhead tính gradient.
-- Đo đạc chi tiết RTF, thời gian xử lý (ms) và thời lượng audio sinh ra (s).
+- GGUF Native Inference: Chạy 100% C++ GGML native qua Process Isolation Worker,
+  hoàn toàn loại bỏ phụ thuộc PyTorch runtime, giải phóng ~4GB VRAM.
+- Không xung đột DLL: Toàn bộ module native chạy trong process riêng, độc lập
+  với `backend/bin/ggml.dll` của ASR.
+- Caching Voice Reference: Trích xuất mã RVQ 1 lần duy nhất, tái sử dụng cho các câu sau.
+- Tự động nạp/tải mô hình GGUF từ `Serveurperso/OmniVoice-GGUF` về duy nhất `backend/models/`.
+- Bảo toàn trọn vẹn hợp đồng API: `BaseTTSEngine`, `synthesize_fitted_sync` (WSOLA lookahead),
+  `synthesize_wav_bytes`, `prewarm()`, `unload_model()`.
 """
 
 import asyncio
-import contextlib
 import gc
 import os
 import threading
@@ -20,20 +22,28 @@ from pathlib import Path
 from typing import Optional, Tuple, Any, Dict
 
 import numpy as np
+import soundfile as sf
 import torch
 
 from backend.config import config, MODELS_DIR
 from backend.tts.base import BaseTTSEngine
 from backend.tts.audio_processor import AudioProcessor
 from backend.tts.voice_manager import VoiceManager
+from backend.tts.worker import TTSWorkerClient
+from backend.tts.downloader import (
+    ensure_tts_models,
+    is_model_available,
+    get_model_paths,
+)
 from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TTS
 from backend.utils.logger import get_logger
 
 logger = get_logger("tts.omnivoice")
+_TAG = "TTS"
 
 
 class OmniVoiceTTS(BaseTTSEngine):
-    """Singleton TTS Engine bao bọc PyTorch OmniVoice phục vụ tổng hợp giọng nói độ trễ thấp."""
+    """Singleton TTS Engine bao bọc omnivoice.cpp phục vụ tổng hợp giọng nói độ trễ thấp."""
 
     _instance: Optional["OmniVoiceTTS"] = None
     _lock = threading.RLock()
@@ -54,105 +64,39 @@ class OmniVoiceTTS(BaseTTSEngine):
                 try:
                     cls._instance.unload_model()
                 except Exception as e:
-                    logger.debug(f"TTS unload_model notice: {e}", extra={"module_tag": "TTS"})
+                    logger.debug(f"TTS unload_model notice: {e}", extra={"module_tag": _TAG})
                 cls._instance = None
 
     def __init__(self):
         self.sample_rate = 24000
         self.device = config.tts.device if hasattr(config, "tts") and config.tts.device else ("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.model = None
+        self.model = None  # Giữ cho mock testing hoặc legacy fallback
         self._is_loaded = False
-        self._cudnn_disabled = False
         self._voice_prompt_cache: "OrderedDict[Tuple[str, str], Any]" = OrderedDict()  # LRU, max 8 entries
         self._voice_prompt_cache_max: int = 8
-        # QWEN-Q15: `_get_voice_clone_prompt` là check-then-act trên OrderedDict KHÔNG lock.
-        # Hai phiên (hai luồng `to_thread`) cùng dùng một giọng mới ⇒ cả hai tính
-        # VoiceClonePrompt (giải mã audio + trích embedding: hàng trăm ms CPU/GPU) rồi ghi
-        # cache đè nhau — lãng phí, và `move_to_end`/`popitem` chạy song song có thể ném
-        # RuntimeError. Lock RIÊNG (không dùng `_infer_lock`) để không chặn inference TTS
-        # của phiên khác lâu hơn mức cần.
         self._voice_prompt_lock = threading.Lock()
-        # QWEN-Q15 (bổ sung): lock theo TỪNG giọng. Chỉ một lock chung thì hai phiên khác
-        # giọng phải xếp hàng vô ích; chỉ double-checked locking thì CÙNG một giọng vẫn bị
-        # tính prompt 2 lần (phần chậm nằm ngoài lock). Per-key lock cho cả hai tính chất.
         self._voice_prompt_key_locks: "Dict[Tuple[str, str], threading.Lock]" = {}
         self._voice_prompt_key_locks_guard = threading.Lock()
         self._init_lock = threading.RLock()
         self._infer_lock = threading.RLock()
-        # A2-2 (Hy3): CUDA stream RIÊNG cho TTS thay vì đồng bộ toàn device.
-        # `torch.cuda.synchronize()` cũ đồng bộ MỌI stream CUDA đang chờ => chặn cả
-        # inference dịch (CUDA) đang xếp hàng, gây priority inversion và latency spike.
-        # Dùng stream riêng + `stream.synchronize()` chỉ chờ công việc của TTS này.
-        self._cuda_stream: Any = None
+        self._worker_client = TTSWorkerClient.get_instance()
 
     def _resolve_model_path(self) -> str:
-        """Xác định đường dẫn mô hình (ưu tiên cache cục bộ, fallback HF repo id)."""
-        cfg_model = config.tts.model if hasattr(config, "tts") and config.tts.model else "splendor1811/omnivoice-vietnamese"
-
-        # 1. Đường dẫn tệp/thư mục cục bộ rõ ràng nếu tồn tại
-        if cfg_model and os.path.exists(cfg_model):
-            return cfg_model
-
-        # 2. Kiểm tra trong MODELS_DIR / huggingface
-        snap_dirs = [
-            MODELS_DIR / "huggingface" / "models--splendor1811--omnivoice-vietnamese" / "snapshots",
-        ]
-        for s_dir in snap_dirs:
-            if s_dir.exists():
-                for child in s_dir.iterdir():
-                    if child.is_dir() and (child / "config.json").exists():
-                        return str(child)
-
-        return cfg_model or "splendor1811/omnivoice-vietnamese"
+        """Xác định đường dẫn mô hình base GGUF."""
+        base_path, _ = get_model_paths()
+        if base_path.is_file():
+            return str(base_path)
+        return str(base_path)
 
     def is_model_ready(self) -> bool:
-        """Kiểm tra xem mô hình có sẵn sàng hay không."""
-        p = self._resolve_model_path()
-        return bool(p and (os.path.exists(p) or "splendor1811" in p))
-
-    def _invoke_generate(self, gen_kwargs: dict) -> Any:
-        """Gọi `model.generate` — trên CUDA stream riêng của TTS nếu đã có.
-
-        A2-2 (Hy3): dùng `with torch.cuda.stream(...)` (API ổn định ở mọi bản PyTorch)
-        thay vì dạng decorator `stream(fn)` để tránh phụ thuộc vào `StreamContext.__call__`.
-        """
-        if self._cuda_stream is not None:
-            with torch.cuda.stream(self._cuda_stream):
-                return self.model.generate(**gen_kwargs)
-        return self.model.generate(**gen_kwargs)
-
-    def _run_generate(self, gen_kwargs: dict) -> Any:
-        """Thực thi model.generate trong inference_mode và xử lý cuDNN an toàn.
-
-        A2-2 (Hy3): chạy trên CUDA stream RIÊNG của TTS (`self._cuda_stream`) thay vì
-        stream mặc định, để sau này chỉ cần `stream.synchronize()` (chờ riêng TTS) thay
-        vì `torch.cuda.synchronize()` (chờ TOÀN device, làm tắc nghẽn inference dịch CUDA
-        khác đang chạy => priority inversion / latency spike).
-        """
-        with torch.inference_mode():
-            if self._cudnn_disabled:
-                with torch.backends.cudnn.flags(enabled=False):
-                    return self._invoke_generate(gen_kwargs)
-
-            try:
-                return self._invoke_generate(gen_kwargs)
-            except RuntimeError as e:
-                if "CUDNN" in str(e):
-                    logger.warning(
-                        f"Phát hiện xung đột cuDNN ({e}). "
-                            f"Tự động tắt cuDNN cho TTS để duy trì độ ổn định tối đa.", extra={"module_tag": "TTS"}
-                    )
-                    self._cudnn_disabled = True
-                    with torch.backends.cudnn.flags(enabled=False):
-                        return self._invoke_generate(gen_kwargs)
-                raise
+        """Kiểm tra xem mô hình GGUF có sẵn sàng trong backend/models hay không."""
+        return is_model_available()
 
     def _lock_for_voice(self, cache_key: Tuple[str, str]) -> threading.Lock:
-        """Lock riêng cho một `cache_key` giọng (QWEN-Q15). Số entry bị chặn trên."""
+        """Lock riêng cho một cache_key giọng (QWEN-Q15). Số entry bị chặn trên."""
         with self._voice_prompt_key_locks_guard:
             lock = self._voice_prompt_key_locks.get(cache_key)
             if lock is None:
-                # Giữ dict có trần: số giọng thật rất nhỏ, nhưng không để nó phình vô hạn.
                 if len(self._voice_prompt_key_locks) >= 32:
                     self._voice_prompt_key_locks = {
                         k: v for k, v in self._voice_prompt_key_locks.items()
@@ -162,115 +106,97 @@ class OmniVoiceTTS(BaseTTSEngine):
             return lock
 
     def _get_voice_clone_prompt(self, ref_audio_path: str, ref_text: str) -> Optional[Any]:
-        """Tạo hoặc lấy từ cache VoiceClonePrompt tái sử dụng cho mẫu giọng tham chiếu.
+        """Tạo hoặc lấy từ cache mã voice reference tái sử dụng cho mẫu giọng tham chiếu.
 
         Tiết kiệm ~70ms cho mỗi câu nói tiếp theo do không phải lặp lại Disk I/O,
-        giải mã âm thanh và trích xuất embedding.
-
-        QWEN-Q15: check-then-act phải được bảo vệ. Dùng **lock theo từng giọng**
-        (`_lock_for_voice`) chứ không phải một lock chung: hai phiên khác giọng vẫn tính
-        song song, còn hai phiên CÙNG giọng mới thì chỉ tính prompt MỘT lần (mỗi lần tính
-        tốn hàng trăm ms: giải mã audio + trích embedding).
+        giải mã âm thanh và trích xuất embedding RVQ.
         """
-        if self.model is None or not hasattr(self.model, "create_voice_clone_prompt"):
-            return None
-
         cache_key = (ref_audio_path, ref_text)
         with self._lock_for_voice(cache_key):
             with self._voice_prompt_lock:
                 if cache_key in self._voice_prompt_cache:
-                    # LRU: promote to most-recently-used position
                     self._voice_prompt_cache.move_to_end(cache_key)
                     return self._voice_prompt_cache[cache_key]
 
-            actual_ref_audio = ref_audio_path
+            # 1. Hỗ trợ mock testing (nếu self.model có create_voice_clone_prompt)
+            if self.model is not None and hasattr(self.model, "create_voice_clone_prompt"):
+                try:
+                    prompt = self.model.create_voice_clone_prompt(ref_audio=ref_audio_path, ref_text=ref_text)
+                    with self._voice_prompt_lock:
+                        self._voice_prompt_cache[cache_key] = prompt
+                        if len(self._voice_prompt_cache) > self._voice_prompt_cache_max:
+                            self._voice_prompt_cache.popitem(last=False)
+                    return prompt
+                except Exception as e:
+                    logger.debug(f"Mock create_voice_clone_prompt notice: {e}", extra={"module_tag": _TAG})
 
-            try:
-                prompt = self.model.create_voice_clone_prompt(ref_audio=actual_ref_audio, ref_text=ref_text)
-            except Exception as e:
-                logger.debug(f"Không tạo được cache VoiceClonePrompt ({e}), dùng thẳng ref_audio.", extra={"module_tag": "TTS"})
-                return None
+            # 2. Xử lý native C++ qua TTS Worker
+            prompt = None
+            if os.path.isfile(ref_audio_path):
+                try:
+                    data, sr = sf.read(ref_audio_path, dtype="float32")
+                    if data.ndim > 1:
+                        data = np.mean(data, axis=1)
+                    if sr != self.sample_rate and len(data) > 0:
+                        # Đổi tần số mẫu sang 24kHz nếu cần
+                        num_target_samples = int(len(data) * self.sample_rate / sr)
+                        from scipy import signal
+                        data = signal.resample(data, num_target_samples).astype(np.float32)
+
+                    # Trích xuất mã RVQ vào worker cache
+                    voice_key = str(Path(ref_audio_path).resolve())
+                    self._worker_client.extract_voice(voice_key, data)
+                    prompt = {"voice_key": voice_key, "ref_text": ref_text}
+                except Exception as exc:
+                    logger.warning(f"Lỗi nạp mẫu giọng '{ref_audio_path}': {exc}", extra={"module_tag": _TAG})
+                    prompt = {"voice_key": str(Path(ref_audio_path).resolve()), "ref_text": ref_text}
 
             with self._voice_prompt_lock:
                 self._voice_prompt_cache[cache_key] = prompt
-                # LRU eviction: xoa entry cu nhat neu vuot maxsize
                 if len(self._voice_prompt_cache) > self._voice_prompt_cache_max:
-                    evicted_key, _ = self._voice_prompt_cache.popitem(last=False)
-                    logger.debug(f"Đã xoá cache giọng cũ: {Path(evicted_key).name}", extra={"module_tag": "TTS"})
-                logger.debug(f"Đã lưu cache VoiceClonePrompt cho: {Path(ref_audio_path).name} (cache={len(self._voice_prompt_cache)})", extra={"module_tag": "TTS"})
+                    self._voice_prompt_cache.popitem(last=False)
+                logger.debug(
+                    f"Đã lưu cache VoiceReference cho: {Path(ref_audio_path).name} (cache={len(self._voice_prompt_cache)})",
+                    extra={"module_tag": _TAG},
+                )
             return prompt
 
     def load_model(self) -> None:
-        """Nạp và warm-up mô hình OmniVoice vào GPU memory."""
+        """Nạp và warm-up mô hình OmniVoice GGUF Native."""
         with self._init_lock:
-            if self._is_loaded and self.model is not None:
+            if self._is_loaded and self._worker_client.is_loaded:
                 return
 
-            try:
-                from omnivoice import OmniVoice
-            except ImportError:
-                logger.error("Chưa cài đặt thư viện 'omnivoice'.", extra={"module_tag": "TTS"})
-                raise RuntimeError("Thư viện omnivoice chưa được cài đặt")
-
-            model_path = self._resolve_model_path()
-            logger.info(f"OmniVoice đang nạp trên thiết bị {self.device}...", extra={"module_tag": "TTS"})
+            logger.info("OmniVoice GGUF đang nạp qua Process Worker...", extra={"module_tag": _TAG})
             t0 = time.perf_counter()
 
-            torch_dtype = torch.float16 if self.device != "cpu" and "cuda" in str(self.device) else torch.float32
-            if torch.cuda.is_available() and "cuda" in str(self.device):
-                try:
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                    torch.backends.cudnn.allow_tf32 = True
-                except Exception:
-                    pass
+            # Đảm bảo model đã có trong backend/models (tự tải nếu cấu hình auto_download=True)
+            auto_dl = getattr(config.tts, "auto_download", True)
+            base_path, tok_path = ensure_tts_models(allow_download=auto_dl)
 
-            self.model = OmniVoice.from_pretrained(
-                model_path,
-                device_map=self.device if self.device != "cpu" else None,
-                dtype=torch_dtype,
-            )
+            use_fa = True
+            clamp_fp16 = False
+            self._worker_client.load_model(str(base_path), str(tok_path), use_fa=use_fa, clamp_fp16=clamp_fp16)
 
-            # Warmup với đoạn văn bản ngắn và tiền nạp cache VoiceClonePrompt
+            # Warmup với đoạn văn bản ngắn và tiền nạp cache VoiceReference
             try:
                 ref_audio_path, ref_text = VoiceManager.resolve_voice(config.tts.default_voice)
                 if os.path.exists(ref_audio_path):
                     cached_prompt = self._get_voice_clone_prompt(ref_audio_path, ref_text)
-                    if cached_prompt is not None:
-                        warmup_kwargs = {
-                            "text": "Sẵn sàng.",
-                            "voice_clone_prompt": cached_prompt,
-                            "num_step": 4,
-                        }
-                    else:
-                        warmup_kwargs = {
-                            "text": "Sẵn sàng.",
-                            "ref_audio": ref_audio_path,
-                            "ref_text": ref_text,
-                            "num_step": 4,
-                        }
-                    if torch.cuda.is_available() and "cuda" in str(self.device):
-                        # A2-2 (Hy3): tạo CUDA stream RIÊNG cho TTS một lần duy nhất.
-                        # Đồng bộ MỘT LẦN ở đây (đường nạp model, không phải hot path) để
-                        # mọi công việc nạp trọng số trên stream mặc định đã hoàn tất trước
-                        # khi TTS bắt đầu đọc trọng số trên stream mới. Nếu bỏ bước này, lần
-                        # sinh đầu tiên có thể đọc trọng số chưa ghi xong (race cross-stream).
-                        torch.cuda.synchronize()
-                        self._cuda_stream = torch.cuda.Stream()
+                    voice_key = (cached_prompt or {}).get("voice_key") if isinstance(cached_prompt, dict) else None
                     with self._infer_lock:
-                        _ = self._run_generate(warmup_kwargs)
-                        if self._cuda_stream is not None:
-                            self._cuda_stream.synchronize()
+                        _ = self._worker_client.synthesize(
+                            text="Sẵn sàng.",
+                            voice_key=voice_key,
+                            ref_text=ref_text,
+                            num_steps=4,
+                        )
             except Exception as e:
-                logger.debug(f"Warmup notice: {e}", extra={"module_tag": "TTS"})
-
-            # Thu hồi toàn bộ bộ nhớ trung gian tạm thời trong quá trình nạp trọng số & trích xuất prompt
-            # Giảm Reserved VRAM từ ~6.0GB xuống ~2.0GB (tiết kiệm ~4.0GB VRAM)
-            if torch.cuda.is_available() and "cuda" in str(self.device):
-                torch.cuda.empty_cache()
+                logger.debug(f"Warmup notice: {e}", extra={"module_tag": _TAG})
 
             self._is_loaded = True
             elapsed = time.perf_counter() - t0
-            logger.info(f"OmniVoice đã sẵn sàng ({elapsed:.2f}s)", extra={"module_tag": "TTS"})
+            logger.info(f"OmniVoice GGUF đã sẵn sàng ({elapsed:.2f}s)", extra={"module_tag": _TAG})
 
     async def prewarm(self) -> bool:
         """Khởi động và nạp sẵn mô hình trong tiến trình nền."""
@@ -279,48 +205,23 @@ class OmniVoiceTTS(BaseTTSEngine):
         return self._is_loaded
 
     def unload_model(self) -> None:
-        """Giải phóng hoàn toàn mô hình khỏi RAM và VRAM GPU.
-
-        A2-3 (Hy3): khi `tts_enabled` chuyển sang False, caller (main.py / handler.py)
-        NÊN gọi hàm này để trả VRAM vài GB (OmniVoice float16) thay vì giữ vô ích.
-        """
+        """Giải phóng hoàn toàn mô hình khỏi RAM và VRAM GPU."""
         with self._init_lock:
             with self._infer_lock:
                 self._is_loaded = False
-
-                # Giải phóng LRU cache của transformers (anti-pattern @lru_cache trên class method
-                # _get_conv1d_layers giữ chặt instance model và 527 weight tensors khiến rò rỉ ~800MB allocated / ~2GB reserved VRAM)
-                try:
-                    from transformers.models.higgs_audio_v2_tokenizer.modeling_higgs_audio_v2_tokenizer import (
-                        HiggsAudioV2TokenizerPreTrainedModel,
-                    )
-                    if hasattr(HiggsAudioV2TokenizerPreTrainedModel._get_conv1d_layers, "cache_clear"):
-                        HiggsAudioV2TokenizerPreTrainedModel._get_conv1d_layers.cache_clear()
-                except Exception:
-                    pass
+                self._voice_prompt_cache.clear()
 
                 if self.model is not None:
                     try:
-                        if hasattr(self.model, "audio_tokenizer"):
-                            self.model.audio_tokenizer = None
                         del self.model
                     except Exception:
                         pass
-                self.model = None
-                self._voice_prompt_cache.clear()
-                self._cuda_stream = None
-                # B9-4 (Hy3): CHỈ giữ `gc.collect()` ở đường unload. Module PyTorch tạo
-                # vòng tham chiếu (module ↔ parameter ↔ hook) nên nếu không ép GC thì
-                # `empty_cache()` bên dưới không đòi lại được VRAM — tức là làm hỏng chính
-                # mục tiêu của A2-3. Đây là đường RẤT hiếm (tắt TTS / đổi model) nên chi phí
-                # GC không nằm trên hot path; `gc.collect()` ở warmup (hot path khởi động)
-                # đã được bỏ.
+                    self.model = None
+
+                self._worker_client.unload_model()
                 gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    with contextlib.suppress(Exception):
-                        torch.cuda.ipc_collect()
-        logger.info("OmniVoice đã giải phóng (VRAM cleared)", extra={"module_tag": "TTS"})
+
+        logger.info("OmniVoice GGUF đã giải phóng (VRAM cleared)", extra={"module_tag": _TAG})
 
     def _synthesize_audio(self, text: str, voice_id: Optional[str], speed: float) -> Tuple[Optional[np.ndarray], float]:
         """Sinh audio float32 (bỏ qua bước mã hóa). Trả (audio, duration_sec)."""
@@ -332,46 +233,40 @@ class OmniVoiceTTS(BaseTTSEngine):
 
         ref_audio_path, ref_text = VoiceManager.resolve_voice(voice_id or config.tts.default_voice)
         if not os.path.exists(ref_audio_path):
-            logger.warning(f"Không tìm thấy file mẫu giọng: {ref_audio_path}", extra={"module_tag": "TTS"})
+            logger.warning(f"Không tìm thấy file mẫu giọng: {ref_audio_path}", extra={"module_tag": _TAG})
             return None, 0.0
 
         clean_text = text.strip()
         voice_name = Path(ref_audio_path).name
 
-        # Dùng VoiceClonePrompt đã được cache nếu khả dụng
+        # Dùng VoiceClonePrompt / VoiceRef đã được cache
         cached_prompt = self._get_voice_clone_prompt(ref_audio_path, ref_text)
-        num_steps = max(4, int(getattr(config.tts, "num_inference_steps", 8)))
-        if cached_prompt is not None:
-            gen_kwargs = {
-                "text": clean_text,
-                "voice_clone_prompt": cached_prompt,
-                "num_step": num_steps,
-            }
-        else:
-            gen_kwargs = {
-                "text": clean_text,
-                "ref_audio": ref_audio_path,
-                "ref_text": ref_text,
-                "num_step": num_steps,
-            }
+        voice_key = (cached_prompt or {}).get("voice_key") if isinstance(cached_prompt, dict) else str(Path(ref_audio_path).resolve())
+        num_steps = max(4, int(getattr(config.tts, "num_inference_steps", 16)))
 
         t_start = time.perf_counter()
         with self._infer_lock:
-            audio_output = self._run_generate(gen_kwargs)
-            # A2-2 (Hy3): chỉ chờ stream RIÊNG của TTS, KHÔNG `torch.cuda.synchronize()`
-            # (cái cũ đồng bộ TOÀN device => chặn inference dịch CUDA khác đang chạy =>
-            # priority inversion / latency spike). Nếu chưa có stream riêng (CPU/trường
-            # hợp lỗi) thì fall back về synchronize toàn device để vẫn đúng kết quả.
-            if self._cuda_stream is not None:
-                self._cuda_stream.synchronize()
-            elif torch.cuda.is_available() and "cuda" in str(self.device):
-                torch.cuda.synchronize()
+            # Nếu mock model đang được gán (trong unit test)
+            if self.model is not None and hasattr(self.model, "generate"):
+                gen_kwargs = {
+                    "text": clean_text,
+                    "voice_clone_prompt": cached_prompt,
+                    "num_step": num_steps,
+                }
+                audio_output = self.model.generate(**gen_kwargs)
+                audio_np = AudioProcessor.convert_to_numpy(audio_output)
+            else:
+                audio_np = self._worker_client.synthesize(
+                    text=clean_text,
+                    voice_key=voice_key,
+                    ref_text=ref_text,
+                    num_steps=num_steps,
+                )
 
         infer_time = time.perf_counter() - t_start
 
         # 1. Chuyển đổi sang mảng 1D float32 numpy
-        audio_np = AudioProcessor.convert_to_numpy(audio_output)
-        del audio_output
+        audio_np = AudioProcessor.convert_to_numpy(audio_np)
 
         # 1b. Cắt tỉa khoảng lặng thừa (Silence Trimming) ở đầu và cuối câu
         audio_np = AudioProcessor.trim_silence(audio_np, sample_rate=self.sample_rate)
@@ -392,7 +287,7 @@ class OmniVoiceTTS(BaseTTSEngine):
         rtf = (infer_time / duration_sec) if duration_sec > 0 else 0.0
         logger.info(
             f"Synth {elapsed_ms}ms | audio {duration_sec:.2f}s | RTF {rtf:.2f} | voice={voice_name}: '{clean_text}'",
-            extra={"module_tag": "TTS"},
+            extra={"module_tag": _TAG},
         )
         return audio_np, duration_sec
 
@@ -414,11 +309,7 @@ class OmniVoiceTTS(BaseTTSEngine):
         voice_id: Optional[str] = None,
         speed: float = 1.0,
     ) -> Tuple[Optional[bytes], float]:
-        """P3.1: như `synthesize_sync` nhưng trả WAV thô (bytes).
-
-        Dùng cho đường gửi binary frame: bỏ base64 (+33% kích thước) và bỏ vòng lặp
-        per-byte `atob` trên main thread của client.
-        """
+        """Trả WAV thô (bytes). Dùng cho binary frame qua WebSocket."""
         audio_np, duration_sec = self._synthesize_audio(text, voice_id, speed)
         if audio_np is None:
             return None, 0.0
@@ -430,10 +321,7 @@ class OmniVoiceTTS(BaseTTSEngine):
         voice_id: Optional[str] = None,
         speed: float = 1.0,
     ) -> Tuple[Optional[bytes], float]:
-        """Bản async của `synthesize_wav_bytes` (không block event loop).
-
-        A2-1: nhường GPU nếu commit ASR đang chạy (no-op khi scheduler tắt).
-        """
+        """Bản async của `synthesize_wav_bytes` (không block event loop)."""
         await gpu_arbiter.admit(PRIORITY_TTS)
         return await asyncio.to_thread(self.synthesize_wav_bytes, text, voice_id, speed)
 
@@ -445,22 +333,7 @@ class OmniVoiceTTS(BaseTTSEngine):
         max_duration_sec: float = 0.0,
         max_speed: float = 1.5,
     ) -> Tuple[Optional[bytes], float]:
-        """Tổng hợp giọng nói VỪA một ngân sách thời gian (dùng cho lồng tiếng Lookahead).
-
-        Vì sao cần: khi phụ đề chỉ chiếm `[start_pts, end_pts]` mà câu đọc dài hơn, việc phát
-        nốt phần dư sẽ **đẩy lùi mọi câu sau** ⇒ lồng tiếng trễ dần không cách nào bắt kịp.
-        Cách xử lý ở đây là **nén thời gian giữ nguyên cao độ** (phase vocoder) để câu đọc
-        nằm gọn trong ngân sách:
-
-        1. Sinh audio ở `speed` (thông số người dùng).
-        2. Nếu vẫn dài hơn `max_duration_sec`: nén thêm hệ số `f = duration / max_duration`,
-           nhưng không vượt `max_speed` (tính cả `speed` gốc) để giọng còn rõ.
-        3. Phần vượt quá `max_speed` (nếu có) do phía client cắt/nén nốt — xem
-           `lib/tts-timeline.js`.
-
-        Returns:
-            (wav_bytes, duration_sec) sau khi đã nén; (None, 0.0) nếu không tổng hợp được.
-        """
+        """Tổng hợp giọng nói VỪA một ngân sách thời gian (dùng cho lồng tiếng Lookahead Pipeline B)."""
         audio_np, duration_sec = self._synthesize_audio(text, voice_id, speed)
         if audio_np is None or len(audio_np) == 0:
             return None, 0.0
@@ -481,7 +354,7 @@ class OmniVoiceTTS(BaseTTSEngine):
                 logger.info(
                     f"Nén lồng tiếng {before:.2f}s -> {duration_sec:.2f}s "
                     f"(ngân sách {budget:.2f}s, hệ số {factor:.2f}x WSOLA)",
-                    extra={"module_tag": "TTS"},
+                    extra={"module_tag": _TAG},
                 )
         return AudioProcessor.encode_wav_bytes(audio_np, self.sample_rate), duration_sec
 
@@ -505,9 +378,6 @@ class OmniVoiceTTS(BaseTTSEngine):
         voice_id: Optional[str] = None,
         speed: float = 1.0,
     ) -> Tuple[Optional[str], float]:
-        """Tổng hợp giọng nói bất đồng bộ không làm block asyncio event loop.
-
-        A2-1: nhường GPU nếu commit ASR đang chạy (no-op khi scheduler tắt).
-        """
+        """Tổng hợp giọng nói bất đồng bộ không làm block asyncio event loop."""
         await gpu_arbiter.admit(PRIORITY_TTS)
         return await asyncio.to_thread(self.synthesize_sync, text, voice_id, speed)

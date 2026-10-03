@@ -119,7 +119,7 @@ Khi người dùng TUA VIDEO (Seek trước / Seek sau):
 - **Cắt câu 4 bậc (Pipeline A)**: `VAD_SILENCE` › `MAX_DURATION` › `STABLE_PREFIX` › `TIMEOUT_FORCE` —
   dùng khi tắt Lookahead hoặc khi Lookahead không khả dụng.
 - **Đổi model nóng**: thay ASR / VAD / model dịch / giọng TTS ngay trong popup, không cần restart.
-- **Lồng tiếng (TTS)**: OmniVoice voice-cloning, nén âm thanh thông minh (WSOLA), auto-ducking âm lượng video gốc.
+- **Lồng tiếng (TTS)**: OmniVoice GGUF native qua **omnivoice.cpp** (chạy trên Process Worker độc lập, giải phóng 100% VRAM khi tắt), voice-cloning, nén âm thanh thông minh (WSOLA), auto-ducking âm lượng video gốc.
 - **Popup theo ngữ cảnh**: bật Lookahead thì các tuỳ chỉnh chỉ dành cho Pipeline A (VAD, Segmentation…)
   tự động bị vô hiệu hoá; tắt Lookahead thì mở lại.
 - **Hoàn toàn offline**: không telemetry, không API bên ngoài sau khi tải model.
@@ -172,36 +172,60 @@ Kỳ vọng: `torch CUDA: OK`, `llama GPU offload: True`, ASR backends gồm `cu
 
 ---
 
-## Chuẩn bị model
+## Quản lý Model (Tập trung tại `backend/models/`)
 
-Tất cả model đặt trong `backend/models/` (bị `.gitignore`, không kèm trong repo).
+Toàn bộ mô hình cho **VAD, ASR, Forced Aligner, Dịch thuật (Translation) và Lồng tiếng (TTS)** đều được **tập trung duy nhất tại `backend/models/`** (được `.gitignore`, không kèm trong mã nguồn repo).
 
-**ASR** — phải copy thủ công vào `backend/models/`:
+### 🚀 Tự Động Tải 100% Cho Lần Khởi Chạy Đầu Tiên
 
-| Key | File | Nguồn (HuggingFace) |
+Khi người dùng clone repo sạch và khởi chạy `python backend\main.py`, hệ thống sẽ **tự động kiểm tra và tải về đầy đủ các model cần thiết trực tiếp vào `backend/models/`**:
+
+1. **ASR**: Tự động tải `Qwen3-ASR-0.6B-Q8_0.gguf` từ `handy-computer/Qwen3-ASR-0.6B-gguf` (~850 MB).
+2. **Forced Aligner (Lookahead)**: Tự động tải snapshot `Qwen3-ForcedAligner-0.6B` từ Hugging Face (~600 MB).
+3. **Dịch thuật (Translation)**: Tự động tải `Index-Translate-2B.Q8_0.gguf` từ `mradermacher/Index-Translate-2B-GGUF` (~2.0 GB, hoặc model được cấu hình trong `translation_models.yaml`).
+4. **VAD**: Tự động chuẩn bị và tải file cho cả 3 engine: `firered_stream/Stream-VAD` (~2.3 MB), `silero_vad.jit` (~2.2 MB), `fsmn_vad` (~6.5 MB).
+5. **TTS (OmniVoice GGUF)**: Tự động tải `omnivoice-base-Q8_0.gguf` (~626 MB) và `omnivoice-tokenizer-F32.gguf` (~700 MB) từ `Serveurperso/OmniVoice-GGUF`.
+
+> **Chốt chặn an toàn (Pre-flight Verification)**: Máy chủ chỉ thông báo `[STARTUP] Pipeline sẵn sàng phục vụ` khi **tất cả model bắt buộc (VAD, ASR, Translate, TTS)** đã hiện diện đầy đủ với dung lượng hợp lệ trong `backend/models/`. Nếu có lỗi mạng hoặc thiếu file, tiến trình sẽ báo lỗi cụ thể và dừng lại ngay lập tức.
+
+### Danh mục Model hỗ trợ mở rộng
+
+Bạn có thể tải thêm hoặc chuyển đổi nóng các model khác trực tiếp từ Extension Popup hoặc cấu hình file YAML:
+
+**ASR Catalog** (`backend/models.yaml`):
+
+| Key | File GGUF | Nguồn (HuggingFace) |
 |---|---|---|
-| `qwen3-asr-1.7b` *(mặc định)* | `Qwen3-ASR-1.7B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-1.7B-gguf` |
-| `qwen3-asr-0.6b` | `Qwen3-ASR-0.6B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-0.6B-gguf` |
-| `sensevoice-small` | `SenseVoiceSmall-F32.gguf` | `handy-computer/SenseVoiceSmall-gguf` |
+| `qwen3-asr-0.6b` *(mặc định)* | `Qwen3-ASR-0.6B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-0.6B-gguf` |
+| `qwen3-asr-1.7b` | `Qwen3-ASR-1.7B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-1.7B-gguf` |
+| `sensevoice-small` | `SenseVoiceSmall-Q8_0.gguf` | `handy-computer/SenseVoiceSmall-gguf` |
 | `cohere-transcribe` | `cohere-transcribe-03-2026-Q8_0.gguf` | `handy-computer/cohere-transcribe-03-2026-gguf` |
 | `voxtral-mini-4b-realtime` | `Voxtral-Mini-4B-Realtime-2602-Q5_K_M.gguf` | `handy-computer/Voxtral-Mini-4B-Realtime-2602-gguf` |
 
-**Dịch** — tự tải khi chọn trong popup (hoặc copy thủ công vào `backend/models/`):
+**Dịch thuật Catalog** (`backend/translation_models.yaml`):
 
-| Key | File | Ghi chú |
+| Key | File GGUF | Ghi chú |
 |---|---|---|
-| `tencent` *(mặc định)* | `Hy-MT2-7B-UD-Q4_K_XL.gguf` | ~4,6 GB, chất lượng cao |
-| `tencent-1.8b` | `Hy-MT2-1.8B-UD-Q8_K_XL.gguf` | ~2,0 GB, siêu nhanh |
-| `xiaomi` | `MiLMMT-46-4B-v1.0.Q4_K_M.gguf` | ~2,5 GB |
+| `index-mt-2b` *(mặc định)* | `Index-Translate-2B.Q8_0.gguf` | ~2,0 GB, siêu nhẹ 2B, tốc độ cao |
+| `tencent` | `HY-MT2-7B-Q6_K.gguf` | ~4,6 GB, chất lượng cao |
+| `tencent-1.8b` | `Hy-MT2-1.8B-Q8_0.gguf` | ~1,9 GB, siêu nhanh |
+| `xiaomi` | `MiLMMT-46-12B-v1.0.Q4_K_M.gguf` | ~7,3 GB, dịch cao cấp |
 | `gemmax` | `GemmaX2-28-9B-v0.2.i1-Q4_K_M.gguf` | ~5,8 GB, hỗ trợ 28 ngôn ngữ |
 
-**VAD** — tự tải lần đầu khi chọn engine (cần mạng một lần duy nhất):
+**TTS Catalog (OmniVoice GGUF Native)**:
 
-| Engine | Nguồn |
-|---|---|
-| `firered-vad` *(mặc định)* | HuggingFace `FireRedTeam/FireRedVAD` |
-| `silero-vad` | Bundle trong gói `silero_vad` |
-| `fsmn-vad` | HuggingFace `funasr/fsmn-vad` |
+| Thành phần | File GGUF | Nguồn (HuggingFace) |
+|---|---|---|
+| Base Model *(mặc định)* | `omnivoice-base-Q8_0.gguf` | `Serveurperso/OmniVoice-GGUF` |
+| Tokenizer / Vocoder | `omnivoice-tokenizer-F32.gguf` | `Serveurperso/OmniVoice-GGUF` |
+
+**VAD Engines**:
+
+| Engine | Thư mục / File trong `backend/models/` | Nguồn |
+|---|---|---|
+| `firered-vad` *(mặc định)* | `firered_stream/Stream-VAD/` | HuggingFace `FireRedTeam/FireRedVAD` |
+| `silero-vad` | `silero_vad.jit` | Package `silero_vad` |
+| `fsmn-vad` | `fsmn_vad/` | HuggingFace `funasr/fsmn-vad` |
 
 ---
 
@@ -211,7 +235,7 @@ Tất cả model đặt trong `backend/models/` (bị `.gitignore`, không kèm 
 python backend\main.py
 ```
 
-Lần đầu mất ~47 s để pre-warm ASR + dịch + VAD. Khi thấy `Uvicorn running on https://0.0.0.0:8765`, chấp nhận chứng chỉ SSL tự ký (chỉ cần làm một lần duy nhất):
+Lần chạy đầu tiên, hệ thống sẽ tự động tải các model còn thiếu về `backend/models/` và pre-warm toàn bộ pipeline (ASR, Forced Aligner, Dịch, VAD, TTS). Khi thấy `Uvicorn running on https://0.0.0.0:8765`, chấp nhận chứng chỉ SSL tự ký (chỉ cần làm một lần duy nhất):
 
 - **Cách 1 (Nhanh qua trình duyệt)**: Mở `https://localhost:8765/api/metrics/pipeline` trên Firefox / Chrome / Edge → Bấm **Nâng cao (Advanced)** → Bấm **Tiếp tục truy cập (Proceed to localhost)**.
 - **Cách 2 (Khuyến nghị cho Chrome/Edge trên Windows)**: Đăng ký chứng chỉ vào Trusted Root của Windows để Chrome, Edge và toàn hệ thống tự động tin tưởng:
@@ -285,12 +309,13 @@ vibe-translation-addon-transcribe_cpp/
 │   ├── core/                      # Ring buffer, CommitManager, dedup, metrics
 │   ├── vad/                       # VADProcessor + engine FireRed / Silero / FSMN
 │   ├── translation/               # GGUF translator, hotswap, registry, prompts
-│   ├── tts/                       # OmniVoice TTS
+│   ├── tts/                       # OmniVoice TTS (omnivoice.cpp binding & process worker)
 │   ├── ws/                        # WebSocket handler, session, serializers
 │   ├── utils/                     # CUDA DLL paths, SSL, env_check, watchdog
-│   ├── bin/                       # DLL native ASR (có trong git, không cần build)
-│   │   └── llama/                 # DLL llama.cpp CUDA (tách riêng khỏi bin/)
-│   ├── models/                    # Model cục bộ — gitignore
+│   ├── bin/                       # DLL native ASR (transcribe.dll, ggml-cuda.dll)
+│   │   ├── llama/                 # DLL llama.cpp CUDA (tách riêng khỏi bin/)
+│   │   └── omnivoice/             # DLL omnivoice.cpp CUDA (tách riêng khỏi bin/)
+│   ├── models/                    # Model tập trung (VAD, ASR, Translate, TTS) — gitignore
 │   └── tests/                     # Test suite (pytest)
 ├── extension_firefox/             # WebExtension Manifest V3
 ├── external/                      # Submodules: transcribe.cpp, omnivoice.cpp

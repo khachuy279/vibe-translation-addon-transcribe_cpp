@@ -177,7 +177,7 @@ def _monitor_progress(
     """Log tiến độ mỗi `interval` giây trong lúc tải (luồng nền, tự dừng khi xong)."""
     started = time.time()
     tag = stage.upper()
-    kind = "ASR" if tag == "ASR" else "dịch"
+    kind = "TTS" if tag == "TTS" else ("ASR" if tag == "ASR" else "dịch")
     while not stop.wait(interval):
         done = _incomplete_bytes(local_dir)
         done_mb = _mb(done)
@@ -232,8 +232,12 @@ def ensure_model_file(
         return str(target)
 
     tag = stage.upper()
-    kind = "ASR" if tag == "ASR" else "dịch"
-    cfg_attr = "ASRConfig.auto_download" if tag == "ASR" else "TranslationConfig.auto_download"
+    kind = "TTS" if tag == "TTS" else ("ASR" if tag == "ASR" else "dịch")
+    cfg_attr = (
+        "TTSConfig.auto_download"
+        if tag == "TTS"
+        else ("ASRConfig.auto_download" if tag == "ASR" else "TranslationConfig.auto_download")
+    )
 
     if not allow_download:
         raise ModelFileMissing(

@@ -12,7 +12,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,7 +49,7 @@ except ImportError:
 from backend.utils.cuda import setup_cuda_dll_paths
 setup_cuda_dll_paths()
 
-from backend.config import config, SUPPORTED_LANGUAGES, load_runtime_state, save_runtime_state
+from backend.config import config, MODELS_DIR, SUPPORTED_LANGUAGES, load_runtime_state, save_runtime_state
 from backend.vad import SUPPORTED_VAD_ENGINES, VADProcessor
 from backend.asr.registry import ModelRegistry
 from backend.asr.engine import TranscribeEngine
@@ -362,6 +362,16 @@ def _prewarm_tts() -> None:
         logger.warning(f"[STARTUP] Cảnh báo pre-warm TTS: {e}", exc_info=True, extra={"module_tag": "TTS"})
 
 
+def _ensure_tts_models_downloaded() -> None:
+    """Đảm bảo các model TTS GGUF đã có trong backend/models (không nạp VRAM nếu chưa bật)."""
+    try:
+        from backend.tts.downloader import ensure_tts_models
+
+        ensure_tts_models(allow_download=bool(getattr(config.tts, "auto_download", True)))
+    except Exception as e:
+        logger.warning(f"[STARTUP] Cảnh báo chuẩn bị model TTS: {e}", exc_info=True, extra={"module_tag": "TTS"})
+
+
 def _prewarm_vad_default() -> None:
     """P1.9: nạp engine VAD đang dùng NGAY (cần cho audio đầu tiên).
 
@@ -372,6 +382,18 @@ def _prewarm_vad_default() -> None:
     nền song song với `prewarm()` (tránh nạp 2 lần).
     """
     try:
+        # Chuẩn bị trước các file model VAD cần thiết vào backend/models
+        try:
+            from backend.vad.engines.firered import FireRedVADEngine
+            from backend.vad.engines.silero import SileroVADEngine
+            from backend.vad.engines.fsmn import FsmnVADEngine
+
+            FireRedVADEngine.prepare_files()
+            SileroVADEngine.prepare_files()
+            FsmnVADEngine.prepare_files()
+        except Exception as prep_err:
+            logger.warning(f"[STARTUP] Cảnh báo chuẩn bị file VAD: {prep_err}", extra={"module_tag": "VAD"})
+
         # Truyền đúng cấu hình VAD đang có hiệu lực để state prewarm giống state thật
         # (`threshold=None` ⇒ engine dùng mặc định docs; xem report/audit/19_…, §10.8).
         vad = VADProcessor(
@@ -418,6 +440,74 @@ def _prewarm_vad_others() -> None:
     return statuses
 
 
+def _verify_all_models_ready() -> Tuple[bool, List[str]]:
+    """Kiểm tra bảo đảm toàn bộ model bắt buộc đã có mặt đầy đủ trong backend/models trước khi sẵn sàng.
+
+    Bao gồm:
+    1. VAD: File model của engine VAD đang cấu hình (+ các engine phụ)
+    2. ASR: File GGUF của model ASR (+ model ForcedAligner nếu Lookahead bật)
+    3. Translate: File GGUF của model dịch
+    4. TTS: Hai file GGUF của OmniVoice (Base + Tokenizer)
+    """
+    missing: List[str] = []
+
+    # 1. VAD
+    vad_engine = (config.vad.vad_engine or "firered-vad").lower().strip()
+    if vad_engine == "firered-vad":
+        fr_dir = MODELS_DIR / "firered_stream" / "Stream-VAD"
+        if not (fr_dir / "cmvn.ark").is_file() or not (fr_dir / "model.pth.tar").is_file():
+            missing.append("VAD (FireRed: Stream-VAD/cmvn.ark hoặc model.pth.tar)")
+    elif vad_engine == "silero-vad":
+        if not (MODELS_DIR / "silero_vad.jit").is_file():
+            missing.append("VAD (Silero: silero_vad.jit)")
+    elif vad_engine == "fsmn-vad":
+        fsmn_dir = MODELS_DIR / "fsmn_vad"
+        if not (fsmn_dir / "model.pt").is_file():
+            missing.append("VAD (FSMN: fsmn_vad/model.pt)")
+
+    # 2. ASR
+    try:
+        from backend.asr.registry import ModelRegistry
+
+        asr_reg = ModelRegistry.get_instance()
+        asr_path = Path(asr_reg.resolve_model_path(config.asr.active_model))
+        if not asr_path.is_file() or asr_path.stat().st_size == 0:
+            missing.append(f"ASR ({asr_path.name})")
+    except Exception as e:
+        missing.append(f"ASR ({config.asr.active_model}: {e})")
+
+    # ForcedAligner (Lookahead offline_batch)
+    if bool(getattr(config.lookahead, "enabled", True)):
+        fa_dir = MODELS_DIR / "Qwen3-ForcedAligner-0.6B"
+        if not (fa_dir / "config.json").is_file() or not (
+            (fa_dir / "model.safetensors").is_file() or any(fa_dir.glob("*.safetensors"))
+        ):
+            missing.append("ASR ForcedAligner (Qwen3-ForcedAligner-0.6B)")
+
+    # 3. Translate
+    try:
+        from backend.translation.registry import TranslationModelRegistry
+
+        trans_reg = TranslationModelRegistry.get_instance()
+        trans_path = Path(trans_reg.resolve_gguf_path(config.translation.base))
+        if not trans_path.is_file() or trans_path.stat().st_size == 0:
+            missing.append(f"Translate ({trans_path.name})")
+    except Exception as e:
+        missing.append(f"Translate ({config.translation.base}: {e})")
+
+    # 4. TTS
+    base_name = getattr(config.tts, "model_base", "omnivoice-base-Q8_0.gguf")
+    tok_name = getattr(config.tts, "model_tokenizer", "omnivoice-tokenizer-F32.gguf")
+    base_path = MODELS_DIR / base_name
+    tok_path = MODELS_DIR / tok_name
+    if not base_path.is_file() or base_path.stat().st_size == 0:
+        missing.append(f"TTS Base ({base_name})")
+    if not tok_path.is_file() or tok_path.stat().st_size == 0:
+        missing.append(f"TTS Tokenizer ({tok_name})")
+
+    return (len(missing) == 0, missing)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Khởi tạo và pre-warm trước (Pre-warm) song song toàn bộ các mô hình khi máy chủ khởi động."""
@@ -439,7 +529,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    logger.info("[STARTUP] Pre-warming pipeline: ASR, Translation, VAD...", extra={"module_tag": "MAIN"})
+    logger.info("[STARTUP] Pre-warming pipeline: ASR, Translation, VAD, TTS...", extra={"module_tag": "MAIN"})
 
     _log_asr_backend_at_startup()
     _log_torch_status_at_startup()
@@ -455,6 +545,7 @@ async def lifespan(app: FastAPI):
         asyncio.to_thread(_prewarm_asr),
         asyncio.to_thread(_prewarm_translation),
         asyncio.to_thread(_prewarm_vad_default),
+        asyncio.to_thread(_ensure_tts_models_downloaded),
     ]
     # QWEN-Q3: TTS trước đây KHÔNG có trong lifespan ⇒ câu lồng tiếng ĐẦU TIÊN phải trả
     # giá nạp vài GB trọng số. Chỉ prewarm khi người dùng thật sự bật TTS (không chiếm VRAM).
@@ -474,6 +565,18 @@ async def lifespan(app: FastAPI):
 
     # Các engine VAD khác nạp ở nền để không làm chậm khởi động.
     track_background_task(asyncio.to_thread(_prewarm_vad_others), name="vad_prewarm_others")
+
+    # Kiểm tra bảo đảm toàn bộ model bắt buộc đã có mặt đầy đủ trước khi thông báo khởi động thành công
+    models_ok, missing_models = _verify_all_models_ready()
+    if not models_ok:
+        err_msg = f"[STARTUP] KHỞI ĐỘNG THẤT BẠI: Chưa có đủ model bắt buộc trong {MODELS_DIR}: {', '.join(missing_models)}"
+        logger.error(err_msg, extra={"module_tag": "MAIN"})
+        raise RuntimeError(err_msg)
+
+    logger.info(
+        f"[STARTUP] Đã kiểm tra đầy đủ các model (VAD, ASR, Translate, TTS) trong {MODELS_DIR}",
+        extra={"module_tag": "MAIN"},
+    )
 
     # F-40: nhịp tim event loop — để `/health` phát hiện được loop bị chặn đứng (treo im lặng).
     from backend.core import heartbeat

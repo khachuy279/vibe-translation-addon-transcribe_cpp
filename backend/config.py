@@ -188,7 +188,7 @@ class VADConfig(BaseModel):
 
 class ASRConfig(BaseModel):
     """Cấu hình nhận dạng giọng nói ASR qua transcribe.cpp."""
-    active_model: str = "qwen3-asr-1.7b"
+    active_model: str = "qwen3-asr-0.6b"
     # Backend cho transcribe.cpp. Giá trị hợp lệ:
     #   "auto"   — CUDA nếu có, không thì Vulkan (mặc định).
     #   "cuda"   — ưu tiên CUDA; KHÔNG có thì fallback về Vulkan (xem `backend_fallback`).
@@ -426,8 +426,12 @@ class TTSConfig(BaseModel):
     num_inference_steps: int = 16
     default_voice: str = "ElevenLabs_10s.wav"
     voices_dir: str = str(VOICES_DIR)
-    volume: float = 1
+    volume: float = 1.0
     sample_rate: int = 24000
+    repo_id: str = "Serveurperso/OmniVoice-GGUF"
+    model_base: str = "omnivoice-base-Q8_0.gguf"
+    model_tokenizer: str = "omnivoice-tokenizer-F32.gguf"
+    auto_download: bool = True
 
 
 class AudioBufferConfig(BaseModel):

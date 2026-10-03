@@ -367,7 +367,7 @@ class GGUFTranslator(BaseTranslator):
     def prewarm(self) -> None:
         """Prewarm mô hình dịch bằng một câu ngắn."""
         try:
-            self.load_model()
+            self.load_model(allow_download=bool(getattr(self.cfg, "auto_download", True)))
             self._translate_sync("Hello", source_lang="en", target_lang="vi")
             logger.info(f"Pre-warm hoàn tất ({self.canonical_key})", extra={"module_tag": "TRANSLATE"})
         except Exception as e:
