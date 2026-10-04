@@ -940,8 +940,11 @@ class LookaheadSessionState:
             )
             k_max = min(len(tail), len(kept), window + 1)
             head_norm = [normalize_for_dedup(getattr(w, "text", "") or "") for w in kept]
-            # `slack`: câu cuối của khối trước có thể đã đi QUÁ vùng chồng lấn vài từ, nên khớp
-            # không nhất thiết phải kết thúc ở đúng đuôi — cho phép lùi lại tối đa 3 từ.
+
+            # BẢO VỆ ĐẠI TỪ / TỪ ĐƠN:
+            # - Nếu k >= 2 từ: cho phép slack trong range(0, 4) vì cụm 2 từ trở lên có tính đặc trưng cao.
+            # - Nếu k == 1 từ: CHỈ cho phép slack == 0 (tức là trùng đúng từ cuối cùng vừa phát),
+            #   và tuyệt đối KHÔNG drop k=1 cho các đại từ mở đầu câu mới (như 'i', 'you', 'we', 'he',...).
             for k in range(k_max, 0, -1):
                 if not any(head_norm[:k]):
                     continue
@@ -949,6 +952,10 @@ class LookaheadSessionState:
                 for slack in range(0, 4):
                     p = len(tail) - k - slack
                     if p >= 0 and tail[p : p + k] == head_norm[:k]:
+                        if k == 1 and slack > 0:
+                            matched_word = head_norm[0]
+                            if matched_word in ("i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them"):
+                                continue
                         matched = True
                         break
                 if matched:
@@ -1332,12 +1339,13 @@ class LookaheadSessionState:
             user_sec = float(self.sync_offset_ms) / 1000.0
             shift = pad_sec + user_sec
 
-            # Lọc trước các câu không thuộc quá khứ (tiết kiệm GPU)
+            # Lọc trước các câu không thuộc quá khứ (tiết kiệm GPU),
+            # với biên an toàn rộng (-3.0s) để không drop câu đầu khối khi video đang phát.
             candidate_subs: List[Tuple[int, SubtitleSentence, float, float]] = []
             for idx, sub in enumerate(subtitles):
                 pts_start = max(0.0, chunk.pts_start + sub.start_time + shift)
                 pts_end = max(pts_start + 0.5, chunk.pts_start + sub.end_time + shift)
-                if pts_end >= self.current_time - 0.5:
+                if pts_end >= self.current_time - 3.0:
                     candidate_subs.append((idx, sub, pts_start, pts_end))
 
             # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu
@@ -1698,10 +1706,11 @@ class LookaheadSessionState:
         return text
 
     def _is_duplicate(self, pts_start: float, pts_end: float, text: str) -> bool:
+        norm = normalize_for_dedup(text)
+        if not norm:
+            return True
         for s0, s1, prev in self._sent_items[-64:]:
-            if prev == text and abs(s0 - pts_start) < 0.35:
-                return True
-            if abs(s0 - pts_start) < 0.25 and abs(s1 - pts_end) < 0.25:
+            if normalize_for_dedup(prev) == norm and abs(s0 - pts_start) < 1.0:
                 return True
         return False
 

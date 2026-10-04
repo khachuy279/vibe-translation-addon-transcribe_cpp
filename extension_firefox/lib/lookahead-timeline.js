@@ -93,10 +93,9 @@ class SubtitleTimelineQueue {
       const endPts = Number(item.end_pts);
       if (!Number.isFinite(startPts) || !Number.isFinite(endPts) || endPts <= startPts) continue;
 
-      // Tránh trùng lặp (cùng mốc hoặc cùng nội dung chồng lấn)
+      // Tránh trùng lặp: chỉ bỏ qua khi CÙNG nội dung và mốc thời gian sát nhau
       const exists = this.items.some(
-        (it) => Math.abs(it.start_pts - startPts) < 0.25
-          || (it.original_text === item.original_text && Math.abs(it.start_pts - startPts) < 1.0)
+        (it) => it.original_text === item.original_text && Math.abs(it.start_pts - startPts) < 1.0
       );
       if (exists) continue;
 
@@ -112,6 +111,17 @@ class SubtitleTimelineQueue {
 
     // Sắp xếp lại timeline theo start_pts tăng dần
     this.items.sort((a, b) => a.start_pts - b.start_pts);
+
+    // Đảm bảo thời lượng hiển thị tối thiểu (ít nhất 1.6s) và không chớp tắt
+    for (let i = 0; i < this.items.length; i++) {
+      const it = this.items[i];
+      const nextIt = this.items[i + 1];
+      const minDuration = 1.6; // tối thiểu 1.6s để mắt kịp đọc
+      const maxAllowed = nextIt ? Math.max(it.start_pts + 0.5, nextIt.start_pts - 0.05) : (it.start_pts + 5.0);
+      if (maxAllowed > it.start_pts) {
+        it.end_pts = Math.max(it.end_pts, Math.min(it.start_pts + minDuration, maxAllowed));
+      }
+    }
 
     // Nếu đang chờ nạp đệm sau khi Tua -> phát tiếp khi đã có câu khớp vị trí hiện tại
     if (this._isPrebuffering && this.videoElement) {
