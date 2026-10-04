@@ -191,7 +191,9 @@ class LookaheadSessionState:
             max_window_sec=float(getattr(la, "batch_max_sec", 18.0)),
             min_silence_ms=float(getattr(la, "batch_min_silence_ms", 250.0)),
             overlap_sec=float(getattr(la, "batch_overlap_sec", 1.0)),
-            search_max_sec=float(getattr(la, "batch_search_max_sec", 30.0)),
+            search_max_sec=float(getattr(la, "batch_search_max_sec", 18.0)),
+            adaptive_max_sec=float(getattr(la, "batch_adaptive_max_sec", 18.0) or 18.0) if getattr(la, "batch_adaptive_max_sec", None) else None,
+            adaptive_threshold_sec=float(getattr(la, "batch_adaptive_threshold_sec", 30.0)),
             strong_silence_ms=float(getattr(la, "batch_strong_silence_ms", 450.0)),
             silence_rel_db=float(getattr(la, "batch_silence_rel_db", 22.0)),
             silence_floor_rms=float(getattr(la, "batch_silence_floor_rms", 0.004)),
@@ -209,8 +211,9 @@ class LookaheadSessionState:
             # Trần cho một CÂU TRỌN VẸN: có dấu kết câu trong phạm vi này ⇒ cả câu là một phụ đề.
             "sentence_max_words": int(getattr(la, "batch_sub_sentence_max_words", 24)),
             "sentence_max_duration_sec": float(
-                getattr(la, "batch_sub_sentence_max_duration_sec", 8.0)
+                getattr(la, "batch_sub_sentence_max_duration_sec", 14.0)
             ),
+            "sentence_max_chars": int(getattr(la, "batch_sub_sentence_max_chars", 160)),
         }
         #: Mốc PTS (trong KHÔNG GIAN AUDIO, chưa cộng offset) của từ cuối ĐÃ PHÁT ở khối trước.
         #: Dùng để trừ phần chồng lấn ở ranh giới khối — nếu không, từ ở ranh giới bị phát hai lần
@@ -485,7 +488,7 @@ class LookaheadSessionState:
 
     def _schedule_asr_model_switch(self, model_key: str) -> None:
         """Đổi model ASR cho phiên Lookahead (tác vụ nền, không chặn vòng nhận tin)."""
-        from backend.asr import hotswap as asr_hotswap
+        from backend.asr import lifecycle as asr_lifecycle
         from backend.asr.registry import ModelRegistry
 
         registry = ModelRegistry.get_instance()
@@ -493,16 +496,16 @@ class LookaheadSessionState:
         if not registry.has_model(clean):
             logger.warning(f"Model ASR '{model_key}' không có trong catalog — bỏ qua.", extra={"module_tag": "WS"})
             return
-        if asr_hotswap.is_busy() and not asr_hotswap.is_busy(clean):
+        if asr_lifecycle.is_busy() and not asr_lifecycle.is_busy(clean):
             logger.info("Đang nạp model ASR khác — bỏ qua yêu cầu đổi model.", extra={"module_tag": "WS"})
             return
 
         async def _run() -> None:
             await self.send_json({"type": "model_status", "stage": "asr", "state": "loading", "model": clean})
             try:
-                if asr_hotswap.needs_download(clean) and not asr_hotswap.auto_download_enabled():
+                if asr_lifecycle.needs_download(clean) and not asr_lifecycle.auto_download_enabled():
                     raise RuntimeError("Chưa có file GGUF cục bộ và auto_download đang tắt")
-                await asr_hotswap.activate_model(clean)
+                await asr_lifecycle.activate_model(clean)
                 registry.set_active_model_key(clean)
                 # Đồng bộ engine của phiên: nếu không, lần suy luận kế tiếp sẽ nạp LẠI model cũ
                 # (vì `_ensure_model_loaded` so `model_key` của instance với model chia sẻ).
@@ -521,7 +524,7 @@ class LookaheadSessionState:
 
     def _schedule_translation_model_switch(self, model_request: str) -> None:
         """Đổi model dịch cho phiên Lookahead (tác vụ nền)."""
-        from backend.translation import hotswap as trans_hotswap
+        from backend.translation import lifecycle as trans_lifecycle
         from backend.translation.registry import TranslationModelRegistry
 
         registry = TranslationModelRegistry.get_instance()
@@ -531,16 +534,16 @@ class LookaheadSessionState:
         canonical = registry.resolve_key(model_request)
         if canonical == getattr(config.translation, "base", None):
             return
-        if trans_hotswap.is_busy() and not trans_hotswap.is_busy(canonical):
+        if trans_lifecycle.is_busy() and not trans_lifecycle.is_busy(canonical):
             logger.info("Đang nạp model dịch khác — bỏ qua yêu cầu đổi model.", extra={"module_tag": "WS"})
             return
 
         async def _run() -> None:
             await self.send_json({"type": "model_status", "stage": "translation", "state": "loading", "model": canonical})
             try:
-                if trans_hotswap.needs_download(canonical) and not trans_hotswap.auto_download_enabled():
+                if trans_lifecycle.needs_download(canonical) and not trans_lifecycle.auto_download_enabled():
                     raise RuntimeError("Chưa có file GGUF cục bộ và auto_download đang tắt")
-                await trans_hotswap.activate_model(canonical)
+                await trans_lifecycle.activate_model(canonical)
                 await self.send_json({"type": "model_status", "stage": "translation", "state": "ready", "model": canonical})
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Đổi model dịch Lookahead sang '{canonical}' thất bại: {exc}", extra={"module_tag": "WS"})
@@ -1132,9 +1135,13 @@ class LookaheadSessionState:
             seq = self._seek_seq
             from_pts = self._batch_from_pts if self._batch_from_pts is not None else self.current_time
 
-            # Chặn nạp quá xa vị trí phát hiện tại (tránh đốt GPU vô ích)
+            # Chặn nạp quá xa vị trí phát hiện tại (tránh đốt GPU vô ích),
+            # nhưng tự động nới lỏng khi browser buffer đã có sẵn dồi dào.
             rate = max(1.0, float(self.playback_rate or 1.0))
-            max_ahead_pts = self.current_time + float(self.lead_time) * rate + float(la.feed_margin_sec)
+            buffered_end_timeline = self.timeline.buffered_end_pts() or self.current_time
+            available_ahead = max(0.0, buffered_end_timeline - self.current_time)
+            adaptive_lead = min(60.0, max(float(self.lead_time), available_ahead * 0.8))
+            max_ahead_pts = self.current_time + adaptive_lead * rate + float(la.feed_margin_sec)
             if self._maybe_reanchor_batch_frontier(from_pts, max_ahead_pts):
                 continue
             if from_pts > max_ahead_pts:
@@ -1297,8 +1304,8 @@ class LookaheadSessionState:
             subtitles = ForcedAlignerService.split_oversized_sentences(
                 subtitles,
                 language=align_lang,
-                max_chars=int(self._batch_sub_opts.get("max_chars", 0) or 0),
-                max_words=int(self._batch_sub_opts.get("max_words", 0) or 0),
+                max_chars=int(self._batch_sub_opts.get("sentence_max_chars", 160) or 160),
+                max_words=int(self._batch_sub_opts.get("sentence_max_words", 24) or 24),
             )
 
             # Bước 2F: GIỮ LẠI mảnh cuối nếu nó CHƯA KẾT CÂU và khối bị cắt giữa câu.
@@ -1320,54 +1327,42 @@ class LookaheadSessionState:
                     extra={"module_tag": "ASR"},
                 )
 
-            # Bước 3 & 4: Dịch từng câu phụ đề và gửi về Client
+            # Bước 3 & 4: Dịch phụ đề khối (Batch Context Translation qua JSON) và gửi về Client
             pad_sec = max(0.0, self._start_pad_ms) / 1000.0
             user_sec = float(self.sync_offset_ms) / 1000.0
             shift = pad_sec + user_sec
 
-            items_to_send = []
-            #: Mốc kết thúc (KHÔNG GIAN AUDIO, chưa cộng offset) của nội dung đã phát ở khối này.
-            #: Khối sau sẽ trừ mọi từ nằm trước mốc này để không phát lặp ở vùng chồng lấn.
-            emitted_end_audio: Optional[float] = None
+            # Lọc trước các câu không thuộc quá khứ (tiết kiệm GPU)
+            candidate_subs: List[Tuple[int, SubtitleSentence, float, float]] = []
             for idx, sub in enumerate(subtitles):
+                pts_start = max(0.0, chunk.pts_start + sub.start_time + shift)
+                pts_end = max(pts_start + 0.5, chunk.pts_start + sub.end_time + shift)
+                if pts_end >= self.current_time - 0.5:
+                    candidate_subs.append((idx, sub, pts_start, pts_end))
+
+            # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu
+            candidate_texts = [sub.text for _, sub, _, _ in candidate_subs]
+            t_tr = time.perf_counter()
+            translated_texts = await self._translate_batch(candidate_texts)
+            tr_ms = (time.perf_counter() - t_tr) * 1000.0
+
+            if candidate_subs:
+                preview_trans = " ⏐ ".join(f'"{t.strip()}"' for t in translated_texts[:8])
+                if len(translated_texts) > 8:
+                    preview_trans += f" ⏐ …(+{len(translated_texts) - 8})"
+                logger.info(
+                    f"Lookahead Batch Translation ({len(candidate_subs)} câu, {tr_ms:.0f}ms): {preview_trans}",
+                    extra={"module_tag": "TRANSLATE"},
+                )
+
+            items_to_send = []
+            emitted_end_audio: Optional[float] = None
+            for (idx, sub, pts_start, pts_end), translated in zip(candidate_subs, translated_texts):
                 if self._closed or seq != self._seek_seq:
                     break
 
-                pts_start = chunk.pts_start + sub.start_time + shift
-                pts_end = chunk.pts_start + sub.end_time + shift
-                if pts_start < 0:
-                    pts_start = 0.0
-                if pts_end <= pts_start:
-                    pts_end = pts_start + 0.5
-
-                if pts_end < self.current_time - 0.5:
-                    continue  # Bỏ câu thuộc quá khứ
-
-                # Phase 3: Xây dựng Bi-directional Context (2 câu trước + 1 câu tiếp theo)
-                context_parts = []
-                if self._recent_utterances:
-                    past_lines = []
-                    for utt in self._recent_utterances[-2:]:
-                        orig = (utt.get("text") or "").strip()
-                        trans = (utt.get("translated") or "").strip()
-                        if orig and trans:
-                            past_lines.append(f'- "{orig}" -> "{trans}"')
-                    if past_lines:
-                        context_parts.append("Previous context:\n" + "\n".join(past_lines))
-
-                if idx + 1 < len(subtitles):
-                    next_text = subtitles[idx + 1].text.strip()
-                    if next_text:
-                        context_parts.append(f'Next sentence:\n- "{next_text}"')
-
-                context_str = "\n\n".join(context_parts) if context_parts else ""
-
-                translated = await self._translate(sub.text, context=context_str)
-                if translated is None:
+                if not translated:
                     translated = sub.text
-
-                if self._closed or seq != self._seek_seq:
-                    break
 
                 if self._is_duplicate(pts_start, pts_end, sub.text):
                     continue
@@ -1656,8 +1651,28 @@ class LookaheadSessionState:
                 except Exception:  # noqa: BLE001
                     pass
 
+    async def _translate_batch(self, texts: List[str]) -> List[str]:
+        """Dịch gộp cả khối câu phụ đề qua Batch Context Translation (Pipeline B)."""
+        if not texts:
+            return []
+        engine = self.translation_engine
+        if engine is None:
+            return list(texts)
+        try:
+            if hasattr(engine, "translate_batch"):
+                return await engine.translate_batch(texts, self.source_lang, self.target_lang)
+            # Fallback nếu engine không có translate_batch
+            results = []
+            for t in texts:
+                res = await self._translate(t)
+                results.append(res or t)
+            return results
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Lỗi dịch Lookahead batch: {exc}", extra={"module_tag": "TRANSLATE"})
+            return list(texts)
+
     async def _translate(self, text: str, context: str = "") -> Optional[str]:
-        """Dịch câu gốc sang ngôn ngữ đích kèm ngữ cảnh (nếu có). None = không gửi (lỗi)."""
+        """Dịch câu gốc đơn lẻ sang ngôn ngữ đích kèm ngữ cảnh (nếu có). None = không gửi (lỗi)."""
         engine = self.translation_engine
         if engine is None:
             return text

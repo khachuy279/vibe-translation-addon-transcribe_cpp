@@ -1,16 +1,25 @@
-"""ContextManager: Quản lý bộ nhớ ngữ cảnh dịch (Sliding Window FIFO)."""
+"""ContextManager: Quản lý bộ nhớ ngữ cảnh dịch cho Pipeline A (Sliding Window FIFO).
+
+⚠️ PHẠM VI ÁP DỤNG:
+- CHỈ ÁP DỤNG CHO PIPELINE A (Realtime Streaming đơn câu).
+- Được bật/tắt và điều chỉnh qua `use_context: bool = False` và `context_window: int = 3`
+  trong `backend/config.py` (TranslationConfig).
+- Pipeline B (Lookahead) KHÔNG sử dụng ContextManager này vì đã sử dụng tính năng
+  Batch Context Translation (dịch gộp toàn bộ các câu trong khối ASR qua JSON instTrans)
+  vốn đã có toàn bộ ngữ cảnh liền mạch tự nhiên và tiết kiệm GPU hơn.
+"""
 
 from collections import deque
 from typing import Deque, List, Tuple
 
 
 class ContextManager:
-    """Quản lý cửa sổ trượt N câu dịch gần nhất để bổ trợ ngữ cảnh."""
+    """Quản lý cửa sổ trượt N câu dịch gần nhất để bổ trợ ngữ cảnh cho Pipeline A."""
 
     def __init__(self, window_size: int = 3):
-        self.window_size = window_size
-        self._history: Deque[Tuple[str, str]] = deque(maxlen=window_size)
-        # B6-3 (Hy3): cache chuỗi ngữ cảnh đã format. `get_context_str()` được gọi cho MỖI
+        self.window_size = int(window_size)
+        self._history: Deque[Tuple[str, str]] = deque(maxlen=self.window_size)
+        # B6-3: cache chuỗi ngữ cảnh đã format. `get_context_str()` được gọi cho MỖI
         # câu dịch khi `translation.use_context = True`; bản cũ ghép lại chuỗi từ deque mỗi
         # lần. Lịch sử chỉ đổi ở `add()`/`clear()` nên chỉ cần dựng lại khi có thay đổi.
         # Mặc định `use_context = False` (handler không gọi hàm này) nên cache thuần tuý là
@@ -45,4 +54,3 @@ class ContextManager:
 
 # Alias tương thích
 TranslationContextTracker = ContextManager
-

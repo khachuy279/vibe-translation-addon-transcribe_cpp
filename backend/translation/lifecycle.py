@@ -1,14 +1,11 @@
-"""Đổi model dịch "nguyên tử" — dùng chung cho REST `/api/config` và WebSocket.
+"""Quản lý vòng đời và tải model dịch (Model Lifecycle & Download State Machine).
 
-Vì sao cần module riêng (F-50): đường REST cũ ghi `config.translation.base` TRƯỚC khi nạp
-và `GGUFTranslator.reconfigure()` giải phóng model cũ trước khi nạp model mới. Khi model mới
-thiếu file GGUF (ví dụ `Hy-MT2-1.8B-UD-Q8_K_XL.gguf` chưa tải về), backend vừa mất model
-đang chạy tốt vừa ghi sai config ⇒ mọi bản dịch sau đó hỏng cho tới khi restart.
-
-Nguyên tắc ở đây:
-1. Kiểm tra catalog + file trước; thiếu file thì **tải trước** (nếu bật `auto_download`).
-2. Chỉ ghi `config.translation.base` SAU khi model mới đã nạp xong.
-3. Lỗi ở bất kỳ bước nào ⇒ model cũ vẫn đang phục vụ, trạng thái được báo rõ cho popup.
+Dùng chung cho REST `/api/config` và WebSocket.
+Quy trình:
+1. Kiểm tra catalog + file trước; thiếu file thì tải trước (nếu bật `auto_download`).
+2. Khóa UI -> Unload model cũ để giải phóng VRAM -> Nạp model mới (tránh tràn VRAM).
+3. Chỉ ghi `config.translation.base` SAU khi model mới đã nạp xong.
+4. Lỗi ở bất kỳ bước nào => báo rõ trạng thái cho popup.
 
 Trạng thái: `idle → downloading → loading → ready | error` (kèm tiến độ tải thật).
 """

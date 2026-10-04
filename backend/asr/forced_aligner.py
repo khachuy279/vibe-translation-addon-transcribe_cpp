@@ -158,11 +158,17 @@ def _split_text_by_sentence(text: str) -> List[str]:
         ch = text[i]
         buf += ch
         i += 1
-        if ch in _SENTENCE_END_CHARS:
+        if ch in _SENTENCE_END_CHARS or ch == ".":
+            # Không tách nếu là số thập phân: ví dụ 3.14 hay 152.39s
+            if ch == "." and i < n and text[i].isdigit() and len(buf) >= 2 and buf[-2].isdigit():
+                continue
+            # Không tách nếu là từ viết liền / tên miền / viết tắt chưa hết: domain.com
+            if ch == "." and i < n and (text[i].isalpha() and not text[i].isspace()):
+                continue
             while i < n and text[i] in _SENTENCE_CLOSERS:
                 buf += text[i]
                 i += 1
-            while i < n and text[i] in _SENTENCE_END_CHARS:
+            while i < n and (text[i] in _SENTENCE_END_CHARS or text[i] == "."):
                 buf += text[i]
                 i += 1
             if buf.strip():
@@ -646,7 +652,8 @@ class ForcedAlignerService:
 
         def _choose_cut(lo: int, cap_end: int) -> int:
             """Chọn từ kết thúc nhóm khi không có dấu kết câu nào trong tầm với."""
-            floor = min(cap_end, lo + min_words - 1)
+            # Sàn cắt trong câu: tối thiểu 2 từ nếu cửa sổ cho phép (tránh cắt mảnh mồ côi 1 từ như "I")
+            floor = min(cap_end, lo + max(2, min_words) - 1)
             # (a) Dấu phẩy CUỐI CÙNG trong cửa sổ (giữ cụm từ dài nhất có thể mà vẫn dưới trần)
             for k in range(cap_end, floor - 1, -1):
                 if _is_clause_end(k):

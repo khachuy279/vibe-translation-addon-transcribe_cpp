@@ -21,8 +21,12 @@ from backend.asr.adapters import build_family_options, normalize_language_for_fa
 from backend.asr.text_cleaner import clean_transcript_text
 from backend.asr.engine import TranscribeEngine
 from backend.asr import native
+from backend.asr import lifecycle
+from backend.asr import lifecycle as hotswap  # Alias tương thích ngược
 
 __all__ = [
+    "lifecycle",
+    "hotswap",
     "BaseASREngine",
     "ModelRegistry",
     "build_family_options",

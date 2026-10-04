@@ -10,12 +10,14 @@ Hỗ trợ:
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import json
 import logging
 import os
 from pathlib import Path
+import re
 import threading
 import time
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from backend.utils.cuda import setup_cuda_dll_paths
 from backend.utils.logger import logger
@@ -54,6 +56,43 @@ from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TRANSLATION
 from backend.utils.text_repetition import collapse_repetitions
 
 _TRANS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="translation_worker")
+
+
+def _parse_batch_json(raw_text: str, expected_count: int) -> Optional[List[str]]:
+    """Trích xuất và parse JSON dictionary { '1': ..., '2': ... } từ output của LLM."""
+    if not raw_text:
+        return None
+    # 1. Chuẩn hoá dấu ngoặc kép kiểu Trung Quốc/Unicode sang ASCII quote
+    cleaned = raw_text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+
+    # 2. Tìm khối JSON bao bởi { ... }
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        cleaned = cleaned[start_idx : end_idx + 1]
+
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        # Thử sửa lỗi phổ biến: thiếu dấu phẩy giữa các dòng JSON
+        try:
+            fixed = re.sub(r'("(?:[^"\\]|\\.)*")\s*\n\s*(")', r'\1,\n\2', cleaned)
+            data = json.loads(fixed)
+        except Exception:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    results = []
+    for i in range(1, expected_count + 1):
+        key = str(i)
+        if key not in data:
+            return None
+        val = str(data[key]).strip()
+        results.append(collapse_repetitions(val))
+
+    return results
 
 
 class GGUFTranslator(BaseTranslator):
@@ -498,6 +537,95 @@ class GGUFTranslator(BaseTranslator):
     ) -> Dict[str, Any]:
         """Alias cho translate_sentence."""
         return await self.translate_sentence(text, source_lang, target_lang, context)
+
+    def translate_batch_sync(
+        self,
+        texts: List[str],
+        source_lang: str = "auto",
+        target_lang: str = "vi",
+    ) -> List[str]:
+        """Dịch gộp cả danh sách câu (cho Pipeline B) qua JSON instTrans trong 1 lần gọi GPU duy nhất."""
+        if not texts:
+            return []
+        if len(texts) == 1:
+            res = self._translate_sync(texts[0], source_lang=source_lang, target_lang=target_lang)
+            return [res.get("translated_text") or texts[0]]
+
+        try:
+            self.load_model()
+        except Exception as exc:  # noqa: BLE001
+            self._log_load_failure(exc)
+            return list(texts)
+
+        if self.__class__._shared_llm is None:
+            return list(texts)
+
+        built_key, built_cfg, built_strategy = self._shared_config_snapshot()
+        prompt_fn = getattr(built_strategy, "build_batch_prompt", None)
+        if prompt_fn is None:
+            # Fallback nếu strategy không hỗ trợ batch
+            return [
+                self._translate_sync(t, source_lang=source_lang, target_lang=target_lang).get("translated_text") or t
+                for t in texts
+            ]
+
+        batch_prompt = built_strategy.build_batch_prompt(texts, source_lang, target_lang)
+        max_tokens = min(1536, max(256, len(texts) * 80))
+        kwargs = {
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "repeat_penalty": 1.05,
+            "stop": built_strategy.get_stop_tokens(),
+        }
+
+        with self.__class__._infer_lock:
+            llm, shared_key, cfg, strategy = self._snapshot_infer_state()
+            if llm is None:
+                return list(texts)
+            if shared_key != built_key and hasattr(strategy, "build_batch_prompt"):
+                batch_prompt = strategy.build_batch_prompt(texts, source_lang, target_lang)
+
+            try:
+                output = llm(batch_prompt, **kwargs)
+                raw_text = output["choices"][0].get("text", "")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Lỗi suy luận batch LLM: {exc}, fallback dịch từng câu", extra={"module_tag": "TRANSLATE"})
+                return [
+                    self._translate_sync(t, source_lang=source_lang, target_lang=target_lang).get("translated_text") or t
+                    for t in texts
+                ]
+
+        parsed = _parse_batch_json(raw_text, len(texts))
+        if parsed is not None and len(parsed) == len(texts):
+            return parsed
+
+        logger.warning(
+            f"Parse JSON batch thất bại ({len(raw_text)} chars), fallback dịch tuần tự từng câu.",
+            extra={"module_tag": "TRANSLATE"},
+        )
+        return [
+            self._translate_sync(t, source_lang=source_lang, target_lang=target_lang).get("translated_text") or t
+            for t in texts
+        ]
+
+    async def translate_batch(
+        self,
+        texts: List[str],
+        source_lang: str = "auto",
+        target_lang: str = "vi",
+    ) -> List[str]:
+        """Async wrapper cho translate_batch_sync chạy trên thread pool với GPU arbiter."""
+        loop = asyncio.get_running_loop()
+        await gpu_arbiter.admit(PRIORITY_TRANSLATION)
+        return await loop.run_in_executor(
+            _TRANS_EXECUTOR,
+            self.translate_batch_sync,
+            texts,
+            source_lang,
+            target_lang,
+        )
 
     # ------------------------------------------------------------------ streaming
     def _translate_stream_sync(self, text: str, source_lang: str, target_lang: str, context: str):

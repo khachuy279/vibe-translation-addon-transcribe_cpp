@@ -31,18 +31,26 @@ def test_translation_registry_and_prompts():
     """Kiểm tra Registry và các chiến lược Prompt."""
     registry = TranslationModelRegistry.get_instance()
     models = registry.list_models()
-    assert len(models) > 0
+    assert len(models) == 2
 
     # Kiểm tra resolve alias
-    assert registry.resolve_key("tencent-7b") == "tencent"
-    assert registry.resolve_key("milmmt") == "xiaomi"
-    assert registry.resolve_key("gemma") == "gemmax"
+    assert registry.resolve_key("index-2b") == "index-translate-2b"
+    assert registry.resolve_key("index-translate") == "index-translate-2b"
+    assert registry.resolve_key("index-mt-9b") == "index-translate-9b"
 
-    # Kiểm tra prompt builder
-    strategy = get_prompt_strategy("tencent")
-    prompt = strategy.build_prompt("Hello world", source_lang="en", target_lang="vi")
-    assert "Translate the following" in prompt
-    assert "Vietnamese" in prompt
+    # Kiểm tra prompt builder Pipeline A (đơn câu)
+    strategy_a = get_prompt_strategy("pipeline_a")
+    prompt_a = strategy_a.build_prompt("Hello world", source_lang="en", target_lang="vi")
+    assert "Translate the user's text" in prompt_a
+    assert "Vietnamese" in prompt_a
+    assert "<think>" in prompt_a
+
+    # Kiểm tra prompt builder Pipeline B (batch JSON instTrans)
+    strategy_b = get_prompt_strategy("pipeline_b")
+    prompt_b = strategy_b.build_batch_prompt(["Hello", "World"], source_lang="en", target_lang="vi")
+    assert "Translate the following subtitle JSON data" in prompt_b
+    assert '"1": "Hello"' in prompt_b
+    assert '"2": "World"' in prompt_b
 
 
 def test_context_manager_and_dedup():
@@ -56,6 +64,60 @@ def test_context_manager_and_dedup():
     assert dedup.is_duplicate("Xin chào") is False
     assert dedup.is_duplicate("Xin chào") is True
     assert dedup.is_duplicate("Chào buổi sáng") is False
+
+
+def test_parse_batch_json():
+    """Kiểm tra parse JSON batch với cả chuẩn ASCII và dấu ngoặc kép kiểu Trung Quốc."""
+    from backend.translation.engine import _parse_batch_json
+
+    # 1. JSON chuẩn
+    raw = '{\n  "1": "Câu một",\n  "2": "Câu hai"\n}'
+    assert _parse_batch_json(raw, 2) == ["Câu một", "Câu hai"]
+
+    # 2. Dấu ngoặc kép kiểu Trung Quốc (của một số model)
+    raw_cn = '{\n  “1”: “Câu một”,\n  “2”: “Câu hai”\n}'
+    assert _parse_batch_json(raw_cn, 2) == ["Câu một", "Câu hai"]
+
+    # 3. Thiếu dấu phẩy giữa các dòng
+    raw_no_comma = '{\n  "1": "Câu một"\n  "2": "Câu hai"\n}'
+    assert _parse_batch_json(raw_no_comma, 2) == ["Câu một", "Câu hai"]
+
+    # 4. Thiếu key hoặc sai số lượng
+    raw_missing = '{\n  "1": "Câu một"\n}'
+    assert _parse_batch_json(raw_missing, 2) is None
+
+
+def test_lookahead_chunker_adaptive_expansion():
+    """Kiểm tra LookaheadChunker tự động mở rộng trần khi buffer trình duyệt dồi dào."""
+    import numpy as np
+    from backend.core.lookahead_timeline import ContinuousAudioTimeline
+    from backend.core.lookahead_chunker import LookaheadChunker
+
+    timeline = ContinuousAudioTimeline()
+    # Nạp 45s audio (45 * 16000 mẫu float32)
+    sr = 16000
+    pcm = np.zeros(45 * sr, dtype=np.float32)
+    # Thêm một khoảng lặng ở mốc 32s (từ 32.0s đến 33.0s là im lặng 0.0)
+    # Các vùng khác cho ít nhiễu để không bị coi là im lặng toàn bộ
+    pcm[: 32 * sr] = 0.05
+    pcm[33 * sr :] = 0.05
+    timeline.append(0.0, pcm)
+
+    chunker = LookaheadChunker(
+        timeline=timeline,
+        sample_rate=sr,
+        target_window_sec=15.0,
+        min_window_sec=12.0,
+        search_max_sec=30.0,
+        adaptive_max_sec=45.0,
+        adaptive_threshold_sec=30.0,
+    )
+
+    chunk = chunker.next_chunk(from_pts=0.0)
+    assert chunk is not None
+    # Nhờ adaptive expansion (buffer 45s >= 30s), chunker tìm được khoảng lặng ở 32.5s (vượt trần 30s cũ)
+    assert chunk.pts_end >= 30.0, f"Chunk phải mở rộng vượt 30s, nhận được: {chunk.pts_end}s"
+
 
 
 @pytest.mark.slow

@@ -372,7 +372,7 @@ class SentenceConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "index-mt-2b"  # tencent, tencent-1.8b, xiaomi, gemmax, index-mt-2b
+    base: str = "index-translate-2b"  # index-translate-2b, index-translate-9b
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None
@@ -383,9 +383,11 @@ class TranslationConfig(BaseModel):
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
     max_tokens: int = 128
+    # ContextManager: chỉ áp dụng cho Pipeline A (Realtime streaming đơn câu).
+    # Pipeline B sử dụng Batch Context Translation (dịch gộp khối qua JSON instTrans).
     use_context: bool = False
     context_window: int = 3
-    prompt_style: Optional[str] = None
+    prompt_style: Optional[str] = "index"
     n_gpu_layers: int = -1
     # P4.3: trước đây các tham số này bị hardcode trong translation/engine.py.
     # A5 (audit Gemini, đã kiểm chứng): KV cache ở đây RẤT nhỏ nên đừng tối ưu.
@@ -512,10 +514,11 @@ class LookaheadConfig(BaseModel):
     # (chẩn đoán "cuối câu này là đầu của câu sau": xem
     #  report/09_lookahead_offline_batch/phase5_chan_doan_ngat_cau.md)
     #
-    #: Trần dải TÌM ranh giới thật. Qwen3-ASR cho chất lượng tốt nhất ở cửa sổ 15–30 s
-    #: (plan §2), nên khối được phép dài tới đây để đổi lấy một khoảng lặng THẬT thay vì
-    #: cắt cứng ở `batch_max_sec` (18 s) — cắt cứng chính là chỗ chẻ đôi câu.
-    batch_search_max_sec: float = 30.0
+    #: Trần dải TÌM ranh giới thật. Giới hạn tối đa 18.0s để không gộp bài hát/nhạc nền với
+    #: tiếng thoại của nhân vật, tránh hiện tượng ASR bị tiếng nói to lấn át làm nuốt mất lời bài hát.
+    batch_search_max_sec: float = 18.0
+    batch_adaptive_max_sec: Optional[float] = 18.0
+    batch_adaptive_threshold_sec: float = 30.0
     #: Khoảng lặng >= mức này là ranh giới MẠNH: cắt ngay dù xa mốc lý tưởng. 250 ms chỉ là
     #: khoảng nghỉ giữa hai từ trong hội thoại phim, KHÔNG phải hết câu.
     batch_strong_silence_ms: float = 450.0
@@ -549,7 +552,8 @@ class LookaheadConfig(BaseModel):
     #: Chỉ khi câu dài hơn mức này mới phải cắt bên trong (theo dấu phẩy/khe âm học).
     #: ⚠️ Dấu câu chỉ có sau khi gắn lại từ văn bản ASR (`ForcedAlignerService.merge_source_text`).
     batch_sub_sentence_max_words: int = 24
-    batch_sub_sentence_max_duration_sec: float = 8.0
+    batch_sub_sentence_max_duration_sec: float = 14.0
+    batch_sub_sentence_max_chars: int = 160
 
     #: Thời gian dịch trước (giây) — khoảng đệm phải sẵn sàng TRƯỚC vị trí phát.
     lead_time_sec: float = 15.0

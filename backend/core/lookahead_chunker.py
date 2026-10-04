@@ -119,6 +119,8 @@ class LookaheadChunker:
         min_rms_ratio: float = 0.35,
         min_rms_hold_ms: float = 120.0,
         dip_search_sec: float = 3.0,
+        adaptive_max_sec: Optional[float] = None,
+        adaptive_threshold_sec: float = 30.0,
     ):
         self.timeline = timeline
         self.sample_rate = int(sample_rate)
@@ -136,6 +138,9 @@ class LookaheadChunker:
         #: batch truyền `batch_search_max_sec` (30 s) để có cơ hội gặp khoảng lặng THẬT.
         search_max = float(search_max_sec) if search_max_sec else float(max_window_sec)
         self.search_max_sec = max(float(min_window_sec), search_max)
+        #: Tự động mở rộng khi browser buffer có sẵn (>= adaptive_threshold_sec)
+        self.adaptive_max_sec = max(self.search_max_sec, float(adaptive_max_sec)) if adaptive_max_sec else None
+        self.adaptive_threshold_sec = float(adaptive_threshold_sec)
         #: Khoảng lặng >= mức này là ranh giới MẠNH (cắt ngay, không cần gần mốc lý tưởng).
         self.strong_silence_ms = max(float(min_silence_ms), float(strong_silence_ms))
         #: Ngưỡng lặng TƯƠNG ĐỐI: p90(mức chương trình) − bao nhiêu dB.
@@ -411,9 +416,16 @@ class LookaheadChunker:
             )
 
         # 3. QUÉT TÌM ĐIỂM CẮT TỐI ƯU
+        # Tự động mở rộng dải tìm ranh giới khi browser buffer có sẵn dồi dào
+        effective_search_max = self.search_max_sec
+        effective_target = self.target_window_sec
+        if self.adaptive_max_sec and available_sec >= self.adaptive_threshold_sec:
+            effective_search_max = min(float(self.adaptive_max_sec), available_sec)
+            effective_target = min(effective_search_max - 2.0, max(self.target_window_sec, effective_search_max * 0.65))
+
         search_start_pts = from_pts + self.min_window_sec
-        search_end_pts = min(buffered_end, from_pts + self.search_max_sec)
-        ideal_cut_pts = min(from_pts + self.target_window_sec, search_end_pts)
+        search_end_pts = min(buffered_end, from_pts + effective_search_max)
+        ideal_cut_pts = min(from_pts + effective_target, search_end_pts)
 
         # MỘT lần đọc duy nhất vùng [from_pts, search_end_pts]: vừa để đo MỨC CHƯƠNG TRÌNH (ngưỡng
         # lặng tương đối), vừa là nguồn cho vùng quét (cắt lát, không copy thêm). Đo mức trên toàn

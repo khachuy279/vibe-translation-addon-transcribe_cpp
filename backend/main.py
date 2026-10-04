@@ -53,10 +53,10 @@ from backend.config import config, MODELS_DIR, SUPPORTED_LANGUAGES, load_runtime
 from backend.vad import SUPPORTED_VAD_ENGINES, VADProcessor
 from backend.asr.registry import ModelRegistry
 from backend.asr.engine import TranscribeEngine
-from backend.asr import hotswap as asr_hotswap
+from backend.asr import lifecycle as asr_lifecycle
 from backend.translation.engine import GGUFTranslationEngine, get_translation_engine, reset_translation_engine
 from backend.translation.registry import TranslationModelRegistry
-from backend.translation import hotswap as translation_hotswap
+from backend.translation import lifecycle as translation_lifecycle
 from backend.tts import VoiceManager, OmniVoiceTTS, get_tts_engine
 from backend.core.metrics import metrics_collector
 from backend.ws.handler import handle_ws
@@ -242,14 +242,14 @@ def track_background_task(coro, name: str = "background_task") -> asyncio.Task:
 async def _activate_translation_model_bg(canonical_key: str, allow_download: bool = True) -> None:
     """Tác vụ nền: tải (nếu cần) + nạp model dịch rồi thông báo cho các phiên đang chạy.
 
-    Trạng thái được `translation.hotswap` giữ lại để popup hỏi tiến độ qua `/api/config`.
+    Trạng thái được `translation.lifecycle` giữ lại để popup hỏi tiến độ qua `/api/config`.
     """
     from backend.ws.handler import get_active_sessions
 
     try:
-        await translation_hotswap.run_reserved(canonical_key, allow_download=allow_download)
+        await translation_lifecycle.run_reserved(canonical_key, allow_download=allow_download)
     except Exception:
-        # hotswap đã log + lưu trạng thái "error" (kèm thông báo) cho popup đọc.
+        # lifecycle đã log + lưu trạng thái "error" (kèm thông báo) cho popup đọc.
         return
 
     for sess in get_active_sessions():
@@ -265,14 +265,14 @@ async def _activate_translation_model_bg(canonical_key: str, allow_download: boo
 async def _activate_asr_model_bg(target_model: str, allow_download: bool = True) -> None:
     """Tác vụ nền: tải (nếu cần) + nạp model ASR rồi thông báo cho các phiên đang chạy.
 
-    Trạng thái được `asr_hotswap` giữ lại để popup hỏi tiến độ qua `/api/config`.
+    Trạng thái được `asr_lifecycle` giữ lại để popup hỏi tiến độ qua `/api/config`.
     """
     from backend.ws.handler import get_active_sessions
 
     try:
-        await asr_hotswap.run_reserved(target_model, allow_download=allow_download)
+        await asr_lifecycle.run_reserved(target_model, allow_download=allow_download)
     except Exception:
-        # asr_hotswap đã log + lưu trạng thái "error" cho popup đọc.
+        # asr_lifecycle đã log + lưu trạng thái "error" cho popup đọc.
         return
 
     for sess in get_active_sessions():
@@ -771,10 +771,10 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
         "asr": {
             "active_model": active_key,
             "auto_download": getattr(config.asr, "auto_download", True),
-            "download": asr_hotswap.status(),
+            "download": asr_lifecycle.status(),
             "available_models": registry.list_models(),
         },
-        "asr_download": asr_hotswap.status(),
+        "asr_download": asr_lifecycle.status(),
         "translation": {
             "model": config.translation.model,
             "gguf_file": config.translation.gguf_file,
@@ -785,7 +785,7 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             # Model nào đã có file GGUF cục bộ (cờ `is_downloaded` trong available_models).
             "auto_download": config.translation.auto_download,
             # Tiến trình tải/nạp model dịch: idle | downloading | loading | ready | error.
-            "download": translation_hotswap.status(),
+            "download": translation_lifecycle.status(),
             "available_models": TranslationModelRegistry.get_instance().list_models(),
         },
         "tts": {
@@ -841,8 +841,8 @@ async def update_backend_config(req: SwitchModelRequest):
             )
 
         active_key = registry.get_active_model_key()
-        if asr_hotswap.needs_download(clean_target):
-            if not asr_hotswap.auto_download_enabled():
+        if asr_lifecycle.needs_download(clean_target):
+            if not asr_lifecycle.auto_download_enabled():
                 model_path = registry.resolve_model_path(clean_target)
                 raise HTTPException(
                     status_code=400,
@@ -851,12 +851,12 @@ async def update_backend_config(req: SwitchModelRequest):
                         f"hoặc bật ASRConfig.auto_download để backend tự tải."
                     ),
                 )
-            if asr_hotswap.is_busy() and not asr_hotswap.is_busy(clean_target):
+            if asr_lifecycle.is_busy() and not asr_lifecycle.is_busy(clean_target):
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Đang tải/nạp model ASR '{asr_hotswap.status().get('model')}', vui lòng đợi.",
+                    detail=f"Đang tải/nạp model ASR '{asr_lifecycle.status().get('model')}', vui lòng đợi.",
                 )
-            snapshot = asr_hotswap.reserve(clean_target)
+            snapshot = asr_lifecycle.reserve(clean_target)
             if snapshot.get("started"):
                 track_background_task(
                     _activate_asr_model_bg(clean_target, bool(snapshot.get("allow_download"))),
@@ -871,7 +871,7 @@ async def update_backend_config(req: SwitchModelRequest):
                 ),
                 "asr_engine": clean_target,
                 "model_id": clean_target,
-                "download": asr_hotswap.status(),
+                "download": asr_lifecycle.status(),
             })
             logger.info(
                 f"Model ASR '{clean_target}' chưa có file — đã xếp lịch tải nền; "
@@ -933,8 +933,8 @@ async def update_backend_config(req: SwitchModelRequest):
             )
         canonical_key = trans_registry.resolve_key(tm)
 
-        if translation_hotswap.needs_download(canonical_key):
-            if not translation_hotswap.auto_download_enabled():
+        if translation_lifecycle.needs_download(canonical_key):
+            if not translation_lifecycle.auto_download_enabled():
                 gguf_path = trans_registry.resolve_gguf_path(canonical_key)
                 raise HTTPException(
                     status_code=400,
@@ -943,12 +943,12 @@ async def update_backend_config(req: SwitchModelRequest):
                         f"hoặc bật TranslationConfig.auto_download để backend tự tải."
                     ),
                 )
-            if translation_hotswap.is_busy() and not translation_hotswap.is_busy(canonical_key):
+            if translation_lifecycle.is_busy() and not translation_lifecycle.is_busy(canonical_key):
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Đang tải/nạp model dịch '{translation_hotswap.status().get('model')}', vui lòng đợi.",
+                    detail=f"Đang tải/nạp model dịch '{translation_lifecycle.status().get('model')}', vui lòng đợi.",
                 )
-            snapshot = translation_hotswap.reserve(canonical_key)
+            snapshot = translation_lifecycle.reserve(canonical_key)
             if snapshot.get("started"):
                 track_background_task(
                     _activate_translation_model_bg(canonical_key, bool(snapshot.get("allow_download"))),
@@ -964,7 +964,7 @@ async def update_backend_config(req: SwitchModelRequest):
                     f"Model '{config.translation.base}' hiện tại vẫn hoạt động bình thường."
                 ),
                 "translation_model": canonical_key,
-                "download": translation_hotswap.status(),
+                "download": translation_lifecycle.status(),
             })
             logger.info(
                 f"Model dịch '{canonical_key}' chưa có file — đã xếp lịch tải nền; "
@@ -973,14 +973,14 @@ async def update_backend_config(req: SwitchModelRequest):
             )
             return JSONResponse(status_code=202, content=payload)
 
-        if translation_hotswap.is_busy():
+        if translation_lifecycle.is_busy():
             raise HTTPException(
                 status_code=409,
-                detail=f"Đang tải/nạp model dịch '{translation_hotswap.status().get('model')}', vui lòng đợi.",
+                detail=f"Đang tải/nạp model dịch '{translation_lifecycle.status().get('model')}', vui lòng đợi.",
             )
         try:
             # F-50: tải (nếu cần) + nạp model mới TRƯỚC, chỉ ghi config sau khi thành công.
-            await translation_hotswap.activate_model(canonical_key, allow_download=True)
+            await translation_lifecycle.activate_model(canonical_key, allow_download=True)
             logger.info(f"Đã chuyển mô hình dịch sang: '{canonical_key}'", extra={"module_tag": "MAIN"})
         except Exception as e:
             logger.error(f"Lỗi chuyển mô hình dịch sang '{canonical_key}': {e}", exc_info=True, extra={"module_tag": "MAIN"})

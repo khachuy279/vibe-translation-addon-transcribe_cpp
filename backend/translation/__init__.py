@@ -14,11 +14,16 @@ from backend.translation.engine import (
     reset_translation_engine,
 )
 
+from backend.translation import lifecycle
+from backend.translation import lifecycle as hotswap  # Alias tương thích ngược
+
 # Alias tương thích ngược
 TranslationContextTracker = ContextManager
 TranslationDeduplicator = TranslationDedupState
 
 __all__ = [
+    "lifecycle",
+    "hotswap",
     "BaseTranslator",
     "TranslationModelRegistry",
     "PromptStrategy",

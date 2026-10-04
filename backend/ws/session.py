@@ -240,7 +240,7 @@ class SessionState:
     # ------------------------------------------------------------ model switching
     def _schedule_asr_model_switch(self, model_key: str) -> None:
         """P1.8: nạp trước model ASR rồi swap, có thông báo trạng thái qua WS (tự tải nếu thiếu file)."""
-        from backend.asr import hotswap as asr_hotswap
+        from backend.asr import lifecycle as asr_lifecycle
         from backend.asr.registry import ModelRegistry
 
         registry = ModelRegistry.get_instance()
@@ -260,8 +260,8 @@ class SessionState:
             model_path = ""
             logger.warning(f"Không resolve được GGUF cho ASR '{clean_key}': {exc}", extra={"module_tag": "WS"})
 
-        needs_download = asr_hotswap.needs_download(clean_key)
-        if needs_download and not asr_hotswap.auto_download_enabled():
+        needs_download = asr_lifecycle.needs_download(clean_key)
+        if needs_download and not asr_lifecycle.auto_download_enabled():
             logger.warning(
                 f"Model ASR '{clean_key}' chưa có file GGUF cục bộ "
                 f"({model_path or 'không xác định'}) và auto_download đang tắt — GIỮ NGUYÊN model "
@@ -275,11 +275,11 @@ class SessionState:
             }))
             return
 
-        if asr_hotswap.is_busy() and not asr_hotswap.is_busy(clean_key):
+        if asr_lifecycle.is_busy() and not asr_lifecycle.is_busy(clean_key):
             self._spawn(self.send_json({
                 "type": "model_status", "stage": "asr",
                 "state": "error", "model": clean_key,
-                "message": f"Đang tải/nạp model ASR khác ({asr_hotswap.status().get('model')})",
+                "message": f"Đang tải/nạp model ASR khác ({asr_lifecycle.status().get('model')})",
             }))
             return
 
@@ -291,7 +291,7 @@ class SessionState:
                 "state": "downloading" if needs_download else "loading", "model": clean_key,
             })
             try:
-                await asr_hotswap.activate_model(clean_key)
+                await asr_lifecycle.activate_model(clean_key)
                 logger.info(f"Session {self.session_id[:8]}: Swapped ASR -> '{clean_key}'", extra={"module_tag": "WS"})
                 await self.send_json({
                     "type": "model_status", "stage": "asr",
@@ -310,11 +310,11 @@ class SessionState:
         """P1.7 + F-50: đổi model dịch có tác dụng thật, nạp trong task nền.
 
         Trước đây `translation_model` từ WS chỉ được ghi vào dict và KHÔNG BAO GIỜ
-        được áp dụng (G1). Nay dùng chung `translation.hotswap` với đường REST: thiếu file
+        được áp dụng (G1). Nay dùng chung `translation.lifecycle` với đường REST: thiếu file
         thì tải trước (nếu bật `auto_download`) → nạp model mới → chỉ khi thành công mới
         đổi config; lỗi thì model đang chạy vẫn nguyên vẹn.
         """
-        from backend.translation import hotswap
+        from backend.translation import lifecycle as trans_lifecycle
         from backend.translation.registry import TranslationModelRegistry
 
         registry = TranslationModelRegistry.get_instance()
@@ -336,8 +336,8 @@ class SessionState:
             gguf_path = ""
             logger.warning(f"Không resolve được GGUF cho '{canonical}': {exc}", extra={"module_tag": "WS"})
 
-        needs_download = hotswap.needs_download(canonical)
-        if needs_download and not hotswap.auto_download_enabled():
+        needs_download = trans_lifecycle.needs_download(canonical)
+        if needs_download and not trans_lifecycle.auto_download_enabled():
             logger.warning(
                 f"Model dịch '{canonical}' chưa có file GGUF cục bộ "
                     f"({gguf_path or 'không xác định'}) và auto_download đang tắt — GIỮ NGUYÊN model "
@@ -351,11 +351,11 @@ class SessionState:
             }))
             return
 
-        if hotswap.is_busy() and not hotswap.is_busy(canonical):
+        if trans_lifecycle.is_busy() and not trans_lifecycle.is_busy(canonical):
             self._spawn(self.send_json({
                 "type": "model_status", "stage": "translation",
                 "state": "error", "model": canonical,
-                "message": f"Đang tải/nạp model dịch khác ({hotswap.status().get('model')})",
+                "message": f"Đang tải/nạp model dịch khác ({trans_lifecycle.status().get('model')})",
             }))
             return
 
@@ -367,7 +367,7 @@ class SessionState:
                 "state": "downloading" if needs_download else "loading", "model": canonical,
             })
             try:
-                await hotswap.activate_model(canonical)
+                await trans_lifecycle.activate_model(canonical)
                 logger.info(f"Session {self.session_id[:8]}: Swapped translation -> '{canonical}'", extra={"module_tag": "WS"})
                 await self.send_json({
                     "type": "model_status", "stage": "translation",

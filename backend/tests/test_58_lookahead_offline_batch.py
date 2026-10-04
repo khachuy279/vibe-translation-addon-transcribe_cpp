@@ -238,6 +238,18 @@ class ContextAwareFakeTranslator(FakeTranslator):
     def __init__(self, prefix: str = "[vi] "):
         super().__init__(prefix=prefix)
         self.context_calls: List[str] = []
+        self.batch_calls: List[List[str]] = []
+
+    async def translate_batch(
+        self,
+        texts: List[str],
+        source_lang: str = "auto",
+        target_lang: str = "vi",
+    ) -> List[str]:
+        self.batch_calls.append(list(texts))
+        for t in texts:
+            self.calls.append(t)
+        return [f"{self.prefix}{t}" for t in texts]
 
     async def translate(
         self,
@@ -334,16 +346,10 @@ async def test_offline_batch_loop_end_to_end():
         assert item0["original_text"] != ""
         assert item0["translated_text"].startswith("[vi] ")
 
-        # Kiểm tra Bi-directional context ở translator
+        # Kiểm tra Batch Context Translation ở translator
         trans: ContextAwareFakeTranslator = session.translation_engine  # type: ignore
+        assert len(trans.batch_calls) >= 1
         assert len(trans.calls) >= 2
-        # Câu 1 phải có 'Next sentence:' trỏ tới câu 2
-        ctx_call_0 = trans.context_calls[0]
-        assert "Next sentence:" in ctx_call_0
-
-        # Câu 2 phải có 'Previous context:' chứa câu 1
-        ctx_call_1 = trans.context_calls[1]
-        assert "Previous context:" in ctx_call_1
 
     finally:
         await session.close()

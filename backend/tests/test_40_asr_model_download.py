@@ -21,7 +21,7 @@ from backend.config import config
 @pytest.fixture
 def reset_asr_hotswap_state():
     """Trạng thái tải/nạp ASR là biến toàn cục — dọn trước và sau mỗi test."""
-    from backend.asr import hotswap as asr_hotswap
+    from backend.asr import lifecycle as asr_hotswap
 
     asr_hotswap.reset_state()
     yield asr_hotswap

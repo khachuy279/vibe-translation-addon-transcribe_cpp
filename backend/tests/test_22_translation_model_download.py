@@ -29,7 +29,7 @@ from backend.config import TranslationConfig, config
 @pytest.fixture
 def reset_hotswap_state():
     """Trạng thái tải/nạp là biến toàn cục — dọn trước và sau mỗi test."""
-    from backend.translation import hotswap
+    from backend.translation import lifecycle as hotswap
 
     hotswap.reset_state()
     yield hotswap
@@ -75,12 +75,12 @@ def test_list_models_marks_is_downloaded(tmp_models):
     from backend.translation.registry import TranslationModelRegistry
 
     reg = TranslationModelRegistry.get_instance()
-    filename = reg.get_model("tencent")["gguf_file"]
+    filename = reg.get_model("index-translate-2b")["gguf_file"]
     (tmp_models / filename).write_bytes(b"gguf")
 
     models = {m["id"]: m for m in reg.list_models()}
-    assert models["tencent"]["is_downloaded"] is True
-    assert models["tencent-1.8b"]["is_downloaded"] is False
+    assert models["index-translate-2b"]["is_downloaded"] is True
+    assert models["index-translate-9b"]["is_downloaded"] is False
     assert all("is_downloaded" in m for m in models.values())
 
 
@@ -89,8 +89,8 @@ def test_is_known_rejects_typo_instead_of_falling_back(tmp_models):
     from backend.translation.registry import TranslationModelRegistry
 
     registry = TranslationModelRegistry.get_instance()
-    assert registry.is_known("tencent-1.8b")
-    assert registry.is_known("hy-mt2-1.8b")  # alias
+    assert registry.is_known("index-translate-2b")
+    assert registry.is_known("index-2b")  # alias
     assert not registry.is_known("khong-ton-tai")
     assert registry.resolve_key("khong-ton-tai") == registry.default_model_key
 
@@ -178,12 +178,12 @@ def test_hotswap_reserve_sets_state_before_task_starts(reset_hotswap_state, monk
     hotswap = reset_hotswap_state
     monkeypatch.setattr(hotswap, "needs_download", lambda key: True)
 
-    snapshot = hotswap.reserve("tencent-1.8b")
+    snapshot = hotswap.reserve("index-translate-9b")
     assert snapshot["started"] is True
     assert snapshot["state"] == "downloading"
-    assert hotswap.status()["model"] == "tencent-1.8b"
+    assert hotswap.status()["model"] == "index-translate-9b"
 
-    again = hotswap.reserve("tencent-1.8b")
+    again = hotswap.reserve("index-translate-9b")
     assert again["started"] is False, "bấm hai lần không được sinh hai lượt tải"
 
 
@@ -200,9 +200,9 @@ def test_hotswap_failure_keeps_current_model_and_config(reset_hotswap_state, mon
 
     monkeypatch.setattr(model_download, "ensure_model_file", _boom)
 
-    hotswap.reserve("tencent-1.8b")
+    hotswap.reserve("index-translate-9b")
     with pytest.raises(model_download.ModelDownloadError):
-        asyncio.run(hotswap.run_reserved("tencent-1.8b"))
+        asyncio.run(hotswap.run_reserved("index-translate-9b"))
 
     assert config.translation.base == before
     assert hotswap.status()["state"] == "error"
@@ -211,13 +211,13 @@ def test_hotswap_failure_keeps_current_model_and_config(reset_hotswap_state, mon
 def test_hotswap_disabled_download_raises_before_touching_model(reset_hotswap_state, monkeypatch, tmp_models):
     """Tắt auto_download ⇒ lỗi `ModelFileMissing` ngay ở bước tải, chưa chạm model đang chạy."""
     from backend.utils import model_download
-    from backend.translation import hotswap
+    from backend.translation import lifecycle as hotswap
 
     monkeypatch.setattr(hotswap, "auto_download_enabled", lambda: False)
     before = config.translation.base
-    hotswap.reserve("tencent-1.8b", allow_download=False)
+    hotswap.reserve("index-translate-9b", allow_download=False)
     with pytest.raises(model_download.ModelFileMissing):
-        asyncio.run(hotswap.run_reserved("tencent-1.8b", allow_download=False))
+        asyncio.run(hotswap.run_reserved("index-translate-9b", allow_download=False))
     assert config.translation.base == before
 
 
@@ -239,17 +239,17 @@ def test_reconfigure_failure_keeps_working_model(
 
     old = _FakeLlama("old-7b")
     monkeypatch.setattr(GGUFTranslator, "_shared_llm", old)
-    monkeypatch.setattr(GGUFTranslator, "_shared_model_key", "tencent")
+    monkeypatch.setattr(GGUFTranslator, "_shared_model_key", "index-translate-2b")
 
     translator = GGUFTranslator.get_instance()
-    monkeypatch.setattr(translator, "canonical_key", "tencent")
+    monkeypatch.setattr(translator, "canonical_key", "index-translate-2b")
 
     with pytest.raises(FileNotFoundError):
-        translator.reconfigure(TranslationConfig(base="tencent-1.8b", auto_download=False), allow_download=False)
+        translator.reconfigure(TranslationConfig(base="index-translate-9b", auto_download=False), allow_download=False)
 
     assert GGUFTranslator._shared_llm is old, "model cũ KHÔNG được giải phóng khi nạp model mới lỗi"
-    assert GGUFTranslator._shared_model_key == "tencent"
-    assert translator.canonical_key == "tencent"
+    assert GGUFTranslator._shared_model_key == "index-translate-2b"
+    assert translator.canonical_key == "index-translate-2b"
     assert old.closed is False
 
 
@@ -262,20 +262,20 @@ def test_reconfigure_success_swaps_then_releases_old(
     old = _FakeLlama("old-7b")
     new = _FakeLlama("new-1.8b")
     monkeypatch.setattr(GGUFTranslator, "_shared_llm", old)
-    monkeypatch.setattr(GGUFTranslator, "_shared_model_key", "tencent")
+    monkeypatch.setattr(GGUFTranslator, "_shared_model_key", "index-translate-2b")
     monkeypatch.setattr(
         GGUFTranslator, "_build_llm",
         lambda self, key, cfg, allow: (new, "prompt-moi"),
     )
 
     translator = GGUFTranslator.get_instance()
-    monkeypatch.setattr(translator, "canonical_key", "tencent")
+    monkeypatch.setattr(translator, "canonical_key", "index-translate-2b")
 
-    translator.reconfigure(TranslationConfig(base="tencent-1.8b", auto_download=False), allow_download=False)
+    translator.reconfigure(TranslationConfig(base="index-translate-9b", auto_download=False), allow_download=False)
 
     assert GGUFTranslator._shared_llm is new
-    assert GGUFTranslator._shared_model_key == "tencent-1.8b"
-    assert translator.canonical_key == "tencent-1.8b"
+    assert GGUFTranslator._shared_model_key == "index-translate-9b"
+    assert translator.canonical_key == "index-translate-9b"
     assert translator.prompt_strategy == "prompt-moi"
     assert old.closed is True, "model cũ phải được giải phóng SAU khi swap xong"
 
@@ -285,7 +285,7 @@ def test_hot_path_degrades_to_passthrough_when_model_unavailable(monkeypatch, tm
     from backend.translation.engine import GGUFTranslator
 
     translator = GGUFTranslator.get_instance()
-    monkeypatch.setattr(translator, "canonical_key", "tencent-1.8b")
+    monkeypatch.setattr(translator, "canonical_key", "index-translate-9b")
 
     def _boom(self, allow_download=False):
         raise FileNotFoundError("thiếu file")
@@ -327,7 +327,7 @@ def test_rest_missing_file_with_auto_download_off_returns_400(
     before = config.translation.base
 
     with pytest.raises(HTTPException) as excinfo:
-        _post_config(translation_model="tencent-1.8b")
+        _post_config(translation_model="index-translate-9b")
     assert excinfo.value.status_code == 400
     assert config.translation.base == before
 
@@ -352,7 +352,7 @@ def test_rest_missing_file_with_auto_download_returns_202_and_keeps_model(
 
     async def _run():
         resp = await main_mod.update_backend_config(
-            main_mod.SwitchModelRequest(translation_model="tencent-1.8b")
+            main_mod.SwitchModelRequest(translation_model="index-translate-9b")
         )
         await asyncio.sleep(0.01)
         return resp
@@ -361,7 +361,7 @@ def test_rest_missing_file_with_auto_download_returns_202_and_keeps_model(
     assert resp.status_code == 202
     body = resp.body.decode("utf-8")
     assert "downloading" in body
-    assert started == [("tencent-1.8b", True)]
+    assert started == [("index-translate-9b", True)]
     assert config.translation.base == before, "chưa nạp xong thì KHÔNG được đổi model"
 
 
@@ -376,13 +376,13 @@ def test_rest_busy_with_another_model_returns_409(reset_hotswap_state, monkeypat
     hotswap = reset_hotswap_state
 
     monkeypatch.setattr(hotswap, "needs_download", lambda key: True)
-    hotswap._set_state(state="downloading", model="xiaomi")
+    hotswap._set_state(state="downloading", model="index-translate-2b")
 
     assert hotswap.is_busy() is True
-    assert hotswap.is_busy("tencent-1.8b") is False, "đang tải model KHÁC"
+    assert hotswap.is_busy("index-translate-9b") is False, "đang tải model KHÁC"
 
     with pytest.raises(HTTPException) as excinfo:
-        _post_config(translation_model="tencent-1.8b")
+        _post_config(translation_model="index-translate-9b")
     assert excinfo.value.status_code == 409
 
 
@@ -391,13 +391,13 @@ def test_rest_busy_with_same_model_does_not_409(reset_hotswap_state, monkeypatch
     hotswap = reset_hotswap_state
 
     monkeypatch.setattr(hotswap, "needs_download", lambda key: True)
-    hotswap._set_state(state="downloading", model="tencent-1.8b")
+    hotswap._set_state(state="downloading", model="index-translate-9b")
 
     assert hotswap.is_busy() is True
-    assert hotswap.is_busy("tencent-1.8b") is True, "cùng model ⇒ nhánh 409 phải bị bỏ qua"
+    assert hotswap.is_busy("index-translate-9b") is True, "cùng model ⇒ nhánh 409 phải bị bỏ qua"
 
     # `reserve()` thấy đã có lượt chạy cho đúng model này ⇒ không xếp thêm task nền (202).
-    resp = _post_config(translation_model="tencent-1.8b")
+    resp = _post_config(translation_model="index-translate-9b")
     assert getattr(resp, "status_code", None) == 202
 
 
@@ -428,7 +428,7 @@ def test_ws_switch_announces_download_then_ready(
     monkeypatch.setattr(hotswap, "run_reserved", _fake_run_reserved)
 
     async def _run():
-        session._schedule_translation_model_switch("tencent-1.8b")
+        session._schedule_translation_model_switch("index-translate-9b")
         await asyncio.sleep(0.05)
 
     asyncio.run(_run())
@@ -436,7 +436,7 @@ def test_ws_switch_announces_download_then_ready(
     states = [m.get("state") for m in session.mock_ws.sent_messages if m.get("type") == "model_status"]
     assert states[0] == "downloading", f"phải báo đang tải trước, nhận được: {states}"
     assert "ready" in states
-    assert called["key"] == "tencent-1.8b"
+    assert called["key"] == "index-translate-9b"
 
 
 def test_popup_handles_202_and_polls_progress():

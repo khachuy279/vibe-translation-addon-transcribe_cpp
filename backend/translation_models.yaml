@@ -1,66 +1,10 @@
 # Catalog cấu hình các mô hình dịch (Translation Models) cho Backend
-# Cho phép nạp động, chuyển đổi linh hoạt qua API hoặc file YAML.
+# Tối ưu chuyên biệt cho Bilibili Index-Translate (hỗ trợ instTrans & JSON batch)
 
-default_model: tencent
+default_model: index-translate-2b
 
 models:
-  tencent-1.8b:
-    name: Hunyuan-MT2 1.8B (Tencent)
-    model: tencent/Hy-MT2-1.8B-GGUF
-    gguf_file: Hy-MT2-1.8B-Q8_0.gguf
-    temperature: 0.7
-    top_p: 0.6
-    top_k: 20
-    repetition_penalty: 1.05
-    prompt_style: tencent
-    aliases:
-      - hy-mt2-1.8b
-      - tencent-1.8
-    description: Siêu nhanh, nhẹ (~2.0GB, Q8_K_XL)
-
-  tencent:
-    name: Hunyuan-MT2 7B (Tencent)
-    model: tencent/Hy-MT2-7B-GGUF
-    gguf_file: HY-MT2-7B-Q6_K.gguf
-    temperature: 0.7
-    top_p: 0.6
-    top_k: 20
-    repetition_penalty: 1.05
-    prompt_style: tencent
-    aliases:
-      - hy-mt2-7b
-      - tencent-7b
-    description: Chất lượng cao (~4.6GB, Q4_K_XL)
-
-  xiaomi:
-    name: MiLMMT 46 12B (Xiaomi)
-    model: mradermacher/MiLMMT-46-12B-v1.0-GGUF
-    gguf_file: MiLMMT-46-12B-v1.0.Q4_K_M.gguf
-    temperature: 0.0
-    top_p: 1.0
-    top_k: 1
-    repetition_penalty: 1.0
-    prompt_style: milmmt
-    aliases:
-      - milmmt
-    description: Chất lượng cao
-
-  gemmax:
-    name: GemmaX2 28-9B v0.2 (Xiaomi)
-    model: mradermacher/GemmaX2-28-9B-v0.2-i1-GGUF
-    gguf_file: GemmaX2-28-9B-v0.2.i1-Q4_K_M.gguf
-    temperature: 0.0
-    top_p: 1.0
-    top_k: 1
-    repetition_penalty: 1.0
-    prompt_style: gemmax
-    aliases:
-      - gemma
-      - gemmax2
-      - gemmax-9b
-    description: Chất lượng cao 28 ngôn ngữ (~5.8GB)
-
-  index-translate:
+  index-translate-2b:
     name: Index-Translate-2B (Bilibili IndexTeam)
     model: IndexTeam/Index-Translate-2B-GGUF
     gguf_file: Index-Translate-2B.Q8_0.gguf
@@ -70,10 +14,12 @@ models:
     repetition_penalty: 1.0
     prompt_style: index
     aliases:
+      - index-translate
+      - index-2b
       - index
       - index-mt-2b
       - index2b
-    description: Siêu nhẹ 2B (en/ja/zh互译, ~2.2GB Q8_0)
+    description: Siêu nhẹ 2B (en/ja/zh/vi..., ~2.2GB Q8_0)
 
   index-translate-9b:
     name: Index-Translate-9B (Bilibili IndexTeam)
@@ -88,5 +34,4 @@ models:
       - index-9b
       - index-mt-9b
       - index9b
-    description: Chất lượng cao 9B (en/ja/zh/..., ~5.5GB Q4_K_M)
-
+    description: Chất lượng cao 9B (en/ja/zh/vi..., ~5.5GB Q4_K_M)

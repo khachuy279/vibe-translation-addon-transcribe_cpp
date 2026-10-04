@@ -5,7 +5,7 @@ Bối cảnh: catalog `translation_models.yaml` / `models.yaml` chỉ khai báo 
 backend báo lỗi cứng, người dùng phải tự copy GGUF vào thư mục models. Module này bổ sung
 đường tải tự động, nhưng có ba ràng buộc cố ý:
 
-1. **Không bao giờ chạy trên hot path** — chỉ `translation.hotswap.activate_model()` (đổi
+1. **Không bao giờ chạy trên hot path** — chỉ `translation.lifecycle.activate_model()` (đổi
    model do người dùng yêu cầu) mới bật `allow_download=True`; đường dịch từng câu chỉ kiểm
    tra `os.path.exists()` rồi đi tiếp.
 2. **Không tải lại thứ đã có** — file đã tồn tại (kể cả do người dùng copy tay) thì trả về

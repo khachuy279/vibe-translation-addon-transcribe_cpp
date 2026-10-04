@@ -61,6 +61,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     "Chỉ áp dụng cho Pipeline A (Realtime Streaming). Tắt Lookahead Video Buffering để chỉnh.";
   //: Timer làm mới trạng thái Lookahead khi popup đang mở.
   let lookaheadStatusTimer = null;
+  //: Trạng thái Pipeline và tính khả dụng Lookahead
+  let currentActivePipeline = null; // "A" | "B" | null
+  let isLookaheadUnavailable = false; // true khi video không hỗ trợ MSE / không khả dụng
   // Chẩn đoán: log mỗi nhịp preview ([SEG_TRACE]) — mặc định TẮT.
   const chkStableTrace = document.getElementById("chkStableTrace");
   const valMinWords = document.getElementById("valMinWords");
@@ -283,26 +286,43 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   }
 
   /**
-   * Vô hiệu hoá nhóm tuỳ chỉnh CHỈ dành cho PIPELINE A khi Lookahead Video Buffering đang bật.
-   *
-   * Phải gọi sau mọi chỗ ghi `disabled` cho các điều khiển này (chúng phụ thuộc `isCapturingNow`),
-   * nên hàm tự tính cả hai điều kiện thay vì ghi đè lẫn nhau.
+   * Xác định xem hệ thống đang chạy hoặc dự kiến chạy Pipeline B (Lookahead) hay không.
+   * - Khi đang trong phiên (isCapturingNow): dựa vào pipeline thực tế đang chạy (`currentActivePipeline === "B"`).
+   * - Khi chưa chạy: dựa vào công tắc Lookahead và tính khả dụng của video hiện tại.
+   *   Nếu Lookahead tắt HOẶC video trên trang báo không khả dụng => sẽ chạy Pipeline A => không khoá VAD/SEG.
+   */
+  function isPipelineBLocked() {
+    if (isCapturingNow) {
+      return currentActivePipeline === "B";
+    }
+    const lookaheadOn = !chkEnableLookahead || chkEnableLookahead.checked !== false;
+    if (!lookaheadOn) return false;
+    if (isLookaheadUnavailable) return false;
+    return true;
+  }
+
+  /**
+   * Vô hiệu hoá nhóm tuỳ chỉnh CHỈ dành cho PIPELINE A khi đang chạy hoặc dự kiến chạy Pipeline B.
+   * Nếu là Pipeline A: không khoá chỉnh VAD, SEG (cho phép live adjust sliders trong lúc streaming).
    */
   function updatePipelineAOnlyUi() {
-    //: Lookahead coi như BẬT khi không bị tắt tường minh (cùng quy tắc với content-script).
-    const lookaheadOn = !chkEnableLookahead || chkEnableLookahead.checked !== false;
-    const editable = !lookaheadOn && !isCapturingNow;
+    const isPipelineB = isPipelineBLocked();
+    const editable = !isPipelineB;
     pipelineAOnlyControls.forEach((el) => {
-      el.disabled = !editable;
-      el.title = lookaheadOn ? PIPELINE_A_ONLY_HINT : "";
+      if (el === selVadEngine) {
+        el.disabled = !editable || isCapturingNow || isSwitchingEngine;
+      } else {
+        el.disabled = !editable;
+      }
+      el.title = isPipelineB ? PIPELINE_A_ONLY_HINT : "";
     });
     pipelineAOnlyGroups.forEach((el) => {
       el.style.opacity = editable ? "1" : "0.45";
-      el.title = lookaheadOn ? PIPELINE_A_ONLY_HINT : "";
+      el.title = isPipelineB ? PIPELINE_A_ONLY_HINT : "";
     });
     ["pipelineAOnlyNote", "pipelineAOnlyNote2"].forEach((id) => {
       const note = document.getElementById(id);
-      if (note) note.style.display = lookaheadOn ? "block" : "none";
+      if (note) note.style.display = isPipelineB ? "block" : "none";
     });
   }
 
@@ -859,7 +879,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     }
     if (isSwitchingTranslationModel) return;
 
-    const newModel = selTranslationModel ? selTranslationModel.value : "tencent";
+    const newModel = selTranslationModel ? selTranslationModel.value : "index-translate-2b";
     const selectedOption = selTranslationModel && selTranslationModel.selectedOptions ? selTranslationModel.selectedOptions[0] : null;
     const modelDesc = selectedOption ? selectedOption.textContent.replace("⚡", "").trim() : newModel;
     const shortDesc = modelDesc.split("(")[0].trim() || newModel;
@@ -921,12 +941,16 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (!status || !status.hasVideo) {
       lookaheadStatusEl.classList.add("is-off");
       lookaheadStatusText.textContent = "Lookahead: chưa tìm thấy video";
+      isLookaheadUnavailable = false;
+      updatePipelineAOnlyUi();
       return;
     }
     const la = status.lookahead;
     if (!la || (!la.cachedChunksCount && !la.hasInitSegment)) {
       lookaheadStatusEl.classList.add("is-off");
       lookaheadStatusText.textContent = "Lookahead: không khả dụng (chạy Realtime)";
+      isLookaheadUnavailable = true;
+      updatePipelineAOnlyUi();
       return;
     }
     const ahead = Number(la.aheadSeconds || 0);
@@ -934,6 +958,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     lookaheadStatusEl.classList.add(enough ? "is-ready" : "is-low");
     lookaheadStatusText.textContent = `Lookahead available +${ahead.toFixed(2)}s`
       + (enough ? "" : " (đang nạp)");
+    isLookaheadUnavailable = false;
+    updatePipelineAOnlyUi();
   }
 
   async function refreshLookaheadStatus() {
@@ -941,7 +967,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const statuses = await broadcastToFrames("GET_STATUS");
       if (!statuses || !statuses.length) return;
       const status = statuses.find(s => s && s.hasVideo) || statuses[0];
-      renderLookaheadStatus(status);
+      if (status) {
+        if (status.isCapturing && (!isCapturingNow || (status.pipeline && currentActivePipeline !== status.pipeline))) {
+          setUI(true, status.sampleRate, status.pipeline);
+        }
+        renderLookaheadStatus(status);
+      }
     } catch (e) { /* popup đang mở ở tab không có content script */ }
   }
 
@@ -1109,10 +1140,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const capturingFrame = statuses?.find(s => s?.isCapturing);
     if (capturingFrame) {
       const rate = capturingFrame.sampleRate || statuses.find(s => s?.sampleRate)?.sampleRate;
-      setUI(true, rate);
+      const pipe = capturingFrame.pipeline || statuses.find(s => s?.pipeline)?.pipeline;
+      setUI(true, rate, pipe);
     } else {
       api.tabs.sendMessage(tab.id, { action: "GET_STATUS", type: "GET_STATUS" }, (r) => {
-        if (!api.runtime.lastError && r?.isCapturing) setUI(true, r?.sampleRate);
+        if (!api.runtime.lastError && r?.isCapturing) setUI(true, r?.sampleRate, r?.pipeline);
       });
     }
 
@@ -1152,8 +1184,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
           return;
         }
         if (r?.success || r?.isCapturing) {
-          setUI(true, r?.sampleRate);
-          showMsg("✅ Đã tìm thấy video và bắt đầu dịch!", "success");
+          const pipe = r?.pipeline || (chkEnableLookahead?.checked && !isLookaheadUnavailable ? "B" : "A");
+          setUI(true, r?.sampleRate, pipe);
+          showMsg(`✅ Đã tìm thấy video và bắt đầu dịch qua Pipeline ${pipe}!`, "success");
         } else {
           showMsg("❌ " + (r?.error || "Không tìm thấy video nào (Hãy bấm Play video trước)"), "error");
           updateStartButtonState();
@@ -1165,8 +1198,9 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const successResult = results.find(r => r && (r.success || r.isCapturing));
     if (successResult) {
       const rate = successResult.sampleRate || results.find(r => r?.sampleRate)?.sampleRate;
-      setUI(true, rate);
-      showMsg("✅ Đã tìm thấy video và bắt đầu dịch!", "success");
+      const pipe = successResult.pipeline || results.find(r => r?.pipeline)?.pipeline || (chkEnableLookahead?.checked && !isLookaheadUnavailable ? "B" : "A");
+      setUI(true, rate, pipe);
+      showMsg(`✅ Đã tìm thấy video và bắt đầu dịch qua Pipeline ${pipe}!`, "success");
     } else {
       const specificError = results.find(r => r?.error && r.error !== "No video found");
       const errorMsg = specificError?.error || results.map(r => r?.error).filter(Boolean)[0] || "Không tìm thấy video nào (Hãy bấm Play video trước)";
@@ -1367,14 +1401,21 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   if (selTtsDucking) selTtsDucking.onchange = onSettingChange;
   if (rangeDuckingLevel) rangeDuckingLevel.oninput = onSettingChange;
 
-  function setUI(active, audioRate = null) {
+  function setUI(active, audioRate = null, pipeline = null) {
     isCapturingNow = active;
     if (active) {
       if (audioRate) {
         currentAudioSampleRate = audioRate;
       }
+      if (pipeline) {
+        currentActivePipeline = pipeline;
+      } else if (!currentActivePipeline) {
+        const lookaheadOn = !chkEnableLookahead || chkEnableLookahead.checked !== false;
+        currentActivePipeline = (lookaheadOn && !isLookaheadUnavailable) ? "B" : "A";
+      }
     } else {
       currentAudioSampleRate = null;
+      currentActivePipeline = null;
     }
 
     // Ẩn/Hiện nhóm lựa chọn model theo trạng thái phiên
@@ -1382,6 +1423,8 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const groupTranslationModel = document.getElementById("groupTranslationModel");
     const activeModelSummary = document.getElementById("activeModelSummary");
     const activeModelsText = document.getElementById("activeModelsText");
+    const activePipelineText = document.getElementById("activePipelineText");
+    const activePipelineBadge = document.getElementById("activePipelineBadge");
 
     if (rowModelEngine) {
       rowModelEngine.style.display = active ? "none" : "";
@@ -1391,14 +1434,33 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     }
     if (activeModelSummary) {
       activeModelSummary.style.display = active ? "block" : "none";
-      if (active && activeModelsText) {
-        const asrText = selAsrEngine && selAsrEngine.selectedOptions && selAsrEngine.selectedOptions[0]
-          ? selAsrEngine.selectedOptions[0].textContent.replace("⚡", "").trim()
-          : (lastActiveAsr || "--");
-        const transText = selTranslationModel && selTranslationModel.selectedOptions && selTranslationModel.selectedOptions[0]
-          ? selTranslationModel.selectedOptions[0].textContent.replace("⚡", "").replace("🌟", "").replace("🎯", "").replace("🎌", "").trim()
-          : "Translation";
-        activeModelsText.textContent = `${asrText.split("(")[0].trim()} ⏐ ${transText.split("(")[0].trim()}`;
+      if (active) {
+        const pipe = currentActivePipeline || "A";
+        if (activePipelineText) {
+          activePipelineText.textContent = pipe === "B"
+            ? "Pipeline B"
+            : "Pipeline A";
+        }
+        if (activePipelineBadge) {
+          if (pipe === "B") {
+            activePipelineBadge.textContent = "Lookahead";
+            activePipelineBadge.style.background = "rgba(16, 185, 129, 0.15)";
+            activePipelineBadge.style.color = "#047857";
+          } else {
+            activePipelineBadge.textContent = "Realtime";
+            activePipelineBadge.style.background = "rgba(245, 158, 11, 0.15)";
+            activePipelineBadge.style.color = "#b45309";
+          }
+        }
+        if (activeModelsText) {
+          const asrText = selAsrEngine && selAsrEngine.selectedOptions && selAsrEngine.selectedOptions[0]
+            ? selAsrEngine.selectedOptions[0].textContent.replace("⚡", "").trim()
+            : (lastActiveAsr || "--");
+          const transText = selTranslationModel && selTranslationModel.selectedOptions && selTranslationModel.selectedOptions[0]
+            ? selTranslationModel.selectedOptions[0].textContent.replace("⚡", "").replace("🌟", "").replace("🎯", "").replace("🎌", "").trim()
+            : "Translation";
+          activeModelsText.textContent = `${asrText.split("(")[0].trim()} ⏐ ${transText.split("(")[0].trim()}`;
+        }
       }
     }
 
@@ -1422,11 +1484,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
     updateStartButtonState();
 
-    // Bật/tắt session thay đổi `isCapturingNow` ⇒ tính lại nhóm tuỳ chỉnh Pipeline A.
+    // Bật/tắt session thay đổi `isCapturingNow` và `currentActivePipeline` ⇒ tính lại nhóm tuỳ chỉnh Pipeline A.
     updatePipelineAOnlyUi();
     statusBadge.textContent = active ? getCapturingLabel(currentAudioSampleRate) : `${lastActiveAsr.toUpperCase()}`;
     statusBadge.className = active ? "badge badge-connected" : "badge badge-ready";
-    statusBadge.title = active && currentAudioSampleRate ? `Đang thu âm thanh: ${currentAudioSampleRate} Hz` : "";
+    statusBadge.title = active ? (currentActivePipeline === "B" ? "Đang chạy Pipeline B (Lookahead OFFLINE_BATCH)" : `Đang thu âm thanh: ${currentAudioSampleRate || 16000} Hz (Pipeline A)`) : "";
   }
 
   function showMsg(t, tp) {

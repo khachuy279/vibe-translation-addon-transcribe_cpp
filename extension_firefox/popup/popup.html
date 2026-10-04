@@ -40,8 +40,14 @@
     </div>
 
     <!-- Active Model HUD / Locked Info during session -->
-    <div id="activeModelSummary" class="hint" style="display:none; margin: 4px 14px 10px; padding: 6px 10px; background: rgba(59, 130, 246, 0.1); border-left: 3px solid #3b82f6; border-radius: 4px;">
-      <span style="font-size: 11px;">🔒 Model đang chạy: <b id="activeModelsText">--</b> (Khoá trong phiên)</span>
+    <div id="activeModelSummary" class="hint" style="display:none; margin: 4px 14px 10px; padding: 7px 10px; background: rgba(59, 130, 246, 0.08); border-left: 3px solid #3b82f6; border-radius: 6px;">
+      <div style="font-size: 11px; margin-bottom: 2px; display: flex; align-items: center; justify-content: space-between;">
+        <span><b id="activePipelineText">Pipeline A</b></span>
+        <span id="activePipelineBadge" style="font-size: 10px; padding: 1px 6px; border-radius: 8px; font-weight: 600;"></span>
+      </div>
+      <div style="font-size: 11px; color: var(--text-sec, #555);">
+        <span><b id="activeModelsText">--</b></span>
+      </div>
     </div>
 
     <!-- Active Model HUD Chip -->
@@ -195,12 +201,8 @@
       <div class="setting-group" id="groupTranslationModel">
         <label for="selTranslationModel">Translation Model</label>
         <select id="selTranslationModel">
-          <option value="tencent-1.8b">Hunyuan-MT2 1.8B (Tencent) ⚡ Siêu nhanh (~2.0GB)</option>
-          <option value="tencent">Hunyuan-MT2 7B (Tencent) 🎯 Chuẩn (~4.6GB)</option>
-          <option value="xiaomi">MiLM-MT 4.6B (Xiaomi) ⚡ Nhanh (~2.5GB)</option>
-          <option value="gemmax">GemmaX2 28-9B v0.2 (Xiaomi) 🌟 Cao cấp (~5.8GB)</option>
-          <option value="index-translate">Index-Translate-2B (IndexTeam) 🎌 2B nhẹ (~2.2GB)</option>
-          <option value="index-translate-9b">Index-Translate-9B (IndexTeam) 🌟 9B chuẩn (~5.5GB)</option>
+          <option value="index-translate-2b" selected>Index-Translate-2B (IndexTeam) ⚡ Siêu nhẹ (~2.2GB)</option>
+          <option value="index-translate-9b">Index-Translate-9B (IndexTeam) 🌟 9B chuẩn cao cấp (~5.5GB)</option>
         </select>
       </div>
 

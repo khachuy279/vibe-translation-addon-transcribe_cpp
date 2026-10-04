@@ -1,9 +1,10 @@
-"""Đổi model ASR nguyên tử kèm tự động tải nền — dùng chung cho REST `/api/config` và WebSocket.
+"""Quản lý vòng đời và tải model ASR (Model Lifecycle & Download State Machine).
 
-Nguyên tắc:
+Dùng chung cho REST `/api/config` và WebSocket.
+Quy trình:
 1. Kiểm tra catalog + file trước; thiếu file thì tải trước (nếu bật `auto_download`).
-2. Tải xong nạp model mới (ngoài lock) -> swap nguyên tử -> cập nhật config ASR.
-3. Lỗi ở bất kỳ bước nào => model cũ vẫn đang phục vụ, trạng thái báo rõ cho popup.
+2. Tải xong nạp model mới -> cập nhật config ASR.
+3. Lỗi ở bất kỳ bước nào => báo rõ trạng thái cho popup.
 
 Trạng thái: `idle → downloading → loading → ready | error` (kèm tiến độ tải thật).
 """
