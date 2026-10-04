@@ -102,6 +102,57 @@ test("bỏ qua item có mốc thời gian không hợp lệ", () => {
   assert.equal(queue.items.length, 0);
 });
 
+test("KHÔNG câu nào bị câu sau nuốt mất khi hai khối chồng mốc (sự cố 2026-10-04)", () => {
+  // Log thật: backend gửi "When you're with me, baby." nhưng nó KHÔNG BAO GIỜ hiện, vì khối
+  // trước gửi câu kết thúc muộn hơn mốc bắt đầu câu đầu của khối sau ⇒ công thức giãn cũ kẹp
+  // câu trước còn 0.5 s và thứ tự duyệt mảng quyết định câu nào được vẽ.
+  const video = makeVideo(70.0);
+  const { queue, seen } = makeQueue(video);
+
+  queue.addSubtitles([
+    { start_pts: 70.2, end_pts: 79.06, original_text: "I can't see loving nobody but you for all my life.", translated_text: "a" },
+  ], "init_0");
+  // Khối sau bắt đầu TRƯỚC mốc kết thúc câu cuối của khối trước.
+  queue.addSubtitles([
+    { start_pts: 78.06, end_pts: 79.4, original_text: "When you're with me, baby.", translated_text: "b" },
+    { start_pts: 79.5, end_pts: 81.0, original_text: "This is Rebecca.", translated_text: "c" },
+  ], "init_0");
+
+  // Câu trước phải được giữ đủ thời lượng tối thiểu, KHÔNG bị co xuống 0.5 s.
+  const first = queue.items.find((i) => i.original_text.startsWith("I can't see"));
+  assert.ok(
+    first.end_pts - first.start_pts >= queue.minDurationSec - 1e-6,
+    `câu trước bị co còn ${(first.end_pts - first.start_pts).toFixed(2)}s`
+  );
+
+  // Chạy hết dải: cả ba câu đều phải xuất hiện trên màn hình.
+  for (let t = 70.0; t <= 81.2; t += 0.1) {
+    video.currentTime = t;
+    queue._tick();
+  }
+  const shown = new Set(seen.filter(Boolean));
+  for (const text of [
+    "I can't see loving nobody but you for all my life.",
+    "When you're with me, baby.",
+    "This is Rebecca.",
+  ]) {
+    assert.ok(shown.has(text), `câu không bao giờ hiện: ${text}`);
+  }
+});
+
+test("câu có mốc bắt đầu muộn hơn được ưu tiên khi hai cửa sổ chồng nhau", () => {
+  const video = makeVideo(10.0);
+  const { queue } = makeQueue(video);
+  queue.addSubtitles([
+    { start_pts: 8.0, end_pts: 12.0, original_text: "câu cũ", translated_text: "a" },
+    { start_pts: 10.5, end_pts: 13.0, original_text: "câu mới", translated_text: "b" },
+  ], "init_0");
+
+  video.currentTime = 10.6; // nằm trong CẢ HAI cửa sổ
+  queue._tick();
+  assert.equal(queue.activeSubtitle.original_text, "câu mới");
+});
+
 test("tua video xoá sạch phụ đề và sinh seek_id mới", () => {
   const video = makeVideo(0);
   const { queue } = makeQueue(video);

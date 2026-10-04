@@ -28,6 +28,9 @@ class SubtitleTimelineQueue {
     this.keepAheadSec = options.keepAheadSec || 120.0;
     //: Giữ câu vừa hết thêm bao lâu (giây) để tránh nhấp nháy giữa 2 câu.
     this.holdAfterEndSec = options.holdAfterEndSec !== undefined ? options.holdAfterEndSec : 0.6;
+    //: SÀN cứng cho thời lượng hiển thị (giây) — chỉ để chống nhấp nháy khi aligner trả câu dài
+    //: ~0 ms. KHÔNG dùng để "giãn" cửa sổ theo ý client: mốc là do backend quyết định.
+    this.minDurationSec = options.minDurationSec !== undefined ? options.minDurationSec : 0.6;
 
     this._isPrebuffering = false;
     this._prebufferTimer = null;
@@ -112,15 +115,29 @@ class SubtitleTimelineQueue {
     // Sắp xếp lại timeline theo start_pts tăng dần
     this.items.sort((a, b) => a.start_pts - b.start_pts);
 
-    // Đảm bảo thời lượng hiển thị tối thiểu (ít nhất 1.6s) và không chớp tắt
-    for (let i = 0; i < this.items.length; i++) {
+    // ── ĐƠN GIẢN HOÁ 2026-10-04: HIỂN THỊ ĐÚNG MỐC BACKEND GỬI ──────────────────────────────
+    // Trước đây client tự "giãn" cửa sổ hiển thị (`minDurationSec`), tự kẹp theo câu kế tiếp, và
+    // tự ưu tiên câu này hay câu kia khi hai cửa sổ chồng nhau. Chính các phép chỉnh đó sinh ra lỗi
+    // "backend gửi mà không hiện":
+    //     maxAllowed = max(start + 0.5, next.start - 0.05)
+    //     end = max(end, min(start + minDuration, maxAllowed))
+    // Khi `next.start < start + 0.55` (hai khối chồng mốc), câu trước bị co còn 0.5 s và cửa sổ hai
+    // câu chồng nhau ⇒ câu bắt đầu sau có thể bị câu cũ che.
+    //
+    // Nay backend chịu trách nhiệm về mốc: mỗi phụ đề có `[start_pts, end_pts]` riêng và các phụ đề
+    // KHÔNG chồng nhau (bộ cắt khối cắt tại khoảng lặng đã xác nhận). Client chỉ cần vẽ câu nào có
+    // `start_pts <= currentTime < end_pts` — không giãn, không kẹp, không ưu tiên.
+    //
+    // NGOẠI LỆ DUY NHẤT: chặn SÀN cưng cứng cho câu quá ngắn (aligner có thể trả câu dài 0 ms khi
+    // audio không khớp văn bản) để phụ đề không nhấp nháy trong một khung hình. Chỉ được phép KÉO
+    // DÀI, không bao giờ cắt ngắn, và không bao giờ vượt mốc bắt đầu của câu kế tiếp.
+    const floorSec = Number(this.minDurationSec) > 0 ? Number(this.minDurationSec) : 0.0;
+    for (let i = 0; i < this.items.length && floorSec > 0; i++) {
       const it = this.items[i];
+      if (it.end_pts - it.start_pts >= floorSec) continue;
       const nextIt = this.items[i + 1];
-      const minDuration = 1.6; // tối thiểu 1.6s để mắt kịp đọc
-      const maxAllowed = nextIt ? Math.max(it.start_pts + 0.5, nextIt.start_pts - 0.05) : (it.start_pts + 5.0);
-      if (maxAllowed > it.start_pts) {
-        it.end_pts = Math.max(it.end_pts, Math.min(it.start_pts + minDuration, maxAllowed));
-      }
+      const limit = nextIt ? nextIt.start_pts : it.start_pts + floorSec;
+      it.end_pts = Math.max(it.end_pts, Math.min(it.start_pts + floorSec, limit));
     }
 
     // Nếu đang chờ nạp đệm sau khi Tua -> phát tiếp khi đã có câu khớp vị trí hiện tại
@@ -231,11 +248,20 @@ class SubtitleTimelineQueue {
     this.rafId = requestAnimationFrame(loop);
   }
 
+  /**
+   * Câu phụ đề đang hiển thị tại `curTime`: câu có `start_pts <= curTime < end_pts`.
+   *
+   * Giữ nguyên quy tắc "câu bắt đầu MUỘN NHẤT thắng" khi có chồng lấn — chỉ là lưới an toàn, vì
+   * backend đã bảo đảm các cửa sổ không chồng nhau.
+   */
   _findSubtitleAt(curTime) {
+    let best = null;
     for (const item of this.items) {
-      if (curTime >= item.start_pts && curTime < item.end_pts) return item;
+      if (curTime >= item.start_pts && curTime < item.end_pts) {
+        if (!best || item.start_pts > best.start_pts) best = item;
+      }
     }
-    return null;
+    return best;
   }
 
   _tick() {
@@ -299,11 +325,11 @@ class SubtitleTimelineQueue {
     let matchedSub = this._findSubtitleAt(curTime);
     if (!matchedSub) {
       // Khi vừa resume sau khi nạp đệm / tua: cho phép dung sai sớm 0.25s để câu nói sát mép
-      // playhead hiển thị NGAY LẬP TỨC trên màn hình mà không bị trễ khung hình đầu.
+      // playhead hiển thị NGAY LẬP TỨC trên màn hình mà không bị trễ khung hình đầu. Vẫn ưu tiên
+      // câu có mốc bắt đầu MUỘN NHẤT khi nhiều câu nằm trong dung sai.
       for (const item of this.items) {
         if (curTime >= item.start_pts - 0.25 && curTime < item.end_pts) {
-          matchedSub = item;
-          break;
+          if (!matchedSub || item.start_pts > matchedSub.start_pts) matchedSub = item;
         }
       }
     }

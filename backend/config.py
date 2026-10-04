@@ -508,7 +508,31 @@ class LookaheadConfig(BaseModel):
     batch_min_sec: float = 12.0
     batch_max_sec: float = 18.0
     batch_min_silence_ms: float = 250.0
-    batch_overlap_sec: float = 1.0
+    #: Vùng CHỒNG LẤN giữa hai khối liền nhau (giây).
+    #:
+    #: ĐÃ ĐẶT VỀ 0.0 NGÀY 2026-10-04. Trước đây là 1.0 s để "không mất từ ở mép cắt", nhưng phía
+    #: nhận phải TRỪ phần chồng lấn đó và phép trừ ấy dựa vào mốc của Forced Aligner — vốn không
+    #: đủ chính xác ở mép khối. Log thật cho thấy nó CẮT MẤT TỪ ĐẦU CÂU:
+    #:     [44.22→56.45] 'Or we could do something…'  (mất 'Or' — chỉ lệch 0.04 s)
+    #:     [127.27→141.58] 'Let me sit on the stairs and think about what I did.'
+    #:                    → 'think about what I did.'  (mất 7 từ)
+    #: Nay khối sau bắt đầu ĐÚNG nơi khối trước kết thúc ⇒ không có gì để trừ.
+    batch_overlap_sec: float = 0.0
+
+    # ── CẮT KHỐI BẰNG VAD (2026-10-04) ────────────────────────────────────────
+    #: Cắt khối CHỈ tại khoảng lặng mà VAD XÁC NHẬN (thay cho dò RMS + `overlap_sec`).
+    #: Khi mép khối nằm giữa khoảng lặng thật thì không từ nào bị chẻ đôi ⇒ không cần trừ chồng
+    #: lấn, không cần mang mảnh cuối sang khối sau, câu ASR trả về là câu TRỌN VẸN.
+    batch_use_vad_silence: bool = True
+    #: Độ dài tối thiểu của một khoảng lặng để được dùng làm điểm cắt (ms). NGƯỠNG CỨNG.
+    batch_vad_silence_ms: float = 1500.0
+    #: Ngưỡng xác suất Silero coi là "có tiếng nói".
+    #:
+    #: ⚠️ Thấp hơn 0.5 (mặc định thư viện) một cách CÓ CHỦ Ý. Silero coi tiếng CƯỜI và lời HÁT là
+    #: "không có tiếng nói" (đo thật trên The Big Bang Theory: p50 ≈ 0.06 ở đoạn cười 3.8–8.5 s và
+    #: 0.03 ở đoạn nhạc 65–83 s). Ở ngưỡng 0.5, cả đoạn nhạc 18 s bị coi là "khoảng lặng" — cắt khối
+    #: vào đó sẽ chẻ đôi lời hát. Hạ ngưỡng làm VAD bám sát "có tiếng người" hơn.
+    batch_vad_silence_threshold: float = 0.30
 
     # ── Siết lại NGẮT KHỐI + NGẮT CÂU 2026-10-02 ───────────────────────────────
     # (chẩn đoán "cuối câu này là đầu của câu sau": xem
@@ -535,8 +559,14 @@ class LookaheadConfig(BaseModel):
     #: không rút ngắn khối (mất ngữ cảnh ASR) mà vẫn cắt vào chỗ ít năng lượng.
     batch_dip_search_sec: float = 3.0
     #: TRỪ phần chồng lấn ở ranh giới khối tại tầng TỪ trước khi gom câu (chống lặp từ).
-    #: TẮT = quay lại hành vi cũ (từ ở ranh giới bị phát hai lần).
-    batch_trim_boundary_overlap: bool = True
+    #:
+    #: ĐÃ BỎ NGÀY 2026-10-04 — giữ lại cờ này chỉ để tương thích cấu hình cũ; giá trị `True`
+    #: KHÔNG còn tác dụng (hàm trừ đã bị xoá khỏi `LookaheadSessionState`). Cơ chế cũ bỏ các từ
+    #: đầu khối theo mốc "đã phát" của khối trước, nhưng mốc Forced Aligner ở mép khối không đủ
+    #: chính xác nên nó ăn mất từ đầu câu (log thật: mất 'Or', mất 'I', mất 7 từ của
+    #: 'Let me sit on the stairs and think about what I did.'). Nay `batch_overlap_sec = 0.0` nên
+    #: không còn vùng chồng lấn nào để trừ.
+    batch_trim_boundary_overlap: bool = False
 
     #: Trần gom câu phụ đề của tuyến batch (trước đây hard-code trong
     #: `ForcedAlignerService.group_words_to_subtitles` nên popup không điều khiển được).

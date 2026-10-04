@@ -60,7 +60,7 @@ ngữ cảnh dài của Qwen3-ASR.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -121,6 +121,9 @@ class LookaheadChunker:
         dip_search_sec: float = 3.0,
         adaptive_max_sec: Optional[float] = None,
         adaptive_threshold_sec: float = 30.0,
+        # ── Cắt khối bằng VAD (2026-10-04) ────────────────────────────────────
+        silence_scanner: Optional[Any] = None,
+        vad_silence_ms: float = 1500.0,
     ):
         self.timeline = timeline
         self.sample_rate = int(sample_rate)
@@ -153,6 +156,14 @@ class LookaheadChunker:
         #: Khi buộc phải cắt: chỉ tìm điểm trũng trong [ideal − dip_search_sec, ideal + dip_search_sec]
         #: để khối không bị ngắn đi (mất ngữ cảnh) mà vẫn cắt vào chỗ ít năng lượng.
         self.dip_search_sec = max(0.0, float(dip_search_sec))
+        #: Bộ dò khoảng lặng bằng VAD (`VADSilenceScanner`). `None` = chỉ dùng năng lượng.
+        self.silence_scanner = silence_scanner
+        #: Độ dài khoảng lặng VAD tối thiểu để làm điểm cắt. NGƯỠNG CỨNG — không nới xuống khoảng
+        #: lặng ngắn hơn, vì cắt vào chỗ VAD chưa chắc chắn chính là lỗi cần tránh.
+        self.vad_silence_ms = float(vad_silence_ms)
+        #: Chẩn đoán lần cắt gần nhất.
+        self.last_cut_via_vad: bool = False
+        self.last_cut_silence_ms: float = 0.0
 
     # ────────────────────────────────────────────────────────── đo năng lượng
     def _frame_rms(self, pcm: np.ndarray, frame_ms: float = _LEVEL_FRAME_MS) -> np.ndarray:
@@ -350,6 +361,51 @@ class LookaheadChunker:
         # 5. Không đo được năng lượng (dải quá ngắn): cắt ở cuối vùng tìm kiếm
         return float(search_end_pts), False, "forced_overlap", 0.0
 
+    def _find_vad_cut(
+        self,
+        from_pts: float,
+        search_start_pts: float,
+        search_end_pts: float,
+    ) -> Optional[Tuple[float, float]]:
+        """Tìm điểm cắt = GIỮA khoảng lặng CUỐI CÙNG (>= `vad_silence_ms`) mà VAD xác nhận.
+
+        Vùng đưa cho VAD là `[from_pts, search_end_pts]` (bắt đầu từ `from_pts`, KHÔNG phải từ
+        `search_start_pts`): khoảng lặng cần cắt có thể nằm ngay sát mép khối, và VAD cần thấy được
+        cả hai mép tiếng nói quanh nó mới kết luận đúng.
+
+        VÌ SAO "CUỐI CÙNG" chứ không phải "dài nhất": khối ASR càng dài càng tốt cho ngữ cảnh, nên
+        ta đẩy mép khối xa nhất có thể mà vẫn dừng ở một khoảng lặng CHẮC CHẮN. Audio gửi cho ASR là
+        TRỌN `[from_pts, cut_pts]` — bao gồm cả khoảng lặng ở cuối.
+
+        Trả `(cut_pts, silence_ms)` hoặc `None` khi VAD không xác nhận được khoảng lặng nào
+        (khi đó `next_chunk` rơi về đường dò năng lượng, hoặc chờ thêm audio).
+        """
+        region = self.timeline.get_audio_range(from_pts, max(0.1, search_end_pts - from_pts))
+        if region is None:
+            return None
+        base_pts, region_pcm = region
+        if region_pcm is None or len(region_pcm) == 0:
+            return None
+
+        # KHOẢNG LẶNG CUỐI CÙNG >= `vad_silence_ms` trong vùng tìm kiếm: khối ASR càng dài càng tốt
+        # cho ngữ cảnh, nên đẩy mép khối xa nhất có thể mà vẫn dừng ở khoảng lặng chắc chắn.
+        gap = self.silence_scanner.find_last_silence(
+            region_pcm,
+            base_pts=float(base_pts),
+            region_start_pts=float(search_start_pts),
+            region_end_pts=float(search_end_pts),
+            min_silence_ms=self.vad_silence_ms,
+        )
+        if gap is None:
+            # KHÔNG nới ngưỡng: hạ xuống khoảng lặng ngắn hơn sẽ cắt vào chỗ VAD CHƯA chắc chắn, đúng
+            # loại lỗi mà cơ chế này sinh ra để tránh. Caller chờ thêm audio (hoặc dùng dự phòng).
+            return None
+
+        # Cắt ở GIỮA khoảng lặng: mép khối nằm trong vùng KHÔNG có tiếng nói nên không từ nào bị
+        # chẻ đôi, và audio gửi cho ASR là TRỌN đoạn `[from_pts, cut_pts]` — bao gồm cả khoảng lặng.
+        cut_pts = min(max(gap.center, search_start_pts), search_end_pts)
+        return float(cut_pts), float(gap.duration * 1000.0)
+
     def next_chunk(
         self,
         from_pts: float,
@@ -427,6 +483,37 @@ class LookaheadChunker:
         search_end_pts = min(buffered_end, from_pts + effective_search_max)
         ideal_cut_pts = min(from_pts + effective_target, search_end_pts)
 
+        # ── 3A. CẮT BẰNG VAD (đường CHÍNH, 2026-10-04) ─────────────────────────────
+        # Tìm khoảng lặng mà VAD XÁC NHẬN trong dải [search_start, search_end] và cắt vào GIỮA
+        # khoảng đó. Vì mép khối nằm giữa khoảng lặng thật, không từ nào bị chẻ đôi ⇒ không cần
+        # `overlap_sec`, không cần trừ chồng lấn, câu ASR trả về là câu trọn vẹn.
+        self.last_cut_via_vad = False
+        self.last_cut_silence_ms = 0.0
+        if self.silence_scanner is not None and self.vad_silence_ms > 0:
+            vad_cut = self._find_vad_cut(from_pts, search_start_pts, search_end_pts)
+            if vad_cut is not None:
+                cut_pts, silence_ms = vad_cut
+                self.last_cut_via_vad = True
+                self.last_cut_silence_ms = float(silence_ms)
+                total_take_sec = max(0.1, cut_pts - from_pts)
+                final_res = self.timeline.get_audio_range(from_pts, total_take_sec)
+                if final_res is not None:
+                    actual_start, chunk_pcm = final_res
+                    actual_end = actual_start + len(chunk_pcm) / self.sample_rate
+                    return ChunkSlice(
+                        pts_start=actual_start,
+                        pts_end=actual_end,
+                        pcm=chunk_pcm,
+                        is_silence_boundary=True,
+                        fallback_mode="vad_silence",
+                        next_read_pts=float(actual_end),
+                        silence_gap_ms=float(silence_ms),
+                        boundary_strength=(
+                            "strong" if silence_ms >= self.strong_silence_ms else "weak"
+                        ),
+                    )
+
+        # ── 3B. DỰ PHÒNG: dò năng lượng (chỉ khi VAD không xác nhận được khoảng lặng nào) ──────
         # MỘT lần đọc duy nhất vùng [from_pts, search_end_pts]: vừa để đo MỨC CHƯƠNG TRÌNH (ngưỡng
         # lặng tương đối), vừa là nguồn cho vùng quét (cắt lát, không copy thêm). Đo mức trên toàn
         # khối chứ không phải chỉ dải quét: dải quét có thể gần như im lặng hoàn toàn, khi đó p90
@@ -464,9 +551,11 @@ class LookaheadChunker:
         actual_start, chunk_pcm = final_res
         actual_end = actual_start + len(chunk_pcm) / self.sample_rate
 
-        # Cắt KHÔNG dựa trên khoảng lặng (min_rms/forced) ⇒ khối sau lấy lùi `overlap_sec` để không
-        # mất từ ở ranh giới. PHÍA NHẬN BẮT BUỘC trừ phần chồng lấn ở tầng từ (xem docstring đầu file).
-        if fallback_mode in ("forced_overlap", "min_rms"):
+        # Đường DỰ PHÒNG cắt KHÔNG dựa trên khoảng lặng (min_rms/forced): giữ nguyên hành vi cũ là
+        # lấy lùi `overlap_sec` — nhưng mặc định `overlap_sec = 0.0` nên khối sau vẫn bắt đầu đúng
+        # nơi khối trước kết thúc. Đặt `overlap_sec > 0` sẽ quay lại cơ chế cũ (CẦN phía nhận trừ
+        # chồng lấn — xem `batch_overlap_sec` trong `config.py`).
+        if fallback_mode in ("forced_overlap", "min_rms") and self.overlap_sec > 0.0:
             next_start = max(actual_start + 1.0, actual_end - self.overlap_sec)
         else:
             next_start = actual_end

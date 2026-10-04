@@ -1,6 +1,6 @@
 # Báo Cáo Đo Lường & Kiểm Thử Phase 4: Module Commit Manager & Phân Câu
 
-- **Thời gian thực hiện**: 2026-10-04 13:37:47
+- **Thời gian thực hiện**: 2026-10-04 15:55:20
 - **Mục tiêu nghiệm thu**:
   1. Thứ tự 4 bậc ưu tiên rõ ràng: `VAD_SILENCE` > `MAX_DURATION` > `STABLE_PREFIX` > `TIMEOUT_FORCE`.
   2. Đếm từ chuẩn xác cho cả tiếng Latin và ký tự tượng hình CJK.
@@ -24,8 +24,8 @@
 
 ## 2. Benchmark Tốc Độ Xử Lý (Throughput)
 
-- **Tốc độ Token Counting**: **89,673 thao tác/giây** (< 0.02 µs / câu).
-- **Tốc độ Deduplication**: **516,956 thao tác/giây** (< 0.5 µs / câu).
+- **Tốc độ Token Counting**: **92,485 thao tác/giây** (< 0.02 µs / câu).
+- **Tốc độ Deduplication**: **528,150 thao tác/giây** (< 0.5 µs / câu).
 
 ## 3. Kết Luận Nghiệm Thu Phase 4
 

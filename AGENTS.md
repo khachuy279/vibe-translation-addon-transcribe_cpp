@@ -67,7 +67,9 @@ vibe-translation-addon-transcribe_cpp/
 │   ├── asr/                 # Engine ASR transcribe.cpp (native wrapper, fallback CUDA/Vulkan)
 │   ├── bin/                 # Bundle DLL native ASR (transcribe.dll, ggml-cuda.dll)
 │   │   └── llama/           # Bundle DLL native llama.cpp CUDA (tách riêng!)
-│   ├── core/                # Audio buffer, commit manager, dedup, GPU scheduler, metrics
+│   ├── core/                # Audio buffer, commit manager, dedup, GPU scheduler, metrics,
+│   │                        # vad_silence.py (dò khoảng lặng bằng VAD để cắt khối lookahead),
+│   │                        # lookahead_chunker.py (cắt khối), lookahead_timeline.py
 │   ├── segmentation/        # Thuật toán cắt câu (VAD_SILENCE, STABLE_PREFIX, MAX_DURATION)
 │   ├── translation/         # Engine dịch GGUF qua llama-cpp-python
 │   ├── tts/                 # Engine lồng tiếng OmniVoice

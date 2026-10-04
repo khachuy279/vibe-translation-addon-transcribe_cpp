@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 
 from backend.asr.forced_aligner import AlignedWord, ForcedAlignerService, SubtitleSentence
+from backend.config import config
 from backend.core.lookahead_timeline import ContinuousAudioTimeline
 from backend.tests.fakes import (
     FakeInferenceEngine,
@@ -537,94 +538,37 @@ async def test_offline_batch_emits_whole_sentences_with_punctuation():
 
 
 @pytest.mark.asyncio
-async def test_unfinished_tail_is_held_back_for_next_block():
-    """Mảnh cuối CHƯA kết câu của khối bị cắt giữa câu phải được GIỮ LẠI, không phát ra.
+async def test_vad_silence_cut_replaces_boundary_patching():
+    """Bộ cắt khối cắt tại khoảng lặng do VAD xác nhận ⇒ KHÔNG cần hàn gắn ranh giới nữa.
 
-    Ảnh chụp màn hình thật 2026-10-02: `"I promise I'll be on my best behavior You better"` —
-    mảnh cụt ở ranh giới khối. Nay nó được cất vào `_batch_carry_words` để ghép vào khối sau.
+    Đây là cơ chế THAY THẾ cho bộ ba đã bị XOÁ ngày 2026-10-04 (trừ chồng lấn ranh giới + mang mảnh
+    cuối sang khối sau + hiệu chỉnh mốc từ). Bộ ba đó chỉ tồn tại để bù cho việc cắt khối ở giữa
+    câu, và chính nó tạo ra lỗi mới — log thật 15:23:02:
+
+        [SEG_BATCH] Ghép 11 từ giữ lại từ khối trước vào khối [74.27 -> 86.37]
+        [SEG_BATCH] "I can't see me" | "loving nobody but you for all my This is Rebecca." | ...
+
+    Nguyên tắc mới: **tin [ASR] tuyệt đối** — ASR tạo câu nào thì gửi đúng câu đó; Forced Aligner chỉ
+    xác định mốc bắt đầu/kết thúc.
     """
-    from types import SimpleNamespace
-
     session = _make_batch_session()
     try:
-        def _sub(text, t0, t1, words):
-            return SubtitleSentence(text, t0, t1, words=words)
+        # Mọi trạng thái/thuật toán "sửa chữa ranh giới" phải KHÔNG còn tồn tại.
+        for attr in (
+            "_batch_carry_words",
+            "_trim_batch_leading_overlap",
+            "_trim_repeated_block_prefix",
+            "_hold_back_unfinished_tail",
+            "_batch_trim_overlap",
+        ):
+            assert not hasattr(session, attr), f"{attr} phải bị xoá khỏi LookaheadSessionState"
 
-        complete = _sub(
-            "I promise I'll be on my best behavior.",
-            0.0, 2.0,
-            [AlignedWord("I", 0.0, 0.1), AlignedWord("behavior.", 1.8, 2.0)],
-        )
-        fragment = _sub(
-            "You better",
-            2.2, 3.4,
-            [AlignedWord("You", 2.2, 2.7), AlignedWord("better", 2.7, 3.4)],
-        )
-        chunk_mid = SimpleNamespace(
-            pts_start=10.0, pts_end=20.0, is_silence_boundary=False, fallback_mode="forced_overlap"
-        )
-
-        kept = session._hold_back_unfinished_tail([complete, fragment], chunk_mid, False)
-        assert [s.text for s in kept] == ["I promise I'll be on my best behavior."]
-        assert [w.text for w in session._batch_carry_words] == ["You", "better"]
-        # Mốc cất giữ ở KHÔNG GIAN AUDIO TUYỆT ĐỐI (chưa cộng offset người dùng)
-        assert session._batch_carry_words[0].start_time == pytest.approx(12.2)
-        assert session._batch_carry_words[1].end_time == pytest.approx(13.4)
-
-        # 1. Khối kết thúc ở KHOẢNG LẶNG THẬT ⇒ im lặng đã là ranh giới câu ⇒ phát bình thường
-        chunk_sil = SimpleNamespace(
-            pts_start=10.0, pts_end=20.0, is_silence_boundary=True, fallback_mode="silence_gap"
-        )
-        kept2 = session._hold_back_unfinished_tail([complete, fragment], chunk_sil, False)
-        assert len(kept2) == 2 and not session._batch_carry_words
-
-        # 2. Video đã hết ⇒ phải phát nốt, không được giữ lại rồi mất
-        kept3 = session._hold_back_unfinished_tail([complete, fragment], chunk_mid, True)
-        assert len(kept3) == 2 and not session._batch_carry_words
-
-        # 3. Mảnh cuối đã TRỌN CÂU ⇒ không giữ gì
-        kept4 = session._hold_back_unfinished_tail([complete, complete], chunk_mid, False)
-        assert len(kept4) == 2 and not session._batch_carry_words
-    finally:
-        await session.close()
-
-
-@pytest.mark.asyncio
-async def test_batch_leading_overlap_trimmed_by_word_sequence():
-    """Trừ chồng lấn ranh giới bằng CHUỖI TỪ, bù sai số mốc giữa hai lần align.
-
-    Đo thật 2026-10-02: lớp trừ THEO MỐC bỏ được 3 từ nhưng "In front of" vẫn lọt ra phụ đề vì
-    mốc align của khối mới muộn hơn khối cũ. Lớp trừ theo chuỗi phải bắt được phần còn sót.
-    """
-    from types import SimpleNamespace
-
-    session = _make_batch_session()
-    try:
-        session._batch_prev_emitted_end_audio = 29.68
-        session._batch_emitted_tail_norm = ["seeing", "in", "front", "of", "me"]
-
-        # Khối mới bắt đầu 28.68s; "in"/"front" nằm trong vùng chồng lấn, "of" bị align muộn
-        # (29.70 > ranh giới) nên lớp-theo-mốc để lọt.
-        raw = [
-            AlignedWord("in", 0.10, 0.45),
-            AlignedWord("front", 0.45, 0.85),
-            AlignedWord("of", 1.02, 1.30),
-            AlignedWord("I", 1.45, 1.65),
-            AlignedWord("promise", 1.65, 2.10),
-        ]
-        kept, dropped_ts, dropped_seq = session._trim_batch_leading_overlap(
-            SimpleNamespace(pts_start=28.68), raw
-        )
-        assert dropped_ts == 2, "lớp theo mốc phải bỏ 'in' và 'front'"
-        assert dropped_seq == 1, "lớp theo chuỗi phải bỏ nốt 'of' đã phát ở khối trước"
-        assert [w.text for w in kept] == ["I", "promise"]
-
-        # Không có chồng lấn ⇒ không được bỏ gì
-        kept2, ts2, seq2 = session._trim_batch_leading_overlap(
-            SimpleNamespace(pts_start=30.5), raw
-        )
-        assert (ts2, seq2) == (0, 0)
-        assert len(kept2) == len(raw)
+        # Bộ cắt khối dùng bộ dò khoảng lặng VAD và KHÔNG lấy lùi (overlap_sec = 0).
+        assert session.chunker.silence_scanner is session.silence_scanner
+        assert session.chunker.overlap_sec == 0.0
+        assert float(config.lookahead.batch_overlap_sec) == 0.0
+        assert float(config.lookahead.batch_vad_silence_ms) >= 1000.0
+        assert bool(config.lookahead.batch_use_vad_silence) is True
     finally:
         await session.close()
 

@@ -59,6 +59,7 @@ from backend.asr.forced_aligner import (
     detect_aligner_language_from_text,
     resolve_aligner_language,
 )
+from backend.core.vad_silence import VADSilenceScanner
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import SessionConfigPayload
 from backend.utils.logger import get_logger
@@ -180,9 +181,19 @@ class LookaheadSessionState:
         # v2 "streaming giả lập" (VAD + CommitManager + preview) đã bị XOÁ ngày 2026-10-02 — người
         # dùng muốn cơ chế cắt câu kiểu đó thì chạy Pipeline A (`/ws`), hoặc tắt Lookahead trong
         # popup để extension tự chuyển sang Pipeline A (xem report/09_lookahead_offline_batch).
-        # Bộ cắt khối: mốc lý tưởng 15 s nhưng dải TÌM ranh giới mở rộng tới `batch_search_max_sec`
-        # (30 s) — khối dài hơn cho ASR nhiều ngữ cảnh hơn (đúng mục tiêu CER/WER của v3), và mép
-        # khối chỉ là ranh giới GIẢI MÃ, không phải ranh giới câu (xem docstring lookahead_chunker).
+        # Bộ cắt khối: cắt CHỈ tại khoảng lặng mà VAD xác nhận (xem `backend/core/vad_silence.py`).
+        # Vì mép khối nằm giữa khoảng lặng thật nên không từ nào bị chẻ đôi ⇒ KHÔNG cần
+        # `overlap_sec`, KHÔNG cần trừ chồng lấn, KHÔNG cần hàn gắn mảnh cuối (đã xoá 2026-10-04).
+        self.silence_scanner: Optional[VADSilenceScanner] = (
+            VADSilenceScanner(
+                engine_name="silero-vad",
+                sample_rate=16000,
+                min_silence_ms=float(getattr(la, "batch_vad_silence_ms", 1500.0)),
+                threshold=float(getattr(la, "batch_vad_silence_threshold", 0.30)),
+            )
+            if bool(getattr(la, "batch_use_vad_silence", True))
+            else None
+        )
         self.chunker = LookaheadChunker(
             timeline=self.timeline,
             sample_rate=16000,
@@ -190,7 +201,7 @@ class LookaheadSessionState:
             min_window_sec=float(getattr(la, "batch_min_sec", 12.0)),
             max_window_sec=float(getattr(la, "batch_max_sec", 18.0)),
             min_silence_ms=float(getattr(la, "batch_min_silence_ms", 250.0)),
-            overlap_sec=float(getattr(la, "batch_overlap_sec", 1.0)),
+            overlap_sec=float(getattr(la, "batch_overlap_sec", 0.0)),
             search_max_sec=float(getattr(la, "batch_search_max_sec", 18.0)),
             adaptive_max_sec=float(getattr(la, "batch_adaptive_max_sec", 18.0) or 18.0) if getattr(la, "batch_adaptive_max_sec", None) else None,
             adaptive_threshold_sec=float(getattr(la, "batch_adaptive_threshold_sec", 30.0)),
@@ -200,6 +211,8 @@ class LookaheadSessionState:
             min_rms_ratio=float(getattr(la, "batch_min_rms_ratio", 0.35)),
             min_rms_hold_ms=float(getattr(la, "batch_min_rms_hold_ms", 120.0)),
             dip_search_sec=float(getattr(la, "batch_dip_search_sec", 3.0)),
+            silence_scanner=self.silence_scanner,
+            vad_silence_ms=float(getattr(la, "batch_vad_silence_ms", 1500.0)),
         )
         #: Trần gom câu phụ đề của tuyến batch (popup có thể thu hẹp qua `min_words_to_commit`).
         self._batch_sub_opts: Dict[str, Any] = {
@@ -215,17 +228,10 @@ class LookaheadSessionState:
             ),
             "sentence_max_chars": int(getattr(la, "batch_sub_sentence_max_chars", 160)),
         }
-        #: Mốc PTS (trong KHÔNG GIAN AUDIO, chưa cộng offset) của từ cuối ĐÃ PHÁT ở khối trước.
-        #: Dùng để trừ phần chồng lấn ở ranh giới khối — nếu không, từ ở ranh giới bị phát hai lần
-        #: ("cuối câu này là đầu của câu sau", sự cố 2026-10-02).
+        #: Mốc PTS (trong KHÔNG GIAN AUDIO) của nội dung ĐÃ PHÁT gần nhất — chỉ để chẩn đoán.
         self._batch_prev_emitted_end_audio: Optional[float] = None
-        #: Đuôi TỪ (đã chuẩn hoá) của nội dung đã phát — trừ chồng lấn theo CHUỖI TỪ, bù sai số mốc
-        #: giữa hai lần forced-align (cùng một từ có thể lệch nhau 100–300 ms giữa hai khối).
+        #: Đuôi TỪ (đã chuẩn hoá) của nội dung đã phát gần nhất — chỉ để chẩn đoán.
         self._batch_emitted_tail_norm: List[str] = []
-        #: Mảnh phụ đề CUỐI của khối trước chưa kết câu (khối bị cắt giữa câu) — giữ lại để ghép
-        #: với đầu khối sau, nhờ vậy câu không bao giờ bị chẻ làm hai phụ đề ở ranh giới khối.
-        #: Mốc thời gian ở KHÔNG GIAN AUDIO TUYỆT ĐỐI (chưa cộng offset người dùng).
-        self._batch_carry_words: List[AlignedWord] = []
         #: THẾ HỆ SEEK của marker `_ready_until_pts`. Marker chỉ có giá trị cho đúng thế hệ này;
         #: sau khi tua, marker cũ (thuộc vị trí cũ) KHÔNG được phép báo "đã sẵn sàng" — nếu không,
         #: video phát qua vùng chưa hề được xử lý (sự cố 2026-10-02: "Đã dịch: 232.9s" trong khi
@@ -234,9 +240,8 @@ class LookaheadSessionState:
         #: Mốc thời gian (perf_counter) bắt đầu thấy con trỏ khối KẸT xa vị trí phát — dùng cho
         #: watchdog neo lại (xem `_maybe_reanchor_batch_frontier`).
         self._frontier_stuck_since: Optional[float] = None
-        #: Fallback khi ForcedAligner lỗi: bộ lọc trùng của Pipeline A (cắt đuôi/đầu trùng nhau).
+        #: Bộ lọc trùng của Pipeline A — chỉ còn dùng cho trường hợp aligner lỗi hẳn (fallback).
         self._batch_dedup = CommitDeduplicator()
-        self._batch_trim_overlap: bool = bool(getattr(la, "batch_trim_boundary_overlap", True))
         self._aligner_service: ForcedAlignerService = ForcedAlignerService.get_instance()
         self._batch_from_pts: Optional[float] = None
         self._fast_bootstrap: bool = False
@@ -839,11 +844,9 @@ class LookaheadSessionState:
             self._session_start_pts = float(target_time)
             self._batch_from_pts = float(target_time)
             self._fast_bootstrap = True
-            # Ranh giới khối + lịch sử dedup của vị trí CŨ không còn dùng được: nếu giữ, khối đầu
-            # tiên của vị trí mới sẽ bị trừ oan phần chồng lấn.
+            # Lịch sử chẩn đoán của vị trí CŨ không còn dùng được.
             self._batch_prev_emitted_end_audio = None
             self._batch_emitted_tail_norm = []
-            self._batch_carry_words = []
             self._batch_dedup.clear()
 
             # Kiểm tra xem RAM đã có sẵn audio cho vị trí mới chưa (ví dụ tua lùi hoặc tua trong vùng đã buffer)
@@ -899,71 +902,6 @@ class LookaheadSessionState:
             return self.asr_engine.transcribe_block(pcm, language=lang if lang != "auto" else None)
         return ""
 
-    def _trim_batch_leading_overlap(
-        self,
-        chunk: Any,
-        aligned_words: List[Any],
-    ) -> Tuple[List[Any], int, int]:
-        """Bỏ phần nội dung ĐÃ PHÁT nằm trong vùng chồng lấn ở đầu khối hiện tại.
-
-        Khối sau có thể bắt đầu TRƯỚC mốc kết thúc nội dung đã phát của khối trước (`overlap_sec`,
-        để không mất từ ở mép cắt). Phần chồng lấn đó phải bị bỏ, nếu không từ ở ranh giới bị phát
-        HAI LẦN ("cuối câu này là đầu của câu sau").
-
-        Dùng HAI lớp vì một lớp là không đủ:
-          1. **Theo MỐC THỜI GIAN** — bỏ từ có mốc bắt đầu trước ranh giới đã phát.
-          2. **Theo CHUỖI TỪ** — bù sai số mốc giữa hai lần forced-align: cùng một từ ở hai khối có
-             thể được căn lệch nhau 100–300 ms, nên lớp 1 để lọt vài từ. Lớp này khớp đuôi từ đã
-             phát với đầu từ của khối mới (giới hạn trong cửa sổ chồng lấn để không ăn nhầm cụm từ
-             lặp lại ở giữa khối). Đo thật 2026-10-02: lớp 1 bỏ 3 từ nhưng "In front of" vẫn lọt ra
-             phụ đề vì mốc align của khối mới muộn hơn.
-
-        Returns:
-            `(words_còn_lại, số_từ_bỏ_theo_mốc, số_từ_bỏ_theo_chuỗi)`.
-        """
-        boundary = self._batch_prev_emitted_end_audio
-        if boundary is None or chunk.pts_start >= boundary - 1e-3:
-            return aligned_words, 0, 0
-
-        kept = [
-            w for w in aligned_words
-            if chunk.pts_start + float(w.start_time) >= boundary - 0.05
-        ]
-        dropped_ts = len(aligned_words) - len(kept)
-
-        tail = self._batch_emitted_tail_norm
-        dropped_seq = 0
-        if tail and kept:
-            # Chỉ xét các từ còn nằm trong (hoặc sát) vùng chồng lấn — chặn ăn nhầm cụm lặp giữa khối.
-            window = sum(
-                1 for w in kept if chunk.pts_start + float(w.start_time) < boundary + 0.35
-            )
-            k_max = min(len(tail), len(kept), window + 1)
-            head_norm = [normalize_for_dedup(getattr(w, "text", "") or "") for w in kept]
-
-            # BẢO VỆ ĐẠI TỪ / TỪ ĐƠN:
-            # - Nếu k >= 2 từ: cho phép slack trong range(0, 4) vì cụm 2 từ trở lên có tính đặc trưng cao.
-            # - Nếu k == 1 từ: CHỈ cho phép slack == 0 (tức là trùng đúng từ cuối cùng vừa phát),
-            #   và tuyệt đối KHÔNG drop k=1 cho các đại từ mở đầu câu mới (như 'i', 'you', 'we', 'he',...).
-            for k in range(k_max, 0, -1):
-                if not any(head_norm[:k]):
-                    continue
-                matched = False
-                for slack in range(0, 4):
-                    p = len(tail) - k - slack
-                    if p >= 0 and tail[p : p + k] == head_norm[:k]:
-                        if k == 1 and slack > 0:
-                            matched_word = head_norm[0]
-                            if matched_word in ("i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them"):
-                                continue
-                        matched = True
-                        break
-                if matched:
-                    dropped_seq = k
-                    kept = kept[k:]
-                    break
-        return kept, dropped_ts, dropped_seq
-
     def _commit_batch_progress(
         self,
         seq: int,
@@ -1013,7 +951,6 @@ class LookaheadSessionState:
         self._ready_until_seq = self._seek_seq
         self._batch_prev_emitted_end_audio = None
         self._batch_emitted_tail_norm = []
-        self._batch_carry_words = []
         self._batch_dedup.clear()
         self._frontier_stuck_since = None
 
@@ -1052,49 +989,6 @@ class LookaheadSessionState:
         metrics_collector.increment_counter("lookahead.batch_frontier_reanchored")
         self._reanchor_batch(self.current_time)
         return True
-
-    def _hold_back_unfinished_tail(
-        self,
-        subtitles: List[SubtitleSentence],
-        chunk: Any,
-        stream_end_block: bool,
-    ) -> List[SubtitleSentence]:
-        """Bỏ mảnh phụ đề CUỐI nếu nó CHƯA KẾT CÂU và khối bị cắt giữa câu; cất vào carry.
-
-        Vì sao: khối audio bị cắt giữa câu thì mảnh cuối khối là một phụ đề cụt — đúng ảnh chụp
-        màn hình 2026-10-02: `"I promise I'll be on my best behavior You better"`. Giữ nó lại rồi
-        ghép vào đầu khối sau (bước 2D) thì câu ra TRỌN VẸN.
-
-        KHÔNG giữ lại khi:
-          * khối kết thúc ở KHOẢNG LẶNG THẬT (`is_silence_boundary`) — im lặng đã là ranh giới câu,
-            mảnh cuối là câu hợp lệ dù ASR không kịp thêm dấu;
-          * video đã hết (`stream_end_block`) — phải phát nốt, không được giữ lại rồi mất;
-          * mảnh cuối không có mốc từ (đường fallback aligner lỗi) — không thể ghép lại.
-        """
-        self._batch_carry_words = []
-        if not subtitles:
-            return subtitles
-        tail = subtitles[-1]
-        if stream_end_block or chunk.is_silence_boundary:
-            return subtitles
-        if _ends_sentence(tail.text) or not tail.words:
-            return subtitles
-
-        self._batch_carry_words = [
-            AlignedWord(
-                text=w.text,
-                start_time=chunk.pts_start + float(w.start_time),
-                end_time=chunk.pts_start + float(w.end_time),
-            )
-            for w in tail.words
-        ]
-        logger.info(
-            f"[SEG_BATCH] Giữ lại mảnh cuối CHƯA kết câu ({len(self._batch_carry_words)} từ, ranh "
-            f"giới khối {chunk.pts_end:.2f}s, mode={chunk.fallback_mode}): '{tail.text}' "
-            f"— sẽ ghép vào đầu khối sau.",
-            extra={"module_tag": "ASR"},
-        )
-        return subtitles[:-1]
 
     def _batch_stream_end(self) -> bool:
         """Video đã dừng/đã hết VÀ không còn audio chờ ⇒ cho phép cắt nốt phần đuôi (< min_window).
@@ -1223,55 +1117,28 @@ class LookaheadSessionState:
             if self._closed or seq != self._seek_seq:
                 continue
 
-            # Bước 2C: TRỪ PHẦN CHỒNG LẤN Ở RANH GIỚI KHỐI (sự cố 2026-10-02)
-            # Khối này có thể bắt đầu TRƯỚC mốc kết thúc nội dung đã phát của khối trước
-            # (`overlap_sec` để không mất từ ở mép cắt). Không trừ thì những từ đó được phiên âm và
-            # phát LẦN HAI ⇒ "cuối câu này là đầu của câu sau".
-            if self._batch_trim_overlap and aligned_words:
-                aligned_words, dropped_ts, dropped_seq = self._trim_batch_leading_overlap(
-                    chunk, aligned_words
-                )
-                if dropped_ts or dropped_seq:
-                    logger.info(
-                        f"Trừ chồng lấn ranh giới (khối bắt đầu {chunk.pts_start:.2f}s, mốc đã phát "
-                        f"{self._batch_prev_emitted_end_audio:.2f}s): bỏ {dropped_ts} từ theo mốc "
-                        f"+ {dropped_seq} từ theo chuỗi.",
-                        extra={"module_tag": "ASR"},
-                    )
-            elif self._batch_trim_overlap and clean_text and self._batch_prev_emitted_end_audio is not None \
-                    and chunk.pts_start < self._batch_prev_emitted_end_audio - 1e-3:
-                # Không có mốc từ (aligner lỗi) ⇒ dùng bộ trim của Pipeline A trên văn bản.
-                trimmed = self._batch_dedup.trim_boundary_overlap(clean_text)
-                if trimmed != clean_text:
-                    logger.info(
-                        f"Trim chồng lấn ranh giới (không có mốc từ): '{clean_text}' -> '{trimmed}'",
-                        extra={"module_tag": "ASR"},
-                    )
-                    clean_text = trimmed
+            # ── ĐƠN GIẢN HOÁ 2026-10-04 ──────────────────────────────────────────────
+            # ĐÃ XOÁ toàn bộ tầng "sửa chữa" quanh Forced Aligner và quanh ranh giới khối:
+            #   * TRỪ CHỒNG LẤN RANH GIỚI (theo mốc thời gian + theo chuỗi từ),
+            #   * GIỮ LẠI mảnh cuối chưa kết câu rồi GHÉP vào khối sau (`_batch_carry_words`),
+            #   * HIỆU CHỈNH MỐC TỪ (`calibrate_word_times`).
+            #
+            # VÌ SAO XOÁ: cả ba chỉ tồn tại để bù cho việc **cắt khối ở giữa câu**. Nay bộ cắt khối
+            # chỉ cắt tại KHOẢNG LẶNG do VAD xác nhận (`LookaheadChunker._find_vad_cut`,
+            # `batch_overlap_sec = 0.0`) nên mép khối không bao giờ rơi vào giữa từ. Giữ chúng lại
+            # chỉ tạo ra lỗi MỚI — log thật 15:23:02:
+            #     [SEG_BATCH] Ghép 11 từ giữ lại từ khối trước vào khối [74.27 → 86.37]
+            #     [SEG_BATCH] Ngắt câu khối: "I can't see me" |
+            #                 "loving nobody but you for all my This is Rebecca." | ...
+            #     → dán liền hai câu của HAI KHỐI KHÁC NHAU thành một phụ đề vô nghĩa.
+            #
+            # NGUYÊN TẮC MỚI: **tin [ASR] tuyệt đối** — ASR tạo ra câu nào thì gửi ra phụ đề đúng
+            # như vậy; Forced Aligner chỉ xác định mốc bắt đầu/kết thúc. Không cắt xén, không bù
+            # đắp, không hàn gắn.
 
-            # Bước 2D: GHÉP mảnh cuối CHƯA KẾT CÂU của khối trước vào đầu khối này.
-            # Vì sao: khối bị cắt giữa câu thì mảnh cuối khối là một phụ đề cụt ("... You better").
-            # Giữ nó lại rồi ghép với đầu khối sau ⇒ câu ra TRỌN VẸN, không bao giờ chẻ ở ranh giới.
-            if self._batch_carry_words:
-                carried_rel = [
-                    AlignedWord(
-                        text=w.text,
-                        start_time=w.start_time - chunk.pts_start,
-                        end_time=w.end_time - chunk.pts_start,
-                    )
-                    for w in self._batch_carry_words
-                ]
-                self._batch_carry_words = []
-                aligned_words = carried_rel + list(aligned_words)
-                logger.info(
-                    f"[SEG_BATCH] Ghép {len(carried_rel)} từ giữ lại từ khối trước vào khối "
-                    f"[{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s].",
-                    extra={"module_tag": "ASR"},
-                )
-
-            # Bước 2E: Gom từ thành các câu phụ đề vừa mắt.
-            # Trần từ/giây/ký tự lấy từ `LookaheadConfig`, và bộ gom câu ưu tiên CÂU TRỌN VẸN
-            # (dấu câu đến từ `merge_source_text` — aligner đã bỏ hết dấu câu khi tokenize).
+            # Bước 2E: Gom từ thành các câu phụ đề (trần từ/giây/ký tự lấy từ `LookaheadConfig`).
+            # Bộ gom câu ưu tiên CÂU TRỌN VẸN; dấu câu đến từ `merge_source_text` vì aligner đã bỏ
+            # hết dấu câu khi tokenize.
             if aligned_words and self._aligner_service is not None:
                 try:
                     subtitles = self._aligner_service.group_words_to_subtitles(
@@ -1290,36 +1157,21 @@ class LookaheadSessionState:
                     subtitles = [
                         SubtitleSentence(text=clean_text, start_time=0.0, end_time=chunk.duration)
                     ]
-            elif self._aligner_service is not None and not align_failed:
-                # Aligner chạy bình thường nhưng KHÔNG còn từ nào sau khi trừ chồng lấn
-                # ⇒ toàn bộ nội dung khối này đã được phát ở khối trước.
-                subtitles = []
             else:
+                # Aligner lỗi (hoặc không có từ nào): dùng trọn khối làm một câu rồi để
+                # `split_oversized_sentences` tách lại theo dấu kết câu.
                 subtitles = [
-                    SubtitleSentence(
-                        text=clean_text,
-                        start_time=0.0,
-                        end_time=chunk.duration,
-                    )
+                    SubtitleSentence(text=clean_text, start_time=0.0, end_time=chunk.duration)
                 ]
 
-            # Bước 2E-bis: LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN.
-            # Nhánh dự phòng ở trên (aligner lỗi) tạo ĐÚNG MỘT câu cho cả khối; nếu aligner trả
-            # một item duy nhất (chọn sai ngôn ngữ) thì tầng gom câu cũng chỉ ra một phụ đề. Cả hai
-            # trường hợp đều bị hàm này tách lại theo dấu kết câu ⇒ không bao giờ còn "cả khối 3 câu
-            # thành một phụ đề dài" (sự cố thật 2026-10-03).
+            # Bước 2E-bis: LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
+            # câu hiện thành MỘT phụ đề dài khi aligner trả một item duy nhất).
             subtitles = ForcedAlignerService.split_oversized_sentences(
                 subtitles,
                 language=align_lang,
                 max_chars=int(self._batch_sub_opts.get("sentence_max_chars", 160) or 160),
                 max_words=int(self._batch_sub_opts.get("sentence_max_words", 24) or 24),
             )
-
-            # Bước 2F: GIỮ LẠI mảnh cuối nếu nó CHƯA KẾT CÂU và khối bị cắt giữa câu.
-            # Mảnh này sẽ được ghép vào đầu khối sau (bước 2D) ⇒ người xem không bao giờ thấy phụ
-            # đề cụt ở ranh giới khối. Khi video đã hết (stream_end) thì KHÔNG giữ — phải phát nốt.
-            subtitles = self._hold_back_unfinished_tail(subtitles, chunk, stream_end_block)
-            carried_now = bool(self._batch_carry_words)
 
             # CHẨN ĐOÁN: đây là text THẬT SỰ được gửi đi (khác `clean_text` của ASR). Không có log
             # này thì không thể biết vì sao phụ đề hiển thị khác bản phiên âm offline — đúng sự cố
@@ -1418,16 +1270,9 @@ class LookaheadSessionState:
                     "items": items_to_send,
                 })
 
-            # Chỉ cập nhật ranh giới khi khối này THỰC SỰ phát câu: nếu không, khối sau sẽ bị trừ
-            # oan phần nội dung chưa từng được phát (mất chữ). Toàn bộ khối sách trạng thái này
-            # CHỈ có giá trị cho thế hệ seek hiện tại (xem `_commit_batch_progress`).
-            if seq == self._seek_seq and not self._closed:
-                if emitted_end_audio is not None:
-                    self._batch_prev_emitted_end_audio = emitted_end_audio
-                if carried_now:
-                    # Mảnh giữ lại sẽ được phát cùng khối sau ⇒ coi như khối này đã tiêu thụ hết nội
-                    # dung tới `pts_end`, để khối sau trừ ĐÚNG vùng chồng lấn (không lặp từ).
-                    self._batch_prev_emitted_end_audio = chunk.pts_end
+            # Ghi mốc nội dung đã phát (chỉ để chẩn đoán — không còn dùng để cắt mép khối).
+            if seq == self._seek_seq and not self._closed and emitted_end_audio is not None:
+                self._batch_prev_emitted_end_audio = emitted_end_audio
 
             self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
             await self.send_status()
