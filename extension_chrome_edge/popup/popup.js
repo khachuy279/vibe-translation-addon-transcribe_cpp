@@ -934,9 +934,21 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
   // ── Trạng thái buffer Lookahead (thay cho HUD nổi trên trang) ──────────────
   // Nguồn dữ liệu: buffer_interceptor_poc.js trong page → content script → popup.
+  //
+  // v0.6.7: kèm MÃ LÝ DO (`status.lookaheadVerdict.code`) — trước đây POPUP chỉ nói
+  // "không khả dụng (chạy Realtime)" mà không nói VÌ SAO, nên không thể sửa. Mã lý do và lời
+  // giải thích lấy từ `lib/lookahead-diagnostics.js` (dùng chung với content script).
   function renderLookaheadStatus(status) {
     if (!lookaheadStatusEl || !lookaheadStatusText) return;
     lookaheadStatusEl.classList.remove("is-ready", "is-low", "is-off");
+
+    const diag = (typeof window !== "undefined" && window.LookaheadDiagnostics) || null;
+    const verdict = status && status.lookaheadVerdict ? status.lookaheadVerdict : null;
+    const reasonText = (code) => {
+      if (!diag || !code || code === "OK") return "";
+      const ex = diag.explainLookaheadReason(code);
+      return ex && ex.vi ? ` — ${ex.vi}` : ` — ${code}`;
+    };
 
     if (!status || !status.hasVideo) {
       lookaheadStatusEl.classList.add("is-off");
@@ -948,18 +960,46 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const la = status.lookahead;
     if (!la || (!la.cachedChunksCount && !la.hasInitSegment)) {
       lookaheadStatusEl.classList.add("is-off");
-      lookaheadStatusText.textContent = "Lookahead: không khả dụng (chạy Realtime)";
+      const code = verdict ? verdict.code : "UNKNOWN";
+      lookaheadStatusText.textContent = `Lookahead: không khả dụng (chạy Realtime)${reasonText(code)}`;
       isLookaheadUnavailable = true;
       updatePipelineAOnlyUi();
+      // In chẩn đoán đầy đủ ra Console của POPUP (DevTools: chuột phải popup → Inspect).
+      console.warn(`[Popup][Diag] Pipeline B KHÔNG khả dụng: ${code} — ${verdict ? verdict.detail : ""}`);
+      if (diag && status.lookaheadFacts) {
+        console.group("%c[Popup][Diag] Vì sao không chạy được Pipeline B?", "color:#f59e0b;font-weight:bold");
+        for (const row of diag.buildDiagnosticRows(status.lookaheadFacts, verdict)) {
+          console.log(`  • ${row[0]}: ${row[1]}`);
+        }
+        console.groupEnd();
+      }
       return;
     }
     const ahead = Number(la.aheadSeconds || 0);
     const enough = ahead >= 10;
     lookaheadStatusEl.classList.add(enough ? "is-ready" : "is-low");
-    lookaheadStatusText.textContent = `Lookahead available +${ahead.toFixed(2)}s`
-      + (enough ? "" : " (đang nạp)");
+    // §2026-10-05: `ahead` là ĐỆM VIDEO (interceptor đọc từ `video.buffered`), còn việc tạm dừng
+    // để nạp đệm lại dựa trên ĐỆM ĐÃ DỊCH (`lookaheadSession.readyAhead`). Hai số này khác nhau
+    // hoàn toàn: đệm video 60s mà đã dịch 0,3s thì video vẫn bị tạm dừng — hiển thị cả hai để
+    // không gây hiểu nhầm "available > 60s mà vẫn pause".
+    const sess = status.lookaheadSession || null;
+    let suffix = enough ? "" : " (đang nạp)";
+    if (sess && status.isCapturing && status.pipeline === "B") {
+      const readyAhead = Number(sess.readyAhead || 0);
+      suffix = ` · đã dịch +${readyAhead.toFixed(1)}s`
+        + (sess.paused ? ` (tạm dừng nạp đệm)` : "");
+    }
+    lookaheadStatusText.textContent = `Lookahead available +${ahead.toFixed(2)}s${suffix}`;
     isLookaheadUnavailable = false;
     updatePipelineAOnlyUi();
+    // Chẩn đoán định kỳ khi có điểm bất thường (ví dụ LỆCH THẺ VIDEO, buffer mù mime).
+    if (verdict && verdict.code !== "OK") {
+      console.info(`[Popup][Diag] Lookahead khả dụng nhưng có điểm bất thường: ${verdict.code} — ${verdict.detail}`);
+      if (verdict.code === "VIDEO_MISMATCH") {
+        console.warn("[Popup][Diag] ⚠️ Interceptor đang theo dõi một thẻ <video> KHÁC với popup. "
+          + "Đệm báo ở đây KHÔNG phải của video đang xem — phụ đề sẽ sai/không hiện.", verdict.detail);
+      }
+    }
   }
 
   async function refreshLookaheadStatus() {
@@ -970,6 +1010,12 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       if (status) {
         if (status.isCapturing && (!isCapturingNow || (status.pipeline && currentActivePipeline !== status.pipeline))) {
           setUI(true, status.sampleRate, status.pipeline);
+        } else if (!status.isCapturing && isCapturingNow) {
+          // PHIÊN ĐÃ TỰ KẾT THÚC ở phía trang (video phát HẾT, đổi video, backend ngắt…) nhưng
+          // POPUP còn tưởng đang chạy ⇒ nút vẫn ở trạng thái "Dừng" và các nhóm cài đặt bị khoá.
+          // Sự cố thật 2026-10-05: video hết mà POPUP vẫn hiện "đang dịch".
+          console.log("[Popup] Phiên dịch đã kết thúc ở phía trang (video hết / đổi video) — trả UI về trạng thái sẵn sàng.");
+          setUI(false);
         }
         renderLookaheadStatus(status);
       }

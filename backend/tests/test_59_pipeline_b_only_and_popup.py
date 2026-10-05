@@ -159,6 +159,32 @@ def test_extension_mirrors_stay_in_sync():
         assert a == b, f"{rel} lệch nhau giữa {EXT_DIRS[0]} và {EXT_DIRS[1]}"
 
 
+#: Sự cố thật 2026-10-05 (ảnh người dùng): video phát HẾT nhưng phiên vẫn sống — overlay
+#: "Đang xử lý tiếp đoạn video…" nằm lại giữa màn hình, backend còn giữ RAM/GPU, POPUP còn hiện
+#: "đang dịch". Bộ test này khoá lại yêu cầu "hết video thì tự tắt session".
+@pytest.mark.parametrize("ext", EXT_DIRS)
+def test_extension_auto_stops_session_when_video_ends(ext: str):
+    content = (ROOT / ext / "content" / "content-script.js").read_text(encoding="utf-8")
+    # 1. Phải dừng phiên khi video SẮP hết (≤ vài giây), không chỉ khi `ended` bắn — nếu extension
+    #    đang tạm dừng video sát mép cuối thì `ended` không bao giờ tới và phiên thành "mồ côi".
+    assert "LA_END_STOP_MARGIN_SEC" in content, f"{ext}: thiếu ngưỡng 'sắp hết' để tự đóng phiên"
+    assert '"timeupdate"' in content, f"{ext}: content-script chưa theo dõi `timeupdate`"
+    assert '"ended"' in content, f"{ext}: content-script chưa lắng nghe sự kiện `ended`"
+    window = content[content.index("const stopAtVideoEnd"):][:2000]
+    assert "t >= d - LA_END_STOP_MARGIN_SEC" in window, f"{ext}: thiếu điều kiện 'còn ≤ vài giây'"
+    assert "stopCapture()" in window, f"{ext}: gặp cuối video nhưng không tự dừng phiên"
+    assert "overlayManager.destroy()" in window, f"{ext}: gặp cuối video nhưng không gỡ overlay"
+    # 2. `cleanup()` không được `play()` một video đã `ended` (gọi play sẽ khiến video CHẠY LẠI
+    #    từ đầu ngay lúc ta vừa đóng phiên vì hết video).
+    assert "!v.ended" in content, f"{ext}: cleanup vẫn `play()` video đã ended"
+
+    js = (ROOT / ext / "popup" / "popup.js").read_text(encoding="utf-8")
+    # 3. POPUP phải tự trả UI về trạng thái rảnh khi phiên đã kết thúc ở phía trang.
+    assert "!status.isCapturing && isCapturingNow" in js, (
+        f"{ext}: popup không phát hiện phiên đã tự kết thúc để trả UI về trạng thái sẵn sàng"
+    )
+
+
 @pytest.mark.asyncio
 async def test_lookahead_session_apply_config_runtime():
     """`apply_config()` từ popup khi đổi source_lang / target_lang / sync_offset không được văng lỗi."""

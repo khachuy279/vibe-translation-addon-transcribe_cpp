@@ -61,6 +61,75 @@ def _make_session() -> LookaheadSessionState:
     return session
 
 
+def test_first_audio_pts_at_or_after_bridges_gap():
+    """`first_audio_pts_at_or_after` là cơ sở cho bước "nhảy con trỏ ra khỏi KHE HỞ"."""
+    tl = ContinuousAudioTimeline(sample_rate=16000)
+    tl.append(330.0, np.zeros(16000 * 2, dtype=np.float32))   # audio [330, 332]
+
+    # Trước đoạn audio ⇒ trả về ĐẦU đoạn (đây chính là mốc để nhảy con trỏ tới).
+    assert tl.first_audio_pts_at_or_after(322.07) == pytest.approx(330.0)
+    # Nằm TRONG đoạn ⇒ audio có ngay tại đó, trả về đúng mốc hỏi.
+    assert tl.first_audio_pts_at_or_after(331.0) == pytest.approx(331.0)
+    # Sau tất cả ⇒ không có gì.
+    assert tl.first_audio_pts_at_or_after(400.0) is None
+
+    # Và `buffered_end_from` đúng là trả None ở khe hở > MAX_GAP_FILL_SEC (5s) — tiền đề của lỗi.
+    assert tl.buffered_end_from(322.07) is None
+
+
+def test_nudge_cursor_out_of_gap_after_seek():
+    """HỒI QUY 2026-10-05 (xvideos.com): sau khi TUA, con trỏ khối rơi vào KHE HỞ.
+
+    Log thật: `Seek … mốc=322.07s`, sau đó `mốc-đã-xử-lý=322.07s` đứng im suốt 35 giây dù
+    `Audio RAM: 245.7s` và `Đệm trước: 36.0s` — vì audio thật của vị trí mới bắt đầu muộn hơn
+    (trình phát nạp lại theo ranh giới segment) nên `next_chunk()` trả `None` MÃI MÃI.
+    """
+    session = _make_session()
+    session.timeline.append(330.0, np.zeros(16000 * 3, dtype=np.float32))
+    session._batch_from_pts = 322.07
+    session._feed_pts = 322.07
+
+    moved = session._nudge_cursor_out_of_gap(322.07)
+
+    assert moved is True, "phải nhảy con trỏ ra khỏi khe hở"
+    assert session._batch_from_pts == pytest.approx(330.0)
+    # `_feed_pts` ("đã qua ASR") KHÔNG được đẩy theo: vùng bị nhảy qua không có audio nên chưa
+    # hề được xử lý — đẩy theo sẽ thổi phồng `fed_ahead` và làm client resume sớm.
+    assert session._feed_pts == pytest.approx(322.07)
+
+    # Khi CÓ audio tại con trỏ thì KHÔNG được nhảy (đang chờ nạp thêm là chuyện bình thường).
+    assert session._nudge_cursor_out_of_gap(331.0) is False
+    assert session._batch_from_pts == pytest.approx(330.0)
+
+
+def test_nudge_cursor_out_of_sliver_then_hole():
+    """HỒI QUY 2026-10-05 (xvideos.com, sau khi tua lần 2): con trỏ ở 330,03 s — có ĐÚNG 0,0 s
+    audio tại đó rồi khe hở mới tới đoạn kế.
+
+    Lúc này `buffered_end_from(con_trỏ)` trả về ~330,03 (KHÁC `None`) nên van "khe hở hoàn toàn"
+    không kích hoạt, mà `next_chunk()` vẫn trả `None` (`buffered_end <= from_pts + 0.05`) ⇒
+    `mốc-đã-xử-lý` đứng im và client pause/resume liên tục ("seek xong thì bị pause liên tục").
+    """
+    session = _make_session()
+    # Mẩu vụn 0,1 s tại 330,0 rồi khe hở 9,9 s tới đoạn thật ở 340,0.
+    session.timeline.append(330.0, np.zeros(int(16000 * 0.1), dtype=np.float32))
+    session.timeline.append(340.0, np.zeros(16000 * 3, dtype=np.float32))
+    session._batch_from_pts = 330.0
+
+    assert session._nudge_cursor_out_of_gap(330.0) is True, "phải nhảy qua mẩu vụn + khe hở"
+    assert session._batch_from_pts == pytest.approx(340.0)
+
+
+def test_nudge_does_not_jump_at_live_edge():
+    """Ở MÉP NẠP (không còn đoạn nào phía sau) thì phải CHỜ, không nhảy — nếu không sẽ bỏ audio."""
+    session = _make_session()
+    session.timeline.append(100.0, np.zeros(16000, dtype=np.float32))   # audio [100, 101]
+    session._batch_from_pts = 100.5
+
+    assert session._nudge_cursor_out_of_gap(100.5) is False
+    assert session._batch_from_pts == pytest.approx(100.5)
+
+
 def _drain_timeline(session: LookaheadSessionState, target_pts: float, block_sec: float = 0.5) -> int:
     """Đọc timeline như tầng xử lý khối vẫn làm; trả về số khối đã đọc."""
     fed = 0

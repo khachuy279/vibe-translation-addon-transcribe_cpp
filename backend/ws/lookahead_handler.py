@@ -78,6 +78,14 @@ _REANCHOR_TOLERANCE_SEC = 1.5
 #: Con trỏ khối batch phải kẹt xa vị trí phát BỀN VỮNG ngần này giây mới neo lại (xem
 #: `_maybe_reanchor_batch_frontier`) — tránh neo nhầm khi playhead vừa nhảy bình thường.
 _FRONTIER_RESYNC_AFTER_SEC = 2.0
+#: Con trỏ khối bị coi là "kẹt PHÍA SAU vị trí phát" khi nó chậm hơn playhead ngần này giây
+#: (đo thật 2026-10-05, xhamster.com: playhead 967s nhưng con trỏ đứng ở 575s — một mốc KHÔNG
+#: có audio trong timeline — nên `next_chunk()` trả None mãi và 'mốc-đã-xử-lý' không bao giờ tiến).
+_FRONTIER_BEHIND_RESYNC_SEC = 20.0
+#: Lượng audio TỐI THIỂU tại con trỏ để còn cắt được một khối. Dưới mức này thì đứng chờ là vô
+#: ích (bộ cắt khối cần ≥ 2,5 s cho cả chế độ bootstrap lẫn nhánh khẩn cấp) ⇒ nhảy tới đoạn kế
+#: nếu có (xem `_nudge_cursor_out_of_gap`).
+_MIN_USEFUL_AUDIO_SEC = 2.5
 
 
 def _pack_binary_frame(header: Dict[str, Any], payload: bytes) -> bytes:
@@ -237,6 +245,11 @@ class LookaheadSessionState:
         #: Mốc thời gian (perf_counter) bắt đầu thấy con trỏ khối KẸT xa vị trí phát — dùng cho
         #: watchdog neo lại (xem `_maybe_reanchor_batch_frontier`).
         self._frontier_stuck_since: Optional[float] = None
+        #: Mốc thời gian bắt đầu "con trỏ khối kẹt PHÍA SAU vị trí phát" (xem
+        #: `_maybe_reanchor_batch_frontier`). Cần bộ đếm RIÊNG vì hai kiểu kẹt loại trừ nhau.
+        #: Mốc thời gian lần cuối log "khối ASR trả về rỗng" (xem `_log_empty_block`).
+        self._last_empty_block_log_at: float = 0.0
+        self._frontier_behind_since: Optional[float] = None
         #: Bộ lọc trùng của Pipeline A — chỉ còn dùng cho trường hợp aligner lỗi hẳn (fallback).
         self._batch_dedup = CommitDeduplicator()
         self._aligner_service: ForcedAlignerService = ForcedAlignerService.get_instance()
@@ -955,6 +968,7 @@ class LookaheadSessionState:
         self._batch_emitted_tail_norm = []
         self._batch_dedup.clear()
         self._frontier_stuck_since = None
+        self._frontier_behind_since = None
 
     def _maybe_reanchor_batch_frontier(self, from_pts: float, max_ahead_pts: float) -> bool:
         """RÀNG BUỘC CỨNG: con trỏ khối không được KẸT xa vị trí phát.
@@ -974,23 +988,144 @@ class LookaheadSessionState:
             True nếu VỪA neo lại (vòng lặp nên `continue` để chạy lại từ mốc mới).
         """
         limit = float(max_ahead_pts) + float(getattr(config.lookahead, "batch_max_audio_sec", 45.0)) + 1.0
-        if from_pts <= limit:
+        if from_pts > limit:
+            now = time.perf_counter()
+            if self._frontier_stuck_since is None:
+                self._frontier_stuck_since = now
+            elif now - self._frontier_stuck_since >= _FRONTIER_RESYNC_AFTER_SEC:
+                logger.warning(
+                    f"Con trỏ khối batch kẹt ở {from_pts:.2f}s trong khi vị trí phát chỉ {self.current_time:.2f}s "
+                    f"(quá tầm nhìn {limit:.1f}s) — NEO LẠI về vị trí phát để không phát video mà không xử lý gì.",
+                    extra={"module_tag": "WS"},
+                )
+                metrics_collector.increment_counter("lookahead.batch_frontier_reanchored")
+                self._reanchor_batch(self.current_time)
+                self._frontier_stuck_since = None
+                return True
+        else:
             self._frontier_stuck_since = None
+
+        # ── KẸT PHÍA SAU vị trí phát (đo thật 2026-10-05, xhamster.com) ─────────────
+        # Triệu chứng: `mốc-đã-xử-lý` đứng im ở 575.01s trong khi playhead chạy tới 967s+ và
+        # "Đã dịch: 0.0s" mãi. Nguyên nhân: con trỏ khối nằm ở một mốc KHÔNG còn audio (khe hở
+        # của timeline sau khi trang tự nạp lại nguồn / sau khi tua mà `seek_reset` không tới
+        # backend) ⇒ `_batch_gate` trả "no_audio", `next_chunk()` trả None, vòng lặp quay mãi.
+        # Van cũ chỉ xử lý "kẹt QUÁ XA PHÍA TRƯỚC" nên không bao giờ cứu được ca này.
+        behind = float(self.current_time) - float(from_pts)
+        frontier_at_cursor = self.timeline.buffered_end_from(from_pts)
+        available_at_cursor = (
+            0.0 if frontier_at_cursor is None else max(0.0, float(frontier_at_cursor) - float(from_pts))
+        )
+        # Điều kiện "không còn đủ audio để cắt khối": KHÔNG có audio, hoặc chỉ còn một mẩu nhỏ hơn
+        # cửa sổ tối thiểu của bộ cắt khối. Đo thật 2026-10-05 (xvideos.com): con trỏ ở 20.04s —
+        # ĐÚNG mép một khe hở của timeline — nên `buffered_end_from()` trả về ~20.04 (khác `None`)
+        # và `available = 0.0s`: bộ cắt khối không bao giờ cắt được, `next_chunk()` trả `None`
+        # mãi trong khi playhead đã ở 41s ("chạy một chút lại dừng").
+        min_window = float(getattr(self.chunker, "min_window_sec", 0.0) or 0.0)
+        if behind < _FRONTIER_BEHIND_RESYNC_SEC or available_at_cursor >= min_window:
+            self._frontier_behind_since = None
             return False
         now = time.perf_counter()
-        if self._frontier_stuck_since is None:
-            self._frontier_stuck_since = now
+        if self._frontier_behind_since is None:
+            self._frontier_behind_since = now
             return False
-        if now - self._frontier_stuck_since < _FRONTIER_RESYNC_AFTER_SEC:
+        if now - self._frontier_behind_since < _FRONTIER_RESYNC_AFTER_SEC:
             return False
         logger.warning(
-            f"Con trỏ khối batch kẹt ở {from_pts:.2f}s trong khi vị trí phát chỉ {self.current_time:.2f}s "
-            f"(quá tầm nhìn {limit:.1f}s) — NEO LẠI về vị trí phát để không phát video mà không xử lý gì.",
+            f"Con trỏ khối batch KẸT PHÍA SAU vị trí phát: con trỏ {from_pts:.2f}s, playhead "
+            f"{self.current_time:.2f}s (chậm {behind:.1f}s) và chỉ còn {available_at_cursor:.1f}s "
+            f"audio tại con trỏ (< {min_window:.1f}s tối thiểu để cắt khối) ⇒ NEO LẠI về vị trí "
+            f"phát (nếu không, video phát mà không xử lý gì).",
             extra={"module_tag": "WS"},
         )
         metrics_collector.increment_counter("lookahead.batch_frontier_reanchored")
         self._reanchor_batch(self.current_time)
+        self._frontier_behind_since = None
         return True
+
+    def _nudge_cursor_out_of_gap(self, from_pts: float) -> bool:
+        """Đưa CON TRỎ KHỐI ra khỏi vùng KHÔNG ĐỦ AUDIO ĐỂ CẮT KHỐI.
+
+        Hai dạng đã gặp thật (xvideos.com, HLS tách track):
+
+        1. **Khe hở hoàn toàn** (2026-10-05): `handle_seek` neo con trỏ đúng vào mốc tua
+           (313,44 s) nhưng audio thật của vị trí mới chỉ bắt đầu muộn hơn ⇒
+           `buffered_end_from(con_trỏ)` trả `None` ⇒ `next_chunk()` trả `None` MÃI MÃI.
+        2. **Mẩu vụn rồi khe hở** (đo lại cùng ngày): con trỏ ở 330,03 s — có ĐÚNG 0,0 s audio
+           tại đó (mép cuối một đoạn) rồi khe hở mới tới đoạn kế. `buffered_end_from()` trả về
+           ~330,03 (KHÁC `None`) nên van theo kiểu (1) không kích hoạt; `next_chunk()` vẫn trả
+           `None` vì `buffered_end <= from_pts + 0.05`. Hệ quả: `mốc-đã-xử-lý` đứng im và client
+           pause/resume liên tục dù RAM đã có hàng chục giây audio ngay sau khe.
+
+        Cách xử lý chung: nếu lượng audio ĐỌC ĐƯỢC tại con trỏ nhỏ hơn mức tối thiểu để cắt một
+        khối (`_MIN_USEFUL_AUDIO_SEC`) VÀ tồn tại một đoạn audio nằm sau khe hở thì nhảy con trỏ
+        tới đầu đoạn đó. Không có đoạn nào phía sau (đang ở mép nạp) ⇒ KHÔNG nhảy, chờ nạp thêm
+        là đúng.
+
+        Returns:
+            True nếu vừa nhảy con trỏ.
+        """
+        run_end = self.timeline.buffered_end_from(from_pts)
+        available = 0.0 if run_end is None else max(0.0, float(run_end) - float(from_pts))
+        if available >= _MIN_USEFUL_AUDIO_SEC:
+            return False
+        # Dò từ NGAY SAU phần audio hiện có: chỉ nhảy khi thật sự có đoạn audio ở phía sau khe.
+        probe = float(from_pts) + max(0.05, available) + 0.05
+        nxt = self.timeline.first_audio_pts_at_or_after(probe)
+        if nxt is None or nxt <= float(from_pts) + 0.2:
+            return False
+        logger.info(
+            f"[SEG_BATCH] Con trỏ khối {from_pts:.2f}s chỉ có {available:.2f}s audio tại chỗ "
+            f"(cần ≥ {_MIN_USEFUL_AUDIO_SEC:.1f}s để cắt khối) — nhảy tới đầu đoạn audio kế tiếp "
+            f"{nxt:.2f}s (lệch {nxt - float(from_pts):.2f}s) để pipeline chạy tiếp thay vì đứng im.",
+            extra={"module_tag": "ASR"},
+        )
+        metrics_collector.increment_counter("lookahead.batch_cursor_gap_nudged")
+        self._batch_from_pts = float(nxt)
+        #: KHÔNG đụng `_feed_pts`: nó nghĩa là "audio ĐÃ QUA ASR". Vùng bị nhảy qua không có audio
+        #: nên không thể xử lý; nếu ta đẩy `_feed_pts` tới đây thì `fed_ahead` bị thổi phồng và
+        #: client tưởng vùng đó đã được quét (resume sớm) — đo thật 2026-10-05: `prebuffer_ready`
+        #: bật với `ready_ahead=0.00s, fed_ahead=29.85s` ngay sau khi nhảy 30s.
+        return True
+
+    def _log_empty_block(self, chunk) -> None:
+        """Log VÌ SAO một khối không ra chữ — tách "audio im lặng" khỏi "model không nhận ra".
+
+        SỰ CỐ THẬT 2026-10-05 (www.av01.media): `mốc-đã-xử-lý` và `fragments/decoded` vẫn tiến,
+        `ready_ahead` 30–66 s (trông rất khoẻ) nhưng số câu (`utterances`) ĐỨNG IM ⇒ về sau không
+        có phụ đề nào. Đường đi là nhánh "ASR trả về rỗng": khối vẫn được cắt, `_commit_batch_progress`
+        vẫn đẩy con trỏ, mà KHÔNG có dòng log nào ⇒ không thể biết là do audio im lặng hay do model.
+
+        Ba chỉ số dưới đây phân biệt ngay:
+          * `RMS`/`đỉnh` ≈ 0 và `tỉ lệ mẫu 0` ≈ 100 % ⇒ PCM là IM LẶNG (lỗi tầng giải mã/khe hở).
+          * `RMS` bình thường mà vẫn rỗng ⇒ model/VAD, không phải audio.
+          * `im lặng do timeline lấp` = số giây silence được `get_audio_range/read` TỰ SINH để bắc
+            qua khe hở ⇒ nếu con số này lớn thì audio thật đang thiếu.
+        """
+        now = time.perf_counter()
+        if now - self._last_empty_block_log_at < 5.0:
+            return
+        self._last_empty_block_log_at = now
+        pcm = getattr(chunk, "pcm", None)
+        if pcm is None or len(pcm) == 0:
+            stats = "PCM RỖNG"
+        else:
+            arr = np.asarray(pcm, dtype=np.float32)
+            peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+            rms = float(np.sqrt(np.mean(np.square(arr)))) if arr.size else 0.0
+            zero_ratio = float(np.mean(arr == 0.0)) if arr.size else 1.0
+            stats = (
+                f"PCM {arr.size / 16000.0:.1f}s | RMS={rms:.5f} | đỉnh={peak:.5f} | "
+                f"mẫu-0={zero_ratio * 100:.1f}%"
+            )
+        logger.warning(
+            f"[SEG_BATCH] Khối [{float(chunk.pts_start):.2f}s → {float(chunk.pts_end):.2f}s] "
+            f"ASR trả về RỖNG ({stats}; mode={getattr(chunk, 'fallback_mode', '?')}; "
+            f"silence={float(getattr(chunk, 'silence_gap_ms', 0.0)):.0f}ms; "
+            f"im lặng-do-lấp={self.timeline.gap_filled_sec:.1f}s; playhead={float(self.current_time):.1f}s) "
+            f"— KHÔNG có phụ đề cho đoạn này.",
+            extra={"module_tag": "ASR"},
+        )
 
     def _batch_stream_end(self) -> bool:
         """Video đã dừng/đã hết VÀ không còn audio chờ ⇒ cho phép cắt nốt phần đuôi (< min_window).
@@ -1131,6 +1266,10 @@ class LookaheadSessionState:
                 chunk = None
 
             if chunk is None or self._closed or seq != self._seek_seq:
+                # Con trỏ rơi vào KHE HỞ ⇒ `next_chunk()` trả None mãi mãi (xem
+                # `_nudge_cursor_out_of_gap`). Chỉ nhảy khi vẫn còn thuộc thế hệ seek hiện tại.
+                if chunk is None and not self._closed and seq == self._seek_seq:
+                    self._nudge_cursor_out_of_gap(from_pts)
                 continue
 
             # Bước 2A: ASR Offline Block Decoding
@@ -1149,20 +1288,26 @@ class LookaheadSessionState:
 
             if not clean_text:
                 # Không nhận diện được tiếng nói (im lặng hoặc nhạc nền)
+                self._log_empty_block(chunk)
                 self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
                 await self.send_status()
                 continue
 
-            # LỌC ẢO GIÁC LẶP TỪ Ở TẦNG KHỐI ASR:
-            # Nếu cả khối ASR bị kẹt vòng lặp (ví dụ 5+ 'あ' hoặc cụm lặp), bỏ qua luôn để không đốt GPU chạy ForcedAligner
-            if is_repetition_hallucination(clean_text, min_reps=5):
-                logger.warning(
-                    f"Lookahead Batch ASR phát hiện ảo giác kẹt vòng (repetition loop), bỏ qua khối: '{clean_text[:60]}...'",
-                    extra={"module_tag": "ASR"},
-                )
-                self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
-                await self.send_status()
-                continue
+            # ── ẢO GIÁC LẶP TỪ: chỉ lọc ở TẦNG CÂU, sau khi đã ngắt câu ─────────────
+            # NGUYÊN TẮC (người dùng chốt 2026-10-05): "Ngắt câu khối trước, câu nào repetition
+            # loop thì bỏ câu đó thôi".
+            #
+            # Bản cũ gọi `is_repetition_hallucination(clean_text)` cho TOÀN BỘ khối — hàm này trả
+            # True khi có BẤT KỲ đoạn lặp ≥ 3 ở đâu trong chuỗi — nên chỉ cần ĐUÔI khối kẹt vòng là
+            # vứt cả khối. Log thật:
+            #
+            #   '一時しないと収まんないよこれ。ちょっと入れるだけだから。ちょっと入れちょっとだから。
+            #    ちょっとちょっと。あああああ…'      ← 4 câu THẬT ở đầu, chỉ ĐUÔI bị kẹt vòng
+            #
+            # Ở đây KHÔNG lọc gì: việc ngắt câu đã có sẵn trong chính tuyến này
+            # (`group_words_to_subtitles` → `split_subtitles_by_clause_comma` →
+            # `split_oversized_sentences`), rồi bộ lọc theo TỪNG CÂU ở `candidate_subs` bỏ đúng
+            # những câu hỏng. Khối rác thuần vẫn ra 0 phụ đề vì câu duy nhất của nó bị bỏ.
 
             logger.info(
                 f"Lookahead Batch ASR [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] ({asr_ms:.0f}ms): '{clean_text}'",
@@ -1307,10 +1452,11 @@ class LookaheadSessionState:
                 if pts_end < self.current_time - 3.0:
                     continue
 
-                # LỌC ẢO GIÁC LẶP TỪ: Loại bỏ câu có từ lặp liên tiếp >= 3 lần (như "あああ")
+                # LỌC ẢO GIÁC LẶP TỪ Ở TẦNG CÂU (đúng nguyên tắc: ngắt câu trước, bỏ câu hỏng sau).
                 if is_repetition_hallucination(sub.text, min_reps=3):
-                    logger.info(
-                        f"Bỏ qua câu ảo giác lặp từ: '{sub.text}'",
+                    logger.warning(
+                        f"[SEG_BATCH] Bỏ 1 CÂU ảo giác lặp từ (các câu khác trong khối vẫn giữ): "
+                        f"'{sub.text[:60]}'",
                         extra={"module_tag": "ASR"},
                     )
                     continue
@@ -1801,7 +1947,9 @@ class LookaheadSessionState:
             f"Audio RAM: {self.timeline.total_stored_seconds():.1f}s | "
             f"Đệm trước: {buffered_ahead:.1f}s | "
             f"Đã dịch: {ready_ahead:.1f}s (đã qua ASR {fed_ahead:.1f}s, "
-            f"giải mã {d_decode / span:.2f}x, PCM/byte {d_decode / max(1, d_bytes):.3f})",
+            f"giải mã {d_decode / span:.2f}x, PCM/byte {d_decode / max(1, d_bytes):.3f}, "
+            f"im lặng-do-lấp {self.timeline.gap_filled_sec:.1f}s, "
+            f"câu {self.utterances_sent})",
             extra={"module_tag": "ASR"},
         )
 

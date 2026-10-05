@@ -41,6 +41,9 @@ class LookaheadClient {
     this.ws = null;
     this.port = null;
     // Cho phép dùng Background Bridge để vượt qua CSP / CORS của các trang web ngoài.
+    // FIREFOX: bridge qua `chrome.runtime.connect` là đường CHÍNH (background script của Firefox
+    // KHÔNG bị kill sau ~30s idle như service worker của Chromium). Bản chrome_edge đặt mặc định
+    // `false` (WebSocket mở thẳng) vì lý do riêng của Chromium — ĐỪNG copy giá trị đó sang đây.
     // Nếu môi trường không có chrome.runtime.connect (vd Node test), tự fallback sang WebSocket trực tiếp.
     this.useBridge = (typeof options.useBridge === "boolean")
       ? options.useBridge
@@ -59,6 +62,56 @@ class LookaheadClient {
     this._syncTimer = null;
     this._messageListener = null;
     this._readyTimer = null;
+
+    // ── THỐNG KÊ CHẨN ĐOÁN ────────────────────────────────────────────────────
+    // Người dùng báo (2026-10-05): POPUP báo "Lookahead available" mà backend log "Đã dịch 0.0s,
+    // PCM/byte 0.000" — cần biết extension có THỰC SỰ gửi mảnh nào sang `/ws/lookahead` không.
+    // Bốn con số dưới đây trả lời chính xác điều đó:
+    //   framesSent   — số khung nhị phân đã gửi THÀNH CÔNG sang backend
+    //   framesQueued — số mảnh phải xếp hàng chờ socket mở
+    //   framesDropped— số mảnh bị bỏ vì hàng đợi đầy (>160) ⇒ MẤT AUDIO
+    //   framesBlocked— số mảnh KHÔNG gửi được vì socket không mở/destroyed
+    this.diag = {
+      framesSent: 0,
+      framesSentBytes: 0,
+      framesQueued: 0,
+      framesDropped: 0,
+      framesBlocked: 0,
+      jsonSent: 0,
+      serverMessages: Object.create(null),
+      connectedAt: null,
+      lastFrameAt: 0,
+      lastFrameLogAt: 0,
+    };
+  }
+
+  /** Ghi một dòng chẩn đoán có tiền tố riêng để lọc nhanh trong Console. */
+  _diagLog(level, message, data) {
+    const prefix = "%c[Lookahead Client][Diag]";
+    try {
+      const style = level === "warn" ? "color:#f59e0b;" : "color:#38bdf8;";
+      // KHÔNG truyền thêm tham số khi không có dữ liệu: Console in ra `<empty string>` rất khó đọc.
+      if (data === undefined || data === null) {
+        if (level === "warn") console.warn(`${prefix} ${message}`, style);
+        else console.log(`${prefix} ${message}`, style);
+        return;
+      }
+      if (level === "warn") console.warn(`${prefix} ${message}`, style, data);
+      else console.log(`${prefix} ${message}`, style, data);
+    } catch (e) {}
+  }
+
+  /** Ảnh chụp thống kê gửi/nhận (dùng cho POPUP và `__bsLookaheadDiagReport`). */
+  getDiag() {
+    return {
+      ...this.diag,
+      serverMessages: { ...this.diag.serverMessages },
+      isConnected: this.isConnected,
+      isServerReady: this.isServerReady,
+      pendingChunks: this._pendingChunks.length,
+      activeSeekId: this.activeSeekId,
+      clientSessionId: this.clientSessionId,
+    };
   }
 
   /**
@@ -70,6 +123,17 @@ class LookaheadClient {
     this._pendingChunks = [];
     this.activeSeekId = "init_0";
     this.clientSessionId = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    // Thống kê của phiên trước không còn ý nghĩa — đếm lại từ đầu (xem `this.diag`).
+    this.diag.framesSent = 0;
+    this.diag.framesSentBytes = 0;
+    this.diag.framesQueued = 0;
+    this.diag.framesDropped = 0;
+    this.diag.framesBlocked = 0;
+    this.diag.jsonSent = 0;
+    this.diag.serverMessages = Object.create(null);
+    this.diag.connectedAt = null;
+    this._diagLog("log", `Mở phiên Lookahead mới (session=${this.clientSessionId}) tới ${this.serverUrl} `
+      + `| video.currentTime=${video ? Number(video.currentTime || 0).toFixed(2) : "?"}s`);
     if (this.useBridge) {
       this._initBridge();
     } else {
@@ -178,8 +242,8 @@ class LookaheadClient {
    * AAC (368 s audio) chỉ trải trên 70 s timeline ⇒ decoder phải giải mã và lọc trùng gấp 5,
    * làm đói cả pipeline.
    *
-   * `token`: "init" cho lần bắt đầu phiên (gửi bao nhiêu lần cũng chỉ replay 1 lần), và
-   * `seek_<id>` cho mỗi lần tua (mỗi mốc mới được replay đúng một lần).
+   * `token`: "init_<seekId>" cho lần bắt đầu phiên (gửi bao nhiêu lần cũng chỉ replay 1 lần),
+   * và `seek_<id>` cho mỗi lần tua (mỗi mốc mới được replay đúng một lần).
    */
   requestInitialChunks(currentTime, token, force = false) {
     if (this._destroyed) return;
@@ -258,7 +322,10 @@ class LookaheadClient {
       return;
     }
     this.isConnected = true;
+    this.diag.connectedAt = Date.now();
     console.log("%c[Lookahead Client] 🟢 Đã kết nối thành công tới /ws/lookahead", "color: #38bdf8; font-weight: bold;");
+    this._diagLog("log", `Socket ĐÃ MỞ. Mảnh đang xếp hàng chờ gửi: ${this._pendingChunks.length}. `
+      + `Sẽ gửi lookahead_init rồi xin replay cache từ interceptor.`);
 
     const curTime = this.videoElement ? Number(this.videoElement.currentTime.toFixed(2)) : 0;
 
@@ -364,6 +431,22 @@ class LookaheadClient {
 
   _handleServerMessage(msg) {
     if (!msg) return;
+    // ── ĐẾM & LOG LOẠI BẢN TIN TỪ BACKEND (chẩn đoán) ─────────────────────────
+    // Câu hỏi thường gặp khi Pipeline B "chạy mà không có phụ đề": backend có gửi
+    // `lookahead_status`/`lookahead_subtitles` không? Đây là chỗ trả lời.
+    {
+      const t = msg.type || "(không có type)";
+      const first = !this.diag.serverMessages[t];
+      this.diag.serverMessages[t] = (this.diag.serverMessages[t] || 0) + 1;
+      if (first) {
+        this._diagLog("log", `📥 Bản tin ĐẦU TIÊN từ backend: type=${t}`,
+          t === "lookahead_status" ? {
+            ready_ahead: msg.ready_ahead, fed_ahead: msg.fed_ahead,
+            ready_until_pts: msg.ready_until_pts, prebuffer_ready: msg.prebuffer_ready,
+            fragments: msg.fragments, decoded_chunks: msg.decoded_chunks,
+          } : undefined);
+      }
+    }
 
     switch (msg.type) {
       case "lookahead_ready": {
@@ -476,7 +559,17 @@ class LookaheadClient {
           this._sendAudioBinaryFrame(rawBytes, payload);
         } else {
           this._pendingChunks.push({ rawBytes, payload });
-          if (this._pendingChunks.length > 160) this._pendingChunks.shift();
+          this.diag.framesQueued += 1;
+          // Hàng đợi đầy ⇒ BỎ mảnh cũ nhất. Đây là MẤT AUDIO thật (không phải lỗi giải mã).
+          if (this._pendingChunks.length > 160) {
+            this._pendingChunks.shift();
+            this.diag.framesDropped += 1;
+            if (this.diag.framesDropped === 1 || this.diag.framesDropped % 20 === 0) {
+              this._diagLog("warn",
+                `⚠️ Hàng đợi mảnh audio đầy (>160) — đã BỎ ${this.diag.framesDropped} mảnh cũ. `
+                + `Nguyên nhân: socket tới /ws/lookahead chưa mở hoặc đang nghẽn.`);
+            }
+          }
         }
       }
     };
@@ -489,8 +582,16 @@ class LookaheadClient {
    * Đóng gói và gửi Binary Frame sang Backend.
    */
   _sendAudioBinaryFrame(rawBytes, meta) {
-    if (this._destroyed) return;
-    if (!this.port && (!this.ws || this.ws.readyState !== WebSocket.OPEN)) return;
+    if (this._destroyed) {
+      this.diag.framesBlocked += 1;
+      return;
+    }
+    if (!this.port && (!this.ws || this.ws.readyState !== WebSocket.OPEN)) {
+      // Socket chưa mở: mảnh này KHÔNG được gửi. Nếu con số này tăng liên tục mà backend không
+      // nhận được gì ⇒ cổng kết nối có vấn đề (xem `framesQueued`/`framesDropped`).
+      this.diag.framesBlocked += 1;
+      return;
+    }
 
     const hdrObj = {
       timestamp_offset: meta?.timestampOffset || 0.0,
@@ -527,7 +628,9 @@ class LookaheadClient {
     if (this.port) {
       try {
         this.port.postMessage({ action: "SEND_RAW_BINARY", buffer: packet.buffer });
+        this._noteFrameSent(rawBytes, meta);
       } catch (e) {
+        this.diag.framesBlocked += 1;
         console.error("[Lookahead Client] Gửi audio packet qua Bridge thất bại:", e);
       }
       return;
@@ -536,9 +639,38 @@ class LookaheadClient {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(packet.buffer);
+        this._noteFrameSent(rawBytes, meta);
       } catch (e) {
+        this.diag.framesBlocked += 1;
         console.error("[Lookahead Client] Gửi audio packet qua Direct WS thất bại:", e);
       }
+    }
+  }
+
+  /** Ghi nhận một khung audio đã gửi thành công + in tóm tắt định kỳ (chẩn đoán). */
+  _noteFrameSent(rawBytes, meta) {
+    const d = this.diag;
+    d.framesSent += 1;
+    d.framesSentBytes += rawBytes ? rawBytes.byteLength : 0;
+    d.lastFrameAt = Date.now();
+    const isInit = !!(meta && meta.isInit);
+    if (d.framesSent === 1 || isInit) {
+      this._diagLog("log",
+        `📤 Khung ${isInit ? "INIT" : "media"} đầu tiên đã gửi (${rawBytes ? rawBytes.byteLength : 0}B, `
+        + `mime=${(meta && meta.mime) || "?"}, epoch=${(meta && meta.epoch) ?? "-"}, `
+        + `media=${meta && meta.mediaStart !== undefined ? `${meta.mediaStart}→${meta.mediaEnd}s` : "chưa rõ"}, `
+        + `seek_id=${(meta && meta.seek_id) || this.activeSeekId})`);
+      return;
+    }
+    // Tóm tắt mỗi 5s: đủ để thấy audio có chảy sang backend hay không mà không ngập Console.
+    const now = Date.now();
+    if (now - d.lastFrameLogAt >= 5000) {
+      d.lastFrameLogAt = now;
+      this._diagLog("log",
+        `📊 Đã gửi ${d.framesSent} khung / ${(d.framesSentBytes / (1024 * 1024)).toFixed(2)} MB `
+        + `| bị chặn (socket chưa mở)=${d.framesBlocked}, xếp hàng=${d.framesQueued}, `
+        + `bỏ do hàng đợi đầy=${d.framesDropped}`
+        + `${d.framesDropped > 0 ? " ⚠️ MẤT AUDIO" : ""}`);
     }
   }
 
@@ -584,6 +716,7 @@ class LookaheadClient {
 
   sendJSON(obj) {
     if (this._destroyed) return;
+    if (obj && obj.type) this.diag.jsonSent += 1;
     if (this.port) {
       try {
         this.port.postMessage({ action: "SEND_JSON", data: obj });

@@ -1,5 +1,48 @@
 import pytest
-from backend.asr.forced_aligner import ForcedAlignerService, SubtitleSentence
+from backend.asr.forced_aligner import AlignedWord, ForcedAlignerService, SubtitleSentence
+
+
+def test_abbreviations_do_not_split_sentences():
+    """HỒI QUY 2026-10-05: `Dr.` bị coi là KẾT CÂU ⇒ phụ đề vụn và bản dịch sai.
+
+    Log thật (align=English):
+      'Fine, Dr. Kuthrapali. … Right on time, Dr. Kuthrapali. I present Dr. Milstone from MIT. …'
+      bị ngắt thành 15 phụ đề: "Fine, Dr." ⏐ "Kuthrapali." ⏐ … ⏐ "I present Dr." ⏐ "Milstone from MIT."
+    """
+    text = (
+        "Fine, Dr. Kuthrapali. Thank you, sir. I'm sorry. Am I late? No, no, no. "
+        "Right on time, Dr. Kuthrapali. I present Dr. Milstone from MIT. "
+        "She'll be heading up our data analysis team. "
+        "It's nice to meet you, Dr. Kuthrapali."
+    )
+    words = text.split()
+    step = 24.0 / max(1, len(words))
+    items = [
+        AlignedWord(text=w, start_time=round(i * step, 3), end_time=round((i + 1) * step, 3))
+        for i, w in enumerate(words)
+    ]
+    merged = ForcedAlignerService.merge_source_text(items, text)
+    subs = ForcedAlignerService.group_words_to_subtitles(merged, language="English")
+    texts = [s.text for s in subs]
+
+    # 1. Không được có mảnh CỤT kết thúc bằng "Dr." (chính dạng lỗi trong log:
+    #    'Fine, Dr.' ⏐ 'Kuthrapali.' ⏐ 'I present Dr.' ⏐ 'Milstone from MIT.').
+    assert not any(t.strip().endswith("Dr.") for t in texts), f"còn mảnh cụt 'Dr.': {texts}"
+    assert not any(t.strip() == "Kuthrapali." for t in texts), f"còn mảnh cụt tên riêng: {texts}"
+    # 2. "Dr. <Tên>" phải nằm nguyên trong MỘT câu.
+    assert any("Fine, Dr. Kuthrapali." in t for t in texts), texts
+    assert any("I present Dr. Milstone from MIT." in t for t in texts), texts
+    # 3. Nhưng dấu chấm THẬT vẫn phải kết câu (không gộp cả khối thành một câu khổng lồ).
+    assert len(texts) >= 4, texts
+
+    # 4. Lưới an toàn theo trần ký tự cũng phải tôn trọng từ viết tắt.
+    res = ForcedAlignerService.split_oversized_sentences(
+        [SubtitleSentence(text=text, start_time=0.0, end_time=24.0)],
+        language="English", max_chars=80, max_words=12,
+    )
+    res_texts = [r.text for r in res]
+    assert not any(t.strip() in ("Dr.", "Kuthrapali.", "Dr") for t in res_texts), res_texts
+    assert any("Fine, Dr. Kuthrapali." in t for t in res_texts), res_texts
 
 
 def test_english_period_segmentation_safety_net():

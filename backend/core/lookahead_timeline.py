@@ -287,6 +287,27 @@ class ContinuousAudioTimeline:
             return False
         return (end - pts) >= min_sec
 
+    def first_audio_pts_at_or_after(self, pts: float) -> Optional[float]:
+        """Mốc BẮT ĐẦU của đoạn audio đầu tiên có chứa `pts` hoặc nằm sau `pts`.
+
+        Dùng để đưa CON TRỎ ĐỌC ra khỏi KHE HỞ (xem `_nudge_cursor_out_of_gap` phía backend):
+        khi khe hở lớn hơn `MAX_GAP_FILL_SEC`, `buffered_end_from(pts)` trả `None` và
+        `next_chunk()` trả `None` MÃI MÃI — pipeline đứng im dù RAM có hàng chục giây audio ở
+        ngay sau khe. Đo thật 2026-10-05 (xvideos.com, sau khi tua): con trỏ 322.07s, audio thật
+        bắt đầu muộn hơn ⇒ "Đã dịch: 0.0s" suốt 35 giây.
+
+        Trả `None` nếu không có đoạn nào kết thúc sau `pts`.
+        """
+        with self._lock:
+            for chunk in self._chunks:
+                if chunk.pts_end <= pts:
+                    continue
+                # Đoạn này chứa `pts` ⇒ audio có ngay tại mốc đó (trả về chính `pts`).
+                if chunk.pts_start <= pts:
+                    return float(pts)
+                return float(chunk.pts_start)
+            return None
+
     def read(self, max_sec: float) -> Optional[Tuple[float, np.ndarray]]:
         """Đọc tối đa `max_sec` giây audio liên tục kể từ con trỏ.
         

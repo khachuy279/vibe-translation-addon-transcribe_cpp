@@ -102,6 +102,57 @@ test("bỏ qua item có mốc thời gian không hợp lệ", () => {
   assert.equal(queue.items.length, 0);
 });
 
+test("KHÔNG câu nào bị câu sau nuốt mất khi hai khối chồng mốc (sự cố 2026-10-04)", () => {
+  // Log thật: backend gửi "When you're with me, baby." nhưng nó KHÔNG BAO GIỜ hiện, vì khối
+  // trước gửi câu kết thúc muộn hơn mốc bắt đầu câu đầu của khối sau ⇒ công thức giãn cũ kẹp
+  // câu trước còn 0.5 s và thứ tự duyệt mảng quyết định câu nào được vẽ.
+  const video = makeVideo(70.0);
+  const { queue, seen } = makeQueue(video);
+
+  queue.addSubtitles([
+    { start_pts: 70.2, end_pts: 79.06, original_text: "I can't see loving nobody but you for all my life.", translated_text: "a" },
+  ], "init_0");
+  // Khối sau bắt đầu TRƯỚC mốc kết thúc câu cuối của khối trước.
+  queue.addSubtitles([
+    { start_pts: 78.06, end_pts: 79.4, original_text: "When you're with me, baby.", translated_text: "b" },
+    { start_pts: 79.5, end_pts: 81.0, original_text: "This is Rebecca.", translated_text: "c" },
+  ], "init_0");
+
+  // Câu trước phải được giữ đủ thời lượng tối thiểu, KHÔNG bị co xuống 0.5 s.
+  const first = queue.items.find((i) => i.original_text.startsWith("I can't see"));
+  assert.ok(
+    first.end_pts - first.start_pts >= queue.minDurationSec - 1e-6,
+    `câu trước bị co còn ${(first.end_pts - first.start_pts).toFixed(2)}s`
+  );
+
+  // Chạy hết dải: cả ba câu đều phải xuất hiện trên màn hình.
+  for (let t = 70.0; t <= 81.2; t += 0.1) {
+    video.currentTime = t;
+    queue._tick();
+  }
+  const shown = new Set(seen.filter(Boolean));
+  for (const text of [
+    "I can't see loving nobody but you for all my life.",
+    "When you're with me, baby.",
+    "This is Rebecca.",
+  ]) {
+    assert.ok(shown.has(text), `câu không bao giờ hiện: ${text}`);
+  }
+});
+
+test("câu có mốc bắt đầu muộn hơn được ưu tiên khi hai cửa sổ chồng nhau", () => {
+  const video = makeVideo(10.0);
+  const { queue } = makeQueue(video);
+  queue.addSubtitles([
+    { start_pts: 8.0, end_pts: 12.0, original_text: "câu cũ", translated_text: "a" },
+    { start_pts: 10.5, end_pts: 13.0, original_text: "câu mới", translated_text: "b" },
+  ], "init_0");
+
+  video.currentTime = 10.6; // nằm trong CẢ HAI cửa sổ
+  queue._tick();
+  assert.equal(queue.activeSubtitle.original_text, "câu mới");
+});
+
 test("tua video xoá sạch phụ đề và sinh seek_id mới", () => {
   const video = makeVideo(0);
   const { queue } = makeQueue(video);
@@ -139,6 +190,62 @@ test("detach gỡ được listener (không rò rỉ)", () => {
   queue.detach();
   assert.equal(video.listeners.seeking.length, 0);
   assert.equal(video.listeners.seeked.length, 0);
+});
+
+// ── RÀNG BUỘC CỨNG: không phát video qua vùng CHƯA được xử lý ────────────────
+// Sự cố 2026-10-02: tua tới vùng video chưa tải ⇒ "lúc hiện phụ đề lúc không"; tua ngược về đầu
+// ⇒ không hiện phụ đề gì. Nguyên nhân gồm việc client KHÔNG hề tạm dừng khi playhead vượt qua
+// vùng backend đã xử lý (comment cũ: "Tuyệt đối KHÔNG tạm dừng video giữa chừng").
+test("tạm dừng khi playhead chạm mốc backend đã xử lý", () => {
+  const video = makeVideo(0);
+  const buffering = [];
+  const queue = new SubtitleTimelineQueue({
+    onBufferingStateChange: (b) => buffering.push(b),
+    onSeekTriggered: () => {},
+  });
+  queue.attachVideo(video);
+
+  queue.addSubtitles([{ start_pts: 0, end_pts: 30, original_text: "A", translated_text: "a" }], "init_0");
+  queue.setReadyHorizon(10.0, "init_0");
+
+  // Còn trong vùng đã xử lý ⇒ KHÔNG tạm dừng (phát mượt)
+  assert.equal(queue.isBehindHorizon(7.0), false);
+  video.currentTime = 7.0;
+  queue._tick();
+  assert.deepEqual(buffering, []);
+
+  // Chạm mốc đã xử lý ⇒ TẠM DỪNG chờ backend
+  assert.equal(queue.isBehindHorizon(10.2), true);
+  video.currentTime = 10.2;
+  queue._tick();
+  assert.deepEqual(buffering, [true], "phải báo bắt đầu nạp đệm khi hết vùng đã xử lý");
+});
+
+test("mốc đã xử lý của thế hệ seek CŨ không áp cho vị trí mới", () => {
+  const video = makeVideo(0);
+  const queue = new SubtitleTimelineQueue({ onSeekTriggered: () => {} });
+  queue.attachVideo(video);
+
+  // Backend báo đã xử lý tới 260s cho thế hệ hiện tại
+  queue.setReadyHorizon(260.0, "init_0");
+  assert.equal(queue.readyUntilPts, 260.0);
+  assert.equal(queue.isBehindHorizon(27.0), false);
+
+  // Người dùng tua ngược về 16.9s ⇒ marker cũ phải bị bỏ NGAY (nếu không, video phát qua vùng
+  // chưa xử lý vì tưởng đã có phụ đề tới 260s)
+  video.currentTime = 16.9;
+  video.fire("seeking");
+  assert.equal(queue.readyUntilPts, 0);
+  assert.equal(queue.isBehindHorizon(16.9), false, "chưa biết mốc ⇒ không ràng buộc");
+
+  // Marker của thế hệ seek CŨ gửi tới muộn cũng không được nhận
+  queue.setReadyHorizon(260.0, "init_0");
+  assert.equal(queue.readyUntilPts, 0, "marker thế hệ cũ bị bỏ");
+
+  // Marker của thế hệ MỚI thì nhận
+  queue.setReadyHorizon(20.5, queue.activeSeekId);
+  assert.equal(queue.readyUntilPts, 20.5);
+  assert.equal(queue.isBehindHorizon(20.4), true);
 });
 
 // ── Hồi quy: "câu đầu tiên không được hiển thị" ─────────────────────────────
@@ -190,4 +297,90 @@ test("tua video LUÔN bật trạng thái nạp đệm (video phải được t�
   video.fire("seeking");
   assert.equal(buffering, true, "Tua video phải phát tín hiệu tạm dừng để nạp lại phụ đề");
   queue.detach();
+});
+
+// ── Hồi quy 2026-10-05 (xhamster.com): "BÃO SEEK" + TUA THẬT BỊ BỎ QUA ───────
+// Log thật #1: `lý do dừng={"start":1,"seek":38}` trong một phiên (trình phát tự bắn `seeking`
+// khi hết đệm ⇒ reset backend + tạm dừng liên tục).
+// Log thật #2 (bản sửa đầu tiên, SAI): bộ lọc so với mốc cập nhật mỗi khung hình nên một cú tua
+// THẬT bị đo thành "nhảy 0s" rồi bị bỏ ⇒ backend không nhận `seek_reset` ⇒ con trỏ khối kẹt:
+//     [BS][Diag][status] playhead=967.53s | mốc-đã-xử-lý=575.01s  (đứng im mãi)
+test("bỏ qua `seeking` nhảy nhỏ (hết đệm) — không reset backend, không tạm dừng", () => {
+  const video = makeVideo(0);
+  let seeks = 0;
+  const buffering = [];
+  const ignored = [];
+  const queue = new SubtitleTimelineQueue({
+    onSubtitleChange: () => {},
+    onSeekTriggered: () => { seeks += 1; },
+    onBufferingStateChange: (on) => buffering.push(on),
+    onSeekIgnored: (info) => ignored.push(info),
+  });
+  queue.attachVideo(video);
+  queue.addSubtitles([{ start_pts: 0, end_pts: 30, original_text: "A", translated_text: "a" }], "init_0");
+
+  video.currentTime = 10;
+  queue._tick();               // mốc tick = 10s
+  video.currentTime = 11.4;    // "seeking" chỉ nhảy 1,4s ⇒ trình phát tự xoay xở với vùng đệm
+  video.fire("seeking");
+
+  assert.equal(seeks, 0, "KHÔNG được báo backend reset pipeline");
+  assert.deepEqual(buffering, [], "KHÔNG được tạm dừng video");
+  assert.equal(queue.items.length, 1, "phụ đề đang có KHÔNG bị xoá");
+  assert.equal(ignored.length, 1);
+  assert.ok(Math.abs(ignored[0].jump - 1.4) < 1e-6, `nhảy ~1,4s, nhận được ${ignored[0].jump}`);
+  assert.equal(queue.ignoredSeeks, 1);
+  assert.equal(queue.acceptedSeeks, 0);
+});
+
+test("TUA THẬT được nhận dù `currentTime` đã đổi TRƯỚC khi sự kiện `seeking` bắn", () => {
+  // Đây chính là ca làm bản sửa đầu tiên thất bại: nếu chỉ so với mốc tick thì độ nhảy đo được
+  // là 0 và cú tua thật bị bỏ ⇒ backend không nhận `seek_reset` ⇒ con trỏ khối kẹt ở 575s.
+  const video = makeVideo(0);
+  let seeks = 0;
+  const accepted = [];
+  const queue = new SubtitleTimelineQueue({
+    onSubtitleChange: () => {},
+    onSeekTriggered: (id, t) => { seeks += 1; accepted.push(t); },
+  });
+  queue.attachVideo(video);
+  queue.addSubtitles([{ start_pts: 0, end_pts: 30, original_text: "A", translated_text: "a" }], "init_0");
+
+  video.currentTime = 556;
+  queue._tick();               // đang phát ở 556s
+  video.currentTime = 967;     // người dùng kéo tới 967s…
+  queue._tick();               // …và rAF kịp chạy TRƯỚC sự kiện `seeking` (đúng như trình duyệt)
+  video.fire("seeking");
+
+  assert.equal(seeks, 1, "tua thật PHẢI được nhận (đây là lỗi đã làm backend kẹt ở 575s)");
+  assert.equal(accepted[0], 967);
+  assert.equal(queue.items.length, 0, "phải bỏ phụ đề của đoạn cũ");
+  assert.equal(queue.readyUntilPts, 0, "mốc đã xử lý của vị trí cũ không còn giá trị");
+});
+
+test("tua dồn dập vẫn được nhận, chỉ cảnh báo 'churn' (không bỏ mất tua thật)", () => {
+  const video = makeVideo(0);
+  const accepted = [];
+  const ignored = [];
+  const queue = new SubtitleTimelineQueue({
+    onSubtitleChange: () => {},
+    onSeekTriggered: (id, t) => accepted.push(t),
+    onSeekIgnored: (info) => ignored.push(info),
+  });
+  queue.attachVideo(video);
+  video.currentTime = 0;
+  queue._tick();               // phiên đã chạy vòng render ⇒ có mốc tick trước lần tua đầu
+
+  let t = 0;
+  for (let i = 1; i <= 6; i += 1) {
+    t += 100;
+    video.currentTime = t;
+    queue._tick();
+    video.fire("seeking");
+  }
+
+  assert.deepEqual(accepted, [100, 200, 300, 400, 500, 600], "MỌI tua thật đều phải tới backend");
+  assert.equal(queue.acceptedSeeks, 6);
+  assert.equal(queue.ignoredSeeks, 0, "không được BỎ một cú tua thật nào");
+  assert.ok(ignored.some((i) => i.churnOnly), "có cảnh báo dồn dập");
 });

@@ -15,6 +15,13 @@
   // giá trị, không còn `original`/`ui_text`/`utteranceId`/`stableText`…).
   const PROTOCOL_VERSION = 3;
 
+  // ── TỰ ĐÓNG PHIÊN KHI VIDEO SẮP/HẾT ────────────────────────────────────────
+  //: Còn ≤ ngần này giây là coi như hết video ⇒ đóng phiên (không dịch 3 giây cuối, đổi lại
+  //: không bao giờ để phiên "mồ côi" + overlay treo trên màn hình).
+  const LA_END_STOP_MARGIN_SEC = 3.0;
+  //: Clip NGẮN hơn ngần này giây thì bỏ qua luật trên (tránh tắt phiên ngay khi vừa bấm Bắt đầu).
+  const LA_END_STOP_MIN_DURATION_SEC = 15.0;
+
   // Tự động inject Buffer Interceptor vào Page Context (Main World)
   function injectBufferInterceptor() {
     try {
@@ -32,10 +39,64 @@
   let lookaheadClient = null;
   let timelineQueue = null;
   let ttsTimeline = null;
+
+  // ── CHẨN ĐOÁN PIPELINE B (v0.6.7) ──────────────────────────────────────────
+  // Người dùng báo (2026-10-05): có trang POPUP báo "Lookahead available" mà Pipeline B vẫn
+  // không chạy (xvideos.com), có trang báo "+5.95s (đang nạp)" trong khi vùng đệm thật đã ~60s
+  // (iq.com), có trang báo "không khả dụng (chạy Realtime)" (xhamster.com, av01.media) — và
+  // KHÔNG có cách nào biết vì sao. Khối này in ra Console của trang:
+  //   • [BS][Diag][gate]     — cổng quyết định Pipeline B: từng điều kiện, giá trị, kết luận.
+  //   • [BS][Diag][session]  — vòng pause/resume khi nạp đệm, kèm số liệu backend.
+  //   • [BS][Diag][status]   — `lookahead_status` rút gọn (ready/fed/ready_until/fragments).
+  //   • [BS][Diag][stall]    — BẾ TẮC: backend không tiến triển trong lúc video bị tạm dừng.
+  // Toàn bộ mã lý do nằm trong `lib/lookahead-diagnostics.js` (một nguồn sự thật duy nhất).
+  const LA_DIAG = (typeof window !== "undefined" && window.LookaheadDiagnostics) || null;
+  const laDiag = LA_DIAG
+    ? new LA_DIAG.LookaheadDiag("BS")
+    : {
+        log() {}, ok() {}, warn() {}, error() {}, group() {},
+        once() { return false; }, throttled() { return false; }, count() { return 0; },
+        setEnabled() { return this; }, setVerbose() { return this; },
+      };
+  if (!LA_DIAG) {
+    console.warn("[BS][Diag] Không nạp được lib/lookahead-diagnostics.js — log chẩn đoán sẽ ở mức tối thiểu.");
+  }
+  //: Bật/tắt log chẩn đoán từ Console: `window.__bsLookaheadDiag(false)`.
+  window.__bsLookaheadDiag = (on) => { laDiag.setEnabled(on !== false); return "ok"; };
+  window.__bsLookaheadVerbose = (on) => { laDiag.setVerbose(on !== false); return "ok"; };
+
+  /** Thông tin thẻ <video> mà content script đang dùng (để đối chiếu với interceptor). */
+  function laVideoInfo(video) {
+    if (!video) return { hasVideo: false, durationFinite: false, bufferedAheadVideo: 0 };
+    let ahead = 0;
+    try {
+      if (video.buffered && video.buffered.length > 0) {
+        const cur = video.currentTime;
+        for (let i = 0; i < video.buffered.length; i++) {
+          if (cur >= video.buffered.start(i) - 0.5 && cur <= video.buffered.end(i) + 0.5) {
+            ahead = video.buffered.end(i) - cur;
+            break;
+          }
+        }
+        if (!ahead) ahead = video.buffered.end(video.buffered.length - 1) - cur;
+      }
+    } catch (e) {}
+    return {
+      hasVideo: true,
+      durationFinite: isFinite(video.duration) && video.duration > 0,
+      duration: isFinite(video.duration) ? Number(video.duration.toFixed(2)) : String(video.duration),
+      bufferedAheadVideo: Number(Math.max(0, ahead).toFixed(2)),
+      currentTime: Number((Number(video.currentTime) || 0).toFixed(2)),
+      paused: !!video.paused,
+      srcSample: String(video.currentSrc || video.src || "").split("?")[0].slice(0, 140),
+    };
+  }
   //: Pipeline B tự tạm dừng video để nạp đệm trước ⇒ phải nhớ để TRẢ LẠI trạng thái phát
   //: khi Stop hoặc khi fallback sang Pipeline A (nếu không, video kẹt ở trạng thái pause).
   let lookaheadPausedVideo = false;
   let lookaheadPauseForBuffering = null;
+  //: Bộ đếm/vòng theo dõi chẩn đoán của phiên Pipeline B đang chạy (xem `startPipelineB`).
+  let lookaheadSessionDiag = null;
   let activePipeline = "A";
   //: Thế hệ phiên capture — tăng mỗi lần Start VÀ mỗi lần Stop/cleanup. Dùng để chặn
   //: pipeline "hồi sinh" sau khi người dùng đã bấm Stop (xem `startCapture`).
@@ -303,7 +364,11 @@
 
   // Hỏi injected script (buffer_interceptor_poc.js) trạng thái đệm audio tương lai.
   // Đây là nguồn dữ liệu cho dòng "Lookahead available +Xs" trong POPUP.
-  function getLookaheadBufferStatus(timeoutMs = 400) {
+  //
+  // `video`: gửi kèm `currentSrc`/`currentTime` để interceptor ĐỐI CHIẾU thẻ video nó đang theo
+  // dõi với thẻ mà content script/popup đang xem (phát hiện LỆCH THẺ VIDEO — nguyên nhân đã đo
+  // trên iq.com: đệm thật ~60s mà interceptor báo +5.95s).
+  function getLookaheadBufferStatus(timeoutMs = 400, video = null) {
     return new Promise((resolve) => {
       let done = false;
       const finish = (value) => {
@@ -319,47 +384,125 @@
         }
       };
       window.addEventListener("message", handler);
-      window.postMessage({ source: "VIBE_LOOKAHEAD_CLIENT", type: "CHECK_BUFFER_STATUS" }, "*");
+      window.postMessage({
+        source: "VIBE_LOOKAHEAD_CLIENT",
+        type: "CHECK_BUFFER_STATUS",
+        currentSrc: video ? String(video.currentSrc || video.src || "") : "",
+        currentTime: video ? Number((Number(video.currentTime) || 0).toFixed(2)) : null,
+      }, "*");
       setTimeout(() => finish(null), timeoutMs);
     });
   }
 
+  /** Neo thẻ video ưu tiên cho interceptor (chống lệch thẻ trên trang nhiều <video>). */
+  function announcePreferredVideo(video) {
+    if (!video) return;
+    try {
+      const currentSrc = String(video.currentSrc || video.src || "");
+      if (!currentSrc) return;
+      window.postMessage({
+        source: "VIBE_LOOKAHEAD_CLIENT",
+        type: "SET_PREFERRED_VIDEO",
+        currentSrc,
+        currentTime: Number((Number(video.currentTime) || 0).toFixed(2)),
+      }, "*");
+    } catch (e) {}
+  }
+
+  /** Gộp dữ kiện interceptor + số đo của content script thành một bộ `facts` thống nhất. */
+  function buildLookaheadFacts(payload, video) {
+    const info = laVideoInfo(video);
+    const d = (payload && payload.diag) || {};
+    return Object.assign({}, d, {
+      hasVideo: info.hasVideo,
+      durationFinite: info.durationFinite,
+      duration: info.duration,
+      bufferedAheadVideo: info.bufferedAheadVideo,
+      cachedChunksCount: payload ? payload.cachedChunksCount : 0,
+      hasInitSegment: payload ? payload.hasInitSegment : false,
+      mediaTaggedChunks: payload ? payload.mediaTaggedChunks : 0,
+      interceptorResponded: !!payload,
+    });
+  }
+
+  /** In BÁO CÁO chẩn đoán đầy đủ (dùng cho popup/console/`__bsLookaheadDiagReport()`). */
+  function printLookaheadDiagnosis(facts, verdict) {
+    if (!LA_DIAG) return;
+    const v = verdict || LA_DIAG.classifyLookaheadAvailability(facts);
+    laDiag.group(`🔬 VÌ SAO PIPELINE B KHÔNG CHẠY? → ${v.code}`,
+      LA_DIAG.buildDiagnosticRows(facts, v),
+      v.code === "OK" ? "ok" : "warn");
+    return v;
+  }
+
   // Kiểm tra xem trình phát video có nạp sẵn buffer âm thanh (MSE / VOD) không
   async function checkBufferAvailable(video) {
-    if (!video) return false;
+    if (!video) {
+      laDiag.warn("gate", "❌ Không có thẻ <video> ⇒ không thể chạy Pipeline B (Pipeline A cũng sẽ không có nguồn audio).");
+      return false;
+    }
+    //: Neo thẻ video trước khi hỏi trạng thái — nếu trang có nhiều <video>, interceptor phải nói
+    //: về CÙNG một thẻ với content script (xem `announcePreferredVideo`).
+    announcePreferredVideo(video);
+
     // Nếu là livestream không xác định độ dài -> không thể dùng Lookahead
     if (!isFinite(video.duration) || video.duration <= 0) {
+      laDiag.warn("gate", `❌ Không chạy Pipeline B: livestream hoặc video chưa có độ dài `
+        + `(duration=${video.duration}).`);
+      printLookaheadDiagnosis(buildLookaheadFacts(null, video));
       return false;
     }
 
     // 1. Kiểm tra trực tiếp TimeRanges trong video.buffered
-    let hasVideoBuffered = false;
-    if (video.buffered && video.buffered.length > 0) {
-      const cur = video.currentTime;
-      let ahead = 0;
-      for (let i = 0; i < video.buffered.length; i++) {
-        if (cur >= video.buffered.start(i) - 0.5 && cur <= video.buffered.end(i) + 0.5) {
-          ahead = video.buffered.end(i) - cur;
-          break;
-        }
-      }
-      if (!ahead && video.buffered.length > 0) {
-        ahead = video.buffered.end(video.buffered.length - 1) - cur;
-      }
-      if (ahead >= 1.5) {
-        hasVideoBuffered = true;
-      }
-    }
+    const info = laVideoInfo(video);
+    const ahead = info.bufferedAheadVideo;
+    const hasVideoBuffered = ahead >= 1.5;
 
     // 2. Hỏi injected script (buffer_interceptor_poc.js) qua postMessage
-    const p = await getLookaheadBufferStatus();
-    if (!p) return false; // Interceptor không phản hồi -> không lấy được audio raw
+    const p = await getLookaheadBufferStatus(400, video);
+    const facts = buildLookaheadFacts(p, video);
+    const verdict = LA_DIAG
+      ? LA_DIAG.classifyLookaheadAvailability(facts)
+      : { code: p ? "OK" : "UNKNOWN", detail: "" };
 
     // ĐIỀU KIỆN BẮT BUỘC: interceptor phải THỰC SỰ bắt được byte audio (mảnh MSE hoặc
     // init segment). Nếu site phát bằng blob URL / XHR (không MSE) thì `video.buffered`
     // vẫn lớn nhưng ta KHÔNG có byte nào để giải mã ⇒ Pipeline B sẽ chạy mà không bao giờ
-    // có phụ đề. Trường hợp đó phải quay về Pipeline A.
-    return Boolean(hasVideoBuffered && (p.cachedChunksCount > 0 || p.hasInitSegment));
+    // có phụ thu; trường hợp đó phải quay về Pipeline A.
+    const hasBytes = !!(p && (p.cachedChunksCount > 0 || p.hasInitSegment));
+    const pass = Boolean(hasVideoBuffered && hasBytes);
+
+    // ── LOG CỔNG QUYẾT ĐỊNH ──────────────────────────────────────────────────
+    // Đây là dòng log ĐẦU TIÊN cần đọc khi một trang "không chạy được Pipeline B".
+    laDiag.log("gate",
+      `Cổng Pipeline B: ${pass ? "ĐẠT" : "KHÔNG ĐẠT"} | `
+      + `video=${info.hasVideo} duration=${info.duration} đệm-trước=${ahead.toFixed(2)}s `
+      + `interceptor=${p ? "có phản hồi" : "KHÔNG phản hồi"} `
+      + `mảnh=${p ? p.cachedChunksCount : "-"} init=${p ? (p.hasInitSegment ? "có" : "chưa") : "-"} `
+      + `| kết luận=${verdict.code} (${verdict.detail})`,
+      p ? p.diag : null);
+
+    if (!pass) {
+      if (!hasVideoBuffered) {
+        laDiag.warn("gate", `❌ Không chạy Pipeline B: vùng đệm trước playhead chỉ ${ahead.toFixed(2)}s `
+          + `(< 1.5s) ⇒ không có "tương lai" để dịch trước.`);
+      } else if (!p) {
+        laDiag.warn("gate", "❌ Không chạy Pipeline B: interceptor KHÔNG phản hồi `BUFFER_STATUS_RESPONSE` "
+          + "⇒ không có byte audio thô. Kiểm tra log `[Lookahead] 🚀 Multi-Layer Interceptor` ở đầu Console.");
+      } else if (!hasBytes) {
+        laDiag.warn("gate", `❌ Không chạy Pipeline B: interceptor chưa bắt được byte audio nào `
+          + `(mảnh=${p.cachedChunksCount}, init=${p.hasInitSegment}) ⇒ sẽ quay về Pipeline A.`);
+      }
+      printLookaheadDiagnosis(facts, verdict);
+    } else {
+      laDiag.ok("gate", `✅ Đủ điều kiện chạy Pipeline B (audio-only/MSE đã bắt được).`);
+      if (verdict.code !== "OK") {
+        // Đạt cổng nhưng dữ kiện vẫn có điểm bất thường (ví dụ: buffer không rõ mime, hoặc lệch
+        // thẻ video) — in báo cáo để không bỏ sót.
+        printLookaheadDiagnosis(facts, verdict);
+      }
+    }
+    return pass;
   }
   api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg.type || msg.action) {
@@ -384,19 +527,40 @@
         break;
       case "GET_STATUS": case "content_status":
         // Bất đồng bộ: cần hỏi injected script về buffer Lookahead trước khi trả lời.
-        getLookaheadBufferStatus().then((lookahead) => {
-          sendResponse?.({
-            isCapturing,
-            hasVideo: !!findVideo(),
-            overlayActive: !!overlayManager,
-            sampleRate: audioCapture?.audioContext?.sampleRate || null,
-            pipeline: activePipeline,
-            lookahead,
+        // Trả kèm `lookaheadVerdict` (mã lý do + chi tiết) để POPUP hiển thị và in log.
+        {
+          const statusVideo = findVideo();
+          getLookaheadBufferStatus(400, statusVideo).then((lookahead) => {
+            const facts = buildLookaheadFacts(lookahead, statusVideo);
+            const verdict = LA_DIAG ? LA_DIAG.classifyLookaheadAvailability(facts) : null;
+            // ĐỆM VIDEO (`la.aheadSeconds`) và ĐỆM ĐÃ DỊCH (`ready_ahead`) là HAI đại lượng khác
+            // nhau: POPUP báo "Lookahead available +60s" (video) nhưng pipeline vẫn có thể tạm dừng
+            // vì phần ĐÃ DỊCH chỉ vài giây. Gửi kèm số liệu phiên để POPUP nói rõ cả hai.
+            const laSt = (lookaheadSessionDiag && lookaheadSessionDiag.lastStatus) || null;
+            sendResponse?.({
+              isCapturing,
+              hasVideo: !!statusVideo,
+              overlayActive: !!overlayManager,
+              sampleRate: audioCapture?.audioContext?.sampleRate || null,
+              pipeline: activePipeline,
+              lookahead,
+              lookaheadFacts: facts,
+              lookaheadVerdict: verdict,
+              lookaheadSession: laSt ? {
+                readyAhead: Number(laSt.ready_ahead || 0),
+                readyUntilPts: Number(laSt.ready_until_pts || 0),
+                fedAhead: Number(laSt.fed_ahead || 0),
+                paused: !!lookaheadPausedVideo,
+                pauses: lookaheadSessionDiag.pauses,
+                resumes: lookaheadSessionDiag.resumes,
+                minResumeAheadSec: 4.0,
+              } : null,
+            });
+          }).catch(() => {
+            sendResponse?.({ isCapturing, hasVideo: !!findVideo(), overlayActive: !!overlayManager, pipeline: activePipeline, lookahead: null, lookaheadVerdict: null });
           });
-        }).catch(() => {
-          sendResponse?.({ isCapturing, hasVideo: !!findVideo(), overlayActive: !!overlayManager, pipeline: activePipeline, lookahead: null });
-        });
-        return true;
+          return true;
+        }
       case "set_overlay_mode":
         if (msg.payload?.mode) settings.overlayStyle = msg.payload.mode;
         if (overlayManager) overlayManager.setMode(settings.overlayStyle);
@@ -439,7 +603,6 @@
   // mới nhưng phiên Lookahead/WS vẫn sống ⇒ backend tiếp tục nhận mảnh của video CŨ (sai
   // timeline) và phiên không bao giờ tự tắt (đo thật 2026-10-01: bấm video khác mà không
   // Stop thì lỗi session cũ còn treo).
-  //
   // Theo dõi 2 dấu hiệu, cả hai đều rẻ:
   //   1. URL đổi (bao gồm `?v=<id>` của YouTube) — SPA dùng history API nên `popstate`
   //      không đủ, phải so chuỗi URL theo nhịp.
@@ -498,7 +661,8 @@
     return id(a) === id(b);
   }
 
-  async function startCapture(msg) {    // Thế hệ phiên: mỗi lần Start tăng lên, mỗi lần Stop/cleanup cũng tăng. Nhờ vậy một
+  async function startCapture(msg) {
+    // Thế hệ phiên: mỗi lần Start tăng lên, mỗi lần Stop/cleanup cũng tăng. Nhờ vậy một
     // tiến trình Start đang `await` (chờ kiểm tra buffer / chờ backend Lookahead) KHÔNG thể
     // "hồi sinh" pipeline sau khi người dùng đã bấm Stop — trước đây nó vẫn gán
     // `isCapturing = true` và có thể để lại socket/đồ thị audio sống sót.
@@ -539,6 +703,38 @@
       captureAbortController = new AbortController();
       const { signal } = captureAbortController;
 
+      // ── VIDEO SẮP HẾT / ĐÃ HẾT ⇒ TỰ ĐÓNG PHIÊN ────────────────────────────────
+      // Sự cố thật 2026-10-05 (ảnh người dùng): video chạy hết nhưng phiên vẫn sống — overlay
+      // "Đang xử lý tiếp đoạn video…" nằm lại giữa màn hình, backend vẫn giữ RAM/GPU, POPUP vẫn
+      // ở trạng thái "đang chạy". Phiên chỉ nên sống khi còn nội dung để dịch.
+      //
+      // Chỉ dựa vào `ended` là KHÔNG đủ: nếu extension đang tạm dừng video sát mép cuối (hoặc
+      // trình phát không bắn `ended` vì bị can thiệp) thì phiên "mồ côi" mãi. Vì vậy dùng luôn
+      // `timeupdate`: còn ≤ `LA_END_STOP_MARGIN_SEC` giây là đóng phiên.
+      const stopAtVideoEnd = (reason) => {
+        if (!isCapturing) return;
+        laDiag.log("session",
+          `⏹️ Video ${reason} — tự dừng phiên dịch và gỡ overlay (không để phiên 'mồ côi').`);
+        try { stopCapture(); } catch (e) {}
+        if (overlayManager) {
+          try { overlayManager.destroy(); } catch (e) {}
+          overlayManager = null;
+        }
+      };
+      const maybeStopNearEnd = () => {
+        if (!isCapturing) return;
+        const d = Number(video.duration);
+        const t = Number(video.currentTime);
+        // Bỏ qua livestream / video chưa biết độ dài, và clip quá ngắn (tránh tắt ngay khi vừa mở).
+        if (!Number.isFinite(d) || d < LA_END_STOP_MIN_DURATION_SEC) return;
+        if (!Number.isFinite(t) || t <= 0) return;
+        if (t >= d - LA_END_STOP_MARGIN_SEC) {
+          stopAtVideoEnd(`sắp hết (còn ${Math.max(0, d - t).toFixed(1)}s / ${d.toFixed(1)}s)`);
+        }
+      };
+      video.addEventListener("timeupdate", maybeStopNearEnd, { signal });
+      video.addEventListener("ended", () => stopAtVideoEnd("đã phát hết"), { signal });
+
       // Xác định chạy Pipeline A hay Pipeline B
       const lookaheadRequested = settings.lookaheadEnabled !== false;
       let canBuffer = false;
@@ -554,6 +750,7 @@
       let result = null;
       if (lookaheadRequested && canBuffer) {
         activePipeline = "B";
+        laDiag.log("pipeline", "▶️ Chạy Pipeline B (Lookahead) — cổng kiểm tra đã ĐẠT.");
         result = await startPipelineB(video, settings, signal);
         if (result && result.fallbackToA) {
           console.warn("[BS] Pipeline B không khả dụng (" + (result.reason || "unknown") + ") -> chuyển sang Pipeline A (Realtime Streaming)");
@@ -563,7 +760,10 @@
       } else {
         activePipeline = "A";
         if (lookaheadRequested && !canBuffer) {
-          console.warn("[BS] Không phát hiện buffer video nạp trước -> Tự động chuyển sang Pipeline A (Realtime Streaming)");
+          laDiag.warn("pipeline", "▶️ Chạy Pipeline A (Realtime) — cổng Pipeline B KHÔNG ĐẠT "
+            + "(xem báo cáo chẩn đoán ngay trên dòng này).");
+        } else if (!lookaheadRequested) {
+          laDiag.log("pipeline", "▶️ Chạy Pipeline A (Realtime) — người dùng đã tắt Lookahead.");
         }
         result = await startPipelineA(video, settings, signal);
       }
@@ -740,6 +940,213 @@
       }
     }
 
+    // ── CHẨN ĐOÁN PHIÊN PIPELINE B (v0.6.7) ────────────────────────────────────
+    // Vì sao cần: đo thật trên xvideos.com (2026-10-05) — backend log cùng MỘT mốc Playhead
+    // 15.7s lặp lại mỗi 10s, "Đã dịch: 0.0s", 'giải mã 0.00x, PCM/byte 0.000' trong ~50s, rồi
+    // người dùng bấm Stop. Log backend KHÔNG nói được client đang làm gì; log trình duyệt cũng
+    // không có gì. Vòng lặp thật là:
+    //   horizon chặn playhead → pause → (video dừng nên trình phát KHÔNG append mảnh mới)
+    //   → backend không có audio mới → mốc đã xử lý đứng yên → horizon lại chặn… BẾ TẮC.
+    // Khối dưới đây in ra đúng vòng lặp đó (đếm pause/resume, số liệu từ `lookahead_status`)
+    // và có VAN AN TOÀN tự phá bế tắc sau `LA_STALL_GUARD_MS`.
+    const LA_STALL_GUARD_MS = 25000;      // không tiến triển bao lâu thì coi là bế tắc
+    //: Ngưỡng RIÊNG cho lúc CHƯA có phụ đề nào (`utterances=0`): chờ lâu như trên sẽ khiến khúc
+    //: đầu video khựng ~25s (đo thật 2026-10-05, xvideos.com: phải 2 lần van an toàn mới qua).
+    const LA_FIRST_STALL_GUARD_MS = 12000;
+    //: ĐỆM ĐÃ DỊCH tối thiểu để cho video CHẠY LẠI (giây).
+    //:
+    //: Vì sao cần (đo thật 2026-10-05, YouTube): POPUP báo `Lookahead available +60s` (đệm VIDEO)
+    //: nhưng `ready_ahead` (đệm ĐÃ DỊCH) lúc đầu chỉ 0,3–3 s. Client cũ chạy lại ngay khi
+    //: `prebuffer_ready`/`ready ≥ 1.5s` ⇒ chạy được 1–2 s là chạm mốc đã xử lý ⇒ tạm dừng lại
+    //: (`lý do dừng={"start":1,"underrun":2}`, mỗi lần dừng 1–2 s). Đệm video dồi dào KHÔNG có
+    //: nghĩa là đã dịch đủ — hai đại lượng khác nhau.
+    const LA_MIN_RESUME_AHEAD_SEC = 4.0;
+    const LA_HORIZON_SUSPEND_MS = 20000;  // treo ràng buộc horizon bao lâu khi phá bế tắc
+    const stallGuardEnabled = (typeof window.__bsStallGuard === "boolean")
+      ? window.__bsStallGuard
+      : settings.lookaheadStallGuard !== false;
+    const laSession = {
+      startedAt: Date.now(),
+      pauses: 0,
+      resumes: 0,
+      pauseReasons: {},
+      pauseStartedAt: 0,
+      lastPauseReason: null,
+      lastStatus: null,
+      lastStatusAt: 0,
+      lastFragments: -1,
+      lastDecoded: -1,
+      lastReadyUntil: -1,
+      lastFragmentsAt: Date.now(),
+      lastReadyAt: Date.now(),
+      lastStatusLogAt: 0,
+      lastStatusLogCount: 0,
+      lastGuardAt: 0,
+      guardFired: 0,
+      ignoredSeeks: 0,
+      horizonSuspendedForStall: false,
+      watchTimer: null,
+    };
+    laDiag.log("session", `Bắt đầu phiên Pipeline B: playhead=${curTime.toFixed(2)}s, `
+      + `đệm trước=+${aheadSec.toFixed(2)}s, lead_time=${leadTimeSec}s, `
+      + `TTS=${settings.ttsEnabled ? "BẬT" : "tắt"}, van-an-toàn=${stallGuardEnabled ? "BẬT" : "tắt"}.`);
+    // Dừng vòng theo dõi của phiên trước (nếu Stop trước đó chưa dọn hết).
+    if (lookaheadSessionDiag && lookaheadSessionDiag.watchTimer) {
+      try { clearInterval(lookaheadSessionDiag.watchTimer); } catch (e) {}
+      lookaheadSessionDiag.watchTimer = null;
+    }
+    lookaheadSessionDiag = laSession;
+
+    /** Đệm đã dịch hiện có (giây), đã trừ thời gian trôi từ lúc backend báo. */
+    const currentReadyAhead = () => {
+      const st = laSession.lastStatus || {};
+      const ready = Number(st.ready_ahead || 0);
+      if (!(ready > 0)) return 0;
+      const ageSec = Math.max(0, (Date.now() - Number(laSession.lastStatusAt || Date.now())) / 1000);
+      const rate = Math.max(0.25, Math.abs(Number(video.playbackRate) || 1));
+      return Math.max(0, ready - ageSec * rate);
+    };
+
+    /**
+     * Đã đủ đệm ĐÃ DỊCH để cho video chạy mà không phải dừng lại ngay chưa?
+     *
+     * Hai điều kiện đạt:
+     *   • `ready ≥ LA_MIN_RESUME_AHEAD_SEC`, hoặc
+     *   • đoạn trước là KHOẢNG IM LẶNG (`fed ≥ 4s` mà `ready = 0`) — không có gì để dịch nên chờ
+     *     thêm là vô ích.
+     *
+     * Không bao giờ chặn vĩnh viễn: các `resumeTimer` (chốt an toàn theo đồng hồ thực) vẫn chạy
+     * song song và sẽ cho video phát kể cả khi backend không bao giờ đạt ngưỡng.
+     */
+    const hasEnoughHeadroomToResume = () => {
+      const st = laSession.lastStatus || {};
+      const fed = Number(st.fed_ahead || 0);
+      if (fed >= 4.0 && Number(st.ready_ahead || 0) <= 0.05) return true;  // khoảng lặng
+      return currentReadyAhead() >= LA_MIN_RESUME_AHEAD_SEC;
+    };
+
+    /** In một dòng trạng thái rút gọn từ `lookahead_status` của backend. */
+    const logLookaheadStatus = (st, tag) => {
+      const s = st || {};
+      laDiag.log("status",
+        `${tag ? tag + " " : ""}playhead=${Number(s.currentTime || video.currentTime).toFixed(2)}s | `
+        + `ready=${Number(s.ready_ahead || 0).toFixed(2)}s fed=${Number(s.fed_ahead || 0).toFixed(2)}s `
+        + `target=${Number(s.target_ahead || 0).toFixed(2)}s | mốc-đã-xử-lý=${Number(s.ready_until_pts || 0).toFixed(2)}s `
+        + `prebuffer=${s.prebuffer_ready} tts_sent=${s.tts_sent ?? "-"} | `
+        + `fragments=${s.fragments ?? "-"} decoded=${s.decoded_chunks ?? "-"} utterances=${s.utterances ?? "-"}`);
+    };
+
+    /**
+     * VAN AN TOÀN CHỐNG BẾ TẮC HORIZON.
+     *
+     * Chỉ kích hoạt khi: video ĐANG bị extension tạm dừng VÀ backend không nhận thêm mảnh nào
+     * trong `LA_STALL_GUARD_MS`. Lúc đó cho video chạy lại + TREO ràng buộc horizon một lúc để
+     * trình phát nạp thêm dữ liệu — thay vì đứng hình vô hạn.
+     */
+    const fireStallGuard = async () => {
+      try {
+      const st = laSession.lastStatus || {};
+      laSession.guardFired += 1;
+      laDiag.warn("stall",
+        `🚑 PHÁ BẾ TẮC (lần ${laSession.guardFired}): playhead ghim ở ${video.currentTime.toFixed(2)}s, `
+        + `${Math.round((Date.now() - laSession.lastFragmentsAt) / 1000)}s không có mảnh mới, `
+        + `${Math.round((Date.now() - laSession.lastReadyAt) / 1000)}s mốc-đã-xử-lý không tiến. `
+        + `fragments=${st.fragments ?? "-"} decoded=${st.decoded_chunks ?? "-"} `
+        + `ready_until=${Number(st.ready_until_pts || 0).toFixed(2)}s. `
+        + `NGUYÊN NHÂN: horizon chặn playhead ⇒ video dừng ⇒ trình phát không append mảnh mới ⇒ `
+        + `backend không có audio mới. Cho video CHẠY LẠI và treo horizon ${LA_HORIZON_SUSPEND_MS / 1000}s.`);
+      try { timelineQueue.suspendHorizon(LA_HORIZON_SUSPEND_MS); } catch (e) {}
+      // Lần thứ 2 trở đi thì chờ lâu hơn hẳn: nếu backend vẫn không tiến triển sau khi đã được
+      // cho thêm dữ liệu, việc tạm dừng video chỉ tạo nhịp "chạy một chút lại dừng" (đo thật
+      // 2026-10-05, xvideos.com: pause=9/resume=8, van-an-toàn phá bế tắc 1 lần rồi lặp lại).
+      if (laSession.guardFired >= 2) {
+        try { timelineQueue.suspendHorizon(180000); } catch (e) {}
+        laDiag.warn("stall",
+          `⏯️ Đã phá bế tắc ${laSession.guardFired} lần ⇒ TREO ràng buộc horizon 180s để video `
+          + `phát liền mạch (tạm thời không phụ đề) thay vì khựng theo chu kỳ.`);
+      }
+      laSession.lastFragmentsAt = Date.now();
+      laSession.lastReadyAt = Date.now();
+      resumePlayback("stall_guard");
+      // In thêm số liệu interceptor (cache còn gì) để biết nguồn có thiếu audio thật không.
+      try {
+        const p = await getLookaheadBufferStatus(300, video);
+        if (p) {
+          laDiag.log("stall", `Interceptor: cache=${p.cachedChunksCount} mảnh `
+            + `(có mốc media: ${p.mediaTaggedChunks}), init=${p.hasInitSegment ? "có" : "chưa"}, `
+            + `đệm video trước=+${Number(p.aheadSeconds || 0).toFixed(2)}s, `
+            + `append=${p.diag ? p.diag.appendCount : "-"} lần, `
+            + `ms-từ-append-cuối=${p.diag && p.diag.msSinceLastAppend !== null ? Math.round(p.diag.msSinceLastAppend) : "-"}`);
+        } else {
+          laDiag.warn("stall", "Interceptor KHÔNG phản hồi khi hỏi trạng thái trong lúc bế tắc.");
+        }
+      } catch (e) {}
+      } catch (e) {
+        // Chẩn đoán/van an toàn KHÔNG được phép làm hỏng phiên dịch.
+        console.warn("[BS][Diag] Lỗi trong van an toàn chống bế tắc:", e);
+      }
+    };
+
+    // Vòng theo dõi bế tắc: chạy trong suốt phiên, tự tắt khi phiên kết thúc.
+    laSession.watchTimer = setInterval(() => {
+      try {
+      if (!lookaheadPausedVideo) return;
+      const now = Date.now();
+      const stalledFrag = now - laSession.lastFragmentsAt;
+      const stalledReady = now - laSession.lastReadyAt;
+      // Điều kiện "bế tắc" phải chặt để KHÔNG phá nhầm lúc backend đang chạy một khối ASR dài:
+      //   (1) không có mảnh mới VÀ mốc đã xử lý không tiến trong `LA_STALL_GUARD_MS`, và
+      //   (2) đây đã là lần tạm dừng thứ HAI trở đi (lần đầu chỉ là nạp đệm bình thường).
+      const looksDeadlocked = laSession.pauses >= 2;
+      // Chưa ra được phụ đề nào ⇒ dùng ngưỡng ngắn hơn để thoát vòng pause/resume của khúc đầu.
+      const noUtteranceYet = Number((laSession.lastStatus || {}).utterances || 0) === 0;
+      const guardMs = noUtteranceYet ? LA_FIRST_STALL_GUARD_MS : LA_STALL_GUARD_MS;
+      // ── BACKEND "NHẬN MÀ KHÔNG RA" (đo thật 2026-10-05, xhamster.com) ──────────
+      // Mảnh vẫn về đều (`fragments` tăng) nhưng mốc-đã-xử-lý đứng im và `decoded_chunks` không
+      // nhích: byte về mà KHÔNG giải mã ra PCM. Van `fireStallGuard` ở dưới không bắt được ca này
+      // (nó đòi cả `fragments` đứng yên), nên vòng pause/seek cứ thế chạy mãi: log backend cho
+      // thấy `giải mã 0.00x, PCM/byte 0.000` trong khi playhead chạy từ 96s tới 201s.
+      // Việc tạm dừng video lúc này là VÔ NGHĨA (backend không thiếu audio, nó không giải mã
+      // được) ⇒ log rõ và TREO ràng buộc horizon để dừng vòng nạp lại.
+      const backendReceivingNoPcm = laSession.lastFragments > 0
+        && stalledReady > 20000 && stalledFrag <= stalledReady;
+      if (backendReceivingNoPcm) {
+        const st = laSession.lastStatus || {};
+        laDiag.throttled("backend-no-pcm", 10000, "warn", "stall",
+          `⚠️ Backend ĐANG NHẬN mảnh (fragments=${st.fragments ?? "-"}, mảnh mới cách đây `
+          + `${Math.round(stalledFrag / 1000)}s) nhưng mốc-đã-xử-lý KHÔNG tiến ${Math.round(stalledReady / 1000)}s `
+          + `(decoded=${st.decoded_chunks ?? "-"}, ready=${Number(st.ready_ahead || 0).toFixed(2)}s). `
+          + `⇒ byte về mà KHÔNG ra PCM/phụ đề: nút cổ chai ở tầng GIẢI MÃ phía backend. `
+          + `Xem log backend các dòng: PCM/byte, LỆCH TRỤC THỜI GIAN, `
+          + `Đường giải mã nối-liền không ra PCM, StreamDemuxer reset.`);
+        if (stalledReady > 45000 && !laSession.horizonSuspendedForStall) {          laSession.horizonSuspendedForStall = true;
+          try { timelineQueue.suspendHorizon(180000); } catch (e) {}
+          laDiag.warn("stall",
+            "⏯️ Đã TREO ràng buộc horizon 180s để DỪNG vòng pause/seek: giữ video phát bình thường "
+            + "(tạm thời không có phụ đề) thay vì nạp lại liên tục. Horizon tự gỡ khi backend đuổi kịp.");
+        }
+        return;
+      }
+      if (looksDeadlocked && stalledFrag > guardMs && stalledReady > guardMs) {
+        if (stallGuardEnabled) {
+          if (now - (laSession.lastGuardAt || 0) > guardMs) {
+            laSession.lastGuardAt = now;
+            void fireStallGuard();
+          }
+        } else {
+          laDiag.throttled("stall-off", 10000, "warn", "stall",
+            `⛔ BẾ TẮC nhưng van an toàn đang TẮT: ${Math.round(stalledFrag / 1000)}s không có mảnh mới, `
+            + `${Math.round(stalledReady / 1000)}s mốc-đã-xử-lý không tiến, video vẫn bị tạm dừng.`);
+        }
+      } else {
+        laDiag.throttled("stall-info", 10000, "log", "stall",
+          `⏳ Đang chờ backend: video tạm dừng ${Math.round((now - laSession.pauseStartedAt) / 1000)}s `
+          + `(lý do=${laSession.lastPauseReason}), mảnh mới cách đây ${Math.round(stalledFrag / 1000)}s, `
+          + `mốc-đã-xử-lý tiến cách đây ${Math.round(stalledReady / 1000)}s.`);
+      }
+      } catch (e) { /* chẩn đoán không được làm hỏng phiên */ }
+    }, 2000);
+
     let pausedByLookahead = false;
     let currentBufferingWhy = "start";
     const showBufferingStatus = (msg) => {
@@ -767,6 +1174,26 @@
       pausedByLookahead = true;
       lookaheadPausedVideo = true;
       currentBufferingWhy = why || "start";
+      // ── LOG VÒNG LẶP PAUSE/RESUME (chẩn đoán bế tắc) ─────────────────────────
+      // Trên xvideos.com vòng lặp này chạy mãi mà KHÔNG ai thấy: video bị tạm dừng ⇒ trình phát
+      // không append mảnh mới ⇒ backend không tiến triển ⇒ horizon lại chặn ⇒ tạm dừng tiếp.
+      {
+        const now = Date.now();
+        const wasPausedMs = laSession.pauseStartedAt ? now - laSession.pauseStartedAt : 0;
+        laSession.pauses += 1;
+        laSession.pauseReasons[why || "start"] = (laSession.pauseReasons[why || "start"] || 0) + 1;
+        laSession.lastPauseReason = why || "start";
+        laSession.pauseStartedAt = now;
+        const st = laSession.lastStatus || {};
+        laDiag.warn("session",
+          `⏸️ TẠM DỪNG video để nạp đệm (lần ${laSession.pauses}, lý do=${why || "start"}` +
+          `${wasPausedMs > 0 ? `, vừa chạy lại được ${(wasPausedMs / 1000).toFixed(1)}s` : ""}) | ` +
+          `playhead=${video.currentTime.toFixed(2)}s | ` +
+          `mốc-đã-xử-lý=${Number(st.ready_until_pts || 0).toFixed(2)}s ` +
+          `ready=${Number(st.ready_ahead || 0).toFixed(2)}s fed=${Number(st.fed_ahead || 0).toFixed(2)}s ` +
+          `fragments=${st.fragments ?? "-"} tts_sent=${st.tts_sent ?? "-"} | ` +
+          `tổng pause=${laSession.pauses} resume=${laSession.resumes}`);
+      }
       showBufferingStatus(
         why === "seek"
           ? "Đang dịch trước đoạn vừa tua..."
@@ -793,14 +1220,20 @@
           if (!lookaheadPausedVideo) return;
           // Còn tiến triển (ready_ahead/fed_ahead tăng) ⇒ gia hạn thay vì phát khi chưa có
           // phụ đề. Tối đa 3 lần để không treo trình phát.
-          const grew = (bufferProgress.ready > 0 || bufferProgress.fed > 0)
-            && Date.now() - bufferProgress.at < 2000
-            && bufferProgress.extensions < 3;
-          if ((why === "seek" || why === "start") && grew) {
+          const progressing = Date.now() - bufferProgress.at < 2000;
+          const grew = (bufferProgress.ready > 0 || bufferProgress.fed > 0) && progressing;
+          // Gia hạn THÊM khi đệm đã dịch còn dưới ngưỡng mà backend VẪN đang nhận/giải mã audio:
+          // phát lúc này là chạy 1-2s rồi phải dừng lại (nhịp pause/play ngắn — đo thật trên
+          // YouTube 2026-10-05). Chỉ gia hạn khi backend còn sống, tối đa 3 lần (≈6s).
+          const backendAlive = Date.now() - Number(laSession.lastFragmentsAt || 0) < 2000;
+          const belowTarget = !hasEnoughHeadroomToResume();
+          if ((why === "seek" || why === "start")
+              && bufferProgress.extensions < 3
+              && (grew || (belowTarget && backendAlive))) {
             bufferProgress.extensions += 1;
             console.log(
               `[BS] Chờ thêm bản dịch tại vị trí hiện tại (ready ${bufferProgress.ready.toFixed(1)}s, ` +
-              `gia hạn ${bufferProgress.extensions}/3).`
+              `cần ≥ ${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s; gia hạn ${bufferProgress.extensions}/3).`
             );
             scheduleResume(2000);
             return;
@@ -845,7 +1278,16 @@
         }
         if (lookaheadPausedVideo) {
           if (!settings.ttsEnabled || firstTtsReceived) {
-            resumePlayback("prebuffer_ready");
+            // Lưới an toàn 8s của `SubtitleTimelineQueue` chỉ là "hết thời gian chờ", KHÔNG có
+            // nghĩa là đã đủ đệm để phát: resume ở đây mà đệm đã dịch còn mỏng thì video chạy được
+            // 1-2s rồi lại bị `_tick` tạm dừng ngay (nhịp pause/play ngắn).
+            if (hasEnoughHeadroomToResume()) {
+              resumePlayback("prebuffer_ready");
+            } else {
+              laDiag.throttled("resume-blocked-timeline", 4000, "log", "session",
+                `⏳ Hết thời gian nạp đệm nhưng đệm đã dịch mới ${currentReadyAhead().toFixed(1)}s `
+                + `(< ${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s) — chờ thêm để khỏi phải dừng lại ngay.`);
+            }
           }
         }
       },
@@ -857,9 +1299,35 @@
         if (lookaheadClient) {
           lookaheadClient.notifySeek(seekId, targetTime);
         }
+        laDiag.log("session", `⏩ Người dùng TUA tới ${Number(targetTime).toFixed(2)}s (seek_id=${seekId}) `
+          + `⇒ xoá phụ đề cũ, tạm dừng chờ backend dịch trước vị trí mới.`);
         // Vị trí mới chưa có phụ đề: TẠM DỪNG video chờ backend dịch trước, rồi tự phát lại
         // khi `lookahead_status.prebuffer_ready` báo sẵn sàng.
         pauseForBuffering("seek");
+      },
+      onUnderrun: (curTime, readyUntilPts) => {
+        // RÀNG BUỘC CỨNG vừa kích hoạt: playhead đã chạm mốc backend xử lý xong. Nếu mốc này
+        // KHÔNG tiến (backend không có thêm audio), đây chính là vế đầu của BẾ TẮC.
+        laDiag.throttled("underrun", 4000, "warn", "session",
+          `⛔ Chạm mốc đã xử lý: playhead=${Number(curTime).toFixed(2)}s ≥ `
+          + `mốc-đã-xử-lý=${Number(readyUntilPts).toFixed(2)}s ⇒ tạm dừng chờ backend. `
+          + `Nếu dòng này lặp lại mãi cùng một mốc ⇒ BẾ TẮC (xem [BS][Diag][stall]).`);
+      },
+      onSeekIgnored: (info) => {
+        // ── `seeking` KHÔNG phải do người dùng tua (nền tảng của "video nạp lại liên tục") ──
+        // Đo thật 2026-10-05 (xhamster.com): `lý do dừng={"start":1,"seek":38}` — 38 lần reset
+        // backend + tạm dừng video chỉ vì trình phát tự bắn `seeking` khi hết đệm.
+        // `churnOnly` = vẫn là TUA THẬT nhưng dồn dập: vẫn nhận (để vị trí cuối không bị mất),
+        // chỉ cảnh báo.
+        laSession.ignoredSeeks = (laSession.ignoredSeeks || 0) + (info.churnOnly ? 0 : 1);
+        laDiag.throttled("seek-ignored", 2000, "warn", "session",
+          info.churnOnly
+            ? `⚡ Tua dồn dập (${info.accepted} lần/${(timelineQueue.seekChurnWindowMs / 1000).toFixed(0)}s) — `
+              + `vẫn NHẬN vị trí cuối ${info.targetTime.toFixed(2)}s để không mất tua thật.`
+            : `↩️ Bỏ qua "seeking" do TRÌNH PHÁT TỰ SINH (nhảy ${info.jump.toFixed(2)}s) — `
+              + `KHÔNG reset backend, KHÔNG tạm dừng video. Tổng: bỏ qua ${info.ignored}, `
+              + `chấp nhận ${info.accepted}. (Chỉ coi là tua thật khi nhảy ≥ `
+              + `${timelineQueue ? timelineQueue.minSeekJumpSec : 3}s.)`);
       },
     });
     timelineQueue.attachVideo(video);
@@ -888,6 +1356,15 @@
       lookaheadPausedVideo = false;
       lastResumeAt = Date.now();
       underrunStreak = 0;
+      // ── LOG: vì sao được phát tiếp (đối chiếu với dòng ⏸️ TẠM DỪNG) ──────────
+      laSession.resumes += 1;
+      const pausedMs = laSession.pauseStartedAt ? Date.now() - laSession.pauseStartedAt : 0;
+      laSession.pauseStartedAt = 0;
+      laDiag.log("session",
+        `▶️ PHÁT TIẾP video (lần ${laSession.resumes}, lý do=${reason || "ready"}` +
+        `${pausedMs > 0 ? `, đã dừng ${(pausedMs / 1000).toFixed(1)}s` : ""}) | ` +
+        `playhead=${video.currentTime.toFixed(2)}s | tổng pause=${laSession.pauses} resume=${laSession.resumes}` +
+        `${laSession.guardFired ? ` | van-an-toàn đã phá bế tắc ${laSession.guardFired} lần` : ""}`);
       if (resumeTimer) {
         clearTimeout(resumeTimer);
         resumeTimer = null;
@@ -922,17 +1399,21 @@
             const hasMatching = items.some((it) => curTime >= Number(it.start_pts) - 0.5 && curTime <= Number(it.end_pts) + 0.5);
             if (hasMatching) {
               if (!settings.ttsEnabled || firstTtsReceived) {
-                resumePlayback("subtitle_arrived");
+                // CHỈ chạy lại khi còn ĐỦ ĐỆM ĐÃ DỊCH. Câu vừa gửi khớp đúng vị trí phát nghĩa là
+                // ta đang ở SÁT mốc đã xử lý — resume lúc này là chạy được 1-2s rồi phải dừng lại.
+                if (hasEnoughHeadroomToResume()) resumePlayback("subtitle_arrived");
               }
             }
           }
         },
         onPrebufferReady: (st) => {
-          // Nếu bật TTS nhưng chưa nhận câu TTS nào và đang có câu nói: chờ onTts kích hoạt
-          if (settings.ttsEnabled && !firstTtsReceived && Number(st?.ready_ahead || 0) > 0) {
-            return;
-          }
-          resumePlayback(st && st.reason ? st.reason : "ready");
+          // `prebuffer_ready` của backend = "đủ theo MỤC TIÊU CỦA NÓ" — có lúc chỉ 2,5s (bootstrap),
+          // không đủ để video chạy mà không phải dừng lại ngay. Quyết định chạy lại nằm ở `onStatus`
+          // với ngưỡng đệm THẬT; ở đây chỉ giữ làm lưới an toàn cho backend không gửi `ready_ahead`.
+          const readyKnown = Number(st?.ready_ahead || 0) > 0;
+          if (readyKnown) return;
+          if (settings.ttsEnabled && !firstTtsReceived) return;
+          resumePlayback("prebuffer_ready_no_metrics");
         },
         onTts: (header, wavBuffer) => {
           if (!settings.ttsEnabled) return;
@@ -945,10 +1426,11 @@
           }
           if (ttsTimeline) ttsTimeline.enqueue(header, wavBuffer);
 
-          // Nếu đang tạm dừng nạp đệm và bật TTS: nhận được câu TTS đầu tiên ⇒ phát video ngay!
+          // Câu TTS đầu tiên đã sẵn sàng — nhưng vẫn phải có đủ đệm đã dịch phía trước, nếu không
+          // video chạy được vài giây lại phải dừng (đúng nhịp pause/play khó chịu cần tránh).
           if (settings.ttsEnabled && lookaheadPausedVideo && !firstTtsReceived) {
             firstTtsReceived = true;
-            resumePlayback("tts_first_ready");
+            if (hasEnoughHeadroomToResume()) resumePlayback("tts_first_ready");
           }
         },
         onReady: () => finish(null),
@@ -964,6 +1446,39 @@
           const ready = Number(st.ready_ahead || 0);
           const fed = Number(st.fed_ahead || 0);
           const isTts = Boolean(settings.ttsEnabled);
+          // ── THEO DÕI TIẾN TRIỂN (chẩn đoán) ──────────────────────────────────
+          // `fragments` = số mảnh audio backend đã nhận; `ready_until_pts` = mốc backend đã
+          // ASR+dịch xong. Hai con số này đứng yên trong lúc video bị tạm dừng = BẾ TẮC (xem
+          // `fireStallGuard`). Chúng cũng là thứ DUY NHẤT cho biết backend còn sống hay không.
+          {
+            const now = Date.now();
+            const frag = Number(st.fragments);
+            const dec = Number(st.decoded_chunks);
+            const ru = Number(st.ready_until_pts);
+            if (Number.isFinite(frag) && frag !== laSession.lastFragments) {
+              laSession.lastFragments = frag;
+              laSession.lastFragmentsAt = now;
+            }
+            if (Number.isFinite(dec)) laSession.lastDecoded = dec;
+            if (Number.isFinite(ru) && ru !== laSession.lastReadyUntil) {
+              if (ru > laSession.lastReadyUntil) laSession.lastReadyAt = now;
+              laSession.lastReadyUntil = ru;
+            }
+            laSession.lastStatus = st;
+            laSession.lastStatusAt = now;
+            // Backend đã đuổi kịp playhead ⇒ gỡ treo horizon (nếu van an toàn đã treo trước đó).
+            if (timelineQueue && Number.isFinite(ru) && ru > (Number(video.currentTime) || 0) + 0.5) {
+              try { timelineQueue.resumeHorizon(); } catch (e) {}
+            }
+            // In trạng thái: lần đầu luôn in, sau đó mỗi 3s khi ĐANG chờ nạp đệm (lúc cần chẩn
+            // đoán nhất) và mỗi 10s khi đang phát bình thường — `lookahead_status` được backend
+            // gửi vài lần mỗi giây nên không thể in hết.
+            const statusLogEveryMs = lookaheadPausedVideo ? 3000 : 10000;
+            if (now - (laSession.lastStatusLogAt || 0) >= statusLogEveryMs) {
+              laSession.lastStatusLogAt = now;
+              logLookaheadStatus(st, laSession.lastStatusLogCount++ === 0 ? "(đầu tiên)" : "");
+            }
+          }
           // Nạp MỐC ĐÃ XỬ LÝ cho timeline queue: đây là ràng buộc cứng "playhead không được vượt
           // qua vùng backend chưa xử lý" (kiểm tra mỗi khung hình trong `_tick`).
           if (timelineQueue) {
@@ -982,35 +1497,26 @@
               showBufferingStatus(`${prefix} (${ready.toFixed(1)}s / ${target.toFixed(1)}s)${extra}`);
             }
 
-            // Sẵn sàng phát lại khi:
-            // 1. Backend báo st.prebuffer_ready (đã tính toán cả TTS nếu tts_enabled)
-            // 2. HOẶC nếu TTS BẬT:
-            //    - Đã nhận câu TTS đầu tiên (firstTtsReceived) VÀ ready >= 1.0s
-            //    - HOẶC đoạn trước là khoảng lặng (fed >= 4.0s và ready === 0: không có tiếng nói để đọc TTS)
-            // 3. HOẶC nếu TTS TẮT:
-            //    - ready >= 1.5s
-            //    - HOẶC fed >= 4.0s && ready === 0 (quét qua khoảng lặng)
+            // Sẵn sàng CHẠY LẠI khi có ĐỦ ĐỆM ĐÃ DỊCH (xem `hasEnoughHeadroomToResume`):
+            //   • TTS tắt: `ready ≥ LA_MIN_RESUME_AHEAD_SEC` (4s), hoặc đoạn trước là khoảng lặng.
+            //   • TTS bật: đã nhận câu TTS đầu VÀ đủ đệm đã dịch như trên.
+            //   • `prebuffer_ready` của backend KHÔNG tự nó là điều kiện đủ: nó chỉ so với mục
+            //     tiêu của backend (có lúc 2,5s) nên resume theo nó là chạy 1-2s rồi dừng lại.
             let readyToResume = false;
-            if (st.prebuffer_ready) {
-              if (!isTts || firstTtsReceived || ready === 0) {
-                readyToResume = true;
-              }
-            } else if (isTts) {
-              if (firstTtsReceived && ready >= 1.0) {
-                readyToResume = true;
-              } else if (fed >= 4.0 && ready === 0) {
-                readyToResume = true;
-              }
-            } else {
-              if (ready >= 1.5) {
-                readyToResume = true;
-              } else if (fed >= 4.0 && ready === 0) {
-                readyToResume = true;
-              }
+            if (hasEnoughHeadroomToResume() && (!isTts || firstTtsReceived)) {
+              readyToResume = true;
             }
 
             if (readyToResume) {
               resumePlayback(st.prebuffer_ready ? "prebuffer_ready" : "status_ready");
+            } else if (lookaheadPausedVideo && now - (laSession.lastResumeBlockedLogAt || 0) > 3000) {
+              // Chẩn đoán: nói rõ VÌ SAO còn phải chờ dù backend đã báo `prebuffer_ready`.
+              laSession.lastResumeBlockedLogAt = now;
+              laDiag.log("session",
+                `⏳ Chưa cho phát: đệm đã dịch ${currentReadyAhead().toFixed(1)}s < `
+                + `${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s (prebuffer_ready=${st.prebuffer_ready}, `
+                + `ready=${ready.toFixed(1)}s, fed=${fed.toFixed(1)}s${isTts && !firstTtsReceived ? ", chờ TTS đầu" : ""}) `
+                + `— chờ thêm để tránh nhịp pause/play ngắn.`);
             }
           }
           // ĐANG PHÁT: việc TẠM DỪNG giữa chừng do RÀNG BUỘC CỨNG ở `timelineQueue._tick()`
@@ -1037,6 +1543,21 @@
     if (availability) {
       // Backend báo KHÔNG chạy được Pipeline B -> gỡ sạch để content script quay về Pipeline A.
       console.warn(`%c[BS] ⚠️ Pipeline B không khả dụng (${availability}) -> Tự động chuyển sang Pipeline A (Realtime Streaming)`, "color: #f59e0b; font-weight: bold;");
+      // Giải thích MÃ LÝ DO bằng tiếng Việt + cách xử lý (từ điển ở lib/lookahead-diagnostics.js).
+      if (LA_DIAG) {
+        const code = /timeout/i.test(availability) ? "CONNECTION_TIMEOUT"
+          : (/unavailable/i.test(availability) ? "BACKEND_UNAVAILABLE" : null);
+        const ex = LA_DIAG.explainLookaheadReason(code || availability);
+        laDiag.group(`⚠️ Pipeline B thất bại: ${availability}`, [
+          ["Vì sao", ex.why],
+          ["Cách xử lý", ex.fix],
+          ["Thống kê phiên", `pause=${laSession.pauses}, resume=${laSession.resumes}, `
+            + `van-an-toàn=${laSession.guardFired}, lý do dừng=${JSON.stringify(laSession.pauseReasons)}`],
+          ["Trạng thái backend cuối", JSON.stringify(laSession.lastStatus || null)],
+        ], "warn");
+      }
+      if (laSession.watchTimer) { try { clearInterval(laSession.watchTimer); } catch (e) {} laSession.watchTimer = null; }
+      lookaheadSessionDiag = null;
       try { lookaheadClient.disconnect(); } catch (e) {}
       lookaheadClient = null;
       try { timelineQueue.detach(); } catch (e) {}
@@ -1077,11 +1598,26 @@
     captureSilenceWarned = false;   // phiên sau phải được cảnh báo lại từ đầu
     // Trả lại trạng thái phát nếu chính Pipeline B đã tạm dừng video để nạp đệm.
     lookaheadPauseForBuffering = null;
+    // Dừng vòng theo dõi chẩn đoán của phiên (nếu để sống, nó sẽ báo bế tắc cho phiên đã Stop).
+    if (lookaheadSessionDiag) {
+      if (lookaheadSessionDiag.watchTimer) {
+        try { clearInterval(lookaheadSessionDiag.watchTimer); } catch (e) {}
+        lookaheadSessionDiag.watchTimer = null;
+      }
+      laDiag.log("session", `⏹️ Kết thúc phiên Pipeline B: pause=${lookaheadSessionDiag.pauses}, `
+        + `resume=${lookaheadSessionDiag.resumes}, van-an-toàn=${lookaheadSessionDiag.guardFired}, `
+        + `seek-bỏ-qua=${lookaheadSessionDiag.ignoredSeeks || 0}, `
+        + `lý do dừng=${JSON.stringify(lookaheadSessionDiag.pauseReasons)}, `
+        + `mốc-đã-xử-lý cuối=${Number((lookaheadSessionDiag.lastStatus || {}).ready_until_pts || 0).toFixed(2)}s.`);
+      lookaheadSessionDiag = null;
+    }
     if (lookaheadPausedVideo) {
       lookaheadPausedVideo = false;
       try {
         const v = getVideo();
-        if (v && v.paused) v.play();
+        // KHÔNG `play()` khi video đã phát hết: gọi `play()` trên video `ended` sẽ khiến nó CHẠY
+        // LẠI TỪ ĐẦU — đúng lúc ta vừa tự đóng phiên vì hết video (sự cố 2026-10-05).
+        if (v && v.paused && !v.ended) v.play();
       } catch (e) {}
     }
     if (overlayManager && typeof overlayManager.hideBuffering === "function") {
@@ -1296,5 +1832,74 @@
 
   window.__bsFindVideo = findVideo;
 
+  /**
+   * CHẨN ĐOÁN THỦ CÔNG — gõ trong Console của trang:
+   *   __bsLookaheadDiagReport()
+   * In: quyết định cổng Pipeline B, dữ kiện thô của interceptor, và các bước xử lý.
+   */
+  window.__bsLookaheadDiagReport = async () => {
+    const v = findVideo();
+    announcePreferredVideo(v);
+    const p = await getLookaheadBufferStatus(600, v);
+    const facts = buildLookaheadFacts(p, v);
+    const verdict = LA_DIAG ? LA_DIAG.classifyLookaheadAvailability(facts) : { code: "UNKNOWN", detail: "thiếu module" };
+    printLookaheadDiagnosis(facts, verdict);
+    if (lookaheadSessionDiag) {
+      laDiag.group("Thống kê phiên Pipeline B đang chạy", [
+        ["pause / resume", `${lookaheadSessionDiag.pauses} / ${lookaheadSessionDiag.resumes}`],
+        ["lý do dừng", JSON.stringify(lookaheadSessionDiag.pauseReasons)],
+        ["van an toàn đã phá bế tắc", String(lookaheadSessionDiag.guardFired)],
+        ["trạng thái backend cuối", JSON.stringify(lookaheadSessionDiag.lastStatus || null)],
+      ]);
+    }
+    if (lookaheadClient && typeof lookaheadClient.getDiag === "function") {
+      laDiag.group("Thống kê gửi/nhận tới /ws/lookahead", Object.entries(lookaheadClient.getDiag())
+        .map(([k, val]) => [k, typeof val === "object" ? JSON.stringify(val) : String(val)]));
+    }
+    console.log("[BS][Diag] Bước tiếp theo: nếu mã là MUXED_ONLY/UNKNOWN_MIME_SB hãy xem log "
+      + "`[Lookahead][Diag] addSourceBuffer` và `sniff` ở đầu Console của trang.");
+    return { verdict, facts, payload: p };
+  };
+
+  // ── WATCHDOG CHẨN ĐOÁN (khi CHƯA capture) ──────────────────────────────────
+  // Chạy mỗi 5s khi trang có <video> nhưng chưa bắt đầu dịch: tự kết luận và in MỘT LẦN cho mỗi
+  // mã lý do mới. Nhờ vậy người dùng chỉ cần mở Console là biết vì sao nút Start sẽ dùng
+  // Pipeline A/B, không phải bấm Start rồi mới biết.
+  let laWatchdogTimer = null;
+  let laWatchdogLastCode = null;
+  function startLookaheadWatchdog() {
+    if (laWatchdogTimer) return;
+    laWatchdogTimer = setInterval(async () => {
+      try {
+        if (isCapturing) return;
+        const v = findVideo();
+        if (!v) return;
+        if (!(v.readyState > 0) && v.paused && !v.currentSrc) return; // trang chưa nạp video
+        announcePreferredVideo(v);
+        const p = await getLookaheadBufferStatus(300, v);
+        const facts = buildLookaheadFacts(p, v);
+        const verdict = LA_DIAG ? LA_DIAG.classifyLookaheadAvailability(facts) : null;
+        if (!verdict) return;
+        if (verdict.code === laWatchdogLastCode) return;
+        laWatchdogLastCode = verdict.code;
+        if (verdict.code === "OK") {
+          laDiag.ok("watchdog", `Trang này ĐỦ điều kiện chạy Pipeline B: ${verdict.detail}`);
+          return;
+        }
+        if (verdict.code === "NO_VIDEO" || verdict.code === "NO_APPEND_YET") {
+          // Trạng thái bình thường khi video chưa được bấm Play — chỉ ghi ở mức thông tin.
+          laDiag.log("watchdog", `Chưa sẵn sàng (${verdict.code}): ${verdict.detail}`);
+          return;
+        }
+        laDiag.warn("watchdog", `Trang này sẽ KHÔNG chạy được Pipeline B: ${verdict.code} — ${verdict.detail}`);
+        printLookaheadDiagnosis(facts, verdict);
+      } catch (e) { /* im lặng: chẩn đoán không được làm hỏng trang */ }
+    }, 5000);
+  }
+  startLookaheadWatchdog();
+
   console.log("[BS Content] Ready (Frame: " + (window === window.top ? "Top" : "Iframe") + ")");
+  console.log("%c[BS][Diag] Chẩn đoán Lookahead: gõ `__bsLookaheadDiagReport()` trong Console của "
+    + "trang. Lọc Console theo `[Diag]` để xem toàn bộ chuỗi quyết định.",
+    "color: #94a3b8;");
 })();

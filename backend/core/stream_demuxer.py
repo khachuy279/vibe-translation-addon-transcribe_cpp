@@ -57,6 +57,10 @@ _SEEK_BACKOFF_SEC = 0.5
 _AXIS_ANCHOR_MIN_SEC = 0.5
 _AXIS_ANCHOR_CONFIRM_SEC = 0.6
 _AXIS_ANCHOR_STRONG_SEC = 5.0
+#: Cửa sổ (giây) chống ĐẢO TRỤC: nếu lần neo trước vừa xảy ra trong khoảng này và lần này có độ
+#: lớn tương đương nhưng NGƯỢC DẤU thì bỏ qua (xem `_anchor_to_browser_axis`). Đo thật
+#: 2026-10-05 (xvideos.com): neo +10,01s rồi −10,01s sau 4s ⇒ timeline thủng 20s audio.
+_AXIS_REVERSAL_GUARD_SEC = 10.0
 
 
 @dataclass
@@ -358,6 +362,9 @@ class StreamDemuxer:
         #: `_anchor_to_browser_axis`.
         self._axis_shift_obs: Optional[float] = None
         self._axis_shift_logged: bool = False
+        #: Lần neo trục GẦN NHẤT (độ lớn có dấu + thời điểm) — dùng để chặn ĐẢO TRỤC.
+        self._axis_shift_signed: float = 0.0
+        self._axis_shift_signed_at: float = 0.0
         self._lock = threading.RLock()
 
         # Thống kê
@@ -425,6 +432,8 @@ class StreamDemuxer:
                 self._browser_axis_bias = None
                 self._axis_shift_obs = None
                 self._axis_shift_logged = False
+                self._axis_shift_signed = 0.0
+                self._axis_shift_signed_at = 0.0
             if epoch is not None:
                 self._epoch = int(epoch)
             else:
@@ -487,6 +496,8 @@ class StreamDemuxer:
                 self._browser_axis_bias = None
                 self._axis_shift_obs = None
                 self._axis_shift_logged = False
+                self._axis_shift_signed = 0.0
+                self._axis_shift_signed_at = 0.0
                 logger.info(
                     f"StreamDemuxer: SourceBuffer epoch mới = {self._epoch} (min_pts={self._min_pts}) — xoá bộ đệm ghép nối",
                     extra={"module_tag": "WS"},
@@ -552,7 +563,72 @@ class StreamDemuxer:
                 self._axis_shift_obs = None
                 self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
                 chunks = self._decode_new()
+            if not chunks and media_end is not None:
+                # ── HỌC LẠI TRỤC TỪ "DẤU VẾT TRÌNH DUYỆT" ─────────────────────────
+                # SỰ CỐ THẬT 2026-10-05 (xhamster.com): mở PHIÊN MỚI giữa video (hoặc trang tự
+                # nạp lại nguồn) làm PTS trong container quay về 0 trong khi trục trình duyệt
+                # đang ở ~984s. `_browser_axis_bias` CHƯA học được ở phiên mới ⇒ mọi frame bị
+                # frontier (`min_pts`) lọc sạch ⇒ `chunks` luôn rỗng ⇒ KHÔNG BAO GIỜ học được
+                # trục ⇒ "Audio RAM: 0.0s" suốt phiên ("tắt mở lại session cũng không được").
+                #
+                # Cách phá vòng luẩn quẩn: extension gửi kèm `media_start`/`media_end` = khoảng
+                # THẬT trong `SourceBuffer.buffered` của mảnh này. Byte này KẾT THÚC ở `media_end`
+                # ⇒ hiệu `media_end − pts_end(container)` chính là bias cần học.
+                raw_end = self._probe_last_frame_pts_end()
+                if raw_end is not None:
+                    learned = float(media_end) - float(raw_end)
+                    had_bias = self._browser_axis_bias is not None
+                    previous = self._axis_offset()
+                    self._browser_axis_bias = learned
+                    self._axis_shift_obs = None
+                    self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
+                    chunks = self._decode_new()
+                    if chunks:
+                        logger.warning(
+                            f"HỌC LẠI TRỤC THỜI GIAN từ dấu vết trình duyệt: byte kết thúc ở "
+                            f"{float(media_end):.2f}s (trục trình duyệt) nhưng PTS container kết "
+                            f"thúc ở {float(raw_end):.2f}s ⇒ bias {learned:+.2f}s (trước đó "
+                            f"{previous:+.2f}s). Đã giải mã được {len(chunks)} đoạn PCM.",
+                            extra={"module_tag": "WS"},
+                        )
+                    else:
+                        # Học xong vẫn không ra PCM ⇒ trả lại trạng thái cũ, không để lại một
+                        # neo sai làm hỏng cả các mảnh sau.
+                        self._browser_axis_bias = previous if had_bias else None
             return self._anchor_to_browser_axis(chunks, media_start, media_end)
+
+    def _probe_last_frame_pts_end(self) -> Optional[float]:
+        """PTS KẾT THÚC (giây, trục CONTAINER) của frame cuối trong bộ đệm hiện tại.
+
+        Dùng để HỌC LẠI trục thời gian khi chưa có neo nào (xem khối "HỌC LẠI TRỤC" trong
+        `feed`). Chỉ giải mã để ĐỌC MỐC, không giữ PCM, nên không ảnh hưởng frontier.
+        Trả `None` nếu không mở được container hoặc không có frame nào.
+        """
+        payload = self._init + bytes(self._media)
+        if not payload:
+            return None
+        last_end: Optional[float] = None
+        try:
+            container = av.open(io.BytesIO(payload))
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            if not container.streams.audio:
+                return None
+            stream = container.streams.audio[0]
+            tb = float(stream.time_base or 0)
+            if tb <= 0:
+                return None
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                start = float(frame.pts) * tb
+                rate = float(getattr(frame, "sample_rate", 0) or 0)
+                dur = (float(frame.samples) / rate) if (rate > 0 and frame.samples) else 0.02
+                last_end = start + dur
+        except Exception:  # noqa: BLE001
+            return last_end
+        return last_end
 
     def _anchor_to_browser_axis(
         self,
@@ -605,8 +681,40 @@ class StreamDemuxer:
             self._axis_shift_obs = observed
             return chunks
 
+        # ── CHỐNG ĐẢO TRỤC (đo thật 2026-10-05, xvideos.com — HLS fMP4 tách track) ──────
+        # Log thật: `LỆCH TRỤC +10,01s` lúc 22:00:46 rồi `LỆCH TRỤC −10,01s` lúc 22:00:50.
+        # Mỗi lần đảo, PCM của các fragment sau được đặt LÙI 10s so với thực tế ⇒ rơi vào vùng
+        # đã có audio ⇒ bị frontier (`_last_pts`) lọc ⇒ audio của vùng thật (20→41s) MẤT HẲN.
+        # Timeline thủng một khe 20s; con trỏ khối ASR chạy tới mép khe (20.04s) rồi kẹt vì
+        # `available = 0.0s` — đúng hiện tượng "chạy một chút lại dừng" của người dùng.
+        #
+        # Vì sao đảo được: `observed` so `media_end` (khoảng vừa thêm vào `SourceBuffer`) với
+        # mốc PCM cuối của TOÀN BỘ frame còn trong bộ đệm ghép nối; hai đại lượng chỉ khớp nhau
+        # khi tập frame giải mã đúng bằng mảnh vừa append. Với luồng HLS tách track (mỗi segment
+        # 10s), sai khác đó xuất hiện đúng bằng một segment và ĐỔI DẤU giữa hai lần.
+        # ⇒ Nếu lần neo trước vừa xảy ra và độ lớn y hệt nhưng NGƯỢC DẤU thì bỏ qua lần này.
+        now = time.perf_counter()
+        reversed_shift = (
+            self._axis_shift_signed_at > 0.0
+            and self._axis_shift_signed != 0.0
+            and observed * self._axis_shift_signed < 0.0
+            and abs(abs(observed) - abs(self._axis_shift_signed)) <= _AXIS_ANCHOR_CONFIRM_SEC
+            and (now - self._axis_shift_signed_at) <= _AXIS_REVERSAL_GUARD_SEC
+        )
+        if reversed_shift:
+            self._axis_shift_obs = None
+            logger.warning(
+                f"Bỏ qua ĐẢO TRỤC: lần neo trước {self._axis_shift_signed:+.2f}s cách đây "
+                f"{now - self._axis_shift_signed_at:.1f}s, lần này ngược dấu {observed:+.2f}s "
+                f"(cùng độ lớn) ⇒ giữ nguyên trục đang dùng để KHÔNG tạo khe hở audio.",
+                extra={"module_tag": "WS"},
+            )
+            return chunks
+
         used = self._axis_offset()
         self._browser_axis_bias = used + observed
+        self._axis_shift_signed = float(observed)
+        self._axis_shift_signed_at = now
         for chunk in chunks:
             chunk.pts_start += observed
             chunk.pts_end += observed

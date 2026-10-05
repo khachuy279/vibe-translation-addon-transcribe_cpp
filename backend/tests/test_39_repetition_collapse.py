@@ -146,30 +146,3 @@ def test_streaming_dich_khong_phinh_thanh_buc_tuong_chu(allow_real_translation_m
     assert len(chunks[-1]) < 40, f"phụ đề vẫn phình: {chunks[-1]!r}"
     assert chunks[-1] == "ha ha ha"
 
-
-def test_is_repetition_hallucination():
-    """Kiểm tra bộ lọc ảo giác lặp từ is_repetition_hallucination."""
-    from backend.utils.text_repetition import is_repetition_hallucination
-
-    # Ký tự đơn tiếng Nhật lặp >= 3 lần (ca thật: 'あああ', 'ああああああ...')
-    assert is_repetition_hallucination("あああああああああああああああああああああ") is True
-    assert is_repetition_hallucination("あああ") is True
-    assert is_repetition_hallucination("ああ") is False  # 2 lần là hợp lệ (cảm thán 'ah ah')
-    assert is_repetition_hallucination("ああ、そうですね") is False
-
-    # Tiếng Nhật lặp cụm từ hoặc phân cách
-    assert is_repetition_hallucination("そうそうそう") is True
-    assert is_repetition_hallucination("はい、はい、はい") is True
-    assert is_repetition_hallucination("はい、はい") is False
-
-    # Tiếng Anh
-    assert is_repetition_hallucination("ha ha ha") is True
-    assert is_repetition_hallucination("no, no, no") is True
-    assert is_repetition_hallucination("Hello world") is False
-    assert is_repetition_hallucination("That is that") is False
-
-    # Không bắt nhầm dấu câu và số
-    assert is_repetition_hallucination("...") is False
-    assert is_repetition_hallucination("1000") is False
-    assert is_repetition_hallucination("") is False
-

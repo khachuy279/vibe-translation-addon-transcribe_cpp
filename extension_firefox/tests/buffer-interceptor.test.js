@@ -20,6 +20,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const { LookaheadClient, payloadInReplayWindow } = require("../lib/lookahead-client.js");
+const { classifyLookaheadAvailability } = require("../lib/lookahead-diagnostics.js");
 
 const CODE = fs.readFileSync(
   path.join(__dirname, "..", "content", "buffer_interceptor_poc.js"),
@@ -174,6 +175,11 @@ function createPage() {
     setVideo(video) { videos.length = 0; videos.push(video); return video; },
     newSourceBuffer(mime = 'audio/webm; codecs="opus"') {
       return new FakeMediaSource().addSourceBuffer(mime);
+    },
+    //: SourceBuffer "mù mime": tạo TRỰC TIẾP, KHÔNG qua `addSourceBuffer` ⇒ mô phỏng buffer được
+    //: tạo trước khi hook kịp chạy (interceptor không biết mime).
+    newSourceBufferRaw(mime = 'video/mp4; codecs="avc1.64001f,mp4a.40.2"') {
+      return new FakeSourceBuffer(mime);
     },
     bytes(n) { return mkBytes(n).buffer; },
     bytesOf(list, size = list.length) {
@@ -432,4 +438,200 @@ test("payloadInReplayWindow ưu tiên mốc media và không coi mảnh mù mố
   assert.equal(payloadInReplayWindow({ videoPts: 5 }, 30.5, 83.5), false);
   // Mù mốc hoàn toàn ⇒ KHÔNG coi là "sẽ được replay" (mảnh vẫn được gửi).
   assert.equal(payloadInReplayWindow({}, 30.5, 83.5), false);
+});
+
+// ── 11. CHẨN ĐOÁN: mime SourceBuffer quyết định audio có được lấy hay không ──
+// Bối cảnh (2026-10-05): nhiều trang ngoài YouTube/Bilibili chỉ tạo MỘT SourceBuffer chứa CẢ
+// hình lẫn tiếng (mime `video/mp4; codecs="avc1…,mp4a…"`). Bản cũ chỉ nhận mime có chữ `audio`
+// nên BỎ QUA toàn bộ mảnh ⇒ POPUP báo "Lookahead: không khả dụng" dù hoàn toàn có thể chạy B.
+test("SourceBuffer MUXED (video+audio) được nhận là nguồn audio (không bị bỏ qua)", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  page.run();
+
+  const sb = page.newSourceBuffer('video/mp4; codecs="avc1.64001f,mp4a.40.2"');
+  page.append(sb, 100, [10, 20]);
+
+  const diag = page.state().diag;
+  assert.equal(diag.muxedSbCount, 1, "phải phân loại là MUXED");
+  assert.equal(diag.audioSbCount, 0);
+  assert.equal(diag.audioCapable, undefined, "audioCapable chỉ có trong payload trạng thái");
+  assert.equal(page.debug().getStatus().diag.audioCapable, true, "MUXED ⇒ vẫn có audio để chạy B");
+  assert.equal(page.audioMessages().length, 1, "mảnh của buffer MUXED phải được gửi sang content script");
+});
+
+test("SourceBuffer VIDEO-ONLY không bị coi là audio (POPUP không báo 'available' sai)", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  page.run();
+
+  const sb = page.newSourceBuffer('video/mp4; codecs="avc1.64001f"');
+  page.append(sb, 100, [10, 20]);
+
+  const diag = page.state().diag;
+  assert.equal(diag.videoSbCount, 1);
+  assert.equal(diag.audioSbCount, 0);
+  assert.equal(page.audioMessages().length, 0, "byte video KHÔNG được gửi lên backend");
+  assert.equal(page.state().cachedAudioChunks.length, 0);
+});
+
+test("SourceBuffer tạo TRƯỚC hook: sniff codec 'mp4a' ⇒ dùng làm audio", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 3, buffered: [[0, 60]] }));
+  const pre = page.newSourceBufferRaw("video/mp4");   // không đi qua addSourceBuffer
+  page.run();
+
+  // Byte đầu tiên: box `ftyp` + fourcc `mp4a` (fMP4 init của một track AAC).
+  pre.nextMediaRange = null;
+  pre.appendBuffer(page.bytesOf([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d,
+    0x00, 0x00, 0x00, 0x00, 0x6d, 0x70, 0x34, 0x61,
+  ], 32));
+  page.append(pre, 96, [5, 10]);
+
+  const diag = page.state().diag;
+  assert.equal(diag.audioSbCount, 1, "sniff thấy `mp4a` ⇒ phân loại lại thành AUDIO");
+  assert.equal(diag.unknownSbCount, 0);
+  assert.equal(page.state().cachedAudioChunks.length, 1, "mảnh phải được cache để replay");
+});
+
+test("SourceBuffer tạo TRƯỚC hook: sniff codec 'avc1' ⇒ BỎ QUA (không gửi video lên backend)", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 3, buffered: [[0, 60]] }));
+  const pre = page.newSourceBufferRaw("video/mp4");
+  page.run();
+
+  pre.nextMediaRange = null;
+  pre.appendBuffer(page.bytesOf([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d,
+    0x00, 0x00, 0x00, 0x00, 0x61, 0x76, 0x63, 0x31,
+  ], 32));
+  page.append(pre, 96, [5, 10]);
+
+  const diag = page.state().diag;
+  assert.equal(diag.videoSbCount, 1, "sniff thấy `avc1` ⇒ phân loại lại thành VIDEO");
+  assert.equal(page.audioMessages().length, 0);
+  assert.equal(page.state().cachedAudioChunks.length, 0);
+});
+
+// ── 13. CHẨN ĐOÁN "append mà cache rỗng" ─────────────────────────────────────
+// Hồi quy 2026-10-05 (xvideos.com): báo cáo cũ nói "14 append nhưng cache rỗng" mà không nói
+// được 14 lần đó là AUDIO hay VIDEO ⇒ kết luận `NO_AUDIO_BYTES` sai. Nay đếm tách riêng và giữ
+// nhật ký từng lần append.
+test("đếm riêng append AUDIO và append VIDEO + giữ nhật ký từng lần", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  page.run();
+
+  const audioSb = page.newSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+  const videoSb = page.newSourceBuffer('video/mp4; codecs="avc1.4d401e"');
+  page.append(audioSb, 64, [5, 10]);
+  page.append(videoSb, 64, [5, 10]);
+  page.append(videoSb, 64, [10, 20]);
+
+  const d = page.state().diag;
+  assert.equal(d.appendCount, 3, "tổng số lần appendBuffer");
+  assert.equal(d.appendsAudioBearing, 1, "chỉ 1 lần append thuộc buffer audio");
+  assert.equal(d.appendsSkippedVideo, 2, "2 lần append thuộc buffer video");
+  assert.equal(d.recentAppends.length, 3);
+  assert.match(d.recentAppends[2].note, /buffer video/);
+  assert.match(d.recentAppends[0].note, /cache/);
+});
+
+test("mảnh bị `prune` NGAY khi thêm cũng được ghi lại (cache rỗng dù append thành công)", () => {
+  const page = createPage();
+  // Playhead rất xa mảnh sắp append ⇒ cửa sổ [playhead-30, playhead+180] loại mảnh ngay lập tức.
+  page.setVideo(makeVideo({ currentTime: 5000, buffered: [[5000, 5100]] }));
+  page.run();
+
+  const sb = page.newSourceBuffer();
+  page.append(sb, 64, [10, 20]);
+
+  const d = page.state().diag;
+  assert.equal(page.state().cachedAudioChunks.length, 0, "mảnh nằm ngoài cửa sổ playhead");
+  assert.equal(d.appendsPrunedOut, 1, "phải đếm được mảnh bị prune ngay");
+  assert.match(d.recentAppends[d.recentAppends.length - 1].note, /prune/);
+});
+
+test("init segment fMP4 bắt đầu bằng `moov` (không có ftyp) VẪN được nhận là init", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  page.run();
+  const sb = page.newSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+
+  // Box đầu là `moov` (0x6d 0x6f 0x6f 0x76), KHÔNG có `moof` ⇒ là header, không phải mảnh media.
+  sb.nextMediaRange = null;
+  sb.appendBuffer(page.bytesOf([
+    0x00, 0x00, 0x00, 0x20, 0x6d, 0x6f, 0x6f, 0x76, 0x00, 0x00, 0x00, 0x00,
+    0x6d, 0x70, 0x34, 0x61,
+  ], 48));
+  let msgs = page.audioMessages();
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload.isInit, true, "init bắt đầu bằng `moov` phải được nhận");
+  assert.equal(page.state().diag.appendsInit, 1);
+
+  // Còn mảnh media thật (có `moof`) thì KHÔNG được coi là init.
+  sb.nextMediaRange = [10, 20];
+  sb.appendBuffer(page.bytesOf([
+    0x00, 0x00, 0x00, 0x20, 0x6d, 0x6f, 0x6f, 0x66, 0x00, 0x00, 0x00, 0x00,
+  ], 48));
+  msgs = page.audioMessages();
+  assert.equal(msgs[msgs.length - 1].payload.isInit, false, "mảnh có `moof` là media");
+  assert.equal(page.state().diag.appendsMedia, 1);
+});
+
+test("payload trạng thái mang đủ dữ kiện chẩn đoán (srcKind, container, EME, append)", () => {
+  const page = createPage();
+  page.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  page.run();
+  const sb = page.newSourceBuffer();
+  page.append(sb, 64, [5, 10]);
+
+  const s = page.debug().getStatus();
+  assert.equal(s.diag.mseUsed, true);
+  assert.equal(s.diag.hasMseApi, true);
+  assert.equal(s.diag.srcKind, "blob:", "video.src = blob: ⇒ nguồn là MSE");
+  assert.equal(s.diag.container, "unknown", "byte toàn số 0 ⇒ container không nhận diện được");
+  assert.equal(s.diag.appendCount, 1);
+  // Mảng đến từ realm của sandbox VM ⇒ so sánh độ dài thay vì `deepEqual` (khác prototype).
+  assert.equal(s.diag.keySystems.length, 0);
+  assert.equal(s.diag.videoMismatch, null);
+});
+
+// ── 12. TÍCH HỢP: dữ kiện interceptor → MÃ LÝ DO mà người dùng đọc ─────────
+test("dữ kiện thật của interceptor cho ra mã lý do đúng (audio-only ⇒ OK, video-only ⇒ VIDEO_ONLY_SB)", () => {
+  const fits = (payload) => Object.assign({}, payload.diag, {
+    hasVideo: true,
+    durationFinite: true,
+    bufferedAheadVideo: 30,
+    cachedChunksCount: payload.cachedChunksCount,
+    hasInitSegment: payload.hasInitSegment,
+    mediaTaggedChunks: payload.mediaTaggedChunks,
+  });
+
+  const good = createPage();
+  good.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  good.run();
+  good.append(good.newSourceBuffer(), 64, [5, 10]);
+  assert.equal(classifyLookaheadAvailability(fits(good.debug().getStatus())).code, "OK");
+
+  const videoOnly = createPage();
+  videoOnly.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  videoOnly.run();
+  videoOnly.append(videoOnly.newSourceBuffer('video/mp4; codecs="avc1.64001f"'), 64, [5, 10]);
+  assert.equal(
+    classifyLookaheadAvailability(fits(videoOnly.debug().getStatus())).code,
+    "VIDEO_ONLY_SB",
+    "trang chỉ có SourceBuffer video phải được báo đúng là VIDEO_ONLY_SB"
+  );
+
+  const none = createPage();
+  none.setVideo(makeVideo({ currentTime: 5, buffered: [[0, 60]] }));
+  none.run();
+  const p = none.debug().getStatus();
+  assert.equal(
+    classifyLookaheadAvailability(fits(p)).code,
+    "MSE_UNUSED",
+    "chưa có addSourceBuffer nào ⇒ MSE_UNUSED (kèm srcKind để biết trang phát kiểu gì)"
+  );
 });

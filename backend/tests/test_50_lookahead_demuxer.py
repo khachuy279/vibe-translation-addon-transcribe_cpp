@@ -14,6 +14,7 @@ import soundfile as sf
 from backend.core.lookahead_demuxer import LookaheadDemuxer, DecodedAudioChunk
 from backend.core.timeline_aligner import TimelineAligner
 from backend.core.stream_demuxer import (
+    StreamAudioChunk,
     StreamDemuxer,
     detect_container,
     looks_like_init_segment,
@@ -204,6 +205,71 @@ def test_stream_demuxer_handles_full_file_without_init_flag(webm_opus_sample):
     chunks = demux.feed(webm_opus_sample, timestamp_offset=0.0, epoch=0)
     assert chunks, "Không giải mã được file WebM tự chứa"
     assert sum(c.duration for c in chunks) > 7.5
+
+
+def test_stream_demuxer_learns_axis_when_session_starts_mid_stream(webm_opus_sample):
+    """HỒI QUY 2026-10-05 (xhamster.com — "tắt mở lại session cũng không được").
+
+    Phiên mới neo ở 984s (`min_pts` = 983.55) trong khi PTS bên trong container chỉ 0..8s.
+    Bản cũ: không có neo trục nào để học (`_browser_axis_bias is None`) nên frontier lọc sạch
+    mọi frame ⇒ `chunks` luôn rỗng ⇒ KHÔNG BAO GIỜ học được trục ⇒ log backend lặp
+    "Audio RAM: 0.0s | Đã dịch: 0.0s (giải mã 0.00x, PCM/byte 0.000)" suốt phiên.
+
+    Nay trục được HỌC từ `media_end` do extension gửi kèm (byte này kết thúc ở `media_end`).
+    """
+    bounds = scan_webm_boundaries(webm_opus_sample)
+    init = webm_opus_sample[:bounds[0]]
+    body = webm_opus_sample[bounds[0]:]
+
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux.reset(epoch=1, min_pts=983.55)
+    assert demux._browser_axis_bias is None, "phiên mới chưa có neo trục"
+
+    assert demux.feed(init, is_init=True, epoch=1, media_start=984.0, media_end=992.0) == []
+
+    chunks = []
+    for i in range(0, len(body), 32768):
+        chunks.extend(
+            demux.feed(body[i:i + 32768], epoch=1, media_start=984.0, media_end=992.0)
+        )
+
+    total = sum(c.duration for c in chunks)
+    assert total >= 7.8, f"phiên mới phải giải mã được audio, chỉ thu {total:.2f}s / 8.00s"
+    assert chunks[0].pts_start >= 983.0, (
+        f"PCM phải nằm trên TRỤC TRÌNH DUYỆT (~984s), nhận được {chunks[0].pts_start:.2f}s"
+    )
+
+
+def test_axis_shift_reversal_is_ignored():
+    """HỒI QUY 2026-10-05 (xvideos.com — HLS fMP4 tách track): chặn ĐẢO TRỤC.
+
+    Log thật: `LỆCH TRỤC +10,01s` rồi `LỆCH TRỤC −10,01s` sau 4 giây. Mỗi lần đảo, PCM của các
+    fragment sau bị đặt LÙI một segment ⇒ rơi vào vùng đã có audio ⇒ bị frontier lọc ⇒ audio
+    vùng thật MẤT HẲN ⇒ timeline thủng một khe 20s và con trỏ khối ASR kẹt ở mép khe
+    ("chạy một chút lại dừng").
+    """
+    demux = StreamDemuxer(target_sample_rate=16000)
+
+    def mk(start: float, end: float):
+        return [StreamAudioChunk(
+            pts_start=start, pts_end=end, duration=end - start,
+            pcm=np.zeros(160, dtype=np.float32),
+        )]
+
+    # Lần 1: PCM kết thúc ở 10s, trình duyệt báo byte kết thúc ở 20s ⇒ neo +10s.
+    first = demux._anchor_to_browser_axis(mk(0.0, 10.0), 10.0, 20.0)
+    assert first[0].pts_start == pytest.approx(10.0)
+    assert demux._browser_axis_bias == pytest.approx(10.0)
+
+    # Lần 2 (4 giây sau): ngược dấu, cùng độ lớn ⇒ phải BỎ QUA.
+    demux._axis_shift_signed_at = time.perf_counter() - 4.0
+    second = demux._anchor_to_browser_axis(mk(20.0, 30.0), 10.0, 20.0)
+    assert second[0].pts_start == pytest.approx(20.0), "KHÔNG được dịch ngược (sẽ tạo khe hở audio)"
+    assert demux._browser_axis_bias == pytest.approx(10.0), "phải giữ nguyên trục đang dùng"
+
+    # Nhưng một thay đổi trục THẬT (khác độ lớn) vẫn phải được áp dụng.
+    third = demux._anchor_to_browser_axis(mk(20.0, 30.0), 60.0, 80.0)
+    assert third[0].pts_start == pytest.approx(70.0), "lệch +50s là đổi trục thật ⇒ phải neo lại"
 
 
 def test_stream_demuxer_epoch_change_resets(webm_opus_sample):

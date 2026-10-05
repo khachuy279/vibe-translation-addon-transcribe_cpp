@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bilingual Subtitle",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Real-time bilingual subtitles for videos using transcribe.cpp (giao thức v3: payload gọn)",
   "browser_specific_settings": {
     "gecko": {
@@ -55,6 +55,7 @@
       "all_frames": true,
       "match_origin_as_fallback": true,
       "js": [
+        "lib/lookahead-diagnostics.js",
         "lib/frame-builder.js",
         "lib/tts-player.js",
         "lib/ws-client.js",

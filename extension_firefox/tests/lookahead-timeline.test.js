@@ -298,3 +298,89 @@ test("tua video LUÔN bật trạng thái nạp đệm (video phải được t�
   assert.equal(buffering, true, "Tua video phải phát tín hiệu tạm dừng để nạp lại phụ đề");
   queue.detach();
 });
+
+// ── Hồi quy 2026-10-05 (xhamster.com): "BÃO SEEK" + TUA THẬT BỊ BỎ QUA ───────
+// Log thật #1: `lý do dừng={"start":1,"seek":38}` trong một phiên (trình phát tự bắn `seeking`
+// khi hết đệm ⇒ reset backend + tạm dừng liên tục).
+// Log thật #2 (bản sửa đầu tiên, SAI): bộ lọc so với mốc cập nhật mỗi khung hình nên một cú tua
+// THẬT bị đo thành "nhảy 0s" rồi bị bỏ ⇒ backend không nhận `seek_reset` ⇒ con trỏ khối kẹt:
+//     [BS][Diag][status] playhead=967.53s | mốc-đã-xử-lý=575.01s  (đứng im mãi)
+test("bỏ qua `seeking` nhảy nhỏ (hết đệm) — không reset backend, không tạm dừng", () => {
+  const video = makeVideo(0);
+  let seeks = 0;
+  const buffering = [];
+  const ignored = [];
+  const queue = new SubtitleTimelineQueue({
+    onSubtitleChange: () => {},
+    onSeekTriggered: () => { seeks += 1; },
+    onBufferingStateChange: (on) => buffering.push(on),
+    onSeekIgnored: (info) => ignored.push(info),
+  });
+  queue.attachVideo(video);
+  queue.addSubtitles([{ start_pts: 0, end_pts: 30, original_text: "A", translated_text: "a" }], "init_0");
+
+  video.currentTime = 10;
+  queue._tick();               // mốc tick = 10s
+  video.currentTime = 11.4;    // "seeking" chỉ nhảy 1,4s ⇒ trình phát tự xoay xở với vùng đệm
+  video.fire("seeking");
+
+  assert.equal(seeks, 0, "KHÔNG được báo backend reset pipeline");
+  assert.deepEqual(buffering, [], "KHÔNG được tạm dừng video");
+  assert.equal(queue.items.length, 1, "phụ đề đang có KHÔNG bị xoá");
+  assert.equal(ignored.length, 1);
+  assert.ok(Math.abs(ignored[0].jump - 1.4) < 1e-6, `nhảy ~1,4s, nhận được ${ignored[0].jump}`);
+  assert.equal(queue.ignoredSeeks, 1);
+  assert.equal(queue.acceptedSeeks, 0);
+});
+
+test("TUA THẬT được nhận dù `currentTime` đã đổi TRƯỚC khi sự kiện `seeking` bắn", () => {
+  // Đây chính là ca làm bản sửa đầu tiên thất bại: nếu chỉ so với mốc tick thì độ nhảy đo được
+  // là 0 và cú tua thật bị bỏ ⇒ backend không nhận `seek_reset` ⇒ con trỏ khối kẹt ở 575s.
+  const video = makeVideo(0);
+  let seeks = 0;
+  const accepted = [];
+  const queue = new SubtitleTimelineQueue({
+    onSubtitleChange: () => {},
+    onSeekTriggered: (id, t) => { seeks += 1; accepted.push(t); },
+  });
+  queue.attachVideo(video);
+  queue.addSubtitles([{ start_pts: 0, end_pts: 30, original_text: "A", translated_text: "a" }], "init_0");
+
+  video.currentTime = 556;
+  queue._tick();               // đang phát ở 556s
+  video.currentTime = 967;     // người dùng kéo tới 967s…
+  queue._tick();               // …và rAF kịp chạy TRƯỚC sự kiện `seeking` (đúng như trình duyệt)
+  video.fire("seeking");
+
+  assert.equal(seeks, 1, "tua thật PHẢI được nhận (đây là lỗi đã làm backend kẹt ở 575s)");
+  assert.equal(accepted[0], 967);
+  assert.equal(queue.items.length, 0, "phải bỏ phụ đề của đoạn cũ");
+  assert.equal(queue.readyUntilPts, 0, "mốc đã xử lý của vị trí cũ không còn giá trị");
+});
+
+test("tua dồn dập vẫn được nhận, chỉ cảnh báo 'churn' (không bỏ mất tua thật)", () => {
+  const video = makeVideo(0);
+  const accepted = [];
+  const ignored = [];
+  const queue = new SubtitleTimelineQueue({
+    onSubtitleChange: () => {},
+    onSeekTriggered: (id, t) => accepted.push(t),
+    onSeekIgnored: (info) => ignored.push(info),
+  });
+  queue.attachVideo(video);
+  video.currentTime = 0;
+  queue._tick();               // phiên đã chạy vòng render ⇒ có mốc tick trước lần tua đầu
+
+  let t = 0;
+  for (let i = 1; i <= 6; i += 1) {
+    t += 100;
+    video.currentTime = t;
+    queue._tick();
+    video.fire("seeking");
+  }
+
+  assert.deepEqual(accepted, [100, 200, 300, 400, 500, 600], "MỌI tua thật đều phải tới backend");
+  assert.equal(queue.acceptedSeeks, 6);
+  assert.equal(queue.ignoredSeeks, 0, "không được BỎ một cú tua thật nào");
+  assert.ok(ignored.some((i) => i.churnOnly), "có cảnh báo dồn dập");
+});

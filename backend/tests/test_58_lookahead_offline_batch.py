@@ -878,3 +878,72 @@ def test_decimal_numbers_not_split_in_forced_aligner():
 
 
 
+
+
+# --- Hồi quy 2026-10-05 (av01.media): NGẮT CÂU TRƯỚC, chỉ bỏ CÂU kẹt vòng ---------------
+# Log thật: ASR trả về '一時しないと収まんないよこれ。ちょっと入れるだけだから。ちょっと入れちょっとだから。
+# ちょっとちょっと。あああああ…' — 4 câu THẬT ở đầu, CHỈ ĐUÔI kẹt vòng. Bản cũ gọi
+# `is_repetition_hallucination(clean_text)` cho CẢ KHỐI nên vứt luôn 4 câu đúng.
+#
+# Hai test dưới đây chạy ĐÚNG vòng lặp batch (`_offline_batch_loop`) chứ không kiểm tra một hàm phụ
+# trợ nào — để khoá đúng HÀNH VI người dùng thấy: câu thật phải ra phụ đề.
+
+_MIXED_REPETITION_TEXT = (
+    "一時しないと収まんないよこれ。ちょっと入れるだけだから。"
+    "ちょっと入れちょっとだから。ちょっとちょっと。あああああああああああああああ"
+)
+_PURE_REPETITION_TEXT = "あ" * 30
+
+
+def _make_batch_session_with_asr_text(text: str) -> LookaheadSessionState:
+    """Phiên batch tối thiểu với ASR giả luôn trả về `text`, aligner kiểu tiếng Nhật."""
+    conn = MockSafeConnection()
+    asr = FakeInferenceEngine(text_fn=lambda n: text)
+    translator = ContextAwareFakeTranslator()
+    session = LookaheadSessionState(ws=conn, asr_engine=asr, translation_engine=translator)
+    session.apply_init({"source_lang": "ja", "target_lang": "vi", "lead_time": 15})
+    session.init_components(vad_engine_override=FakeVADEngine())
+    session._aligner_service = UpstreamLikeAligner()   # tokenize kiểu tiếng Nhật
+    return session
+
+
+async def _run_one_batch_iteration(session: LookaheadSessionState, seconds: float = 20.0):
+    """Nạp `seconds` audio rồi chờ vòng batch xử lý xong một lượt."""
+    conn: MockSafeConnection = session.connection  # type: ignore
+    await session.start_tasks()
+    session.timeline.append(0.0, make_speech_pcm(seconds))
+    session._ingest_event.set()
+    for _ in range(40):
+        if conn.of_type("lookahead_subtitles") or session.utterances_sent:
+            break
+        await asyncio.sleep(0.05)
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_mixed_repetition_tail_keeps_the_real_sentences():
+    """Khối lẫn lộn (câu thật + đuôi kẹt vòng) ⇒ PHẢI ra phụ đề cho các câu thật."""
+    session = _make_batch_session_with_asr_text(_MIXED_REPETITION_TEXT)
+    try:
+        conn = await _run_one_batch_iteration(session)
+        subs = conn.of_type("lookahead_subtitles")
+        assert subs, "Khối còn câu dùng được ⇒ KHÔNG được vứt cả khối"
+        texts = [it["original_text"] for it in subs[0]["items"]]
+        assert any("収まんない" in t for t in texts), f"câu thật phải được giữ, thực tế: {texts}"
+        assert not any("あああああ" in t for t in texts), f"câu ảo giác phải bị bỏ: {texts}"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_pure_repetition_block_emits_nothing():
+    """Khối rác thuần ⇒ không gửi phụ đề nào (nhưng đã đẩy con trỏ để không kẹt)."""
+    session = _make_batch_session_with_asr_text(_PURE_REPETITION_TEXT)
+    try:
+        conn = await _run_one_batch_iteration(session)
+        assert not conn.of_type("lookahead_subtitles"), "khối rác thuần không được ra phụ đề"
+        assert session._batch_from_pts is not None and session._batch_from_pts > 0.0, (
+            "con trỏ vẫn phải tiến để vòng lặp không kẹt ở khối rác"
+        )
+    finally:
+        await session.close()

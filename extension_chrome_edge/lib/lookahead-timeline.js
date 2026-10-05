@@ -56,6 +56,69 @@ class SubtitleTimelineQueue {
     this.underrunPrebufferMs = options.underrunPrebufferMs !== undefined ? options.underrunPrebufferMs : 8000;
     //: Callback báo "playhead đã chạm mốc đã xử lý" (chẩn đoán + cho phía content script biết lý do).
     this.onUnderrun = options.onUnderrun || null;
+    //: Callback báo "đã BỎ QUA một sự kiện `seeking` không phải do người dùng tua" (xem dưới).
+    this.onSeekIgnored = options.onSeekIgnored || null;
+
+    // ── PHÂN BIỆT "TUA THẬT" VỚI `seeking` DO TRÌNH PHÁT TỰ SINH ───────────────
+    // Trình phát phát sinh `seeking` KHÔNG chỉ khi người dùng tua: nó còn bắn khi HẾT ĐỆM
+    // (starvation), khi trang tự nạp lại nguồn, hoặc ngay sau khi ta gọi `video.play()` mà
+    // playhead nằm ngoài vùng đệm. Nếu coi MỌI `seeking` là tua thật thì mỗi lần:
+    //     `notifySeek()` (backend RESET toàn bộ pipeline) + tạm dừng video chờ nạp đệm
+    // Đo thật 2026-10-05 (xhamster.com): 38 lần pause với lý do `seek`, `mốc đã xử lý` đứng im
+    // trong khi playhead chạy tiếp — video bị "nạp lại liên tục".
+    //
+    // ⚠️ BÀI HỌC TỪ BẢN SỬA ĐẦU TIÊN (đã sai, 2026-10-05 tối): so vị trí seek với `_lastKnownTime`
+    // được cập nhật MỖI KHUNG HÌNH là vô nghĩa — trình duyệt cập nhật `currentTime` TRƯỚC khi
+    // phát sự kiện `seeking`, nên một cú tua thật bị đo thành "nhảy 0s" và bị BỎ QUA ⇒ backend
+    // không bao giờ nhận `seek_reset` ⇒ con trỏ khối của backend kẹt ở vị trí cũ:
+    //     [BS][Diag][status] playhead=967.53s | mốc-đã-xử-lý=575.01s  (đứng im mãi)
+    // Cách đúng: ĐÓNG BĂNG mốc neo trong lúc có seek đang chờ, và CHỈ QUYẾT ĐỊNH sau một khoảng
+    // lặng ngắn (debounce) — nhờ vậy kéo thanh trượt (bắn hàng chục sự kiện) chỉ tạo ĐÚNG MỘT
+    // lần tua, và vị trí CUỐI luôn tới được backend.
+    this.minSeekJumpSec = options.minSeekJumpSec !== undefined ? options.minSeekJumpSec : 3.0;
+    this.seekChurnWindowMs = options.seekChurnWindowMs !== undefined ? options.seekChurnWindowMs : 10000;
+    this.seekChurnLimit = options.seekChurnLimit !== undefined ? options.seekChurnLimit : 4;
+    //: Theo dõi playhead theo ĐỒNG HỒ THỰC để phát hiện "nhảy" mà tốc độ phát không giải thích
+    //: được. Đây là bằng chứng ĐỘC LẬP với thứ tự sự kiện `seeking`: trình duyệt có thể đổi
+    //: `currentTime` rồi để `requestAnimationFrame` chạy TRƯỚC khi phát `seeking`, nên cách so
+    //: sánh "vị trí lúc nghe sự kiện" một mình có thể đo ra độ nhảy bằng 0.
+    this._lastTickTime = null;
+    this._lastTickAt = 0;
+    this._discontinuityJump = 0;
+    this._discontinuityAt = 0;
+    this._seekEvents = [];
+    this.ignoredSeeks = 0;
+    this.acceptedSeeks = 0;
+    //: MỐC THỜI GIAN (Date.now()) mà ràng buộc horizon bị TREO TẠM.
+    //:
+    //: Vì sao cần (đo thật 2026-10-05, xvideos.com): ràng buộc "playhead không được vượt mốc
+    //: backend đã xử lý" tạo ra BẾ TẮC khi backend không nhận thêm audio:
+    //:     horizon chặn playhead → video bị tạm dừng → trình phát KHÔNG append mảnh mới
+    //:     → backend không có audio mới → mốc đã xử lý đứng yên → horizon lại chặn…
+    //: Log backend khi đó chỉ lặp lại CÙNG một mốc Playhead mỗi 10s với "Đã dịch 0.0s".
+    //: Van an toàn phía content script (`fireStallGuard`) gọi `suspendHorizon(ms)` để cho video
+    //: chạy lại và để trình phát nạp thêm dữ liệu, thay vì đứng hình vô hạn.
+    this._horizonSuspendedUntil = 0;
+  }
+
+  /**
+   * Treo TẠM ràng buộc horizon trong `ms` (mili giây). Dùng khi playhead bị ghim mà backend
+   * không tiến triển — mục đích là để trình phát CHẠY và nạp thêm mảnh cho backend.
+   */
+  suspendHorizon(ms) {
+    const until = Date.now() + Math.max(0, Number(ms) || 0);
+    if (until > this._horizonSuspendedUntil) this._horizonSuspendedUntil = until;
+    return this._horizonSuspendedUntil;
+  }
+
+  /** Gỡ treo horizon NGAY (backend đã đuổi kịp playhead). */
+  resumeHorizon() {
+    this._horizonSuspendedUntil = 0;
+  }
+
+  /** Ràng buộc horizon có đang bị treo tạm không? (chẩn đoán) */
+  isHorizonSuspended() {
+    return this._horizonSuspendedUntil > 0 && Date.now() < this._horizonSuspendedUntil;
   }
 
   /**
@@ -76,6 +139,8 @@ class SubtitleTimelineQueue {
 
   /** Playhead đã chạm/vượt mốc đã xử lý chưa (⇒ cần tạm dừng chờ backend). */
   isBehindHorizon(curTime) {
+    // Đang treo tạm để phá bế tắc ⇒ KHÔNG chặn (xem `suspendHorizon`).
+    if (this.isHorizonSuspended()) return false;
     const cur = Number(curTime);
     if (!Number.isFinite(cur)) return false;
     if (!(this.readyUntilPts > 0)) return false;
@@ -194,7 +259,53 @@ class SubtitleTimelineQueue {
   }
 
   _onVideoSeeking() {
-    const targetTime = this.videoElement ? this.videoElement.currentTime : 0;
+    const targetTime = Number(this.videoElement ? this.videoElement.currentTime : 0) || 0;
+    const now = Date.now();
+    this._seekEvents = this._seekEvents.filter((t) => now - t < this.seekChurnWindowMs);
+    const churn = this._seekEvents.length >= this.seekChurnLimit;
+
+    // ── PHÂN BIỆT TUA THẬT VỚI `seeking` DO TRÌNH PHÁT TỰ SINH ────────────────
+    // Hai nguồn bằng chứng, lấy giá trị LỚN HƠN — vì trình duyệt có thể đổi `currentTime`
+    // rồi để `requestAnimationFrame` chạy TRƯỚC khi phát `seeking`, khiến cách so sánh
+    // "vị trí lúc nghe sự kiện" đo ra độ nhảy bằng 0 (lỗi đã gây kẹt backend ở 575s):
+    //   (a) `target − _lastTickTime`: vị trí lúc nghe sự kiện so với mốc tick gần nhất;
+    //   (b) "nhảy bất thường" mà `_tick` vừa quan sát theo ĐỒNG HỒ THỰC.
+    const fromTick = this._lastTickTime === null ? 0 : Number(this._lastTickTime) || 0;
+    const jumpFromEvent = Math.abs(targetTime - fromTick);
+    const nowMs = (typeof performance !== "undefined" && performance.now)
+      ? performance.now() : Date.now();
+    const jumpFromTick = (nowMs - Number(this._discontinuityAt || 0)) <= 1500
+      ? Math.abs(Number(this._discontinuityJump) || 0)
+      : 0;
+    const jump = Math.max(jumpFromEvent, jumpFromTick);
+
+    if (jump < this.minSeekJumpSec) {
+      // Trình phát chỉ đang tự xoay xở với vùng đệm (hết đệm / tự nạp lại nguồn): KHÔNG xoá
+      // phụ đề, KHÔNG sinh `seek_id`, KHÔNG báo backend, KHÔNG tạm dừng video.
+      this.ignoredSeeks += 1;
+      if (this.onSeekIgnored) {
+        try {
+          this.onSeekIgnored({
+            targetTime, jump, churn,
+            ignored: this.ignoredSeeks,
+            accepted: this.acceptedSeeks,
+          });
+        } catch (e) {}
+      }
+      return;
+    }
+
+    // TUA THẬT.
+    this._seekEvents.push(now);
+    this.acceptedSeeks += 1;
+    this._discontinuityJump = 0;
+    if (churn && this.onSeekIgnored) {
+      try {
+        this.onSeekIgnored({ targetTime, jump, churn: true, churnOnly: true,
+          ignored: this.ignoredSeeks, accepted: this.acceptedSeeks });
+      } catch (e) {}
+    }
+
     const newSeekId = `seek_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     this.activeSeekId = newSeekId;
 
@@ -267,6 +378,23 @@ class SubtitleTimelineQueue {
   _tick() {
     if (!this.videoElement) return;
     const curTime = this.videoElement.currentTime;
+    //: Mốc tham chiếu + phát hiện "NHẢY BẤT THƯỜNG" theo ĐỒNG HỒ THỰC. Một cú tua thật làm
+    //: `currentTime` nhảy xa hơn nhiều so với `dtReal × playbackRate`; hiện tượng hết đệm thì
+    //: chỉ xê dịch vài phần trăm giây. Bằng chứng này KHÔNG phụ thuộc thứ tự sự kiện `seeking`.
+    const nowMs = (typeof performance !== "undefined" && performance.now)
+      ? performance.now() : Date.now();
+    if (this._lastTickTime !== null && this._lastTickAt) {
+      const dtReal = Math.max(0, (nowMs - Number(this._lastTickAt)) / 1000);
+      const rate = Math.max(0.25, Math.abs(Number(this.videoElement.playbackRate) || 1));
+      const natural = dtReal * rate + 0.75;   // dung sai rộng: không bắt nhầm khi buffer/khựng
+      const delta = Number(curTime) - Number(this._lastTickTime);
+      if (Math.abs(delta) > natural) {
+        this._discontinuityJump = delta;
+        this._discontinuityAt = nowMs;
+      }
+    }
+    this._lastTickTime = Number(curTime) || 0;
+    this._lastTickAt = nowMs;
 
     // ── RÀNG BUỘC CỨNG: KHÔNG phát video qua vùng CHƯA được xử lý ────────────────────────────
     // `readyUntilPts` là mốc cuối cùng backend đã ASR + dịch xong cho thế hệ seek hiện tại. Khi
@@ -357,11 +485,19 @@ class SubtitleTimelineQueue {
    */
   stats() {
     if (!this.videoElement || !this.items.length) {
-      return { count: this.items.length, ahead: 0 };
+      return {
+        count: this.items.length, ahead: 0,
+        ignoredSeeks: this.ignoredSeeks, acceptedSeeks: this.acceptedSeeks,
+        horizonSuspended: this.isHorizonSuspended(),
+      };
     }
     const cur = this.videoElement.currentTime;
     const ahead = this.items.filter((it) => it.end_pts > cur).reduce((m, it) => Math.max(m, it.end_pts - cur), 0);
-    return { count: this.items.length, ahead };
+    return {
+      count: this.items.length, ahead,
+      ignoredSeeks: this.ignoredSeeks, acceptedSeeks: this.acceptedSeeks,
+      horizonSuspended: this.isHorizonSuspended(),
+    };
   }
 
   clear() {

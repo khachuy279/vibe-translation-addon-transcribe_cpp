@@ -146,6 +146,63 @@ _SENTENCE_CLOSERS = "」』）)]}〉》\"'”’"
 #: Ngôn ngữ viết KHÔNG có khoảng trắng ⇒ đo độ dài bằng KÝ TỰ thay vì TỪ.
 _NO_SPACE_LANGS = ("japanese", "chinese", "korean", "cantonese")
 
+#: TỪ VIẾT TẮT thường gặp: dấu `.` đi kèm KHÔNG phải kết câu.
+#:
+#: SỰ CỐ THẬT 2026-10-05 (log người dùng): ASR trả về
+#:   'Fine, Dr. Kuthrapali. Thank you, sir. … I present Dr. Milstone from MIT.'
+#: và tầng "Ngắt câu khối" chẻ thành 15 phụ đề vụn: "Fine, Dr." ⏐ "Kuthrapali." ⏐ … ⏐ "I present Dr."
+#: ⏐ "Milstone from MIT." — vừa sai phụ đề vừa sai bản dịch.
+#: Danh sách dưới đây CỐ Ý bỏ các từ mơ hồ hay gặp ở dạng từ thường ("no", "am", "pm", "us").
+_ABBREVIATIONS_CI = frozenset({
+    "dr", "mr", "mrs", "ms", "miss", "prof", "sr", "jr", "st", "mt", "rev", "hon",
+    "gen", "col", "capt", "lt", "sgt", "cmdr", "adm", "gov", "sen", "rep", "pres",
+    "vs", "etc", "eg", "ie", "al", "cf", "approx", "dept", "est", "inc", "ltd",
+    "co", "corp", "univ", "fig", "vol", "pp", "ed", "eds",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "phd", "md", "ba", "ma", "bsc", "msc",
+})
+
+
+def _word_before_trailing_period(text: str) -> str:
+    """Từ NGAY TRƯỚC dấu `.` cuối cùng của `text` (rỗng nếu `text` không kết thúc bằng `.`)."""
+    t = (text or "").rstrip()
+    if not t.endswith("."):
+        return ""
+    out = ""
+    for ch in reversed(t[:-1]):
+        if ch.isalnum() or ch in "&'’-":
+            out = ch + out
+        else:
+            break
+    return out
+
+
+def _ends_with_abbreviation(text: str) -> bool:
+    """`text` kết thúc bằng TỪ VIẾT TẮT kèm dấu chấm ⇒ dấu chấm đó KHÔNG kết câu.
+
+    Nhận hai dạng:
+      * từ viết tắt thông dụng: `Dr.` `Mr.` `Prof.` `St.` `Ph.D.`…
+      * chữ cái đầu / viết tắt từng chữ: `J.` `A.` `U.S.` `A.B.`
+        (dạng này nhận qua quy tắc "từ cuối chỉ có MỘT ký tự và là chữ HOA").
+    """
+    word = _word_before_trailing_period(text)
+    if not word:
+        return False
+    if word.lower() in _ABBREVIATIONS_CI:
+        return True
+    return len(word) == 1 and word.isupper()
+
+
+def _looks_like_sentence_end(text: str) -> bool:
+    """Dấu kết câu cuối cùng của `text` có thật sự KẾT CÂU không (đã trừ từ viết tắt)?"""
+    t = (text or "").rstrip()
+    if not t:
+        return False
+    if t.endswith("."):
+        return not _ends_with_abbreviation(t)
+    return True
+
 
 def _split_text_by_sentence(text: str) -> List[str]:
     """Cắt văn bản thành các CÂU theo dấu kết câu (giữ dấu ở cuối mảnh, gộp ngoặc/nháy đóng)."""
@@ -165,6 +222,11 @@ def _split_text_by_sentence(text: str) -> List[str]:
                 continue
             # Không tách nếu là từ viết liền / tên miền / viết tắt chưa hết: domain.com
             if ch == "." and i < n and (text[i].isalpha() and not text[i].isspace()):
+                continue
+            # Không tách tại TỪ VIẾT TẮT khi phía sau CÒN chữ: "Dr. Kuthrapali", "J. K. Rowling",
+            # "U.S. Navy"… (sự cố thật 2026-10-05: "Fine, Dr." | "Kuthrapali." — xem
+            # `_ABBREVIATIONS_CI`). Nếu viết tắt nằm ở CUỐI văn bản thì dấu chấm đó vẫn kết câu.
+            if ch == "." and text[i:].strip() and _ends_with_abbreviation(buf):
                 continue
             while i < n and text[i] in _SENTENCE_CLOSERS:
                 buf += text[i]
@@ -648,6 +710,16 @@ class ForcedAlignerService:
                         return False
                 elif t == ".":
                     if i > 0 and _text_at(i - 1)[-1:].isdigit() and i + 1 < n and _text_at(i + 1)[:1].isdigit():
+                        return False
+                # ── TỪ VIẾT TẮT / CHỮ CÁI ĐẦU KHÔNG KẾT CÂU ────────────────────────
+                # SỰ CỐ THẬT 2026-10-05: 'Fine, Dr. Kuthrapali. … I present Dr. Milstone from MIT.'
+                # bị chẻ thành "Fine, Dr." ⏐ "Kuthrapali." ⏐ … ⏐ "I present Dr." ⏐ "Milstone from MIT."
+                # Chỉ bỏ qua khi PHÍA SAU còn token: viết tắt nằm ở cuối khối thì vẫn là kết câu.
+                if i + 1 < n:
+                    window = t if len(t) > 1 else (
+                        (_text_at(i - 1) if i > 0 else "") + "."
+                    )
+                    if _ends_with_abbreviation(window):
                         return False
             return True
 
