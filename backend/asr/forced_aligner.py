@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gc
 import os
+import re
 import sys
 import threading
 import time
@@ -776,6 +777,129 @@ class ForcedAlignerService:
                 continue
             for piece, st, en in _allocate_spans(expanded, sub.start_time, sub.end_time):
                 out.append(SubtitleSentence(text=piece, start_time=st, end_time=en))
+        return out
+
+    @staticmethod
+    def split_subtitles_by_clause_comma(
+        subtitles: List[SubtitleSentence],
+        language: str = "English",
+        min_words: int = 4,
+    ) -> List[SubtitleSentence]:
+        """Tách các câu phụ đề dài tại dấu ngắt vế câu (、 hoặc , hoặc ;) khi số từ phía trước >= min_words.
+
+        Quy tắc:
+        1. Duyệt qua từng SubtitleSentence: nếu có dấu ngắt vế (、, ,, ;) và tích lũy >= min_words
+           từ/ký tự, đồng thời phần còn lại phía sau có ít nhất 2 từ/token thì tách thành phụ đề riêng.
+        2. Nếu câu có `words` (từ Forced Aligner): mốc thời gian start_time và end_time được
+           lấy chính xác 100% từ mốc âm học của các từ trong vế đó.
+        3. Nếu không có `words`: phân bổ thời gian theo tỉ lệ độ dài ký tự qua `_allocate_spans`.
+        """
+        if not subtitles or min_words <= 0:
+            return subtitles
+
+        is_cjk = str(language or "").strip().lower() in ("japanese", "chinese", "korean", "cantonese")
+        clause_delims = {",", "、", ";", "；"}
+
+        def count_tokens(s: str) -> int:
+            clean = re.sub(r"[,、;；\.?!。？！\s]", "", s)
+            if not is_cjk and " " in s:
+                return len(s.split())
+            return len(re.findall(r"[a-zA-Z0-9]+|[^\s\W\d_]", clean))
+
+        out: List[SubtitleSentence] = []
+        for sub in subtitles:
+            text = (sub.text or "").strip()
+            if not text:
+                continue
+
+            # Kiểm tra nhanh: nếu câu không chứa bất kỳ dấu ngắt vế nào thì giữ nguyên
+            if not any(d in text for d in clause_delims):
+                out.append(sub)
+                continue
+
+            # ── Nhánh 1: Có mốc từ chính xác từ Forced Aligner
+            if sub.words and len(sub.words) > 1:
+                res = []
+                buf: List[AlignedWord] = []
+                buf_tokens = 0
+                for i, w in enumerate(sub.words):
+                    buf.append(w)
+                    buf_tokens += count_tokens(w.text)
+
+                    w_text = (w.text or "").strip()
+                    ends_with_comma = any(w_text.endswith(d) for d in clause_delims)
+                    remaining_words = sub.words[i + 1:]
+                    remaining_tokens = sum(count_tokens(rw.text) for rw in remaining_words)
+
+                    if ends_with_comma and buf_tokens >= min_words and remaining_tokens >= 2:
+                        joined_text = ("" if is_cjk else " ").join(bw.text for bw in buf).strip()
+                        if joined_text:
+                            res.append(
+                                SubtitleSentence(
+                                    text=joined_text,
+                                    start_time=float(buf[0].start_time),
+                                    end_time=float(buf[-1].end_time),
+                                    words=list(buf),
+                                )
+                            )
+                        buf = []
+                        buf_tokens = 0
+
+                if buf:
+                    joined_text = ("" if is_cjk else " ").join(bw.text for bw in buf).strip()
+                    if joined_text:
+                        res.append(
+                            SubtitleSentence(
+                                text=joined_text,
+                                start_time=float(buf[0].start_time),
+                                end_time=float(buf[-1].end_time),
+                                words=list(buf),
+                            )
+                        )
+
+                if len(res) > 1:
+                    out.extend(res)
+                else:
+                    out.append(sub)
+                continue
+
+            # ── Nhánh 2: Dự phòng chỉ có văn bản (không có mốc từ)
+            parts = re.split(r"([,、;；])", text)
+            clauses = []
+            i = 0
+            while i < len(parts):
+                chunk = parts[i]
+                delim = parts[i + 1] if i + 1 < len(parts) else ""
+                c = chunk + delim
+                if c.strip():
+                    clauses.append(c.strip())
+                i += 2
+
+            res_texts = []
+            buf_texts: List[str] = []
+            buf_tokens = 0
+            for idx, c in enumerate(clauses):
+                buf_texts.append(c)
+                buf_tokens += count_tokens(c)
+                remaining_clauses = clauses[idx + 1:]
+                remaining_tokens = sum(count_tokens(rc) for rc in remaining_clauses)
+                ends_with_comma = any(c.endswith(d) for d in clause_delims)
+
+                if ends_with_comma and buf_tokens >= min_words and remaining_tokens >= 2:
+                    res_texts.append(("" if is_cjk else " ").join(buf_texts).strip())
+                    buf_texts = []
+                    buf_tokens = 0
+
+            if buf_texts:
+                res_texts.append(("" if is_cjk else " ").join(buf_texts).strip())
+
+            if len(res_texts) <= 1:
+                out.append(sub)
+                continue
+
+            for piece, st, en in _allocate_spans(res_texts, sub.start_time, sub.end_time):
+                out.append(SubtitleSentence(text=piece, start_time=st, end_time=en))
+
         return out
 
     def unload_model(self) -> None:

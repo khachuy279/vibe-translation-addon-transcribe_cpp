@@ -543,6 +543,8 @@ class LookaheadConfig(BaseModel):
     batch_sub_sentence_max_words: int = 24
     batch_sub_sentence_max_duration_sec: float = 14.0
     batch_sub_sentence_max_chars: int = 160
+    #: Tách câu phụ đề tại dấu ngắt vế (、 hoặc ,) khi số từ/token phía trước >= ngần này
+    batch_sub_comma_min_words: int = 4
 
     # ── BỘ ĐỆM & DỊCH TRƯỚC (LOOKAHEAD BUFFER & TIMELINE) ─────────────────────
     #: Thời gian dịch trước (giây) — khoảng đệm mục tiêu trước vị trí phát.

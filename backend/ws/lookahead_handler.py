@@ -1263,7 +1263,15 @@ class LookaheadSessionState:
                     SubtitleSentence(text=clean_text, start_time=0.0, end_time=chunk.duration)
                 ]
 
-            # Bước 2E-bis: LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
+            # Bước 2E-bis: Tách các câu dài tại dấu ngắt vế (、 hoặc ,) khi số từ phía trước >= min_words
+            min_comma_words = int(getattr(config.lookahead, "batch_sub_comma_min_words", 4) or 4)
+            subtitles = ForcedAlignerService.split_subtitles_by_clause_comma(
+                subtitles,
+                language=align_lang,
+                min_words=min_comma_words,
+            )
+
+            # LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
             # câu hiện thành MỘT phụ đề dài khi aligner trả một item duy nhất).
             subtitles = ForcedAlignerService.split_oversized_sentences(
                 subtitles,

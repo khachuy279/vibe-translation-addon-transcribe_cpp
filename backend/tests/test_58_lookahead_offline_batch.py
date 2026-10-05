@@ -770,3 +770,72 @@ def test_chunker_urgent_takes_short_tail_instead_of_waiting():
     assert chunk.fallback_mode == "urgent_tail"
     assert chunk.duration == pytest.approx(5.0, abs=0.05)
 
+
+def test_split_subtitles_by_clause_comma():
+    """Kiểm tra ngắt câu phụ đề tại dấu phẩy (、 hoặc ,) khi số từ/token phía trước >= 4."""
+    # 1. Tiếng Nhật: 'まあそれは、うん実は好きな人とか、まあ、まあ何。'
+    words = [
+        AlignedWord("まあ", 0.0, 0.5),
+        AlignedWord("それ", 0.5, 1.0),
+        AlignedWord("は、", 1.0, 1.5),
+        AlignedWord("うん", 3.0, 3.5),
+        AlignedWord("実は", 3.5, 4.2),
+        AlignedWord("好き", 4.2, 4.8),
+        AlignedWord("な", 4.8, 5.0),
+        AlignedWord("人", 5.0, 5.5),
+        AlignedWord("とか、", 5.5, 6.2),
+        AlignedWord("まあ、", 10.0, 11.0),
+        AlignedWord("まあ", 12.0, 12.5),
+        AlignedWord("何。", 12.5, 13.0),
+    ]
+    sub = SubtitleSentence(
+        text="まあそれは、うん実は好きな人とか、まあ、まあ何。",
+        start_time=0.0,
+        end_time=13.0,
+        words=words,
+    )
+    splits = ForcedAlignerService.split_subtitles_by_clause_comma([sub], language="Japanese", min_words=4)
+    assert len(splits) == 3, f"Phải tách thành 3 câu nhỏ: {[s.text for s in splits]}"
+    assert splits[0].text == "まあそれは、"
+    assert splits[0].start_time == 0.0
+    assert splits[0].end_time == 1.5
+    assert splits[1].text == "うん実は好きな人とか、"
+    assert splits[1].start_time == 3.0
+    assert splits[1].end_time == 6.2
+    assert splits[2].text == "まあ、まあ何。"
+    assert splits[2].start_time == 10.0
+    assert splits[2].end_time == 13.0
+
+    # 2. Tiếng Anh: 'Because I was tired and hungry, I decided to go home.'
+    en_words = [
+        AlignedWord("Because", 0.0, 0.5),
+        AlignedWord("I", 0.5, 0.7),
+        AlignedWord("was", 0.7, 0.9),
+        AlignedWord("tired", 0.9, 1.4),
+        AlignedWord("and", 1.4, 1.6),
+        AlignedWord("hungry,", 1.6, 2.2),
+        AlignedWord("I", 2.5, 2.7),
+        AlignedWord("decided", 2.7, 3.1),
+        AlignedWord("to", 3.1, 3.3),
+        AlignedWord("go", 3.3, 3.6),
+        AlignedWord("home.", 3.6, 4.0),
+    ]
+    en_sub = SubtitleSentence(
+        text="Because I was tired and hungry, I decided to go home.",
+        start_time=0.0,
+        end_time=4.0,
+        words=en_words,
+    )
+    en_splits = ForcedAlignerService.split_subtitles_by_clause_comma([en_sub], language="English", min_words=4)
+    assert len(en_splits) == 2, f"Phải tách thành 2 câu: {[s.text for s in en_splits]}"
+    assert en_splits[0].text == "Because I was tired and hungry,"
+    assert en_splits[1].text == "I decided to go home."
+
+    # 3. Câu ngắn < 4 từ thì KHÔNG tách
+    short_words = [AlignedWord("Oh,", 0.0, 0.3), AlignedWord("no.", 0.4, 0.7)]
+    short_sub = SubtitleSentence(text="Oh, no.", start_time=0.0, end_time=0.7, words=short_words)
+    short_splits = ForcedAlignerService.split_subtitles_by_clause_comma([short_sub], language="English", min_words=4)
+    assert len(short_splits) == 1
+    assert short_splits[0].text == "Oh, no."
+
+
