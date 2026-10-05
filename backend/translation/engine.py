@@ -59,40 +59,100 @@ _TRANS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="translat
 
 
 def _parse_batch_json(raw_text: str, expected_count: int) -> Optional[List[str]]:
-    """Trích xuất và parse JSON dictionary { '1': ..., '2': ... } từ output của LLM."""
-    if not raw_text:
+    """Trích xuất và parse JSON dictionary/list từ output của LLM với khả năng chịu lỗi tối đa."""
+    if not raw_text or expected_count <= 0:
         return None
+
     # 1. Chuẩn hoá dấu ngoặc kép kiểu Trung Quốc/Unicode sang ASCII quote
     cleaned = raw_text.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
 
-    # 2. Tìm khối JSON bao bởi { ... }
-    start_idx = cleaned.find("{")
-    end_idx = cleaned.rfind("}")
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        cleaned = cleaned[start_idx : end_idx + 1]
+    # 2. Loại bỏ markdown code block nếu có (```json ... ```)
+    cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"```\s*$", "", cleaned.strip(), flags=re.MULTILINE)
 
+    # 3. Tìm khối JSON bao bởi { ... } hoặc [ ... ]
+    s_brace = cleaned.find("{")
+    e_brace = cleaned.rfind("}")
+    s_bracket = cleaned.find("[")
+    e_bracket = cleaned.rfind("]")
+
+    candidate = cleaned
+    if s_brace != -1 and e_brace != -1 and e_brace > s_brace:
+        candidate = cleaned[s_brace : e_brace + 1]
+    elif s_bracket != -1 and e_bracket != -1 and e_bracket > s_bracket:
+        candidate = cleaned[s_bracket : e_bracket + 1]
+
+    # Loại bỏ comment kiểu C/JS //...
+    candidate = re.sub(r"//.*$", "", candidate, flags=re.MULTILINE)
+    # Loại bỏ dấu phẩy thừa trước dấu đóng ngoặc (lỗi kinh điển của LLM)
+    candidate = re.sub(r",\s*\}", "}", candidate)
+    candidate = re.sub(r",\s*\]", "]", candidate)
+
+    data = None
     try:
-        data = json.loads(cleaned)
+        data = json.loads(candidate, strict=False)
     except Exception:
         # Thử sửa lỗi phổ biến: thiếu dấu phẩy giữa các dòng JSON
         try:
-            fixed = re.sub(r'("(?:[^"\\]|\\.)*")\s*\n\s*(")', r'\1,\n\2', cleaned)
-            data = json.loads(fixed)
+            fixed = re.sub(r'("(?:[^"\\]|\\.)*")\s*\n\s*(")', r'\1,\n\2', candidate)
+            fixed = re.sub(r",\s*\}", "}", fixed)
+            data = json.loads(fixed, strict=False)
         except Exception:
-            return None
+            pass
 
-    if not isinstance(data, dict):
-        return None
+    # Nếu LLM trả về JSON Array danh sách câu
+    if isinstance(data, list) and len(data) == expected_count:
+        return [collapse_repetitions(str(x).strip()) for x in data]
 
-    results = []
-    for i in range(1, expected_count + 1):
-        key = str(i)
-        if key not in data:
-            return None
-        val = str(data[key]).strip()
-        results.append(collapse_repetitions(val))
+    # Nếu LLM trả về JSON Object / Dictionary
+    if isinstance(data, dict):
+        # Mở bọc nếu bị lồng trong key cha như {"subtitles": {...}} hoặc {"translations": {...}}
+        if len(data) == 1:
+            first_val = next(iter(data.values()))
+            if isinstance(first_val, dict):
+                data = first_val
+            elif isinstance(first_val, list) and len(first_val) == expected_count:
+                return [collapse_repetitions(str(x).strip()) for x in first_val]
 
-    return results
+        results = []
+        found_all = True
+        for i in range(1, expected_count + 1):
+            val = data.get(str(i))
+            if val is None:
+                val = data.get(i)
+            if val is None:
+                val = data.get(f"{i}.")
+            if val is None:
+                found_all = False
+                break
+            results.append(collapse_repetitions(str(val).strip()))
+        if found_all and len(results) == expected_count:
+            return results
+
+    # 4. Fallback cứu nguy: Dùng Regex trích xuất từng cặp key-value
+    # Hữu hiệu khi JSON bị lỗi cú pháp do chuỗi dịch có chứa dấu ngoặc kép không escape
+    # Ví dụ: "2": "À, trên "Travel Dow" nó được 3.9 sao",
+    lines = candidate.splitlines()
+    kv: Dict[int, str] = {}
+    for line in lines:
+        m = re.search(r'^\s*"?(\d+)"?\s*:\s*"(.*)"\s*,?\s*$', line)
+        if m:
+            idx = int(m.group(1))
+            val = m.group(2).strip()
+            kv[idx] = val
+
+    if all(i in kv for i in range(1, expected_count + 1)):
+        return [collapse_repetitions(kv[i]) for i in range(1, expected_count + 1)]
+
+    # Regex fallback 2: tìm mẫu "?(\d+)"?:\s*"(.*?)" trên toàn bộ khối
+    pattern = r'"?(\d+)"?\s*:\s*"(.*?)"(?:\s*[,}]\s*|\s*$)'
+    matches = re.findall(pattern, candidate, re.DOTALL)
+    if matches:
+        kv2 = {int(k): v.strip() for k, v in matches if k.isdigit()}
+        if all(i in kv2 for i in range(1, expected_count + 1)):
+            return [collapse_repetitions(kv2[i]) for i in range(1, expected_count + 1)]
+
+    return None
 
 
 class GGUFTranslator(BaseTranslator):
@@ -602,7 +662,7 @@ class GGUFTranslator(BaseTranslator):
             return parsed
 
         logger.warning(
-            f"Parse JSON batch thất bại ({len(raw_text)} chars), fallback dịch tuần tự từng câu.",
+            f"Parse JSON batch thất bại ({len(raw_text)} chars), fallback dịch tuần tự từng câu. Raw: {raw_text[:200]!r}",
             extra={"module_tag": "TRANSLATE"},
         )
         return [

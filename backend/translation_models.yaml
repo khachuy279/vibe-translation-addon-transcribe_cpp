@@ -1,7 +1,4 @@
-# Catalog cấu hình các mô hình dịch (Translation Models) cho Backend
-# Tối ưu chuyên biệt cho Bilibili Index-Translate (hỗ trợ instTrans & JSON batch)
-
-default_model: index-translate-2b
+default_model: index-translate-9b
 
 models:
   index-translate-2b:

@@ -364,7 +364,7 @@ class SentenceConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "index-translate-2b"  # index-translate-2b, index-translate-9b
+    base: str = "index-translate-9b"  # index-translate-2b, index-translate-9b
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None

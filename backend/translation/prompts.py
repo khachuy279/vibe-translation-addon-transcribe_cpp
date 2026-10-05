@@ -144,11 +144,11 @@ class PipelineBPromptStrategy(PromptStrategy):
         system = (
             f"You are a professional translator. "
             f"Translate the user's text into {tgt}. "
-            f"Output ONLY the translation, no explanations."
+            f"Output ONLY valid JSON, no explanations, no markdown formatting."
         )
         user_content = (
             f"Translate the following subtitle JSON data into {tgt}: "
-            f"translate only user-facing text fields; never alter the structure, keys, or placeholders:\n"
+            f"translate only user-facing text values; strictly preserve the exact numeric keys, structure, and JSON format:\n"
             f"{json_text}"
         )
 

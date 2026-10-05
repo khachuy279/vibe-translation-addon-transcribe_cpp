@@ -197,17 +197,14 @@ Bạn có thể tải thêm hoặc chuyển đổi nóng các model khác trực
 
 | Key | File GGUF | Nguồn (HuggingFace) |
 |---|---|---|
-| `qwen3-asr-0.6b` *(mặc định)* | `Qwen3-ASR-0.6B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-0.6B-gguf` |
+| `qwen3-asr-0.6b` | `Qwen3-ASR-0.6B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-0.6B-gguf` |
 | `qwen3-asr-1.7b` | `Qwen3-ASR-1.7B-Q8_0.gguf` | `handy-computer/Qwen3-ASR-1.7B-gguf` |
-| `sensevoice-small` | `SenseVoiceSmall-Q8_0.gguf` | `handy-computer/SenseVoiceSmall-gguf` |
-| `cohere-transcribe` | `cohere-transcribe-03-2026-Q8_0.gguf` | `handy-computer/cohere-transcribe-03-2026-gguf` |
-| `voxtral-mini-4b-realtime` | `Voxtral-Mini-4B-Realtime-2602-Q5_K_M.gguf` | `handy-computer/Voxtral-Mini-4B-Realtime-2602-gguf` |
 
 **Dịch thuật Catalog** (`backend/translation_models.yaml`):
 
 | Key | File GGUF | Ghi chú |
 |---|---|---|
-| `index-translate-2b` *(mặc định)* | `Index-Translate-2B.Q8_0.gguf` | ~2,0 GB, tốc độ cao |
+| `index-translate-2b` | `Index-Translate-2B.Q8_0.gguf` | ~2,0 GB, tốc độ cao |
 | `index-translate-9b` | `Index-Translate-9B.Q4_K_M.gguf` | ~5,4 GB, chất lượng cao |
 
 **TTS Catalog (OmniVoice GGUF Native)**:

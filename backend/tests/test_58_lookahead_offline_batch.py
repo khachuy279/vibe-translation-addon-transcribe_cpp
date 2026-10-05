@@ -839,3 +839,42 @@ def test_split_subtitles_by_clause_comma():
     assert short_splits[0].text == "Oh, no."
 
 
+def test_decimal_numbers_not_split_in_forced_aligner():
+    """Số thập phân (ví dụ '星3.9でさ') và số hàng nghìn (1,000) không bị chẻ thành câu mới."""
+    text = "あ、トラベルダウで星3.9でさ、温泉がいいらしいよ。"
+    raw_items = [
+        AlignedWord("あ", 0.0, 0.3),
+        AlignedWord("トラベルダウ", 0.3, 1.0),
+        AlignedWord("で", 1.0, 1.2),
+        AlignedWord("星", 1.2, 1.5),
+        AlignedWord("3", 1.5, 1.8),
+        AlignedWord("9", 1.8, 2.1),
+        AlignedWord("でさ", 2.1, 2.5),
+        AlignedWord("温泉", 2.8, 3.3),
+        AlignedWord("が", 3.3, 3.5),
+        AlignedWord("いい", 3.5, 3.8),
+        AlignedWord("らしい", 3.8, 4.1),
+        AlignedWord("よ", 4.1, 4.5),
+    ]
+
+    merged = ForcedAlignerService.merge_source_text(raw_items, text)
+    # 3. và 9 phải được gộp thành 3.9
+    texts = [m.text for m in merged]
+    assert "3.9" in texts, f"Token số phải được gộp thành '3.9', thực tế: {texts}"
+
+    # Gom câu không được chẻ tại '3.'
+    subs = ForcedAlignerService.group_words_to_subtitles(merged, language="Japanese")
+    sub_texts = [s.text for s in subs]
+    assert len(subs) == 1, f"Toàn câu phải giữ nguyên 1 câu trọn vẹn, thực tế: {sub_texts}"
+    assert "星3.9でさ" in subs[0].text
+
+    # Khi qua split_subtitles_by_clause_comma, câu được tách tại 'でさ、' (không tách tại 3.9)
+    clause_subs = ForcedAlignerService.split_subtitles_by_clause_comma(subs, language="Japanese", min_words=4)
+    clause_texts = [s.text for s in clause_subs]
+    assert clause_texts == [
+        "あ、トラベルダウで星3.9でさ、",
+        "温泉がいいらしいよ。",
+    ], f"Tách vế câu chuẩn xác, thực tế: {clause_texts}"
+
+
+

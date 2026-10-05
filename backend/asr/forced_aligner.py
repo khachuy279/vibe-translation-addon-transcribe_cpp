@@ -517,12 +517,12 @@ class ForcedAlignerService:
             spans.append((kept_positions[start_k], kept_positions[end_k]))
             pos = end_k + 1
 
-        merged: List[AlignedWord] = []
         total = len(source_text)
+        raw_pieces: List[Tuple[AlignedWord, str]] = []
         for i, item in enumerate(aligned_items):
             span = spans[i]
             if span is None:
-                merged.append(item)
+                raw_pieces.append((item, ""))
                 continue
             # Lấy ĐOẠN GỐC từ ký tự đầu của từ này tới hết các ký tự KHÔNG-được-giữ ngay sau ký tự
             # cuối của chính nó (dấu câu + khoảng trắng). Dừng ngay khi gặp ký tự chữ/số kế tiếp ⇒
@@ -531,14 +531,44 @@ class ForcedAlignerService:
             end_char = span[1] + 1
             while end_char < total and not is_aligner_kept_char(source_text[end_char]):
                 end_char += 1
-            text = source_text[span[0] : end_char].strip()
-            merged.append(
+            raw_slice = source_text[span[0] : end_char]
+            text = raw_slice.strip()
+            raw_pieces.append((
                 AlignedWord(
                     text=text or item.text,
                     start_time=item.start_time,
                     end_time=item.end_time,
+                ),
+                raw_slice,
+            ))
+
+        # Gộp các token số bị chẻ bởi dấu chấm thập phân hoặc dấu phẩy hàng nghìn không có khoảng trắng
+        # Ví dụ: "3." và "9" trong "星3.9でさ" -> "3.9" (raw_slice là "3.", không có khoảng trắng sau dấu chấm)
+        merged: List[AlignedWord] = []
+        for idx, (item, raw_slice) in enumerate(raw_pieces):
+            if not merged:
+                merged.append(item)
+                continue
+            prev = merged[-1]
+            prev_t = prev.text or ""
+            cur_t = item.text or ""
+            prev_raw = raw_pieces[idx - 1][1] if idx - 1 < len(raw_pieces) else ""
+            if (
+                len(prev_t) >= 2
+                and prev_t[-2].isdigit()
+                and prev_t[-1] in (".", ",")
+                and len(cur_t) >= 1
+                and cur_t[0].isdigit()
+                and not any(c.isspace() for c in prev_raw)
+            ):
+                merged[-1] = AlignedWord(
+                    text=prev_t + cur_t,
+                    start_time=prev.start_time,
+                    end_time=item.end_time,
                 )
-            )
+            else:
+                merged.append(item)
+
         return merged
 
     @staticmethod
@@ -607,10 +637,34 @@ class ForcedAlignerService:
             return t[-1] if t else ""
 
         def _is_sent_end(i: int) -> bool:
-            return _last_char(i) in sentence_end_punct
+            ch = _last_char(i)
+            if ch not in sentence_end_punct:
+                return False
+            # Không coi là kết câu nếu là số thập phân (ví dụ: "3." và token sau bắt đầu bằng số "9")
+            if ch == ".":
+                t = _text_at(i)
+                if len(t) >= 2 and t[-2].isdigit():
+                    if i + 1 < n and _text_at(i + 1)[:1].isdigit():
+                        return False
+                elif t == ".":
+                    if i > 0 and _text_at(i - 1)[-1:].isdigit() and i + 1 < n and _text_at(i + 1)[:1].isdigit():
+                        return False
+            return True
 
         def _is_clause_end(i: int) -> bool:
-            return _last_char(i) in clause_punct
+            ch = _last_char(i)
+            if ch not in clause_punct:
+                return False
+            # Không coi là ngắt vế nếu là dấu phẩy phân cách hàng nghìn / số thập phân (ví dụ: "1,000")
+            if ch == ",":
+                t = _text_at(i)
+                if len(t) >= 2 and t[-2].isdigit():
+                    if i + 1 < n and _text_at(i + 1)[:1].isdigit():
+                        return False
+                elif t == ",":
+                    if i > 0 and _text_at(i - 1)[-1:].isdigit() and i + 1 < n and _text_at(i + 1)[:1].isdigit():
+                        return False
+            return True
 
         def _gap_after(i: int) -> float:
             """Khe âm học giữa từ `i` và từ `i + 1`."""
@@ -828,6 +882,11 @@ class ForcedAlignerService:
 
                     w_text = (w.text or "").strip()
                     ends_with_comma = any(w_text.endswith(d) for d in clause_delims)
+                    # Bỏ qua nếu dấu phẩy nằm trong số (ví dụ: "1," theo sau là "000")
+                    if ends_with_comma and w_text.endswith(","):
+                        if len(w_text) >= 2 and w_text[-2].isdigit():
+                            if i + 1 < len(sub.words) and (sub.words[i + 1].text or "").strip()[:1].isdigit():
+                                ends_with_comma = False
                     remaining_words = sub.words[i + 1:]
                     remaining_tokens = sum(count_tokens(rw.text) for rw in remaining_words)
 
@@ -864,7 +923,8 @@ class ForcedAlignerService:
                 continue
 
             # ── Nhánh 2: Dự phòng chỉ có văn bản (không có mốc từ)
-            parts = re.split(r"([,、;；])", text)
+            # Dùng regex không tách dấu phẩy nằm giữa hai chữ số (như 1,000)
+            parts = re.split(r"((?<!\d),(?!\d)|[、;；])", text)
             clauses = []
             i = 0
             while i < len(parts):

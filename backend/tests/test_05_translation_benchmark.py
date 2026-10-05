@@ -82,7 +82,27 @@ def test_parse_batch_json():
     raw_no_comma = '{\n  "1": "Câu một"\n  "2": "Câu hai"\n}'
     assert _parse_batch_json(raw_no_comma, 2) == ["Câu một", "Câu hai"]
 
-    # 4. Thiếu key hoặc sai số lượng
+    # 4. Trailing comma trước dấu ngoặc đóng (lỗi rất phổ biến của LLM lớn)
+    raw_trailing = '{\n  "1": "Câu một",\n  "2": "Câu hai",\n}'
+    assert _parse_batch_json(raw_trailing, 2) == ["Câu một", "Câu hai"]
+
+    # 5. Dấu ngoặc kép bên trong câu không escape (ví dụ "Travel Dow")
+    raw_unescaped = '{\n  "1": "Câu một",\n  "2": "À, trên "Travel Dow" nó được 3.9 sao",\n}'
+    assert _parse_batch_json(raw_unescaped, 2) == ["Câu một", 'À, trên "Travel Dow" nó được 3.9 sao']
+
+    # 6. Bọc trong Markdown codeblock và có comment //
+    raw_md = '```json\n// Ghi chú dịch\n{\n  "1": "Câu một",\n  "2": "Câu hai"\n}\n```'
+    assert _parse_batch_json(raw_md, 2) == ["Câu một", "Câu hai"]
+
+    # 7. Trả về JSON Array danh sách câu
+    raw_list = '[\n  "Câu một",\n  "Câu hai"\n]'
+    assert _parse_batch_json(raw_list, 2) == ["Câu một", "Câu hai"]
+
+    # 8. Bọc trong key cha như {"subtitles": {...}}
+    raw_nested = '{\n  "subtitles": {\n    "1": "Câu một",\n    "2": "Câu hai"\n  }\n}'
+    assert _parse_batch_json(raw_nested, 2) == ["Câu một", "Câu hai"]
+
+    # 9. Thiếu key hoặc sai số lượng
     raw_missing = '{\n  "1": "Câu một"\n}'
     assert _parse_batch_json(raw_missing, 2) is None
 
