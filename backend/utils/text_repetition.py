@@ -122,3 +122,36 @@ def collapse_repetitions_preserve_spacing(text: str, **kwargs) -> str:
     if collapsed == " ".join(text.split()):
         return text
     return collapsed
+
+
+def is_repetition_hallucination(text: str, min_reps: int = 3) -> bool:
+    """Kiểm tra xem văn bản có phải ảo giác kẹt vòng (từ/ký tự lặp liên tiếp >= min_reps lần).
+
+    Quy tắc:
+    1. Ký tự chữ cái/chữ Nhật-Trung đơn lặp liên tiếp (ví dụ 'あああ', 'aaaa' -> True).
+    2. Cụm 2-4 ký tự lặp liên tiếp (ví dụ 'そうそうそう' -> True).
+    3. Từ phân cách bằng khoảng trắng hoặc dấu ngắt lặp liên tiếp (ví dụ 'ha ha ha', 'no, no, no', 'はい、はい、はい' -> True).
+    4. Không bắt nhầm dấu câu thông thường ('...') hay chữ số ('1000').
+    """
+    if not text or not text.strip():
+        return False
+    s = text.strip()
+    if len(s) < min_reps:
+        return False
+
+    # 1. Ký tự đơn lặp liên tiếp >= min_reps lần (bỏ qua số và dấu câu)
+    if re.search(r"([^\s\W\d_])\1{" + str(min_reps - 1) + r",}", s):
+        return True
+
+    # 2. Cụm 2-4 ký tự lặp liên tiếp >= min_reps lần (tiếng Nhật/Trung không dấu cách: ví dụ そうそうそう)
+    for k in range(2, 5):
+        if len(s) >= k * min_reps and re.search(r"([^\s\W\d_]{" + str(k) + r"})\1{" + str(min_reps - 1) + r",}", s):
+            return True
+
+    # 3. Từ phân cách bằng khoảng trắng hoặc dấu ngắt lặp liên tiếp >= min_reps lần
+    pattern_word = r"(?:\b|^)(\w+)(?:\s*[,、，\.!\?]?\s*\1){" + str(min_reps - 1) + r",}(?:\b|$)"
+    if re.search(pattern_word, s, flags=re.IGNORECASE):
+        return True
+
+    return False
+

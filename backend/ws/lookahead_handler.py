@@ -63,6 +63,7 @@ from backend.core.vad_silence import VADSilenceScanner
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import SessionConfigPayload
 from backend.utils.logger import get_logger
+from backend.utils.text_repetition import is_repetition_hallucination
 
 logger = get_logger("ws.lookahead")
 
@@ -1152,6 +1153,17 @@ class LookaheadSessionState:
                 await self.send_status()
                 continue
 
+            # LỌC ẢO GIÁC LẶP TỪ Ở TẦNG KHỐI ASR:
+            # Nếu cả khối ASR bị kẹt vòng lặp (ví dụ 5+ 'あ' hoặc cụm lặp), bỏ qua luôn để không đốt GPU chạy ForcedAligner
+            if is_repetition_hallucination(clean_text, min_reps=5):
+                logger.warning(
+                    f"Lookahead Batch ASR phát hiện ảo giác kẹt vòng (repetition loop), bỏ qua khối: '{clean_text[:60]}...'",
+                    extra={"module_tag": "ASR"},
+                )
+                self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
+                await self.send_status()
+                continue
+
             logger.info(
                 f"Lookahead Batch ASR [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] ({asr_ms:.0f}ms): '{clean_text}'",
                 extra={"module_tag": "ASR"},
@@ -1284,8 +1296,18 @@ class LookaheadSessionState:
             for idx, sub in enumerate(subtitles):
                 pts_start = max(0.0, chunk.pts_start + sub.start_time + shift)
                 pts_end = max(pts_start + 0.5, chunk.pts_start + sub.end_time + shift)
-                if pts_end >= self.current_time - 3.0:
-                    candidate_subs.append((idx, sub, pts_start, pts_end))
+                if pts_end < self.current_time - 3.0:
+                    continue
+
+                # LỌC ẢO GIÁC LẶP TỪ: Loại bỏ câu có từ lặp liên tiếp >= 3 lần (như "あああ")
+                if is_repetition_hallucination(sub.text, min_reps=3):
+                    logger.info(
+                        f"Bỏ qua câu ảo giác lặp từ: '{sub.text}'",
+                        extra={"module_tag": "ASR"},
+                    )
+                    continue
+
+                candidate_subs.append((idx, sub, pts_start, pts_end))
 
             # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu
             candidate_texts = [sub.text for _, sub, _, _ in candidate_subs]
