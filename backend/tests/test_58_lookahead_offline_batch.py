@@ -575,7 +575,6 @@ async def test_vad_silence_cut_replaces_boundary_patching():
         # Bộ cắt khối dùng bộ dò khoảng lặng VAD và KHÔNG lấy lùi (overlap_sec = 0).
         assert session.chunker.silence_scanner is session.silence_scanner
         assert session.chunker.overlap_sec == 0.0
-        assert float(config.lookahead.batch_overlap_sec) == 0.0
         assert float(config.lookahead.batch_vad_silence_ms) >= 1000.0
         assert bool(config.lookahead.batch_use_vad_silence) is True
     finally:

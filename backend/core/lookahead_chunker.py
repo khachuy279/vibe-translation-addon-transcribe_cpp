@@ -107,26 +107,22 @@ class LookaheadChunker:
         sample_rate: int = 16000,
         target_window_sec: float = 25.0,
         min_window_sec: float = 8.0,
-        max_window_sec: float = 45.0,
         min_silence_ms: float = 250.0,
         silence_rms_threshold: float = 0.015,
         overlap_sec: float = 0.0,
-        # ── Siết lại 2026-10-02 ────────────────────────────────────────────────
-        search_max_sec: Optional[float] = None,
         strong_silence_ms: float = 450.0,
         silence_rel_db: float = 22.0,
         silence_floor_rms: float = 0.004,
         min_rms_ratio: float = 0.35,
         min_rms_hold_ms: float = 120.0,
         dip_search_sec: float = 3.0,
-        adaptive_max_sec: Optional[float] = None,
-        adaptive_threshold_sec: float = 30.0,
-        # ── Cắt khối bằng VAD (2026-10-04) ────────────────────────────────────
+        # ── Cắt khối bằng VAD (Phase 8) ────────────────────────────────────
         silence_scanner: Optional[Any] = None,
         vad_silence_ms: float = 1500.0,
         #: TRẦN CỨNG độ dài khối (giây) do ngân sách token của transcribe.dll quyết định
         #: (`k_max_new = 256`, chưa expose qua C ABI). Xem `config.lookahead.batch_max_audio_sec`.
         max_audio_sec: float = 45.0,
+        **kwargs: Any,
     ):
         self.timeline = timeline
         self.sample_rate = int(sample_rate)
@@ -134,19 +130,10 @@ class LookaheadChunker:
         self.target_window_sec = float(target_window_sec)
         #: Không bao giờ cắt khối ngắn hơn mức này.
         self.min_window_sec = float(min_window_sec)
-        #: Trần cũ (18 s) — giữ lại để tương thích tham số, không còn là trần cắt.
-        self.max_window_sec = float(max_window_sec)
         self.min_silence_ms = float(min_silence_ms)
         #: Ngưỡng RMS tuyệt đối CŨ — chỉ còn dùng khi không đo được mức chương trình.
         self.silence_rms_threshold = float(silence_rms_threshold)
         self.overlap_sec = float(overlap_sec)
-        #: Trần MỀM khi tìm ranh giới. Mặc định = trần cũ để caller cũ giữ nguyên hành vi; tuyến
-        #: batch truyền `batch_search_max_sec` (30 s) để có cơ hội gặp khoảng lặng THẬT.
-        search_max = float(search_max_sec) if search_max_sec else float(max_window_sec)
-        self.search_max_sec = max(float(min_window_sec), search_max)
-        #: Tự động mở rộng khi browser buffer có sẵn (>= adaptive_threshold_sec)
-        self.adaptive_max_sec = max(self.search_max_sec, float(adaptive_max_sec)) if adaptive_max_sec else None
-        self.adaptive_threshold_sec = float(adaptive_threshold_sec)
         #: Khoảng lặng >= mức này là ranh giới MẠNH (cắt ngay, không cần gần mốc lý tưởng).
         self.strong_silence_ms = max(float(min_silence_ms), float(strong_silence_ms))
         #: Ngưỡng lặng TƯƠNG ĐỐI: p90(mức chương trình) − bao nhiêu dB.
@@ -457,12 +444,12 @@ class LookaheadChunker:
 
         # CHẨN ĐOÁN TẠI CHÍNH ĐIỂM QUYẾT ĐỊNH (không suy diễn từ log của tầng trên).
         # Chỉ log khi có mốc cắt thực sự, để đọc được đúng `available_sec` và nhánh đã chọn.
-        logger.info(
-            f"[CHUNKER] from={from_pts:.2f}s frontier={buffered_end:.2f}s available={available_sec:.2f}s "
-            f"RAM={self.timeline.total_stored_seconds():.1f}s bootstrap={fast_bootstrap} "
-            f"stream_end={is_stream_end} max_audio={self.max_audio_sec:.1f}s",
-            extra={"module_tag": "ASR"},
-        )
+        # logger.info(
+        #     f"[CHUNKER] from={from_pts:.2f}s frontier={buffered_end:.2f}s available={available_sec:.2f}s "
+        #     f"RAM={self.timeline.total_stored_seconds():.1f}s bootstrap={fast_bootstrap} "
+        #     f"stream_end={is_stream_end} max_audio={self.max_audio_sec:.1f}s",
+        #     extra={"module_tag": "ASR"},
+        # )
 
         # 1. KỊCH BẢN FAST-BOOTSTRAP (Sau khi tua)
         if fast_bootstrap:

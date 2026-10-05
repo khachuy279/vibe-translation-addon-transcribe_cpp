@@ -55,7 +55,7 @@ Hệ thống hỗ trợ 2 chế độ xử lý linh hoạt tùy theo định d�
 
 ### Cơ chế hoạt động của Pipeline B — OFFLINE_BATCH (Qwen3-ASR + Forced Aligner)
 
-Pipeline B là tuyến **duy nhất** cho video VoD: nó lưu trọn audio vào RAM, dịch trước 10–15 s và
+Pipeline B là tuyến **duy nhất** cho video VoD: nó lưu trọn audio vào RAM, dịch trước 12–30 s và
 nhờ vậy khắc phục triệt để vấn đề mất phụ đề khi tua video. Toàn bộ việc nhận dạng chạy ở chế độ
 **offline theo khối** (không phải streaming giả lập):
 
@@ -207,11 +207,8 @@ Bạn có thể tải thêm hoặc chuyển đổi nóng các model khác trực
 
 | Key | File GGUF | Ghi chú |
 |---|---|---|
-| `index-mt-2b` *(mặc định)* | `Index-Translate-2B.Q8_0.gguf` | ~2,0 GB, siêu nhẹ 2B, tốc độ cao |
-| `tencent` | `HY-MT2-7B-Q6_K.gguf` | ~4,6 GB, chất lượng cao |
-| `tencent-1.8b` | `Hy-MT2-1.8B-Q8_0.gguf` | ~1,9 GB, siêu nhanh |
-| `xiaomi` | `MiLMMT-46-12B-v1.0.Q4_K_M.gguf` | ~7,3 GB, dịch cao cấp |
-| `gemmax` | `GemmaX2-28-9B-v0.2.i1-Q4_K_M.gguf` | ~5,8 GB, hỗ trợ 28 ngôn ngữ |
+| `index-translate-2b` *(mặc định)* | `Index-Translate-2B.Q8_0.gguf` | ~2,0 GB, tốc độ cao |
+| `index-translate-9b` | `Index-Translate-9B.Q4_K_M.gguf` | ~5,4 GB, chất lượng cao |
 
 **TTS Catalog (OmniVoice GGUF Native)**:
 

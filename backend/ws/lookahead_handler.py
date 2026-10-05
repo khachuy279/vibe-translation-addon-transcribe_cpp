@@ -197,14 +197,9 @@ class LookaheadSessionState:
         self.chunker = LookaheadChunker(
             timeline=self.timeline,
             sample_rate=16000,
-            target_window_sec=float(getattr(la, "batch_target_sec", 15.0)),
-            min_window_sec=float(getattr(la, "batch_min_sec", 12.0)),
-            max_window_sec=float(getattr(la, "batch_max_sec", 18.0)),
+            target_window_sec=float(getattr(la, "batch_target_sec", 25.0)),
+            min_window_sec=float(getattr(la, "batch_min_sec", 8.0)),
             min_silence_ms=float(getattr(la, "batch_min_silence_ms", 250.0)),
-            overlap_sec=float(getattr(la, "batch_overlap_sec", 0.0)),
-            search_max_sec=float(getattr(la, "batch_search_max_sec", 18.0)),
-            adaptive_max_sec=float(getattr(la, "batch_adaptive_max_sec", 18.0) or 18.0) if getattr(la, "batch_adaptive_max_sec", None) else None,
-            adaptive_threshold_sec=float(getattr(la, "batch_adaptive_threshold_sec", 30.0)),
             strong_silence_ms=float(getattr(la, "batch_strong_silence_ms", 450.0)),
             silence_rel_db=float(getattr(la, "batch_silence_rel_db", 22.0)),
             silence_floor_rms=float(getattr(la, "batch_silence_floor_rms", 0.004)),
@@ -971,13 +966,13 @@ class LookaheadSessionState:
         xử lý trong 30 s tiếp theo.
 
         Ở đây chỉ phát hiện + neo lại (không tự ý bỏ qua khối đang xử lý). Ngưỡng gồm cả một khối
-        dài nhất (`batch_search_max_sec`) nên throttle bình thường không bao giờ kích hoạt; cần thêm
+        dài nhất (`batch_max_audio_sec`) nên throttle bình thường không bao giờ kích hoạt; cần thêm
         `_FRONTIER_RESYNC_AFTER_SEC` giây BỀN VỮNG để không rung khi playhead vừa nhảy.
 
         Returns:
             True nếu VỪA neo lại (vòng lặp nên `continue` để chạy lại từ mốc mới).
         """
-        limit = float(max_ahead_pts) + float(getattr(config.lookahead, "batch_search_max_sec", 30.0)) + 1.0
+        limit = float(max_ahead_pts) + float(getattr(config.lookahead, "batch_max_audio_sec", 45.0)) + 1.0
         if from_pts <= limit:
             self._frontier_stuck_since = None
             return False
@@ -1076,8 +1071,8 @@ class LookaheadSessionState:
 
         Quy trình:
         1. Đợi có audio mới trên ContinuousAudioTimeline qua `_ingest_event`.
-        2. Dùng LookaheadChunker cắt khối (ưu tiên khoảng lặng THẬT trong dải tới
-           `batch_search_max_sec`) hoặc Fast-Bootstrap (3-4s khi seek).
+        2. Dùng LookaheadChunker cắt khối (ưu tiên khoảng lặng VAD trong dải tới
+           `batch_max_audio_sec`) hoặc Fast-Bootstrap (3-4s khi seek).
         3. ASR Offline block decoding qua transcribe.cpp (TRỌN khối — giữ ngữ cảnh dài).
         4. Gióng hàng mốc từ siêu tốc qua ForcedAlignerService (+ gắn lại dấu câu từ văn bản ASR).
         5. TRỪ phần chồng lấn ở ranh giới khối (theo mốc từ + theo chuỗi từ) — chống lặp từ.
@@ -1269,9 +1264,9 @@ class LookaheadSessionState:
             # này thì không thể biết vì sao phụ đề hiển thị khác bản phiên âm offline — đúng sự cố
             # 2026-10-02 (ASR log hoàn hảo mà phụ đề ra mảnh cụt không dấu câu).
             if subtitles:
-                preview = " ⏐ ".join(f'"{s.text}"' for s in subtitles[:8])
-                if len(subtitles) > 8:
-                    preview += f" ⏐ …(+{len(subtitles) - 8})"
+                preview = " ⏐ ".join(f'"{s.text}"' for s in subtitles[:10])
+                if len(subtitles) > 10:
+                    preview += f" ⏐ …(+{len(subtitles) - 10})"
                 logger.info(
                     f"[SEG_BATCH] Ngắt câu khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] "
                     f"({len(subtitles)} phụ đề, align={align_lang}): {preview}",
@@ -1299,9 +1294,9 @@ class LookaheadSessionState:
             tr_ms = (time.perf_counter() - t_tr) * 1000.0
 
             if candidate_subs:
-                preview_trans = " ⏐ ".join(f'"{t.strip()}"' for t in translated_texts[:8])
-                if len(translated_texts) > 8:
-                    preview_trans += f" ⏐ …(+{len(translated_texts) - 8})"
+                preview_trans = " ⏐ ".join(f'"{t.strip()}"' for t in translated_texts[:10])
+                if len(translated_texts) > 10:
+                    preview_trans += f" ⏐ …(+{len(translated_texts) - 10})"
                 logger.info(
                     f"Lookahead Batch Translation ({len(candidate_subs)} câu, {tr_ms:.0f}ms): {preview_trans}",
                     extra={"module_tag": "TRANSLATE"},

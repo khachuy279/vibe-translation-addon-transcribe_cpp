@@ -81,10 +81,7 @@ def make_chunker(pcm: np.ndarray) -> LookaheadChunker:
         sample_rate=SR,
         target_window_sec=float(la.batch_target_sec),
         min_window_sec=float(la.batch_min_sec),
-        max_window_sec=float(la.batch_max_sec),
         min_silence_ms=float(la.batch_min_silence_ms),
-        overlap_sec=float(la.batch_overlap_sec),
-        search_max_sec=float(la.batch_search_max_sec),
         strong_silence_ms=float(la.batch_strong_silence_ms),
         silence_rel_db=float(la.batch_silence_rel_db),
         silence_floor_rms=float(la.batch_silence_floor_rms),
@@ -330,8 +327,8 @@ def main() -> None:
         f"{la.batch_min_silence_ms:.0f}ms)"
     )
     print(
-        f"Cấu hình: target={la.batch_target_sec}s dải tìm kiếm tới {la.batch_search_max_sec}s "
-        f"(trần cũ batch_max_sec={la.batch_max_sec}s) | ranh giới mạnh >= {la.batch_strong_silence_ms}ms "
+        f"Cấu hình: target={la.batch_target_sec}s trần audio={la.batch_max_audio_sec}s "
+        f"| ranh giới mạnh >= {la.batch_strong_silence_ms}ms "
         f"| ngưỡng lặng = p90 - {la.batch_silence_rel_db}dB"
     )
     a = run("KỊCH BẢN A — nhạc nền TO", 0.05, gt, total)

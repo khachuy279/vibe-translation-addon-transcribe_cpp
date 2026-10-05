@@ -504,156 +504,69 @@ class LookaheadConfig(BaseModel):
     """
 
     enabled: bool = True
+
+    # ── ĐIỀU PHỐI CỠ KHỐI (PIPELINE B BATCH) ──────────────────────────────────
     #: Độ dài khối LÝ TƯỞNG khi bộ đệm lookahead dồi dào (giây).
-    #:
-    #: NÂNG 15.0 → 28.0 NGÀY 2026-10-05. Hướng tới mục tiêu đưa khối gần bằng 30s vào ASR
-    #: khi bộ đệm lookahead dồi dào (> 30s), tận dụng tối đa ngữ cảnh âm học.
-    #: Giới hạn trên thực tế là `batch_max_audio_sec` (trần ngân sách token của transcribe.dll).
+    #: Nâng lên 28.0s để đưa khối gần bằng 30s vào ASR khi có đủ lookahead, tối đa hoá ngữ cảnh.
     batch_target_sec: float = 28.0
-    #: KHÔNG BAO GIỜ cắt khối ngắn hơn mức này (giây).
-    #:
-    #: HẠ 12.0 → 8.0 NGÀY 2026-10-04. Sàn cũ chặn luôn những khoảng lặng DÀI nhất nằm trong 12 s
-    #: đầu tiên của vùng tìm kiếm — tức là bỏ phí các điểm cắt sạch nhất ngay gần mép khối.
+    #: Sàn tối thiểu độ dài một khối chuẩn (giây).
     batch_min_sec: float = 8.0
-    #: Trần cứng độ dài khối (giây) — xem `batch_max_audio_sec`.
-    batch_max_sec: float = 45.0
-    batch_min_silence_ms: float = 250.0
-    #: Vùng CHỒNG LẤN giữa hai khối liền nhau (giây).
-    #:
-    #: ĐÃ ĐẶT VỀ 0.0 NGÀY 2026-10-04. Trước đây là 1.0 s để "không mất từ ở mép cắt", nhưng phía
-    #: nhận phải TRỪ phần chồng lấn đó và phép trừ ấy dựa vào mốc của Forced Aligner — vốn không
-    #: đủ chính xác ở mép khối. Log thật cho thấy nó CẮT MẤT TỪ ĐẦU CÂU:
-    #:     [44.22→56.45] 'Or we could do something…'  (mất 'Or' — chỉ lệch 0.04 s)
-    #:     [127.27→141.58] 'Let me sit on the stairs and think about what I did.'
-    #:                    → 'think about what I did.'  (mất 7 từ)
-    #: Nay khối sau bắt đầu ĐÚNG nơi khối trước kết thúc ⇒ không có gì để trừ.
-    batch_overlap_sec: float = 0.0
-
-    #: TRẦN CỨNG độ dài audio của một khối gửi vào `transcribe.dll` (giây). **RÀNG BUỘC NATIVE.**
-    #:
-    #: `external/transcribe.cpp/src/arch/qwen3_asr/model.cpp` hardcode `constexpr int k_max_new = 256`
-    #: và C ABI (`struct transcribe_run_params`) **không expose** trường `max_new_tokens`. Nghĩa là
-    #: một lần `run()` chỉ sinh được tối đa 256 token; khối dài hơn sẽ bị **NUỐT CHỮ ÂM THẦM** ở
-    #: cuối (bản thân thư viện có set cờ truncation và `TranscribeEngine` đã log
-    #: `asr.output_truncated`, nhưng phụ đề đã mất chữ thì không cứu được).
-    #:
-    #: Với tiếng Anh, tốc độ nói thật ~3–5 token/giây ⇒ 256 token ≈ 50–85 s audio. Chọn 45 s để có
-    #: biên an toàn. Khi nào C++ expose `max_new_tokens` và DLL được build lại thì nâng giá trị này
-    #: (và `k_max_new`) tương ứng.
+    #: TRẦN CỨNG độ dài audio một khối gửi vào `transcribe.dll` (giây). RÀNG BUỘC NATIVE
+    #: do `k_max_new = 256` token của Qwen3-ASR trong C++ (tương đương 50-85s nói liên tục).
     batch_max_audio_sec: float = 45.0
-    #: Dải tìm ranh giới TỐI ĐA khi bộ đệm dồi dào (giây): cắt khối ở khoảng lặng cuối cùng trong
-    #: `[batch_min_sec, batch_search_max_sec]`. NÂNG 18.0 → 30.0 (2026-10-04).
-    batch_search_max_sec: float = 30.0
-    #: Dải tìm ranh giới TỐI ĐA khi bộ đệm đã rất dồi dào (>= `batch_adaptive_threshold_sec`).
-    batch_adaptive_max_sec: Optional[float] = 30.0
 
-    # ── CỔNG KIÊN NHẪN: GOM KHỐI DÀI THAY VÌ CẮT NGAY (2026-10-05) ───────────────
-    #: Bật cổng chờ: KHÔNG cắt khối mới chỉ vì vừa có đủ `batch_min_sec` audio. Vòng lặp batch
-    #: theo dõi liên tục (a) audio đã có phía trước con trỏ khối và (b) phần ĐÃ DỊCH còn lại phía
-    #: trước vị trí phát, rồi chỉ cắt khi:
-    #:   1. audio phía trước con trỏ >= `batch_ready_sec` (đủ một khối dài), HOẶC
-    #:   2. phần đã dịch phía trước playhead <= `batch_urgent_lead_sec` + thời gian xử lý ước
-    #:      lượng (phải chạy ngay để phụ đề không bị gián đoạn), HOẶC
-    #:   3. hết luồng / vừa tua (bootstrap).
-    #: Log thật 2026-10-05: không có cổng này, ASR (5× thời gian thực) đuổi kịp mép bộ đệm rồi cắt
-    #: khối 8 s mỗi khi trình duyệt nạp thêm ~10 s — dù phần đã dịch trước playhead còn 30–60 s.
+    # ── CỔNG KIÊN NHẪN (PATIENT GATE, 2026-10-05) ─────────────────────────────
+    #: Bật cổng chờ: không vội cắt khối ngắn khi audio mới có sẵn ít, mà kiên nhẫn đợi
+    #: trình duyệt gom đủ audio dài ~30s trừ khi sắp hết phụ đề phía trước playhead.
     batch_wait_for_full_block: bool = True
-    #: Lượng audio (giây) phía trước con trỏ khối coi là "đủ một khối dài" ⇒ cắt ngay không cần chờ
-    #: khẩn cấp. Bị kẹp bởi `batch_max_audio_sec`.
+    #: Lượng audio có sẵn (giây) coi là "đủ một khối dài" để gửi ASR ngay.
     batch_ready_sec: float = 30.0
-    #: Phần đã dịch còn lại phía trước playhead (giây, theo thời gian media) mà dưới mức này thì
-    #: PHẢI chạy khối tiếp theo ngay. Ngưỡng thật = giá trị này + 2 × thời gian xử lý một khối
-    #: (ASR + Aligner + dịch) đo được gần nhất, nhân với tốc độ phát.
+    #: Ngưỡng khoảng cách an toàn tối thiểu (giây) giữa phụ đề đã dịch và playhead.
+    #: Khi playhead tiến gần mốc này thì kích hoạt chế độ khẩn cấp (urgent) để không gián đoạn video.
     batch_urgent_lead_sec: float = 5.0
 
-    # ── CẮT KHỐI BẰNG VAD (2026-10-04) ────────────────────────────────────────
-    #: Cắt khối CHỈ tại khoảng lặng mà VAD XÁC NHẬN (thay cho dò RMS + `overlap_sec`).
-    #: Khi mép khối nằm giữa khoảng lặng thật thì không từ nào bị chẻ đôi ⇒ không cần trừ chồng
-    #: lấn, không cần mang mảnh cuối sang khối sau, câu ASR trả về là câu TRỌN VẸN.
+    # ── CẮT KHỐI BẰNG VAD SILENCE (ĐƯỜNG CHÍNH) ──────────────────────────────
+    #: Cắt khối tại khoảng lặng do VAD (Silero) xác nhận. Điểm cắt tại GIỮA khoảng lặng.
+    #: Audio gửi vào ASR là nguyên vẹn 100% (không lọc ruột, overlap = 0.0s).
     batch_use_vad_silence: bool = True
-    #: Độ dài tối thiểu của một khoảng lặng để được dùng làm điểm cắt (ms). NGƯỠNG CỨNG.
+    #: Độ dài tối thiểu của khoảng lặng để được dùng làm điểm cắt an toàn (ms).
     batch_vad_silence_ms: float = 1500.0
-    #: Ngưỡng xác suất Silero coi là "có tiếng nói".
-    #:
-    #: ⚠️ Thấp hơn 0.5 (mặc định thư viện) một cách CÓ CHỦ Ý. Silero coi tiếng CƯỜI và lời HÁT là
-    #: "không có tiếng nói" (đo thật trên The Big Bang Theory: p50 ≈ 0.06 ở đoạn cười 3.8–8.5 s và
-    #: 0.03 ở đoạn nhạc 65–83 s). Ở ngưỡng 0.5, cả đoạn nhạc 18 s bị coi là "khoảng lặng" — cắt khối
-    #: vào đó sẽ chẻ đôi lời hát. Hạ ngưỡng làm VAD bám sát "có tiếng người" hơn.
+    #: Ngưỡng xác suất Silero coi là có tiếng nói (0.30 thấp hơn 0.5 để bắt cả tiếng cười/hát).
     batch_vad_silence_threshold: float = 0.30
 
-    # ── Siết lại NGẮT KHỐI + NGẮT CÂU 2026-10-02 ───────────────────────────────
-    # (chẩn đoán "cuối câu này là đầu của câu sau": xem
-    #  report/09_lookahead_offline_batch/phase5_chan_doan_ngat_cau.md)
-    #
-    #: Trần dải TÌM ranh giới thật khi bộ đệm ít (`< batch_adaptive_threshold_sec`).
-    #: (Hai knob `batch_search_max_sec`/`batch_adaptive_max_sec` được khai báo ở khối "CẮT KHỐI
-    #: BẰNG VAD" phía trên — xem `batch_max_audio_sec` để biết trần cứng độ dài khối.)
-    batch_adaptive_threshold_sec: float = 30.0
-    #: Khoảng lặng >= mức này là ranh giới MẠNH: cắt ngay dù xa mốc lý tưởng. 250 ms chỉ là
-    #: khoảng nghỉ giữa hai từ trong hội thoại phim, KHÔNG phải hết câu.
+    # ── DỰ PHÒNG: DÒ NĂNG LƯỢNG RMS (CHỈ KHI VAD KHÔNG TÌM THẤY KHOẢNG LẶNG) ──
+    batch_min_silence_ms: float = 250.0
     batch_strong_silence_ms: float = 450.0
-    #: Ngưỡng lặng TƯƠNG ĐỐI: p90(mức chương trình) − bao nhiêu dB. Thay cho hằng số tuyệt
-    #: đối 0.015 vốn không bao giờ đạt với audio có nhạc nền/room tone.
     batch_silence_rel_db: float = 22.0
-    #: Sàn tuyệt đối của ngưỡng lặng (chống audio cực nhỏ bị coi là im lặng toàn bộ).
     batch_silence_floor_rms: float = 0.004
-    #: Điểm trũng chỉ được coi là ranh giới mềm khi < tỉ lệ này × trung vị RMS vùng quét...
     batch_min_rms_ratio: float = 0.35
-    #: ... và kéo dài tối thiểu ngần này ms (khe giữa hai từ thường chỉ 40–80 ms).
     batch_min_rms_hold_ms: float = 120.0
-    #: Khi buộc phải cắt: chỉ tìm điểm trũng trong ± ngần này giây quanh độ dài lý tưởng, để
-    #: không rút ngắn khối (mất ngữ cảnh ASR) mà vẫn cắt vào chỗ ít năng lượng.
     batch_dip_search_sec: float = 3.0
-    #: TRỪ phần chồng lấn ở ranh giới khối tại tầng TỪ trước khi gom câu (chống lặp từ).
-    #:
-    #: ĐÃ BỎ NGÀY 2026-10-04 — giữ lại cờ này chỉ để tương thích cấu hình cũ; giá trị `True`
-    #: KHÔNG còn tác dụng (hàm trừ đã bị xoá khỏi `LookaheadSessionState`). Cơ chế cũ bỏ các từ
-    #: đầu khối theo mốc "đã phát" của khối trước, nhưng mốc Forced Aligner ở mép khối không đủ
-    #: chính xác nên nó ăn mất từ đầu câu (log thật: mất 'Or', mất 'I', mất 7 từ của
-    #: 'Let me sit on the stairs and think about what I did.'). Nay `batch_overlap_sec = 0.0` nên
-    #: không còn vùng chồng lấn nào để trừ.
-    batch_trim_boundary_overlap: bool = False
 
-    #: Trần gom câu phụ đề của tuyến batch (trước đây hard-code trong
-    #: `ForcedAlignerService.group_words_to_subtitles` nên popup không điều khiển được).
+    # ── TÁCH VÀ GOM CÂU PHỤ ĐỀ (FORCED ALIGNER) ──────────────────────────────
     batch_sub_max_words: int = 10
     batch_sub_max_duration_sec: float = 4.5
     batch_sub_max_chars: int = 45
-    #: Số từ tối thiểu của một phụ đề; mảnh ngắn hơn được GỘP vào câu bên cạnh (không bỏ chữ).
     batch_sub_min_words: int = 2
-    #: Số từ được phép nới thêm để đạt dấu câu khi vừa chạm trần (tránh chẻ giữa cụm từ).
     batch_sub_defer_words: int = 3
-    #: Trần cho một CÂU TRỌN VẸN (ưu tiên số 1 của tầng gom câu): có dấu kết câu trong phạm vi này
-    #: thì cả câu là MỘT phụ đề — người xem thấy câu trọn vẹn và bản dịch nhận được câu trọn vẹn.
-    #: Chỉ khi câu dài hơn mức này mới phải cắt bên trong (theo dấu phẩy/khe âm học).
-    #: ⚠️ Dấu câu chỉ có sau khi gắn lại từ văn bản ASR (`ForcedAlignerService.merge_source_text`).
+    #: Trần cho một CÂU TRỌN VẸN: có dấu kết câu trong phạm vi này thì cả câu là MỘT phụ đề.
     batch_sub_sentence_max_words: int = 24
     batch_sub_sentence_max_duration_sec: float = 14.0
     batch_sub_sentence_max_chars: int = 160
 
-    #: Thời gian dịch trước (giây) — khoảng đệm phải sẵn sàng TRƯỚC vị trí phát.
+    # ── BỘ ĐỆM & DỊCH TRƯỚC (LOOKAHEAD BUFFER & TIMELINE) ─────────────────────
+    #: Thời gian dịch trước (giây) — khoảng đệm mục tiêu trước vị trí phát.
     lead_time_sec: float = 15.0
     min_lead_time_sec: float = 10.0
     max_lead_time_sec: float = 15.0
-    #: Nạp audio tới `currentTime + lead_time + margin` rồi dừng (chặn đốt GPU vô ích).
     feed_margin_sec: float = 6.0
-    #: Ngưỡng tối thiểu coi là "đã sẵn sàng phát" (tránh treo trình phát).
     min_ready_ahead_sec: float = 2.5
-
-    #: Trần bộ đệm byte ghép nối của StreamDemuxer (RAM) và số ranh giới cluster giữ lại.
     max_media_bytes: int = 8 * 1024 * 1024
     keep_boundaries: int = 60
-    #: Trần audio chờ đọc (giây) trong ContinuousAudioTimeline.
     max_pending_sec: float = 90.0
-    #: Dung lượng tối đa lưu trữ audio liên tục trong RAM (giây) — mặc định 3 tiếng (10800s ~690 MB float32).
     max_storage_sec: float = 10800.0
-
-    #: Nhịp gửi `lookahead_status` về client (ms).
     status_interval_ms: int = 500
-    #: Nhịp log chẩn đoán năng lực (giải mã / độ phủ phụ đề) tính bằng số đo thật (giây).
     diag_interval_sec: float = 10.0
-    #: PCM giải mã ra mà NẰM XA hơn ngần này giây phía trước vị trí phát thì KHÔNG nạp vào
-    #: timeline. Mặc định 10800s (3 tiếng) để nạp toàn bộ audio đệm vào RAM cho Pipeline B.
     max_decode_lead_sec: float = 10800.0
 
     # ── Lồng tiếng (TTS) cho Pipeline B ───────────────────────────────────────
