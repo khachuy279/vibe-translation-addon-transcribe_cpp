@@ -370,3 +370,44 @@ def test_timeline_buffered_range_is_queryable_per_position() -> None:
     assert tl.buffered_end_from(2.0) == pytest.approx(10.0, abs=0.05)
     assert tl.pending_seconds() == pytest.approx(4.0, abs=0.05)
     assert tl.has_audio_at(20.0) is False
+
+
+def test_buffered_end_bridges_small_decode_holes() -> None:
+    """Khe hở NHỎ do giải mã MSE tăng dần không được coi là "hết đệm".
+
+    SỰ CỐ THẬT 2026-10-04 (phiên `7afc26e3`): `buffered_end_from` cắt vùng tại khe hở
+    > `REPORT_EPS_SEC` (0.15 s). Bộ giải mã MSE tăng dần sinh ra các khe ~0.2 s, nên **chỉ một khe
+    0.2 s là đủ để hàm báo "chỉ có 1 s audio phía trước" trong khi RAM giữ 30 s**. Bộ cắt khối đọc
+    giá trị đó làm `available_sec` nên bị kẹp xuống ~9–18 s và chỉ cắt khối **8 s** dù log ghi
+    `bộ đệm trước 43.3s`:
+
+        [SEG_BATCH] Chọn khối: dài 8.1s (mục tiêu 6.3s, dải tìm tới 8.3s, bộ đệm trước 43.3s)
+
+    `get_audio_range`/`read` đã lấp các khe này bằng silence (tới `MAX_GAP_FILL_SEC`), nên vùng
+    "đọc được" phải rộng hơn vùng "liền mạch byte".
+    """
+    sr = 16000
+    tl = ContinuousAudioTimeline(sample_rate=sr, max_pending_sec=90.0)
+    # 30 mảnh 1 s, cách nhau 0.2 s (mô phỏng khe của bộ giải mã tăng dần).
+    t = 0.0
+    for _ in range(30):
+        tl.append(t, np.full(sr, 0.3, dtype=np.float32))
+        t += 1.2
+
+    end = tl.buffered_end_from(0.0)
+    assert end is not None
+    # Trước khi vá: 1.0 s. Sau khi vá: phủ hết phần đã lưu (khe cuối được lấp bằng silence).
+    assert end >= 29.0, f"chỉ báo {end:.1f}s trong khi RAM giữ {tl.total_stored_seconds():.1f}s"
+
+    # Và phần được báo là "có audio" phải THỰC SỰ đọc ra được (liên tục theo trục thời gian).
+    res = tl.get_audio_range(0.0, 25.0)
+    assert res is not None
+    pts, pcm = res
+    assert pts == pytest.approx(0.0)
+    assert len(pcm) / sr == pytest.approx(25.0, abs=1.0)
+
+    # Khe hở LỚN (lỗ tua thật) vẫn phải cắt vùng — không được lấp bằng im lặng giả.
+    tl2 = ContinuousAudioTimeline(sample_rate=sr, max_pending_sec=90.0)
+    tl2.append(0.0, np.full(sr * 5, 0.3, dtype=np.float32))
+    tl2.append(40.0, np.full(sr * 5, 0.3, dtype=np.float32))
+    assert tl2.buffered_end_from(0.0) == pytest.approx(5.0, abs=0.05)

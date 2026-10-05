@@ -105,6 +105,7 @@ class PipelineBProbe:
             dip_search_sec=float(self.la.batch_dip_search_sec),
             silence_scanner=self.scanner,
             vad_silence_ms=float(self.la.batch_vad_silence_ms),
+            max_audio_sec=float(self.la.batch_max_audio_sec),
         )
         self.sub_opts: Dict[str, Any] = {
             "max_words": int(self.la.batch_sub_max_words),
@@ -200,6 +201,8 @@ def main() -> int:
         print(f"KHỐI #{ci}  [{chunk.pts_start:.2f}s → {chunk.pts_end:.2f}s]  "
               f"dur={chunk.duration:.2f}s  mode={chunk.fallback_mode}  "
               f"silence={chunk.silence_gap_ms:.0f}ms  strength='{chunk.boundary_strength}'  "
+              f"target={probe.chunker.last_effective_target_sec:.1f}s  "
+              f"search_max={probe.chunker.last_effective_search_max_sec:.1f}s  "
               f"VAD_scan={probe.scanner.last_scan_ms:.0f}ms  "
               f"next_read={chunk.next_read_pts:.2f}s")
         print("=" * 110)

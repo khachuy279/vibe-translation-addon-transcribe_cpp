@@ -108,19 +108,174 @@ tiếp phần đã có nên chi phí trung bình chỉ còn phần audio MỚI.
 ### 4.2. `LookaheadChunker._find_vad_cut` — quy tắc cắt
 
 ```
-vùng tìm kiếm = [from_pts + min_window_sec, from_pts + search_max_sec]
-gap           = khoảng lặng CUỐI CÙNG (xa nhất) có độ dài >= 1500 ms mà VAD xác nhận
-cut_pts       = GIỮA khoảng lặng đó
-audio gửi ASR = TRỌN [from_pts, cut_pts]  (bao gồm cả khoảng lặng ở cuối)
-next_read_pts = cut_pts                    (KHÔNG lùi — overlap_sec = 0.0)
+vùng quét VAD  = [from_pts, from_pts + min(available_sec, max_audio_sec)]
+vùng tìm kiếm  = [from_pts + min_window_sec, from_pts + search_max_sec]
+gap            = khoảng lặng >= 1500 ms mà VAD xác nhận, GẦN mốc lý tưởng nhất
+cut_pts        = GIỮA khoảng lặng đó
+audio gửi ASR  = TRỌN [from_pts, cut_pts]  (bao gồm cả khoảng lặng ở cuối)
+next_read_pts  = cut_pts                    (KHÔNG lùi — overlap_sec = 0.0)
 ```
 
-* **"CUỐI CÙNG" chứ không phải "dài nhất"**: khối ASR càng dài càng tốt cho ngữ cảnh, nên đẩy mép
-  khối xa nhất có thể mà vẫn dừng ở khoảng lặng chắc chắn.
+* **"GẦN MỐC LÝ TƯỞNG NHẤT"** chứ không phải "khoảng lặng cuối cùng": bản đầu dùng quy tắc "cuối
+  cùng" và **log thật phiên `bcbd0d7c` cho thấy nó hỏng** — khối chỉ **8–13 s** trong khi mục tiêu
+  25–28 s, dù đệm trước tới 36–50 s:
+
+  ```
+  [ASR] Lookahead Batch ASR [28.81s -> 39.10s]     (10.3 s)
+  [ASR] Lookahead Batch ASR [39.10s -> 47.82s]     ( 8.7 s)
+  [ASR] Lookahead Batch ASR [47.82s -> 56.07s]     ( 8.3 s)
+  ```
+
+  Nguyên nhân: trong dải tìm kiếm có nhiều khoảng lặng ngắn (khe giữa hai câu, tiếng cười) và
+  khoảng "cuối cùng" lại rơi SỚM HƠN mốc lý tưởng. Nay chọn khoảng lặng **bám sát mốc lý tưởng
+  nhất** (hoà thì ưu tiên khoảng dài hơn). Vẫn đúng tinh thần yêu cầu: khoảng lặng > 1.5 s, và gửi
+  TRỌN `[from_pts, cut_pts]` (bao gồm khoảng lặng) cho ASR.
+* **Quét trọn phần audio đã có** (tới `from_pts + max_audio_sec`) rồi mới CHỌN điểm trong
+  `[search_start, search_end]`: nếu chỉ quét tới `search_end` thì khoảng lặng vắt qua mép dải bị
+  cắt cụt và bị loại oan.
 * **Ngưỡng 1.5 s là NGƯỠNG CỨNG**: không nới xuống khoảng lặng ngắn hơn, vì cắt vào chỗ VAD chưa
   chắc chắn chính là loại lỗi cơ chế này sinh ra để tránh.
 * **Dự phòng**: nếu không có khoảng lặng nào đạt ngưỡng trong vùng, dùng lại đường dò năng lượng
   (dải tìm kiếm đã bị chặn trên nên không cắt bừa giữa câu).
+
+Sau khi sửa, đo lại trên audio thật (`diag_pipeline_b`): khối **28.9 / 28.6 / 17.1 / 22.0 / 13.4 /
+27.0 / 27.5 / 22.4 s**. Các khối ngắn hơn mục tiêu đều có lý do rõ: khoảng lặng đủ dài gần nhất nằm
+sớm (17–22 s), hoặc khoảng lặng kéo dài tới 17.9 s nên `ideal+2` rơi vào giữa nó.
+
+**Chẩn đoán**: mỗi khối log thêm một dòng `[SEG_BATCH] Chọn khối: dài Xs (mục tiêu …, dải tìm tới
+…, mốc cắt …, biên liên tục tới …, RAM …, đệm giải mã trước …, playhead …, mode …)`.
+
+### 4.2d. SỰ CỐ 2026-10-04 (phiên `7afc26e3`): khối 8 s dù log ghi "bộ đệm trước 43.3 s"
+
+Log người dùng:
+
+```
+[SEG_BATCH] Chọn khối: dài  8.1s (mục tiêu  6.3s, dải tìm tới  8.3s, bộ đệm trước 43.3s, mode=forced_overlap)
+[SEG_BATCH] Chọn khối: dài  8.1s (mục tiêu  6.3s, dải tìm tới  8.3s, bộ đệm trước 44.7s, mode=forced_overlap)
+```
+
+`dải tìm tới 8.3s` = `available_sec`, tức `buffered_end_from(from_pts) - from_pts ≈ 8.3 s` — **mâu
+thuẫn** với "bộ đệm trước 43.3 s" (con số đó lấy từ `_decoded_end_pts`, không phải từ frontier
+liên tục của timeline).
+
+**Nguyên nhân #1 (đã vá)**: `ContinuousAudioTimeline.buffered_end_from` cắt vùng tại khe hở
+> `REPORT_EPS_SEC` = **0.15 s**. Bộ giải mã MSE tăng dần sinh ra các khe ~0.2 s, nên **chỉ một khe
+0.2 s là đủ để hàm báo "chỉ có 1 s audio phía trước" trong khi RAM giữ 30 s**. Đo lại:
+
+```
+30 mảnh 1 s cách nhau 0.2 s  →  buffered_end_from(0) = 1.0 s   (RAM: 30.0 s)   ← TRƯỚC
+                             →  buffered_end_from(0) = 35.8 s  (phủ hết phần đã lưu) ← SAU
+```
+
+Trong khi đó `get_audio_range`/`read` **đã lấp** các khe nhỏ bằng silence (tới `MAX_GAP_FILL_SEC`
+= 5 s) ⇒ vùng "ĐỌC ĐƯỢC" rộng hơn hẳn vùng "liền mạch byte". Nay `buffered_end_from` dùng đúng
+`MAX_GAP_FILL_SEC`, còn khe LỚN (lỗ tua thật) vẫn cắt vùng như cũ.
+
+**Nguyên nhân #2 (đã vá — phiên `3f4a90ec`)**: sau khi frontier được vá, log mới cho thấy frontier
+KHÔNG còn là nút cổ chai, và thủ phạm thật lộ ra:
+
+```
+[SEG_BATCH] Chọn khối: dài 11.9s (mục tiêu 12.2s, dải tìm tới 14.2s,
+            biên liên tục tới 69.99s, RAM 67.6s, đệm giải mã trước 52.2s, playhead 18.3s, ...)
+```
+
+`biên liên tục tới 69.99s` và `RAM 67.6s` — bộ đệm thừa sức cho khối dài hơn, nhưng **dải tìm chỉ
+tới 14.2 s**. Đó là do chính tôi: biến `effective_search_max` bị kẹp theo `adaptive_max_sec`
+(30 s) rồi theo `budget`. VAD chỉ được nhìn thấy khoảng lặng đầu tiên (~12 s) nên cắt ở đó.
+
+**Đã sửa**: cỡ khối nay là **"TỐI ĐA CÓ THỂ"**, chỉ bị chặn bởi ĐÚNG HAI thứ:
+
+```python
+budget             = min(available_sec, max_audio_sec)   # (1) đệm đọc được, (2) trần token DLL
+effective_search_max = max(min_window_sec, budget)       # KHÔNG còn trần nhân tạo 30 s
+effective_target     = min(max_audio_sec, max(target_window_sec, budget - 2))
+```
+
+Đo lại trên audio thật sau khi sửa: khối **31.5 / 39.6 / 38.9 / 42.3 / 44.0 / 44.2 / 41.5 s** — chạm
+trần 45 s, đúng "gửi đoạn âm thanh tối đa có thể vào ASR".
+
+Kiểm chứng ASR không bị nuốt chữ ở cỡ này: `truncated=False` ở 30 / 40 / 44 s, và nội dung khớp
+đúng lời thoại (44 s → 96 từ, 497 ký tự, kết thúc trọn câu).
+
+**Đánh đổi cần biết** (khối dài hơn không miễn phí):
+
+| | Khối 8–15 s | Khối 31–44 s |
+|---|---|---|
+| Ngữ cảnh ASR | ngắn | dài (CER/WER tốt hơn) |
+| Số ranh giới khối | nhiều | ít (ít rủi ro mép khối) |
+| Thời gian dịch 1 khối | ~0.3–0.9 s | **~2.9–3.8 s**, có lần `Parse JSON batch thất bại` phải fallback dịch tuần tự |
+| Độ trễ phụ đề cho đoạn mới | thấp | cao hơn (phải chờ ASR xong khối dài) |
+
+Nếu thấy dịch quá chậm hoặc phụ đề tới muộn, hạ `batch_max_audio_sec` (ví dụ 30) hoặc
+`batch_target_sec` — không cần sửa code.
+
+Mô phỏng đầu-cuối `sim_pipeline_b --hole-sec 0.2` (khe PTS ~0.2 s như bộ giải mã thật) được giữ lại
+làm công cụ tái hiện.
+
+### 4.2b. CỠ KHỐI THÍCH ỨNG THEO BỘ ĐỆM (2026-10-04)
+
+**Vấn đề đo được**: ảnh popup cho thấy YouTube giữ `Lookahead available +117.95s`, log cho thấy
+`Đệm trước: 88.3s`, nhưng bộ cắt khối chỉ gửi khối **12–18 s** cho ASR ⇒ lãng phí phần lớn khoảng
+đệm đã có sẵn.
+
+**Cỡ khối nay suy từ `available_sec` (audio đã có phía trước `from_pts`) tại mỗi lần cắt:**
+
+| Tình huống | target | dải tìm | khối thực tế |
+|---|---|---|---|
+| Bộ đệm dồi dào (>= 30 s, như YouTube) | 25 s | tới 30 s | **~25–29 s** |
+| Bộ đệm vừa (ví dụ 20 s) | 18 s | 18 s | ~18 s |
+| Bộ đệm eo hẹp (< `min_window_sec` = 8 s) | — | — | chờ thêm audio (`None`) |
+
+Công thức:
+
+```python
+budget         = min(available_sec, max_audio_sec)          # trần token của DLL
+search_max     = adaptive_max_sec nếu available_sec >= adaptive_threshold_sec
+                 ngược lại search_max_sec
+search_max     = clamp(search_max, min_window_sec, budget)
+search_max     = max(search_max, min(budget, target_window_sec + 2))   # đủ chỗ chọn khoảng lặng
+effective_target = min(max_audio_sec, max(target_window_sec, budget - 2))
+effective_target = min(effective_target, search_max - 2)
+```
+
+Thay đổi giá trị mặc định: `batch_target_sec 15→25`, `batch_min_sec 12→8`, `batch_max_sec 18→45`,
+`batch_search_max_sec 18→30`, `batch_adaptive_max_sec 18→30`.
+Sàn `batch_min_sec` hạ xuống 8 s vì sàn cũ 12 s **chặn luôn những khoảng lặng dài nhất nằm trong
+12 s đầu** vùng tìm kiếm — tức bỏ phí các điểm cắt sạch nhất ngay gần mép khối.
+
+### 4.2c. TRẦN CỨNG `batch_max_audio_sec = 45 s` — RÀNG BUỘC NATIVE
+
+`external/transcribe.cpp/src/arch/qwen3_asr/model.cpp`:
+
+```cpp
+constexpr int k_max_new = 256;                     // dòng 78
+const int max_audio_tokens = hp.dec_max_position_embeddings - k_prompt_overhead - k_max_new;
+...
+const int32_t max_new = k_max_new;                 // dòng 874 — ngân sách sinh token
+```
+
+`struct transcribe_run_params` (C ABI) **không** có trường `max_new_tokens` ⇒ **chừng nào chưa sửa
+C++ và build lại DLL**, một lần `run()` chỉ sinh được tối đa **256 token**; khối dài hơn sẽ bị **nuốt
+chữ âm thầm ở cuối**.
+
+Đo thật để chọn trần (`transcribe_block` trên audio liên tục):
+
+| Thời lượng khối | Số từ | Ký tự | `was_truncated` |
+|---|---|---|---|
+| 30 s | 58 | 302 | False |
+| 45 s | 97 | 502 | False |
+| 60 s | 125 | 630 | False nhưng câu bị cụt giữa chừng |
+
+Tốc độ nói đo được trên đoạn đối thoại liên tục: **~2.6 từ/giây (~13 ký tự/giây)**. Với ~1.3
+token/từ ⇒ 256 token ≈ **75 s audio** ⇒ khớp với ước lượng 60–90 s mà người dùng đưa ra.
+
+⇒ Chọn trần **45 s** (biên an toàn ~1.7×). Khối thực tế hiện tại 25–29 s nằm sâu trong vùng an toàn.
+`enforce_session_limits` **không** cứu được trường hợp này: `_max_audio_samples` đọc từ
+`transcribe_limits` là 5218 s (trần NGỮ CẢNH, không phải trần SINH TOKEN).
+
+**Khi nào nâng trần**: sau khi thêm `max_new_tokens` vào `struct transcribe_run_params`, tăng
+`k_max_new` trong `src/arch/qwen3_asr/model.cpp`, build lại DLL, rồi nâng `batch_max_audio_sec`
+tương ứng (và `batch_target_sec` nếu muốn khối dài hơn).
 
 ### 4.3. Đã XOÁ khỏi `lookahead_handler.py`
 

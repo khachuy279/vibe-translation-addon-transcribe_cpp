@@ -67,17 +67,18 @@ Trình duyệt Video (YouTube / MSE)
   ▼
 [Persistent Audio RAM] ── luồng PCM 16 kHz liên tục theo timeline tuyệt đối (0s → 3h)
   │
-  ├── 1. CẮT KHỐI (12–30 s): quét khoảng lặng THẬT trong dải [playhead+12s, playhead+30s]
-  │        • ngưỡng lặng TƯƠNG ĐỐI (p90 − 22 dB) ⇒ đúng cho cả audio to/nhỏ
-  │        • ranh giới MẠNH ≥ 450 ms cắt ngay; nếu người nói không ngừng thì cắt tại
-  │          điểm trũng năng lượng gần độ dài lý tưởng + 1.0 s chồng lấn
-  ├── 2. Qwen3-ASR (transcribe.cpp) nhận TRỌN khối ⇒ ngữ cảnh đầy đủ + dấu câu chuẩn (WER/CER thấp)
-  ├── 3. Qwen3-ForcedAligner-0.6B gắn mốc TỪNG TỪ (~30–50 ms) và GẮN LẠI dấu câu từ văn bản ASR
+  ├── 1. CẮT KHỐI BẰNG VAD (~25–30s): VAD (Silero) quét tìm khoảng lặng THẬT (>= 1.5s) trong dải tìm kiếm
+  │        • Điểm cắt đặt tại GIỮA khoảng lặng; audio gửi vào ASR là NGUYÊN VẸN 100% (không lọc VAD ruột)
+  │        • Không chồng lấn (overlap = 0.0s), loại bỏ hoàn toàn các tầng vá chồng chéo / trừ lặp phức tạp
+  ├── 2. CỔNG KIÊN NHẪN (Patient Gate): theo dõi tốc độ giải mã & phần đã dịch trước playhead
+  │        • Đợi bộ đệm gom đủ ~30s mới gửi ASR nếu phần đã dịch trước playhead còn dồi dào
+  │        • Tự động kích hoạt khẩn cấp (urgent) khi playhead sắp đuổi kịp phụ đề ⇒ không gián đoạn video
+  ├── 3. Qwen3-ASR (transcribe.cpp) nhận TRỌN khối ⇒ tối đa ngữ cảnh âm học + dấu câu chuẩn (tin ASR tuyệt đối)
+  ├── 4. Qwen3-ForcedAligner-0.6B gắn mốc TỪNG TỪ (~30–50 ms) và GẮN LẠI dấu câu từ văn bản ASR
   │        (model aligner bỏ hết dấu câu khi tokenize — nếu không gắn lại, phụ đề sẽ cụt và mất dấu)
-  ├── 4. TÁCH CÂU: câu trọn vẹn (≤ 24 từ / 8 s) là MỘT phụ đề; câu quá dài cắt ở dấu phẩy/khe âm học;
-  │        mảnh cụt ở cuối khối được GIỮ LẠI ghép vào khối sau ⇒ không bao giờ chẻ câu ở ranh giới
-  ├── 5. DỊCH từng câu kèm ngữ cảnh 2 chiều (2 câu trước + 1 câu sau) ⇒ giữ ánh xạ 1:1 với mốc thời gian
-  └── 6. PHỤ ĐỀ 0.0 s + TTS (nén WSOLA vừa cửa sổ, auto-ducking); tua tới/lui bất kỳ luôn có sẵn audio
+  ├── 5. TÁCH CÂU: câu trọn vẹn (≤ 24 từ / 14 s) là MỘT phụ đề; câu quá dài cắt ở dấu câu / khe âm học
+  ├── 6. DỊCH gộp cả khối (Batch Context Translation qua JSON) ⇒ nhanh, nhất quán và giữ nguyên mốc
+  └── 7. PHỤ ĐỀ 0.0 s + TTS (nén WSOLA vừa cửa sổ, auto-ducking); tua tới/lui bất kỳ luôn có sẵn audio
 
 Khi người dùng TUA VIDEO (Seek trước / Seek sau):
   1. Extension gửi `seek_reset` kèm mốc mới; backend tăng "thế hệ seek" và reset con trỏ (nguyên tử).
@@ -86,14 +87,14 @@ Khi người dùng TUA VIDEO (Seek trước / Seek sau):
      video khi playhead chạm mốc đó ⇒ không bao giờ phát qua vùng chưa được ASR + dịch.
 ```
 
-1. **Khối dài ⇒ nhận dạng tốt hơn**: ASR chỉ nhận khối 12–30 s liên tục thay vì từng mảnh 4 s, nên
-   model có trọn ngữ cảnh âm học và trả về dấu câu chuẩn — đây là lý do WER/CER giảm so với cắt theo VAD.
-2. **Mốc thời gian cấp TỪ**: Forced Aligner (NAR, ~35 ms cho 15 s audio, AAS 32–52 ms) gắn mốc từng
+1. **Khối dài (~25–30s) & Cổng kiên nhẫn**: ASR xử lý rất nhanh (~5x thời gian thực). Cổng kiên nhẫn giúp
+   hệ thống gom đủ khối dài ~30s trước khi gửi ASR, chỉ gửi khẩn cấp khi playhead sắp đuổi kịp để không gián đoạn.
+2. **Cắt tại khoảng lặng VAD & Tin ASR tuyệt đối**: VAD chỉ làm nhiệm vụ duy nhất là tìm khoảng lặng an toàn
+   để cắt ranh giới khối (overlap = 0.0s). Audio gửi vào ASR là nguyên vẹn 100%, không bị cắt xén hay hàn vá.
+3. **Mốc thời gian cấp TỪ**: Forced Aligner (NAR, ~35 ms cho 15 s audio, AAS 32–52 ms) gắn mốc từng
    từ, nhờ đó phụ đề khớp khẩu hình và TTS đọc đúng nhịp.
-3. **Câu trọn vẹn**: phụ đề được cắt theo dấu câu của bản phiên âm, không cắt giữa cụm từ; phần chồng
-   lấn ở ranh giới khối được trừ theo mốc từ **và** theo chuỗi từ nên không lặp/lost chữ.
-4. **Dịch theo ngữ cảnh, giữ đúng mốc**: mỗi câu được dịch riêng nhưng prompt có 2 câu trước + 1 câu
-   sau ⇒ xưng hô và văn phong nhất quán mà vẫn gán được bản dịch về đúng mốc thời gian (TTS/canvas).
+4. **Câu trọn vẹn & Dịch gộp khối**: phụ đề được gom theo câu trọn vẹn dựa vào dấu câu gốc của ASR; dịch gộp
+   toàn bộ câu trong khối trong 1 lượt GPU duy nhất qua định dạng JSON.
 5. **Tua an toàn tuyệt đối**: audio đã nằm trong RAM nên tua lùi/tới đều có ngay; con trỏ xử lý được
    neo lại theo vị trí phát nếu state lệch, và có watchdog chống "kẹt con trỏ" (video chạy mà không
    xử lý gì).

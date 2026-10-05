@@ -213,6 +213,7 @@ class LookaheadSessionState:
             dip_search_sec=float(getattr(la, "batch_dip_search_sec", 3.0)),
             silence_scanner=self.silence_scanner,
             vad_silence_ms=float(getattr(la, "batch_vad_silence_ms", 1500.0)),
+            max_audio_sec=float(getattr(la, "batch_max_audio_sec", 45.0)),
         )
         #: Trần gom câu phụ đề của tuyến batch (popup có thể thu hẹp qua `min_words_to_commit`).
         self._batch_sub_opts: Dict[str, Any] = {
@@ -245,6 +246,11 @@ class LookaheadSessionState:
         self._aligner_service: ForcedAlignerService = ForcedAlignerService.get_instance()
         self._batch_from_pts: Optional[float] = None
         self._fast_bootstrap: bool = False
+        #: Thời gian xử lý TRỌN một khối (ASR + Aligner + dịch + gửi), trung bình trượt (giây) —
+        #: dùng để tính ngưỡng "khẩn cấp" của cổng kiên nhẫn (xem `_batch_gate`).
+        self._batch_proc_ema_sec: float = 1.5
+        #: Khoá (seek_seq, from_pts) của lần cổng bắt đầu CHỜ gần nhất — chỉ để log một lần.
+        self._batch_gate_wait_key: Optional[Tuple[int, float]] = None
 
         # Cấu hình phiên (từ popup). `_parsed_config` giữ payload đã validate để áp khi
         # dựng components; các thay đổi sau đó đi qua `apply_config()`.
@@ -1003,6 +1009,68 @@ class LookaheadSessionState:
             return False
         return bool(self.is_paused and (buffered_end - from_pts) < self.chunker.min_window_sec)
 
+    def _batch_gate(self, from_pts: float, stream_end: bool) -> Tuple[bool, str, bool]:
+        """CỔNG KIÊN NHẪN: có nên cắt khối mới NGAY BÂY GIỜ không?
+
+        SỰ CỐ THẬT 2026-10-05 (phiên `29d8eb1a`): ASR chạy ~5× thời gian thực nên đuổi kịp mép bộ
+        đệm đã giải mã rất nhanh. Sau đó cứ mỗi lần trình duyệt nạp thêm ~10 s, `available` vừa chạm
+        `batch_min_sec` (8 s) là vòng lặp cắt ngay — dù phần ĐÃ DỊCH trước playhead còn 30–60 s:
+
+            [CHUNKER] from=39.10s frontier=47.11s available=8.02s
+            [SEG_BATCH] Chọn khối: dài 8.0s (... playhead 8.8s, mode=forced_overlap)
+
+        ⇒ khối 8 s cắt cưỡng bức (không có khoảng lặng VAD) lặp đi lặp lại. Không phải bộ cắt khối
+        chọn sai: nó chỉ được nhìn thấy 8 s audio.
+
+        Quy tắc (theo yêu cầu người dùng):
+          1. audio đã có phía trước con trỏ khối >= `batch_ready_sec` (~30 s)   ⇒ cắt ("full").
+          2. phần đã dịch phía trước playhead <= ngưỡng khẩn cấp              ⇒ cắt ("urgent").
+             Ngưỡng = (`batch_urgent_lead_sec` + 2 × thời gian xử lý một khối) × tốc độ phát.
+          3. bootstrap sau khi tua / hết luồng                                    ⇒ cắt.
+          Còn lại ⇒ CHỜ (video vẫn phát, bộ đệm tiếp tục dày lên).
+
+        Returns:
+            `(go, reason, urgent)`.
+        """
+        la = config.lookahead
+        if self._fast_bootstrap:
+            return True, "bootstrap", True
+        if stream_end:
+            return True, "stream_end", True
+        if not bool(getattr(la, "batch_wait_for_full_block", True)):
+            return True, "gate_off", False
+
+        frontier = self.timeline.buffered_end_from(from_pts)
+        if frontier is None:
+            # Chưa có audio ở con trỏ: để bộ cắt khối tự trả `None` như cũ.
+            return True, "no_audio", False
+        available = max(0.0, float(frontier) - float(from_pts))
+        want = min(
+            float(getattr(la, "batch_ready_sec", 30.0)),
+            float(self.chunker.max_audio_sec),
+        )
+        if available >= want - 0.05:
+            return True, "full", False
+
+        rate = max(1.0, float(self.playback_rate or 1.0))
+        ready_ahead = float(from_pts) - float(self.current_time)
+        urgent_lead = (
+            float(getattr(la, "batch_urgent_lead_sec", 5.0)) + 2.0 * float(self._batch_proc_ema_sec)
+        ) * rate
+        if ready_ahead <= urgent_lead:
+            return True, "urgent", True
+
+        key = (int(self._seek_seq), round(float(from_pts), 2))
+        if key != self._batch_gate_wait_key:
+            self._batch_gate_wait_key = key
+            logger.info(
+                f"[SEG_GATE] Chờ gom khối dài từ {from_pts:.2f}s: có {available:.1f}s/{want:.1f}s audio, "
+                f"đã dịch trước playhead {ready_ahead:.1f}s (khẩn cấp khi <= {urgent_lead:.1f}s, "
+                f"xử lý ~{self._batch_proc_ema_sec:.1f}s/khối).",
+                extra={"module_tag": "ASR"},
+            )
+        return False, "wait", False
+
     async def _offline_batch_loop(self) -> None:
         """Vòng lặp xử lý Offline Batch cho Pipeline B v3.
 
@@ -1049,12 +1117,18 @@ class LookaheadSessionState:
                 continue
 
             stream_end_block = self._batch_stream_end()
+            go, gate_reason, gate_urgent = self._batch_gate(from_pts, stream_end_block)
+            if not go:
+                continue
+            gate_ready_ahead = float(from_pts) - float(self.current_time)
+            t_block = time.perf_counter()
             try:
                 chunk = await asyncio.to_thread(
                     self.chunker.next_chunk,
                     from_pts=from_pts,
                     fast_bootstrap=self._fast_bootstrap,
                     is_stream_end=stream_end_block,
+                    urgent=gate_urgent,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Lỗi LookaheadChunker: {exc}", extra={"module_tag": "WS"})
@@ -1085,6 +1159,24 @@ class LookaheadSessionState:
 
             logger.info(
                 f"Lookahead Batch ASR [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] ({asr_ms:.0f}ms): '{clean_text}'",
+                extra={"module_tag": "ASR"},
+            )
+            # CHẨN ĐOÁN CỠ KHỐI: không có dòng này thì không thể biết vì sao khối ngắn hơn mục tiêu
+            # — do bộ đệm CHỈ LIÊN TỤC chưa đủ (khe hở trong timeline), do throttle theo vị trí phát,
+            # do không có khoảng lặng gần mốc lý tưởng, hay do trần ngân sách token.
+            timeline = self.timeline
+            frontier = timeline.buffered_end_from(chunk.pts_start)
+            logger.info(
+                f"[SEG_BATCH] Chọn khối: dài {chunk.duration:.1f}s "
+                f"(mục tiêu {getattr(self.chunker, 'last_effective_target_sec', 0.0):.1f}s, "
+                f"dải tìm tới {getattr(self.chunker, 'last_effective_search_max_sec', 0.0):.1f}s, "
+                f"mốc cắt {chunk.pts_start:.2f}s, "
+                f"biên liên tục tới {(frontier if frontier is not None else -1.0):.2f}s, "
+                f"RAM {timeline.total_stored_seconds():.1f}s, "
+                f"đệm giải mã trước {available_ahead:.1f}s, "
+                f"playhead {self.current_time:.1f}s, mode={chunk.fallback_mode}, "
+                f"silence={chunk.silence_gap_ms:.0f}ms, cổng={gate_reason}, "
+                f"đã dịch trước playhead lúc cắt {gate_ready_ahead:.1f}s).",
                 extra={"module_tag": "ASR"},
             )
 
@@ -1275,6 +1367,9 @@ class LookaheadSessionState:
                 self._batch_prev_emitted_end_audio = emitted_end_audio
 
             self._commit_batch_progress(seq, chunk.next_read_pts, chunk.pts_end)
+            # Đo thời gian xử lý TRỌN khối để cổng kiên nhẫn biết phải bắt đầu sớm bao nhiêu.
+            proc_sec = max(0.0, time.perf_counter() - t_block)
+            self._batch_proc_ema_sec = 0.5 * float(self._batch_proc_ema_sec) + 0.5 * proc_sec
             await self.send_status()
 
     # ────────────────────────────────────────────────────────── lồng tiếng (TTS)

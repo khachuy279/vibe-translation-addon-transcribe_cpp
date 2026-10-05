@@ -372,9 +372,18 @@ async def test_batch_auto_source_language_splits_long_japanese_utterance():
     )
     conn = MockSafeConnection()
     aligner = UpstreamLikeAligner()
+    # ASR giả trả văn bản ĐÚNG MỘT LẦN: ASR thật không phiên âm lại cùng một câu ở khối sau khi bộ
+    # cắt khối đã tiến con trỏ (`next_read_pts`). Nếu trả mãi, cùng một câu sẽ được gửi lại ở mỗi
+    # khối và test sẽ đo nhầm hiện tượng trùng lặp của chính bộ giả, không phải tầng ngắt câu.
+    calls = {"n": 0}
+
+    def _ja_once(_n: int) -> str:
+        calls["n"] += 1
+        return ja_text if calls["n"] == 1 else ""
+
     session = LookaheadSessionState(
         ws=conn,
-        asr_engine=FakeInferenceEngine(text_fn=lambda n: ja_text),
+        asr_engine=FakeInferenceEngine(text_fn=_ja_once),
         translation_engine=FakeTranslator(),
     )
     session.apply_init({"source_lang": "auto", "target_lang": "vi"})
@@ -709,3 +718,56 @@ async def test_offline_batch_flushes_tail_when_playback_stopped():
         assert subs, "phải flush được đoạn đuôi ngắn khi trình phát đã dừng"
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_gate_waits_for_full_block_unless_urgent():
+    """CỔNG KIÊN NHẪN (sự cố 2026-10-05, phiên `29d8eb1a`).
+
+    Log thật: `[CHUNKER] from=39.10s frontier=47.11s available=8.02s` ⇒ khối 8 s `forced_overlap`
+    trong khi playhead mới ở 8.8s (đã dịch trước 30 s). Vòng lặp phải CHỜ cho tới khi có đủ
+    `batch_ready_sec` audio, hoặc tới khi playhead tiến sát phần đã dịch.
+    """
+    session = _make_batch_session()
+    try:
+        session._fast_bootstrap = False
+        session._batch_proc_ema_sec = 1.0
+        session.timeline.append(0.0, make_speech_pcm(47.11))
+        want = min(float(config.lookahead.batch_ready_sec), float(session.chunker.max_audio_sec))
+        urgent_lead = float(config.lookahead.batch_urgent_lead_sec) + 2.0
+
+        # Đúng hình dạng log thật: 8 s audio phía trước con trỏ, đã dịch trước playhead ~30 s.
+        session.current_time = 8.8
+        go, reason, urgent = session._batch_gate(39.10, stream_end=False)
+        assert (go, reason) == (False, "wait"), "không được cắt khối 8 s khi còn dư lookahead"
+
+        # Playhead tiến sát phần đã dịch ⇒ PHẢI chạy ngay (khẩn cấp) dù chưa đủ khối dài.
+        session.current_time = 39.10 - urgent_lead + 0.1
+        go, reason, urgent = session._batch_gate(39.10, stream_end=False)
+        assert (go, reason, urgent) == (True, "urgent", True)
+
+        # Đủ một khối dài phía trước con trỏ ⇒ cắt ngay, không cần chờ khẩn cấp.
+        session.current_time = 0.0
+        go, reason, _ = session._batch_gate(47.11 - want, stream_end=False)
+        assert (go, reason) == (True, "full")
+
+        # Bootstrap sau khi tua và hết luồng luôn được đi.
+        session._fast_bootstrap = True
+        assert session._batch_gate(39.10, stream_end=False)[0] is True
+        session._fast_bootstrap = False
+        assert session._batch_gate(39.10, stream_end=True)[0] is True
+    finally:
+        await session.close()
+
+
+def test_chunker_urgent_takes_short_tail_instead_of_waiting():
+    """Khẩn cấp + bộ đệm mỏng (< `min_window_sec`) ⇒ lấy trọn phần đang có thay vì chờ."""
+    session = LookaheadSessionState(ws=MockSafeConnection(), asr_engine=None, translation_engine=None)
+    chunker = session.chunker
+    session.timeline.append(0.0, make_speech_pcm(5.0))
+    assert chunker.next_chunk(from_pts=0.0) is None
+    chunk = chunker.next_chunk(from_pts=0.0, urgent=True)
+    assert chunk is not None
+    assert chunk.fallback_mode == "urgent_tail"
+    assert chunk.duration == pytest.approx(5.0, abs=0.05)
+

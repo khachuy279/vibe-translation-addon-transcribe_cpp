@@ -79,7 +79,7 @@ class ChunkSlice:
     pts_end: float
     pcm: np.ndarray
     is_silence_boundary: bool
-    fallback_mode: str  # "silence_gap", "min_rms", "forced_overlap", "end_of_stream", "bootstrap"
+    fallback_mode: str  # "vad_silence", "silence_gap", "min_rms", "forced_overlap", "end_of_stream", "urgent_tail", "bootstrap"
     next_read_pts: float
     silence_gap_ms: float = 0.0
     #: Độ mạnh ranh giới: "strong" | "weak" | "" (không có ranh giới thật) — dùng để chẩn đoán.
@@ -105,12 +105,12 @@ class LookaheadChunker:
         self,
         timeline: ContinuousAudioTimeline,
         sample_rate: int = 16000,
-        target_window_sec: float = 15.0,
-        min_window_sec: float = 12.0,
-        max_window_sec: float = 18.0,
+        target_window_sec: float = 25.0,
+        min_window_sec: float = 8.0,
+        max_window_sec: float = 45.0,
         min_silence_ms: float = 250.0,
         silence_rms_threshold: float = 0.015,
-        overlap_sec: float = 1.0,
+        overlap_sec: float = 0.0,
         # ── Siết lại 2026-10-02 ────────────────────────────────────────────────
         search_max_sec: Optional[float] = None,
         strong_silence_ms: float = 450.0,
@@ -124,6 +124,9 @@ class LookaheadChunker:
         # ── Cắt khối bằng VAD (2026-10-04) ────────────────────────────────────
         silence_scanner: Optional[Any] = None,
         vad_silence_ms: float = 1500.0,
+        #: TRẦN CỨNG độ dài khối (giây) do ngân sách token của transcribe.dll quyết định
+        #: (`k_max_new = 256`, chưa expose qua C ABI). Xem `config.lookahead.batch_max_audio_sec`.
+        max_audio_sec: float = 45.0,
     ):
         self.timeline = timeline
         self.sample_rate = int(sample_rate)
@@ -161,9 +164,15 @@ class LookaheadChunker:
         #: Độ dài khoảng lặng VAD tối thiểu để làm điểm cắt. NGƯỠNG CỨNG — không nới xuống khoảng
         #: lặng ngắn hơn, vì cắt vào chỗ VAD chưa chắc chắn chính là lỗi cần tránh.
         self.vad_silence_ms = float(vad_silence_ms)
+        #: Trần cứng độ dài khối (giây) — ràng buộc NATIVE, xem `batch_max_audio_sec` trong config.
+        #: Không bao giờ cắt một khối dài hơn mức này, kể cả khi bộ đệm lookahead rất dồi dào.
+        self.max_audio_sec = max(4.0, float(max_audio_sec))
         #: Chẩn đoán lần cắt gần nhất.
         self.last_cut_via_vad: bool = False
         self.last_cut_silence_ms: float = 0.0
+        #: Độ dài mục tiêu / dải tìm kiếm THỰC TẾ của lần cắt gần nhất (chẩn đoán + log).
+        self.last_effective_target_sec: float = 0.0
+        self.last_effective_search_max_sec: float = 0.0
 
     # ────────────────────────────────────────────────────────── đo năng lượng
     def _frame_rms(self, pcm: np.ndarray, frame_ms: float = _LEVEL_FRAME_MS) -> np.ndarray:
@@ -366,41 +375,55 @@ class LookaheadChunker:
         from_pts: float,
         search_start_pts: float,
         search_end_pts: float,
+        ideal_cut_pts: float,
+        scan_end_pts: Optional[float] = None,
     ) -> Optional[Tuple[float, float]]:
-        """Tìm điểm cắt = GIỮA khoảng lặng CUỐI CÙNG (>= `vad_silence_ms`) mà VAD xác nhận.
+        """Chọn điểm cắt = GIỮA khoảng lặng VAD xác nhận GẦN MỐC LÝ TƯỞNG NHẤT.
 
-        Vùng đưa cho VAD là `[from_pts, search_end_pts]` (bắt đầu từ `from_pts`, KHÔNG phải từ
-        `search_start_pts`): khoảng lặng cần cắt có thể nằm ngay sát mép khối, và VAD cần thấy được
-        cả hai mép tiếng nói quanh nó mới kết luận đúng.
+        Vùng đưa cho VAD là `[from_pts, scan_end_pts]` (mặc định `search_end_pts`), LUÔN bắt đầu từ
+        `from_pts`: khoảng lặng cần cắt có thể nằm ngay sát mép khối, và VAD cần thấy cả hai mép
+        tiếng nói quanh nó mới kết luận đúng.
 
-        VÌ SAO "CUỐI CÙNG" chứ không phải "dài nhất": khối ASR càng dài càng tốt cho ngữ cảnh, nên
-        ta đẩy mép khối xa nhất có thể mà vẫn dừng ở một khoảng lặng CHẮC CHẮN. Audio gửi cho ASR là
-        TRỌN `[from_pts, cut_pts]` — bao gồm cả khoảng lặng ở cuối.
+        VÌ SAO "GẦN MỐC LÝ TƯỞNG NHẤT" chứ không phải "khoảng lặng cuối cùng":
+        đo thật 2026-10-04 (log phiên `bcbd0d7c`, đệm trước 36–50 s): quy tắc "cuối cùng" cho ra
+        khối **8–13 s** trong khi mục tiêu là 25–28 s, vì trong dải tìm kiếm có nhiều khoảng lặng
+        ngắn (khe giữa hai câu, tiếng cười) và khoảng "cuối cùng" lại rơi sớm hơn mốc lý tưởng.
+
+        VÌ SAO "CUỐI CÙNG" cũng đã từng được dùng: nó đúng về Ý TƯỞNG (khối càng dài càng tốt cho
+        ngữ cảnh) nhưng sai về CHỌN ĐIỂM. Cách đúng là nhắm độ dài mục tiêu rồi lấy khoảng lặng bám
+        sát mốc đó — vẫn thỏa "khoảng lặng > 1.5 s" và vẫn gửi TRỌN `[from_pts, cut_pts]` cho ASR.
 
         Trả `(cut_pts, silence_ms)` hoặc `None` khi VAD không xác nhận được khoảng lặng nào
         (khi đó `next_chunk` rơi về đường dò năng lượng, hoặc chờ thêm audio).
         """
-        region = self.timeline.get_audio_range(from_pts, max(0.1, search_end_pts - from_pts))
+        end_pts = float(scan_end_pts if scan_end_pts is not None else search_end_pts)
+        region = self.timeline.get_audio_range(from_pts, max(0.1, end_pts - from_pts))
         if region is None:
             return None
         base_pts, region_pcm = region
         if region_pcm is None or len(region_pcm) == 0:
             return None
 
-        # KHOẢNG LẶNG CUỐI CÙNG >= `vad_silence_ms` trong vùng tìm kiếm: khối ASR càng dài càng tốt
-        # cho ngữ cảnh, nên đẩy mép khối xa nhất có thể mà vẫn dừng ở khoảng lặng chắc chắn.
-        gap = self.silence_scanner.find_last_silence(
-            region_pcm,
-            base_pts=float(base_pts),
-            region_start_pts=float(search_start_pts),
-            region_end_pts=float(search_end_pts),
-            min_silence_ms=self.vad_silence_ms,
+        # Quét TRỌN vùng đã có (tới `end_pts`) rồi mới chọn: nếu chỉ quét tới `search_end_pts` thì
+        # khoảng lặng nằm vắt qua mép dải sẽ bị cắt cụt và bị loại oan.
+        gaps = self.silence_scanner.find_silence_gaps(
+            region_pcm, base_pts=float(base_pts), min_silence_ms=self.vad_silence_ms
         )
-        if gap is None:
+        eligible = [
+            g for g in gaps
+            if g.center >= float(search_start_pts) - 1e-6
+            and g.start_pts < float(search_end_pts) - 1e-6
+        ]
+        if not eligible:
             # KHÔNG nới ngưỡng: hạ xuống khoảng lặng ngắn hơn sẽ cắt vào chỗ VAD CHƯA chắc chắn, đúng
             # loại lỗi mà cơ chế này sinh ra để tránh. Caller chờ thêm audio (hoặc dùng dự phòng).
             return None
 
+        # Gần mốc lý tưởng nhất; hoà thì ưu tiên khoảng lặng DÀI hơn (ranh giới sạch hơn).
+        gap = min(
+            eligible,
+            key=lambda g: (abs(g.center - float(ideal_cut_pts)), -g.duration),
+        )
         # Cắt ở GIỮA khoảng lặng: mép khối nằm trong vùng KHÔNG có tiếng nói nên không từ nào bị
         # chẻ đôi, và audio gửi cho ASR là TRỌN đoạn `[from_pts, cut_pts]` — bao gồm cả khoảng lặng.
         cut_pts = min(max(gap.center, search_start_pts), search_end_pts)
@@ -411,6 +434,7 @@ class LookaheadChunker:
         from_pts: float,
         fast_bootstrap: bool = False,
         is_stream_end: bool = False,
+        urgent: bool = False,
     ) -> Optional[ChunkSlice]:
         """Trích xuất khối audio tiếp theo tính từ `from_pts`.
 
@@ -418,6 +442,9 @@ class LookaheadChunker:
             from_pts: Mốc thời gian tuyệt đối (PTS giây) bắt đầu lấy audio.
             fast_bootstrap: Bật khi vừa Tua video (Seek) - lấy nhanh 3.0s - 4.0s để xuất câu đầu tiên tức thì.
             is_stream_end: Bật khi video đã kết thúc hoặc không còn nhận thêm audio.
+            urgent: Playhead sắp vượt phần đã dịch (cổng kiên nhẫn của `_offline_batch_loop`). Khi
+                audio có sẵn còn ít hơn `min_window_sec` thì lấy TRỌN phần đang có (>= 2.5 s)
+                thay vì chờ — thà khối ngắn còn hơn để phụ đề bị gián đoạn.
 
         Returns:
             ChunkSlice nếu có đủ audio để xử lý, hoặc None nếu cần chờ buffer nạp thêm.
@@ -427,6 +454,15 @@ class LookaheadChunker:
             return None
 
         available_sec = buffered_end - from_pts
+
+        # CHẨN ĐOÁN TẠI CHÍNH ĐIỂM QUYẾT ĐỊNH (không suy diễn từ log của tầng trên).
+        # Chỉ log khi có mốc cắt thực sự, để đọc được đúng `available_sec` và nhánh đã chọn.
+        logger.info(
+            f"[CHUNKER] from={from_pts:.2f}s frontier={buffered_end:.2f}s available={available_sec:.2f}s "
+            f"RAM={self.timeline.total_stored_seconds():.1f}s bootstrap={fast_bootstrap} "
+            f"stream_end={is_stream_end} max_audio={self.max_audio_sec:.1f}s",
+            extra={"module_tag": "ASR"},
+        )
 
         # 1. KỊCH BẢN FAST-BOOTSTRAP (Sau khi tua)
         if fast_bootstrap:
@@ -452,10 +488,11 @@ class LookaheadChunker:
 
         # 2. KIỂM TRA ĐỦ AUDIO ĐỂ CẮT CỬA SỔ CHUẨN
         if available_sec < self.min_window_sec:
-            if not is_stream_end:
+            urgent_ok = bool(urgent) and available_sec >= 2.5
+            if not is_stream_end and not urgent_ok:
                 # Chưa đủ audio, đợi buffer nạp thêm để đảm bảo ngữ cảnh offline
                 return None
-            # Hết stream: lấy nốt phần còn lại
+            # Hết stream (hoặc khẩn cấp): lấy nốt phần còn lại
             audio_res = self.timeline.get_audio_range(from_pts, available_sec)
             if audio_res is None:
                 return None
@@ -466,18 +503,40 @@ class LookaheadChunker:
                 pts_end=cut_pts,
                 pcm=pcm,
                 is_silence_boundary=False,
-                fallback_mode="end_of_stream",
+                fallback_mode="end_of_stream" if is_stream_end else "urgent_tail",
                 next_read_pts=cut_pts,
                 silence_gap_ms=0.0,
             )
 
         # 3. QUÉT TÌM ĐIỂM CẮT TỐI ƯU
-        # Tự động mở rộng dải tìm ranh giới khi browser buffer có sẵn dồi dào
-        effective_search_max = self.search_max_sec
-        effective_target = self.target_window_sec
-        if self.adaptive_max_sec and available_sec >= self.adaptive_threshold_sec:
-            effective_search_max = min(float(self.adaptive_max_sec), available_sec)
-            effective_target = min(effective_search_max - 2.0, max(self.target_window_sec, effective_search_max * 0.65))
+        #
+        # CỠ KHỐI = "TỐI ĐA CÓ THỂ" (theo yêu cầu thiết kế), bị chặn bởi ĐÚNG HAI thứ:
+        #   1. `available_sec` — audio ĐỌC ĐƯỢC liên tục phía trước `from_pts`;
+        #   2. `max_audio_sec`  — trần ngân sách token của `transcribe.dll`
+        #      (`k_max_new = 256`, C ABI chưa expose `max_new_tokens`).
+        # Trong hai mép đó, KHÔNG có trần nhân tạo nào khác: dải tìm kiếm được mở hết cỡ.
+        #
+        # SỰ CỐ THẬT 2026-10-04 (phiên `3f4a90ec`): dải tìm bị giới hạn bởi `search_max_sec` (30 s)
+        # nên VAD chỉ nhìn thấy khoảng lặng đầu tiên (~12 s) rồi cắt ở đó, DÙ log ghi
+        # `biên liên tục tới 99.81s, RAM 97.4s` (bộ đệm thừa sức cho khối dài hơn):
+        #     [SEG_BATCH] Chọn khối: dài 11.9s (mục tiêu 12.2s, dải tìm tới 14.2s,
+        #                 biên liên tục tới 69.99s, RAM 67.6s, ...)
+        # Nay dải tìm mở tới `min(available_sec, max_audio_sec)`; chỉ MỤC TIÊU mới bị kẹp theo
+        # `target_window_sec` để không nhắm vào mốc quá xa.
+        budget = min(float(available_sec), self.max_audio_sec)
+
+        # Dải tìm = trọn phần audio còn dùng được (không còn trần nhân tạo 30 s).
+        effective_search_max = max(self.min_window_sec, budget)
+        self.last_effective_search_max_sec = float(effective_search_max)
+
+        # Mục tiêu: `target_window_sec` khi bộ đệm cho phép, nhưng không vượt trần ngân sách token
+        # và luôn chừa biên để tìm khoảng lặng (nên `- 2.0`).
+        effective_target = min(
+            self.max_audio_sec,
+            max(self.target_window_sec, budget - 2.0),
+        )
+        effective_target = min(effective_target, max(1.0, effective_search_max - 2.0))
+        self.last_effective_target_sec = float(effective_target)
 
         search_start_pts = from_pts + self.min_window_sec
         search_end_pts = min(buffered_end, from_pts + effective_search_max)
@@ -490,7 +549,13 @@ class LookaheadChunker:
         self.last_cut_via_vad = False
         self.last_cut_silence_ms = 0.0
         if self.silence_scanner is not None and self.vad_silence_ms > 0:
-            vad_cut = self._find_vad_cut(from_pts, search_start_pts, search_end_pts)
+            # Quét trọn phần audio đã có (tới trần ngân sách) để không bỏ sót khoảng lặng vắt qua
+            # mép dải tìm kiếm; việc CHỌN điểm vẫn giới hạn trong `[search_start, search_end]`.
+            scan_end_pts = min(buffered_end, from_pts + self.max_audio_sec)
+            vad_cut = self._find_vad_cut(
+                from_pts, search_start_pts, search_end_pts, ideal_cut_pts,
+                scan_end_pts=scan_end_pts,
+            )
             if vad_cut is not None:
                 cut_pts, silence_ms = vad_cut
                 self.last_cut_via_vad = True

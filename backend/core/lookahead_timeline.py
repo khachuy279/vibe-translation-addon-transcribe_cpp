@@ -36,9 +36,9 @@ logger = get_logger("core.lookahead_timeline")
 #: Hai đoạn lệch nhau dưới mức này coi như LIỀN nhau khi ĐỌC (sai số lượng tử hóa PTS 1 ms
 #: + mép cluster). Lớn hơn ⇒ lấp silence để bảo toàn mốc thời gian tuyệt đối.
 GAP_EPS_SEC = 0.02
-#: Ngưỡng "liền nhau" khi BÁO CÁO vùng đệm liên tục. Rộng hơn `GAP_EPS_SEC` vì các mối nối
-#: giữa hai lượt giải mã có thể hụt ~20-40 ms; nếu lấy chặt thì `buffered_ahead` báo sai
-#: (thấp hơn thực tế) và client tưởng buffer ngắn.
+#: Ngưỡng "liền nhau" khi BÁO CÁO vùng đệm liên tục — dùng cho `pending_seconds`.
+#: LƯU Ý: `buffered_end_from` KHÔNG dùng hằng số này mà dùng `MAX_GAP_FILL_SEC`, vì vùng "đọc được"
+#: rộng hơn vùng "liền mạch": các khe nhỏ đã được lấp bằng silence khi đọc (xem `get_audio_range`).
 REPORT_EPS_SEC = 0.15
 #: Khe hở tối đa được phép lấp bằng im lặng (silence). Lớn hơn ngưỡng này được coi là
 #: khoảng trống do tua (seek hole) và sẽ trả None để chờ dữ liệu thật thay vì lấp hàng chục giây im lặng giả.
@@ -238,7 +238,21 @@ class ContinuousAudioTimeline:
 
     # ------------------------------------------------------------------ egress
     def buffered_end_from(self, pts: Optional[float] = None) -> Optional[float]:
-        """Mốc kết thúc của vùng audio LIÊN TỤC tính từ `pts`."""
+        """Mốc kết thúc của vùng audio ĐỌC ĐƯỢC LIÊN TỤC tính từ `pts`.
+
+        Khe hở nhỏ hơn `MAX_GAP_FILL_SEC` KHÔNG cắt vùng này, vì `get_audio_range`/`read` đã lấp
+        chúng bằng silence (xem `MAX_GAP_FILL_SEC`) ⇒ vẫn đọc ra được audio liên tục.
+
+        SỰ CỐ THẬT 2026-10-04: hàm này trước đây cắt vùng tại khe hở > `REPORT_EPS_SEC` (0.15 s).
+        Bộ giải mã MSE tăng dần sinh ra các khe ~0.2 s, nên **chỉ một khe 0.2 s là đủ để hàm báo
+        "chỉ có 1 s audio phía trước" trong khi RAM đang giữ 30 s**. Hệ quả nhìn thấy trong log:
+        bộ cắt khối bị kẹp `available_sec` xuống ~9–18 s nên chỉ cắt khối **8 s** dù đệm trước 42 s:
+
+            [SEG_BATCH] Chọn khối: dài 8.1s (mục tiêu 6.3s, dải tìm tới 8.3s, bộ đệm trước 43.3s)
+
+        Đo lại bằng `tlprobe`: 30 mảnh 1 s cách nhau 0.2 s ⇒ `buffered_end_from(0)` cũ = **1.0 s**
+        trong khi `total_stored_seconds()` = 30.0 s. Sau khi sửa = 30.0 s (khớp phần đọc được thật).
+        """
         with self._lock:
             if not self._chunks:
                 return None
@@ -251,12 +265,12 @@ class ContinuousAudioTimeline:
                 if c.pts_start <= target <= c.pts_end + 1e-4:
                     frontier = c.pts_end
                 elif frontier is not None:
-                    if c.pts_start <= frontier + REPORT_EPS_SEC:
+                    if c.pts_start <= frontier + MAX_GAP_FILL_SEC:
                         frontier = max(frontier, c.pts_end)
                     else:
                         break
                 elif target < c.pts_start:
-                    if (c.pts_start - target) <= REPORT_EPS_SEC:
+                    if (c.pts_start - target) <= MAX_GAP_FILL_SEC:
                         frontier = c.pts_end
                     else:
                         break

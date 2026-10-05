@@ -504,9 +504,19 @@ class LookaheadConfig(BaseModel):
     """
 
     enabled: bool = True
-    batch_target_sec: float = 15.0
-    batch_min_sec: float = 12.0
-    batch_max_sec: float = 18.0
+    #: Độ dài khối LÝ TƯỞNG khi bộ đệm lookahead dồi dào (giây).
+    #:
+    #: NÂNG 15.0 → 28.0 NGÀY 2026-10-05. Hướng tới mục tiêu đưa khối gần bằng 30s vào ASR
+    #: khi bộ đệm lookahead dồi dào (> 30s), tận dụng tối đa ngữ cảnh âm học.
+    #: Giới hạn trên thực tế là `batch_max_audio_sec` (trần ngân sách token của transcribe.dll).
+    batch_target_sec: float = 28.0
+    #: KHÔNG BAO GIỜ cắt khối ngắn hơn mức này (giây).
+    #:
+    #: HẠ 12.0 → 8.0 NGÀY 2026-10-04. Sàn cũ chặn luôn những khoảng lặng DÀI nhất nằm trong 12 s
+    #: đầu tiên của vùng tìm kiếm — tức là bỏ phí các điểm cắt sạch nhất ngay gần mép khối.
+    batch_min_sec: float = 8.0
+    #: Trần cứng độ dài khối (giây) — xem `batch_max_audio_sec`.
+    batch_max_sec: float = 45.0
     batch_min_silence_ms: float = 250.0
     #: Vùng CHỒNG LẤN giữa hai khối liền nhau (giây).
     #:
@@ -518,6 +528,43 @@ class LookaheadConfig(BaseModel):
     #:                    → 'think about what I did.'  (mất 7 từ)
     #: Nay khối sau bắt đầu ĐÚNG nơi khối trước kết thúc ⇒ không có gì để trừ.
     batch_overlap_sec: float = 0.0
+
+    #: TRẦN CỨNG độ dài audio của một khối gửi vào `transcribe.dll` (giây). **RÀNG BUỘC NATIVE.**
+    #:
+    #: `external/transcribe.cpp/src/arch/qwen3_asr/model.cpp` hardcode `constexpr int k_max_new = 256`
+    #: và C ABI (`struct transcribe_run_params`) **không expose** trường `max_new_tokens`. Nghĩa là
+    #: một lần `run()` chỉ sinh được tối đa 256 token; khối dài hơn sẽ bị **NUỐT CHỮ ÂM THẦM** ở
+    #: cuối (bản thân thư viện có set cờ truncation và `TranscribeEngine` đã log
+    #: `asr.output_truncated`, nhưng phụ đề đã mất chữ thì không cứu được).
+    #:
+    #: Với tiếng Anh, tốc độ nói thật ~3–5 token/giây ⇒ 256 token ≈ 50–85 s audio. Chọn 45 s để có
+    #: biên an toàn. Khi nào C++ expose `max_new_tokens` và DLL được build lại thì nâng giá trị này
+    #: (và `k_max_new`) tương ứng.
+    batch_max_audio_sec: float = 45.0
+    #: Dải tìm ranh giới TỐI ĐA khi bộ đệm dồi dào (giây): cắt khối ở khoảng lặng cuối cùng trong
+    #: `[batch_min_sec, batch_search_max_sec]`. NÂNG 18.0 → 30.0 (2026-10-04).
+    batch_search_max_sec: float = 30.0
+    #: Dải tìm ranh giới TỐI ĐA khi bộ đệm đã rất dồi dào (>= `batch_adaptive_threshold_sec`).
+    batch_adaptive_max_sec: Optional[float] = 30.0
+
+    # ── CỔNG KIÊN NHẪN: GOM KHỐI DÀI THAY VÌ CẮT NGAY (2026-10-05) ───────────────
+    #: Bật cổng chờ: KHÔNG cắt khối mới chỉ vì vừa có đủ `batch_min_sec` audio. Vòng lặp batch
+    #: theo dõi liên tục (a) audio đã có phía trước con trỏ khối và (b) phần ĐÃ DỊCH còn lại phía
+    #: trước vị trí phát, rồi chỉ cắt khi:
+    #:   1. audio phía trước con trỏ >= `batch_ready_sec` (đủ một khối dài), HOẶC
+    #:   2. phần đã dịch phía trước playhead <= `batch_urgent_lead_sec` + thời gian xử lý ước
+    #:      lượng (phải chạy ngay để phụ đề không bị gián đoạn), HOẶC
+    #:   3. hết luồng / vừa tua (bootstrap).
+    #: Log thật 2026-10-05: không có cổng này, ASR (5× thời gian thực) đuổi kịp mép bộ đệm rồi cắt
+    #: khối 8 s mỗi khi trình duyệt nạp thêm ~10 s — dù phần đã dịch trước playhead còn 30–60 s.
+    batch_wait_for_full_block: bool = True
+    #: Lượng audio (giây) phía trước con trỏ khối coi là "đủ một khối dài" ⇒ cắt ngay không cần chờ
+    #: khẩn cấp. Bị kẹp bởi `batch_max_audio_sec`.
+    batch_ready_sec: float = 30.0
+    #: Phần đã dịch còn lại phía trước playhead (giây, theo thời gian media) mà dưới mức này thì
+    #: PHẢI chạy khối tiếp theo ngay. Ngưỡng thật = giá trị này + 2 × thời gian xử lý một khối
+    #: (ASR + Aligner + dịch) đo được gần nhất, nhân với tốc độ phát.
+    batch_urgent_lead_sec: float = 5.0
 
     # ── CẮT KHỐI BẰNG VAD (2026-10-04) ────────────────────────────────────────
     #: Cắt khối CHỈ tại khoảng lặng mà VAD XÁC NHẬN (thay cho dò RMS + `overlap_sec`).
@@ -538,10 +585,9 @@ class LookaheadConfig(BaseModel):
     # (chẩn đoán "cuối câu này là đầu của câu sau": xem
     #  report/09_lookahead_offline_batch/phase5_chan_doan_ngat_cau.md)
     #
-    #: Trần dải TÌM ranh giới thật. Giới hạn tối đa 18.0s để không gộp bài hát/nhạc nền với
-    #: tiếng thoại của nhân vật, tránh hiện tượng ASR bị tiếng nói to lấn át làm nuốt mất lời bài hát.
-    batch_search_max_sec: float = 18.0
-    batch_adaptive_max_sec: Optional[float] = 18.0
+    #: Trần dải TÌM ranh giới thật khi bộ đệm ít (`< batch_adaptive_threshold_sec`).
+    #: (Hai knob `batch_search_max_sec`/`batch_adaptive_max_sec` được khai báo ở khối "CẮT KHỐI
+    #: BẰNG VAD" phía trên — xem `batch_max_audio_sec` để biết trần cứng độ dài khối.)
     batch_adaptive_threshold_sec: float = 30.0
     #: Khoảng lặng >= mức này là ranh giới MẠNH: cắt ngay dù xa mốc lý tưởng. 250 ms chỉ là
     #: khoảng nghỉ giữa hai từ trong hội thoại phim, KHÔNG phải hết câu.

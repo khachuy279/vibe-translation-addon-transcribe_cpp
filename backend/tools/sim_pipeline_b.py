@@ -204,18 +204,39 @@ async def run_sim(args: argparse.Namespace) -> int:
                 sim.add(items)
 
     async def _feed_playhead() -> None:
-        """Playhead đi theo thời gian THẬT: mỗi `step` mô phỏng, chờ `step/rate` giây tường."""
+        """Playhead đi theo thời gian THẬT: mỗi `step` mô phỏng, chờ `step/rate` giây tường.
+
+        `--hole-sec H`: chèn khe hở H giây giữa các mảnh append để mô phỏng **bộ giải mã MSE tăng
+        dần** (nó sinh ra các khe ~0.2 s). Đây là điều kiện tái hiện sự cố 2026-10-04: chỉ một khe
+        0.2 s làm `buffered_end_from` báo "chỉ có 1 s đệm" trong khi RAM giữ hàng chục giây, khiến
+        bộ cắt khối chỉ cắt khối 8 s.
+        """
         nonlocal _fed_upto
+        hole = max(0.0, float(getattr(args, "hole_sec", 0.0) or 0.0))
+        #: Vị trí đọc trong file audio (độc lập với trục PTS khi có khe hở giả lập).
+        read_pos = float(_fed_upto)
         t2 = 0.0
         while t2 <= limit:
             session.current_time = t2
             session.is_paused = False
             want_feed = min(limit, t2 + float(args.buffer_ahead))
             if want_feed > _fed_upto + 1e-3:
-                a = int(_fed_upto * 16000)
-                b = int(want_feed * 16000)
-                session.timeline.append(_fed_upto, pcm_full[a:b])
-                _fed_upto = want_feed
+                if hole > 0.0:
+                    # Nạp từng mảnh ngắn rồi NHẢY PTS qua `hole` giây (nội dung vẫn liền mạch).
+                    # Đây chính là hình dạng của bộ giải mã MSE tăng dần: RAM giữ audio liên tục
+                    # nhưng trục PTS có các khe ~0.2 s.
+                    piece = max(0.2, float(args.step))
+                    while _fed_upto + piece < want_feed:
+                        a = int(read_pos * 16000)
+                        b = int((read_pos + piece) * 16000)
+                        session.timeline.append(_fed_upto, pcm_full[a:b])
+                        read_pos += piece
+                        _fed_upto += piece + hole
+                else:
+                    a = int(_fed_upto * 16000)
+                    b = int(want_feed * 16000)
+                    session.timeline.append(_fed_upto, pcm_full[a:b])
+                    _fed_upto = want_feed
             session._decoded_end_pts = _fed_upto
             session._ingest_event.set()
             await _drain_client()
@@ -265,6 +286,8 @@ def main() -> int:
     ap.add_argument("--rate", type=float, default=0.35,
                     help="Tốc độ playhead so với thời gian tường (1.0 = thời gian thật).")
     ap.add_argument("--flush-sec", type=float, default=60.0)
+    ap.add_argument("--hole-sec", type=float, default=0.0,
+                    help="Khe hở PTS giữa các mảnh append (mô phỏng bộ giải mã MSE tăng dần).")
     ap.add_argument("--texts", nargs="*", default=None,
                     help="Danh sách văn bản ASR theo khối (bỏ trống ⇒ dùng ASR thật).")
     return asyncio.run(run_sim(ap.parse_args()))
