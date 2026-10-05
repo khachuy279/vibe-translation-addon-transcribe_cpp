@@ -249,16 +249,8 @@ class ASRConfig(BaseModel):
     preview_slow_ms: float = 350.0        # trung vị preview >= mức này => giãn nhịp
     preview_fast_ms: float = 120.0        # trung vị <= mức này => thu hẹp nhịp
     preview_max_interval_ms: int = 1000   # trần nhịp preview
-    # P2.5: tái sử dụng kết quả preview cho commit. MẶC ĐỊNH TẮT vì có thể mất từ
-    # cuối câu (trái ưu tiên C4). Chỉ bật sau khi đo WER đạt chênh <= 0.3%.
-    # ⚠️ ĐÃ TỪNG BỊ ĐẶT NHẦM THÀNH `True` (commit 2026-09-29) và gây lỗi phụ đề ngay trong
-    # log thật cùng ngày: `[ASR_COMMIT] [VAD_SILENCE] (infer=0.0ms): '泳いてくるね。'` —
-    # commit KHÔNG chạy lại ASR trên mảnh đã đóng mà chỉ CHÉP LẠI preview cuối, tức là chép
-    # lại đúng giả thuyết đã trôi của model (câu đúng `寄り行ってくる。` chỉ xuất hiện ở nhịp
-    # +0,7 s rồi bị các nhịp sau ghi đè). Đây cũng trái kết luận đo WER đã ghi ở
-    # `report/audit/XAC_NHAN_QWEN_VA_DINH_CHINH.md` (Q7a: bật ⇒ chất lượng XẤU HƠN sàn nhiễu)
-    # và ở `README.md` (bảng cấu hình: "Giữ TẮT"). Muốn bật thì phải chạy lại
-    # `test_09_wer_ab.py` theo TỪNG family model rồi mới đổi.
+    # P2.5: tái sử dụng kết quả preview cho commit. MẶC ĐỊNH TẮT (False) vì có thể làm trôi/mất
+    # từ cuối câu khi preview chưa ổn định. Commit luôn chạy lại ASR trọn vẹn trên toàn bộ câu.
     preview_reuse_for_commit: bool = False
     preview_reuse_max_delta_sec: float = 0.4
     #: Cho phép TẮT hẳn inference preview. Pipeline A (realtime) cần preview để hiện chữ
@@ -382,6 +374,8 @@ class TranslationConfig(BaseModel):
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    #: Giới hạn token sinh tối đa cho MỖI CÂU ĐƠN (Pipeline A).
+    #: Tuyến Batch (Pipeline B) tự động tính ngân sách theo số câu trong khối: min(1536, max(256, len(texts) * 80)).
     max_tokens: int = 128
     # ContextManager: chỉ áp dụng cho Pipeline A (Realtime streaming đơn câu).
     # Pipeline B sử dụng Batch Context Translation (dịch gộp khối qua JSON instTrans).
@@ -389,12 +383,10 @@ class TranslationConfig(BaseModel):
     context_window: int = 3
     prompt_style: Optional[str] = "index"
     n_gpu_layers: int = -1
-    # P4.3: trước đây các tham số này bị hardcode trong translation/engine.py.
-    # A5 (audit Gemini, đã kiểm chứng): KV cache ở đây RẤT nhỏ nên đừng tối ưu.
-    # Kiến trúc Hy-MT2-1.8B: 32 layer × 4 KV-head × head_dim 128 ⇒ KV cache f16 =
-    # 2×32×n_ctx×4×128×2 byte. n_ctx=512 → **33,6 MB** (không phải "~450 MB" như báo cáo
-    # Gemini ước lượng — sai ~13×). Hạ xuống 384 chỉ tiết kiệm ~8 MB ⇒ không đáng đổi.
-    n_ctx: int = 512
+    #: Kích thước ngữ cảnh (Context Window) của Llama.cpp (bao gồm cả Prompt + Output).
+    #: Nâng lên 2048 (KV cache chỉ ~134 MB) để đảm bảo Pipeline B khi dịch gộp cả khối 10-15 câu
+    #: qua JSON (prompt ~300 tokens + output ~500 tokens) không bao giờ bị nghẽn context hay fallback.
+    n_ctx: int = 2048
     n_batch: int = 256
     # A1-1 (Hy3): cùng lý do như `ASRConfig.threads` — llama.cpp chỉ cần vài thread CPU để
     # feed/parse token (phần nặng nằm trên GPU CUDA), nên trên máy ít nhân hạ xuống 3 để
@@ -440,8 +432,6 @@ class AudioBufferConfig(BaseModel):
     """Cấu hình Circular Ring Buffer cho Audio Ingress."""
     sample_rate: int = 16000
     capacity_sec: float = 60.0             # Dung lượng cố định 60 giây audio (~960,000 samples Float32)
-    chunk_size_samples: int = 400          # độ dài 1 mẩu PCM phía client (~25 ms @ 16 kHz); KHÔNG phải frame VAD
-    max_speech_segment_sec: float = 30.0   # Độ dài tối đa 1 đoạn phát âm
 
 
 class MetricsConfig(BaseModel):
