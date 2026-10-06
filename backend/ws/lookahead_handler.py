@@ -206,7 +206,6 @@ class LookaheadSessionState:
         self.chunker = LookaheadChunker(
             timeline=self.timeline,
             sample_rate=16000,
-            target_window_sec=float(getattr(la, "batch_target_sec", 25.0)),
             min_window_sec=float(getattr(la, "batch_min_sec", 8.0)),
             min_silence_ms=float(getattr(la, "batch_min_silence_ms", 250.0)),
             strong_silence_ms=float(getattr(la, "batch_strong_silence_ms", 450.0)),
@@ -765,6 +764,22 @@ class LookaheadSessionState:
             self._fragment_digests.pop(self._fragment_digest_order.popleft(), None)
 
         self._playhead_pts = float(self.current_time or 0.0)
+
+        # ── ĐỔI EPOCH (nguồn/SourceBuffer mới) ⇒ bộ dò khoảng lặng phải QUÊN cache ──────────
+        # Cache xác suất VAD khoá theo mốc PTS TUYỆT ĐỐI. Khi epoch đổi, cùng một PTS ứng với nội
+        # dung audio KHÁC (video khác trên cùng phiên WebSocket, hoặc nguồn được nạp lại) nên tái
+        # dùng xác suất cũ sẽ cắt khối vào chỗ không hề im lặng, hoặc bỏ qua khoảng lặng thật.
+        if (
+            epoch is not None
+            and int(epoch) != int(self.demuxer.epoch)
+            and self.silence_scanner is not None
+        ):
+            self.silence_scanner.invalidate_cache()
+            logger.info(
+                f"Đổi epoch {self.demuxer.epoch} -> {int(epoch)}: đã xoá cache xác suất VAD.",
+                extra={"module_tag": "VAD"},
+            )
+
         t_dec = time.perf_counter()
         try:
             decoded = await asyncio.to_thread(
@@ -853,6 +868,10 @@ class LookaheadSessionState:
             # Giữ nguyên epoch và init segment: cùng một SourceBuffer thì header không đổi, chỉ
             # bỏ phần media đã ghép (dữ liệu của vị trí cũ).
             self.demuxer.reset(self.demuxer.epoch, min_pts=max(0.0, float(target_time) - 0.5))
+            # Bộ dò khoảng lặng khoá cache theo PTS tuyệt đối; sau khi tua, vị trí đọc nhảy sang
+            # đoạn khác nên bỏ cache + audio mồi để lần quét tới tính lại từ dữ liệu thật.
+            if self.silence_scanner is not None:
+                self.silence_scanner.invalidate_cache()
             # Không xoá audio RAM khi tua: chỉ chuyển con trỏ đọc (read cursor) tới mốc mới
             self.timeline.seek(float(target_time))
             self._feed_pts = float(target_time)
@@ -1211,15 +1230,19 @@ class LookaheadSessionState:
            `batch_max_audio_sec`) hoặc Fast-Bootstrap (3-4s khi seek).
         3. ASR Offline block decoding qua transcribe.cpp (TRỌN khối — giữ ngữ cảnh dài).
         4. Gióng hàng mốc từ siêu tốc qua ForcedAlignerService (+ gắn lại dấu câu từ văn bản ASR).
-        5. TRỪ phần chồng lấn ở ranh giới khối (theo mốc từ + theo chuỗi từ) — chống lặp từ.
-        6. Ghép mảnh cuối CHƯA KẾT CÂU của khối trước vào khối này (câu không bị chẻ ở ranh giới).
-        7. Gom từ thành các câu phụ đề SubtitleSentence theo dấu câu.
-        8. Dịch từng câu phụ đề và gửi lookahead_subtitles về Client (độ trễ hiển thị 0.0s).
-        9. Xếp vào hàng đợi TTS OmniVoice.
+        5. Gom từ thành các câu phụ đề SubtitleSentence theo dấu câu.
+        6. Dịch từng câu phụ đề và gửi lookahead_subtitles về Client (độ trễ hiển thị 0.0s).
+        7. Xếp vào hàng đợi TTS OmniVoice.
 
-        ⚠️ Bước 5 KHÔNG được bỏ: `LookaheadChunker` cố ý cho khối sau lấy lùi `overlap_sec` khi
-        ranh giới không phải khoảng lặng, để không mất từ. Không trừ thì từ ở ranh giới bị phát
-        hai lần — đúng sự cố "cuối câu này là đầu của câu sau".
+        ⚠️ KHÔNG còn bước "TRỪ phần chồng lấn ở ranh giới khối" và bước "GHÉP mảnh cuối chưa kết
+        câu của khối trước" — cả hai đã bị XOÁ ngày 2026-10-04 (xem khối chú thích
+        "ĐƠN GIẢN HOÁ 2026-10-04" bên dưới). Chúng chỉ tồn tại để bù cho việc cắt khối GIỮA CÂU;
+        nay `LookaheadChunker` cắt vào GIỮA khoảng lặng do VAD xác nhận
+        (`LookaheadChunker._find_vad_cut`) và `overlap_sec` mặc định = 0.0, nên mép khối không bao
+        giờ rơi vào giữa từ ⇒ không có gì để trừ và cũng không được ghép.
+        ⇒ Nếu ai đó bật `LookaheadChunker(overlap_sec > 0)` thì phải khôi phục tầng trừ chồng lấn
+        TRƯỚC, nếu không từ ở ranh giới sẽ bị phát hai lần (sự cố "cuối câu này là đầu của câu
+        sau", 2026-10-02).
         """
         la = config.lookahead
         while not self._closed:

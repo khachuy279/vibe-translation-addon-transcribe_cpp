@@ -26,10 +26,15 @@ VÌ SAO CHỌN SILERO (đo thật trên máy chuẩn, RTX 5060 Ti)
 | `silero-vad` | từng cửa sổ 512 mẫu | 1 001 ms | 90× thời gian thực |
 | `silero-vad` | **gọi theo LÔ** (256 cửa sổ/lần) | **127 ms** | **~700× thời gian thực** |
 
+⚠️ Dòng "theo LÔ" ở bảng trên chỉ là SỐ ĐO ĐỘNG CƠ, **không phải cách module này chạy**: gọi lô > 1
+làm state nội bộ của Silero được xử lý khác và kết quả ĐỔI HẲN, nên `SILERO_BATCH_WINDOWS` bị KHOÁ
+bằng 1 (xem chú thích tại hằng số đó). Chi phí thật của đường batch=1 là ~90× thời gian thực — vẫn
+thừa sức quét toàn vùng tìm kiếm.
+
 FireRed bị chi phối bởi chi phí gọi model cho TỪNG frame 10 ms ⇒ không thể quét toàn vùng tìm kiếm
-(18–30 s) cho mỗi khối. Silero nhận lô cửa sổ và trả về xác suất cho cả lô ⇒ quét được **toàn bộ**
-vùng tìm kiếm với chi phí không đáng kể. Nhờ vậy module này **không cần** tầng tiền quét năng lượng
-làm "mẹo tăng tốc" nữa: VAD là nguồn quyết định duy nhất, đúng như yêu cầu thiết kế.
+cho mỗi khối, còn Silero trả xác suất cho cả dải cửa sổ ⇒ quét được **toàn bộ** vùng tìm kiếm với
+chi phí không đáng kể. Nhờ vậy module này **không cần** tầng tiền quét năng lượng làm "mẹo tăng
+tốc" nữa: VAD là nguồn quyết định chính.
 
 Engine dự phòng: nếu không nạp được Silero (thiếu file/gói), scanner suy giảm sang dò năng lượng
 tương đối và **nói rõ trong log** — không bao giờ chặn pipeline.
@@ -64,6 +69,30 @@ SILERO_WINDOW_SAMPLES = 512
 #:     batch=1024→6.82 s
 #: Vì vậy chỉ dùng batch=1: đúng ngữ nghĩa streaming, và vẫn đủ nhanh (đo được ~90× thời gian thực).
 SILERO_BATCH_WINDOWS = 1
+#: Số cửa sổ 512 mẫu chạy "MỒI" (warm-up) trước vùng cần tính xác suất.
+#:
+#: VÌ SAO CẦN: Silero giữ state nội bộ chạy tiếp giữa các cửa sổ. Nếu mỗi lần tính thêm chỉ
+#: `reset_states()` rồi chạy thẳng vào cửa sổ mới thì cửa sổ ĐẦU của vùng mới được tính với state
+#: NGUỘI, nên xác suất của CÙNG một đoạn audio phụ thuộc vào chỗ vùng quét bắt đầu. Mà
+#: `LookaheadChunker` gọi quét với `base_pts`/vùng khác nhau mỗi khối ⇒ cùng dữ liệu có thể cho ra
+#: khoảng lặng khác nhau. Chạy mồi qua audio NGAY TRƯỚC vùng mới làm state ấm lại.
+#:
+#: ĐO THẬT 2026-10-06 (audio 12 s tone + 3 s lặng + 12 s tone; quét liền mạch làm mốc tham chiếu,
+#: rồi so với quét tăng dần [0,12] → [6,27]; lệch xác suất trên vùng chung):
+#:     mồi = 0 cửa sổ  (hành vi cũ)   → max|Δp| 0.2883
+#:     mồi = 32 (1.02 s)              → max|Δp| 0.1095
+#:     mồi = 96 (3.07 s)              → max|Δp| 0.0588
+#:     mồi = 320 (10.24 s)            → max|Δp| 0.0060   ← chọn mức này
+#:     mồi = 640 (20.48 s)            → max|Δp| 0.0028
+#: State của Silero nhớ rất dài nên phải mồi ~10 s mới hội tụ; 0.006 là dưới xa ngưỡng 0.30 nên
+#: gần như không thể lật quyết định có/không tiếng nói. Chi phí: 320 cửa sổ ≈ 0.11 s cho mỗi lần
+#: quét THÊM (batch=1, ~90× thời gian thực) — chấp nhận được vì cổng kiên nhẫn chỉ gọi bộ cắt khối
+#: ~1 lần cho mỗi 25–40 s audio.
+#:
+#: GIỚI HẠN CÒN LẠI: lần quét ĐẦU TIÊN của một scanner vẫn nguội, vì scanner chỉ có audio từ
+#: `base_pts` trở đi (không có gì phía trước để mồi). Mồi chỉ bảo đảm các lần quét NỐI TIẾP vùng
+#: đã quét không bị lệch theo chỗ cắt vùng.
+SILERO_PRIME_WINDOWS = 320
 #: Bước nhảy của tầng dò năng lượng dự phòng (ms).
 ENERGY_FRAME_MS = 20.0
 
@@ -91,11 +120,13 @@ class SilenceGap:
 
 
 class VADSilenceScanner:
-    """Tìm khoảng lặng để cắt khối bằng VAD Silero (chạy theo LÔ, không giữ state phiên).
+    """Tìm khoảng lặng để cắt khối bằng VAD Silero (chạy TUẦN TỰ từng cửa sổ, không giữ state phiên).
 
     Scanner giữ một model JIT **riêng** cho việc quét; `reset_states()` gọi trước mỗi lần quét nên
     không ảnh hưởng state VAD của phiên Pipeline A (đúng ràng buộc "engine sở hữu state machine"):
     state của phiên nằm trong `VADStreamState` do `VADProcessor` giữ, còn đây là một model độc lập.
+    Trong một lần quét, state được chạy MỒI liên tục qua `SILERO_PRIME_WINDOWS` cửa sổ trước vùng
+    cần tính (xem `SILERO_PRIME_WINDOWS`) để xác suất không lệch theo chỗ cắt vùng quét.
     """
 
     def __init__(
@@ -131,6 +162,11 @@ class VADSilenceScanner:
         #: Cache xác suất theo LÔ: mỗi phần tử là `(t0, hop, probs)`. Lần quét sau nối tiếp phần đã
         #: có nên chi phí trung bình chỉ còn phần audio MỚI (đo thật: quét 30 s ≈ 330 ms).
         self._prob_cache: List[tuple] = []
+        #: Audio "mồi" cho lần tính tiếp theo: `_PRIME_WINDOWS` cửa sổ CUỐI của vùng đã quét gần
+        #: nhất, kết thúc đúng tại `_prime_end_pts`. Dùng để state Silero ấm ở mép vùng mới (xem
+        #: `SILERO_PRIME_WINDOWS`). Rỗng = chưa có gì để mồi (lần quét đầu / sau `invalidate_cache`).
+        self._prime_pcm: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._prime_end_pts: float = 0.0
 
     # ------------------------------------------------------------------ model
     def _load_model(self):
@@ -186,6 +222,19 @@ class VADSilenceScanner:
             )
 
     # ------------------------------------------------------------------ quét
+    def invalidate_cache(self) -> None:
+        """Xoá cache xác suất + audio mồi.
+
+        BẮT BUỘC gọi khi mốc PTS không còn tương ứng với cùng nội dung audio — tức khi trình duyệt
+        đổi `epoch` (nguồn/SourceBuffer mới, video khác trên CÙNG phiên WebSocket) hoặc khi tua.
+        Nếu không, xác suất của video CŨ tại cùng mốc PTS sẽ được tái dùng cho video MỚI ⇒ cắt khối
+        vào chỗ không hề im lặng, hoặc bỏ qua khoảng lặng thật.
+        """
+        with self._lock:
+            self._prob_cache = []
+            self._prime_pcm = np.zeros(0, dtype=np.float32)
+            self._prime_end_pts = 0.0
+
     def speech_mask(self, pcm: np.ndarray, base_pts: float = 0.0) -> np.ndarray:
         """Xác suất tiếng nói theo từng cửa sổ 512 mẫu (Silero, chạy tuần tự đúng streaming).
 
@@ -193,6 +242,10 @@ class VADSilenceScanner:
 
         `base_pts` là mốc tuyệt đối của mẫu đầu tiên trong `pcm`; dùng cho cache theo lô nên lần
         quét sau (vùng dịch về phía trước) chỉ phải tính phần audio MỚI.
+
+        Phần audio MỚI luôn được tính với state đã chạy MỒI qua `SILERO_PRIME_WINDOWS` cửa sổ ngay
+        trước đó (nếu có audio liền trước), nhờ vậy kết quả của một cửa sổ KHÔNG phụ thuộc vào chỗ
+        vùng quét bị cắt — xem `SILERO_PRIME_WINDOWS` (kể cả giới hạn còn lại của nó).
         """
         hop_sec = SILERO_WINDOW_SAMPLES / float(self.sample_rate)
         arr = np.asarray(pcm, dtype=np.float32)
@@ -215,16 +268,31 @@ class VADSilenceScanner:
                 cached_end = t0 + probs.size * hop
             aligned = max(float(base_pts), cached_end)
             aligned = float(int(round(aligned / hop_sec)) * hop_sec)
+            prime_pcm = self._prime_pcm
+            prime_end_pts = self._prime_end_pts
 
         start_idx = int(round((aligned - float(base_pts)) / hop_sec))
         if start_idx < 0:
             start_idx = 0
         new_win = n_win - start_idx
         if new_win > 0:
-            probs_new = self._run_windows(arr[start_idx * SILERO_WINDOW_SAMPLES : n_win * SILERO_WINDOW_SAMPLES])
+            # Mồi state bằng audio NGAY TRƯỚC `aligned`, chỉ dùng được khi audio mồi kết thúc đúng
+            # tại `aligned` (tức vùng mới nối liền vùng vừa quét). Lệch nhau ⇒ state nguội như cũ
+            # (không có audio để mồi), KHÔNG bịa mồi từ vùng khác.
+            prime: Optional[np.ndarray] = None
+            if prime_pcm.size >= SILERO_WINDOW_SAMPLES and abs(prime_end_pts - aligned) <= hop_sec / 2.0:
+                prime = prime_pcm
+            probs_new = self._run_windows(
+                arr[start_idx * SILERO_WINDOW_SAMPLES : n_win * SILERO_WINDOW_SAMPLES],
+                prime=prime,
+            )
             if probs_new.size:
                 with self._lock:
                     self._prob_cache.append((aligned, hop_sec, probs_new))
+                    # Audio mồi cho lần sau = đuôi của vùng VỪA quét (kết thúc ở cuối `arr`).
+                    tail = arr[max(0, n_win - SILERO_PRIME_WINDOWS) * SILERO_WINDOW_SAMPLES : n_win * SILERO_WINDOW_SAMPLES]
+                    self._prime_pcm = np.ascontiguousarray(tail)
+                    self._prime_end_pts = float(base_pts) + n_win * hop_sec
 
         # ── Ghép cache thành mảng xác suất cho đúng `[base_pts, base_pts + n_win*hop]`.
         out = np.zeros(n_win, dtype=np.float32)
@@ -239,8 +307,12 @@ class VADSilenceScanner:
                         filled[i] = True
         return out
 
-    def _run_windows(self, samples: np.ndarray) -> np.ndarray:
-        """Chạy model Silero trên một dải mẫu (bội số của 512) theo đúng thứ tự thời gian."""
+    def _run_windows(self, samples: np.ndarray, prime: Optional[np.ndarray] = None) -> np.ndarray:
+        """Chạy model Silero trên một dải mẫu (bội số của 512) theo đúng thứ tự thời gian.
+
+        `prime`: audio NGAY TRƯỚC `samples` (bội số của 512). Model được chạy qua phần mồi trước
+        (bỏ kết quả) để state ấm đúng như khi chạy streaming liên tục — xem `SILERO_PRIME_WINDOWS`.
+        """
         try:
             import torch
 
@@ -259,15 +331,29 @@ class VADSilenceScanner:
         if self._use_gpu:
             windows = windows.cuda()
 
+        prime_windows = None
+        if prime is not None and prime.size >= SILERO_WINDOW_SAMPLES:
+            n_prime = prime.size // SILERO_WINDOW_SAMPLES
+            prime_windows = torch.from_numpy(
+                np.ascontiguousarray(prime[: n_prime * SILERO_WINDOW_SAMPLES])
+            ).reshape(n_prime, SILERO_WINDOW_SAMPLES)
+            if self._use_gpu:
+                prime_windows = prime_windows.cuda()
+
         probs: List[np.ndarray] = []
         t0 = time.perf_counter()
         with self._lock:
             with torch.no_grad():
                 model.reset_states()
+                if prime_windows is not None:
+                    # Chỉ để ĐẨY STATE, không lấy xác suất của phần mồi.
+                    for i in range(0, prime_windows.shape[0], SILERO_BATCH_WINDOWS):
+                        model(prime_windows[i : i + SILERO_BATCH_WINDOWS], self.sample_rate)
                 for i in range(0, n_win, SILERO_BATCH_WINDOWS):
                     chunk = windows[i : i + SILERO_BATCH_WINDOWS]
                     out = model(chunk, self.sample_rate)
                     probs.append(out.detach().reshape(-1).cpu().numpy().astype(np.float32))
+        # `last_scan_ms` bao gồm cả phần mồi (đó là chi phí thật của lần quét này).
         self.last_scan_ms = (time.perf_counter() - t0) * 1000.0
         self.last_scanned_sec += n_win * SILERO_WINDOW_SAMPLES / float(self.sample_rate)
         return np.concatenate(probs) if probs else np.zeros(0, dtype=np.float32)

@@ -126,11 +126,7 @@ def test_lookahead_chunker_adaptive_expansion():
     chunker = LookaheadChunker(
         timeline=timeline,
         sample_rate=sr,
-        target_window_sec=15.0,
         min_window_sec=12.0,
-        search_max_sec=30.0,
-        adaptive_max_sec=45.0,
-        adaptive_threshold_sec=30.0,
     )
 
     chunk = chunker.next_chunk(from_pts=0.0)

@@ -75,8 +75,11 @@ def test_lookahead_config_has_no_streaming_v2_knobs():
     for key in REMOVED_LOOKAHEAD_KEYS:
         assert key not in fields, f"khoá '{key}' của Pipeline B v2 vẫn còn trong LookaheadConfig"
     # Các khoá của tuyến batch phải còn nguyên
-    for key in ("enabled", "batch_target_sec", "batch_max_audio_sec", "batch_sub_max_words"):
+    for key in ("enabled", "batch_max_audio_sec", "batch_sub_max_words"):
         assert key in fields
+    # `batch_target_sec` đã bị XOÁ (2026-10-06): nó không bao giờ ảnh hưởng cỡ khối vì bị dòng kẹp
+    # theo dải tìm kiếm triệt tiêu. Cỡ khối nay do `batch_max_audio_sec` quyết định.
+    assert "batch_target_sec" not in fields
 
 
 def test_lookahead_session_has_no_streaming_v2_methods():

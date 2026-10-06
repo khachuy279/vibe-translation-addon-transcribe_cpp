@@ -89,7 +89,6 @@ class PipelineBProbe:
         self.chunker = LookaheadChunker(
             timeline=self.timeline,
             sample_rate=16000,
-            target_window_sec=float(self.la.batch_target_sec),
             min_window_sec=float(self.la.batch_min_sec),
             min_silence_ms=float(self.la.batch_min_silence_ms),
             strong_silence_ms=float(self.la.batch_strong_silence_ms),

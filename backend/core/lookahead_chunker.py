@@ -13,12 +13,18 @@ việc "có cắt câu hay không":
   Qwen3-ForcedAligner (xem `ForcedAlignerService.group_words_to_subtitles`).
 
 Vì vậy mọi thay đổi ở file này phải phục vụ: **khối càng dài & ranh giới càng "sạch" càng tốt**,
-và mép khối phải VÔ HÌNH ở đầu ra. Mép khối vô hình nhờ hai cơ chế phối hợp:
-  1. `overlap_sec` — khối sau lấy lùi lại một đoạn để không mất từ ở ranh giới.
-  2. Phía nhận (`LookaheadSessionState._offline_batch_loop`) **BẮT BUỘC** trừ phần chồng lấn ở
-     tầng từ trước khi gom câu. Nếu tầng đó không trừ, từ ở ranh giới sẽ được phát hai lần —
-     đúng sự cố "cuối câu này là đầu của câu sau" (2026-10-02).
-     ⇒ Nếu bạn bỏ bước trừ ở phía nhận thì ĐỪNG bật overlap ở đây.
+và mép khối phải VÔ HÌNH ở đầu ra. Mép khối vô hình nhờ cắt tại KHOẢNG LẶNG, theo hai đường:
+
+  1. Đường CHÍNH (Phase 8, `silence_scanner` + `_find_vad_cut`): cắt vào **GIỮA khoảng lặng mà VAD
+     xác nhận**. Mép khối nằm trong vùng không có tiếng nói ⇒ không từ nào bị chẻ đôi ⇒
+     **KHÔNG cần** `overlap_sec` và **KHÔNG cần** phía nhận trừ chồng lấn.
+  2. Đường DỰ PHÒNG (chỉ chạy khi VAD không xác nhận được khoảng lặng nào, hoặc khi
+     `silence_scanner is None`): dò năng lượng tương đối. Đường này cắt vào chỗ KHÔNG chắc chắn là
+     im lặng nên mới cần tới `overlap_sec`; mặc định `overlap_sec = 0.0`.
+     ⚠️ Nếu ai đó đặt `overlap_sec > 0`, phía nhận **BẮT BUỘC** phải trừ phần chồng lấn. Tầng trừ
+     đó (`_offline_batch_loop` bước 5 cũ) **đã bị XOÁ ngày 2026-10-04** cùng với mảnh ghép cuối
+     khối ⇒ hiện KHÔNG có gì trừ hộ. Đừng bật `overlap_sec` trừ khi khôi phục lại tầng đó.
+     (Sự cố gốc: "cuối câu này là đầu của câu sau", 2026-10-02.)
 
 Nhiệm vụ của bộ cắt khối:
 1. Quét khoảng lặng trong dải [T + min_window, T + search_max] trên RAM timeline.
@@ -47,14 +53,28 @@ Bản này:
     `silence_floor_rms` (xem `silence_threshold`) — không còn phụ thuộc âm lượng tuyệt đối.
   * **Hai mức ranh giới**: `>= strong_silence_ms` (450 ms) là MẠNH (cắt ngay), `>= min_silence_ms`
     (250 ms) là YẾU (chỉ cắt khi gần mốc lý tưởng).
-  * **Nới dải tìm kiếm** tới `search_max_sec` (tuyến batch: 30 s — đúng cửa sổ tối ưu 15–30 s của
-    Qwen3-ASR) ⇒ khối dài hơn, ít ranh giới hơn. Không còn cắt cứng ở 18 s.
+  * **Nới dải tìm kiếm** tới trọn phần audio đọc được, chỉ bị chặn bởi trần ngân sách token
+    (`max_audio_sec`, tuyến batch: 45 s) ⇒ khối dài hơn, ít ranh giới hơn. Không còn cắt cứng ở 18 s
+    (trần 30 s cũ cũng đã bỏ — xem mục "CHÍNH SÁCH CỠ KHỐI" dưới đây).
   * Cắt cưỡng bức tại **điểm trũng quanh độ dài lý tưởng**, không phải ở mép dải.
 
+CHÍNH SÁCH CỠ KHỐI (hiện hành)
+------------------------------
+Cỡ khối = **TỐI ĐA CÓ THỂ**, bị chặn bởi ĐÚNG HAI thứ:
+  1. `available_sec` — lượng audio ĐỌC ĐƯỢC liên tục phía trước `from_pts`;
+  2. `max_audio_sec` — trần ngân sách token của `transcribe.dll` (`k_max_new = 256`, C ABI chưa
+     expose `max_new_tokens`).
+Mốc lý tưởng để chấm điểm ranh giới là `min(available_sec, max_audio_sec) − 2.0` (chừa 2 s biên để
+còn chỗ tìm khoảng lặng). KHÔNG có tham số "độ dài mục tiêu" riêng: một tham số như vậy từng tồn
+tại (`target_window_sec`, nạp từ `config.lookahead.batch_target_sec`) nhưng **không bao giờ ảnh
+hưởng kết quả** — dòng kẹp theo dải tìm kiếm triệt tiêu nó trong mọi trường hợp — nên đã XOÁ ngày
+2026-10-06. Muốn đổi độ dài khối thì đổi `max_audio_sec`.
+
 GHI CHÚ: tham số `vad_engine` của bản cũ đã được BỎ vì nó được nhận vào nhưng **không bao giờ
-được đọc** (dead code). Bộ dò hiện dùng năng lượng tương đối. Cố ý KHÔNG dùng VAD/CommitManager để
-chốt câu ở đây: làm vậy là kéo tuyến batch về đúng cách ngắt câu của Pipeline A và mất hết lợi thế
-ngữ cảnh dài của Qwen3-ASR.
+được đọc** (dead code). Bộ dò khoảng lặng nay do `silence_scanner` (`VADSilenceScanner`) đảm nhiệm
+và đó là ĐƯỜNG CHÍNH; dò năng lượng tương đối chỉ còn là dự phòng. Việc chốt CÂU vẫn KHÔNG dùng
+VAD/CommitManager của Pipeline A — cắt câu diễn ra bên trong bản phiên âm đầy đủ (Forced Aligner),
+nên vẫn giữ được lợi thế ngữ cảnh dài của Qwen3-ASR.
 """
 
 from __future__ import annotations
@@ -105,7 +125,6 @@ class LookaheadChunker:
         self,
         timeline: ContinuousAudioTimeline,
         sample_rate: int = 16000,
-        target_window_sec: float = 25.0,
         min_window_sec: float = 8.0,
         min_silence_ms: float = 250.0,
         silence_rms_threshold: float = 0.015,
@@ -124,10 +143,20 @@ class LookaheadChunker:
         max_audio_sec: float = 45.0,
         **kwargs: Any,
     ):
+        # Tham số cũ/không tồn tại bị nuốt im lặng là lỗi đã gặp (test cũ truyền mãi
+        # `max_window_sec`, `search_max_sec`, `adaptive_*` mà không ai đọc). Cảnh báo để
+        # không ai tưởng chúng còn tác dụng.
+        if kwargs:
+            logger.warning(
+                "LookaheadChunker bỏ qua tham số KHÔNG được hỗ trợ: "
+                + ", ".join(sorted(kwargs))
+                + " (xem docstring 'CHÍNH SÁCH CỠ KHỐI' — cỡ khối nay chỉ do `available_sec` "
+                "và `max_audio_sec` quyết định).",
+                extra={"module_tag": "ASR"},
+            )
+
         self.timeline = timeline
         self.sample_rate = int(sample_rate)
-        #: Độ dài LÝ TƯỞNG của một khối (mốc để chấm điểm ranh giới).
-        self.target_window_sec = float(target_window_sec)
         #: Không bao giờ cắt khối ngắn hơn mức này.
         self.min_window_sec = float(min_window_sec)
         self.min_silence_ms = float(min_silence_ms)
@@ -508,21 +537,19 @@ class LookaheadChunker:
         # `biên liên tục tới 99.81s, RAM 97.4s` (bộ đệm thừa sức cho khối dài hơn):
         #     [SEG_BATCH] Chọn khối: dài 11.9s (mục tiêu 12.2s, dải tìm tới 14.2s,
         #                 biên liên tục tới 69.99s, RAM 67.6s, ...)
-        # Nay dải tìm mở tới `min(available_sec, max_audio_sec)`; chỉ MỤC TIÊU mới bị kẹp theo
-        # `target_window_sec` để không nhắm vào mốc quá xa.
+        # Nay dải tìm mở tới `min(available_sec, max_audio_sec)` — không còn trần nhân tạo nào
+        # (trần `search_max_sec` 30 s và `target_window_sec` đều đã bị xoá).
         budget = min(float(available_sec), self.max_audio_sec)
 
         # Dải tìm = trọn phần audio còn dùng được (không còn trần nhân tạo 30 s).
         effective_search_max = max(self.min_window_sec, budget)
         self.last_effective_search_max_sec = float(effective_search_max)
 
-        # Mục tiêu: `target_window_sec` khi bộ đệm cho phép, nhưng không vượt trần ngân sách token
-        # và luôn chừa biên để tìm khoảng lặng (nên `- 2.0`).
-        effective_target = min(
-            self.max_audio_sec,
-            max(self.target_window_sec, budget - 2.0),
-        )
-        effective_target = min(effective_target, max(1.0, effective_search_max - 2.0))
+        # Mốc lý tưởng = sát mép trần ngân sách, chừa 2 s biên để còn chỗ tìm khoảng lặng.
+        # KHÔNG có tham số "độ dài mục tiêu" riêng: bản cũ (`target_window_sec`, nạp từ
+        # `config.lookahead.batch_target_sec`) bị chính dòng kẹp theo dải tìm kiếm triệt tiêu nên
+        # không bao giờ ảnh hưởng kết quả; đã xoá 2026-10-06. Muốn đổi cỡ khối ⇒ đổi `max_audio_sec`.
+        effective_target = min(self.max_audio_sec, max(1.0, budget - 2.0))
         self.last_effective_target_sec = float(effective_target)
 
         search_start_pts = from_pts + self.min_window_sec
@@ -605,8 +632,9 @@ class LookaheadChunker:
 
         # Đường DỰ PHÒNG cắt KHÔNG dựa trên khoảng lặng (min_rms/forced): giữ nguyên hành vi cũ là
         # lấy lùi `overlap_sec` — nhưng mặc định `overlap_sec = 0.0` nên khối sau vẫn bắt đầu đúng
-        # nơi khối trước kết thúc. Đặt `overlap_sec > 0` sẽ quay lại cơ chế cũ (CẦN phía nhận trừ
-        # chồng lấn — xem `batch_overlap_sec` trong `config.py`).
+        # nơi khối trước kết thúc. ⚠️ Đặt `overlap_sec > 0` sẽ quay lại cơ chế cũ và CẦN một tầng
+        # trừ chồng lấn ở phía nhận — tầng đó (`_offline_batch_loop` bước 5 cũ, khoá config
+        # `batch_overlap_sec`) ĐÃ BỊ XOÁ ngày 2026-10-04. Hiện không còn gì trừ hộ ⇒ đừng bật.
         if fallback_mode in ("forced_overlap", "min_rms") and self.overlap_sec > 0.0:
             next_start = max(actual_start + 1.0, actual_end - self.overlap_sec)
         else:

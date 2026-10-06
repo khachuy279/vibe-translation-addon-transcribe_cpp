@@ -10,6 +10,12 @@ Kèm theo:
 - Bộ đếm từ chuẩn hỗ trợ cả chữ Latin và ký tự CJK (Trung, Nhật, Hàn).
 - Lọc câu ngắn (min_words_to_commit) loại bỏ âm thanh ậm ừ.
 - Chống trùng lặp 3 lớp (CommitDeduplicator).
+
+⚠️ ĐƯỜNG CHẠY THẬT (2026-10-06): runtime KHÔNG gọi `decide_commit_trigger()` (hàm gộp 4 bậc) mà
+gọi từng hàm thành phần từ `TranscribeEngine._evaluate_tier234()` (`backend/asr/engine.py`), kèm
+các guard riêng (`enable_tier234`, `preview_fresh`, `stability_min_duration_sec`,
+`stability_min_words`). BẬC 1 do `TranscribeEngine.on_speech_end()` sinh trực tiếp. Khi sửa hành vi
+chốt câu, sửa ở `engine.py` — không phải ở `decide_commit_trigger()`.
 """
 
 import logging
@@ -84,7 +90,13 @@ class CommitManager:
         self._stable_poll_count = 0
 
     def is_text_filtered(self, text: str, min_words: Optional[int] = None) -> bool:
-        """Kiểm tra nếu câu quá ngắn (dưới ngưỡng min_words_to_commit) để drop."""
+        """Kiểm tra nếu câu quá ngắn (dưới ngưỡng min_words_to_commit) để drop.
+
+        ⚠️ KHÔNG ĐƯỢC GỌI TRONG RUNTIME (2026-10-06): không có call-site nào ngoài test. Việc lọc
+        câu ngắn của Pipeline A nằm ở tầng gom câu/`min_words` phía engine và ở
+        `LookaheadChunker`/Forced Aligner của Pipeline B. Giữ lại để không phá test cũ; đừng dùng
+        cho logic mới.
+        """
         threshold = min_words if min_words is not None else self.cfg.min_words_to_commit
         if threshold <= 0:
             return False
@@ -178,7 +190,20 @@ class CommitManager:
         preview_text: str,
         is_speech_active: bool,
     ) -> Optional[CommitReason]:
-        """Quyết định lý do chốt câu dựa trên thứ tự 4 bậc ưu tiên rõ ràng."""
+        """Quyết định lý do chốt câu dựa trên thứ tự 4 bậc ưu tiên rõ ràng.
+
+        ⚠️ DEPRECATED / KHÔNG NẰM TRÊN ĐƯỜNG CHẠY (2026-10-06): runtime **không gọi hàm này**.
+        `TranscribeEngine._evaluate_tier234()` (`backend/asr/engine.py`) tự gọi ba hàm thành phần
+        (`check_max_duration` → `evaluate_preview_stability` → `evaluate_inactivity_timeout(True)`)
+        và bổ sung các guard không có ở đây: `config.sentence.enable_tier234`, `preview_fresh`,
+        `stability_min_duration_sec`, `stability_min_words`. BẬC 1 (VAD_SILENCE) do
+        `on_speech_end` sinh trực tiếp.
+
+        Hệ quả cần biết trước khi sửa: `evaluate_inactivity_timeout` ở đây nhận `is_speech_active`
+        thật, còn runtime truyền cứng `True` — nên nhánh `if not is_speech_active: return False`
+        KHÔNG hề chặn BẬC 4 trong thực tế. Hàm này chỉ còn được test dùng
+        (`backend/tests/test_04_commit_logic.py`).
+        """
         # BẬC 1: Ưu tiên cao nhất - VAD Silence
         if vad_silence:
             return CommitReason.VAD_SILENCE

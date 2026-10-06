@@ -18,7 +18,11 @@ Cải tiến v3 (Persistent RAM Audio Storage for Pipeline B):
    Chấp nhận các mảnh đến theo bất kỳ thứ tự nào (out-of-order) và tự động gộp/cắt chồng lấn.
 5. **Xử lý khe hở thông minh (Smart Gap Handling)**:
    - Khe hở nhỏ (<= 5.0s, khoảng lặng nói): lấp im lặng (silence) để bảo toàn mốc thời gian tuyệt đối.
-   - Khe hở lớn (> 5.0s, do tua nhảy cóc): trả None để chờ buffer nạp thay vì tạo im lặng giả.
+   - Khe hở lớn (> 5.0s, do tua nhảy cóc): DỪNG đọc tại mép khe hở — `get_audio_range` trả về phần
+     đã gom được (NGẮN hơn `duration_sec` yêu cầu), và chỉ trả `None` khi chưa gom được gì (khe hở
+     nằm ngay đầu vùng đọc). Việc cắt ngắn này được log WARNING + đếm metric
+     `lookahead.read_truncated_by_gap`, vì caller (`LookaheadChunker`) tính `pts_end` theo
+     `len(pcm)` nên khối sẽ ngắn đi mà không có dấu vết nào khác.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from backend.core.metrics import metrics_collector
 from backend.utils.logger import get_logger
 
 logger = get_logger("core.lookahead_timeline")
@@ -364,7 +369,10 @@ class ContinuousAudioTimeline:
         """Lấy một khối audio liên tục từ `start_pts` với độ dài tối đa `duration_sec` mà KHÔNG di chuyển `_cursor`.
 
         Tự động ghép nối qua nhiều chunk trong RAM và lấp các khe hở nhỏ (<= MAX_GAP_FILL_SEC) bằng silence.
-        
+
+        ⚠️ Khe hở LỚN hơn `MAX_GAP_FILL_SEC` làm hàm trả về kết quả NGẮN hơn `duration_sec`
+        (dừng ở mép khe hở), không phải `None` — xem chú thích tại nhánh `break` bên dưới.
+
         Returns:
             (pts_start, pcm) hoặc None nếu không có audio tại `start_pts`.
         """
@@ -392,7 +400,22 @@ class ContinuousAudioTimeline:
                 if chunk.pts_start > curr_pts:
                     gap_sec = chunk.pts_start - curr_pts
                     if gap_sec > MAX_GAP_FILL_SEC:
-                        # Khe hở quá lớn (lỗ tua seek hole) -> dừng ở mép khe hở
+                        # Khe hở quá lớn (lỗ tua seek hole) -> dừng ở mép khe hở.
+                        # ⚠️ KHÔNG trả None ở đây: nếu đã gom được audio thì trả phần đã gom (NGẮN
+                        # hơn `duration_sec` yêu cầu) — người gọi (`LookaheadChunker`) tính
+                        # `pts_end` theo `len(pcm)` nên khối sẽ ngắn đi. Log + metric để việc ngắn
+                        # đi này KHÔNG còn im lặng (trước 2026-10-06 nó hoàn toàn vô hình).
+                        if pieces:
+                            got_sec = sum(len(p) for p in pieces) / self.sample_rate
+                            logger.warning(
+                                f"Vùng đọc bị CẮT NGẮN tại khe hở {gap_sec:.2f}s "
+                                f"(> MAX_GAP_FILL_SEC {MAX_GAP_FILL_SEC:.1f}s): yêu cầu "
+                                f"{duration_sec:.2f}s từ {target_start:.2f}s nhưng chỉ đọc được "
+                                f"{got_sec:.2f}s (dừng ở {curr_pts:.2f}s, audio kế tiếp bắt đầu ở "
+                                f"{chunk.pts_start:.2f}s).",
+                                extra={"module_tag": "CORE"},
+                            )
+                            metrics_collector.increment_counter("lookahead.read_truncated_by_gap")
                         break
                     gap_samples = int(round(gap_sec * self.sample_rate))
                     if gap_samples > 0:

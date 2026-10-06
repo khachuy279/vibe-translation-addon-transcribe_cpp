@@ -484,8 +484,9 @@ class LookaheadConfig(BaseModel):
 
     Pipeline B CHỈ có một chế độ: **OFFLINE_BATCH** (Qwen3-ASR + Qwen3-ForcedAligner-0.6B).
     Mảnh audio tương lai từ MSE (`SourceBuffer.appendBuffer`) được ghép nối liên tục thành dòng
-    PCM trên RAM, cắt thành khối 12-30 s tại khoảng lặng thật, đưa TRỌN khối cho ASR (ngữ cảnh đầy
-    đủ ⇒ WER/CER thấp), rồi gắn mốc thời gian từng từ bằng Forced Aligner và cắt câu theo dấu câu.
+    PCM trên RAM, cắt thành khối **tối đa có thể** (bị chặn bởi lượng audio đọc được và trần
+    `batch_max_audio_sec`) tại khoảng lặng thật, đưa TRỌN khối cho ASR (ngữ cảnh đầy đủ ⇒ WER/CER
+    thấp), rồi gắn mốc thời gian từng từ bằng Forced Aligner và cắt câu theo dấu câu.
     Mốc PTS tuyệt đối được trả về Extension để phụ đề hiện ĐÚNG lúc `video.currentTime` đi qua.
 
     Chế độ "streaming" (Pipeline B v2: VAD + CommitManager + preview) đã bị XOÁ ngày 2026-10-02.
@@ -496,9 +497,11 @@ class LookaheadConfig(BaseModel):
     enabled: bool = True
 
     # ── ĐIỀU PHỐI CỠ KHỐI (PIPELINE B BATCH) ──────────────────────────────────
-    #: Độ dài khối LÝ TƯỞNG khi bộ đệm lookahead dồi dào (giây).
-    #: Nâng lên 28.0s để đưa khối gần bằng 30s vào ASR khi có đủ lookahead, tối đa hoá ngữ cảnh.
-    batch_target_sec: float = 28.0
+    # GHI CHÚ 2026-10-06: khoá `batch_target_sec` (độ dài khối "lý tưởng") đã bị XOÁ. Nó được
+    # truyền vào `LookaheadChunker.target_window_sec` nhưng KHÔNG BAO GIỜ ảnh hưởng kết quả: dòng
+    # kẹp `min(effective_target, effective_search_max - 2.0)` triệt tiêu nó trong mọi trường hợp,
+    # nên cỡ khối thực tế luôn là `min(available_sec, batch_max_audio_sec) - 2`. Muốn đổi độ dài
+    # khối thì đổi `batch_max_audio_sec`.
     #: Sàn tối thiểu độ dài một khối chuẩn (giây).
     batch_min_sec: float = 8.0
     #: TRẦN CỨNG độ dài audio một khối gửi vào `transcribe.dll` (giây). RÀNG BUỘC NATIVE

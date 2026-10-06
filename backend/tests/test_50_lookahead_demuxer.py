@@ -1,18 +1,15 @@
-"""Unit tests for Phase 2: Lookahead Audio Demuxer & Timeline Aligner.
+"""Unit tests cho `StreamDemuxer` — bộ ghép nối byte LIÊN TỤC của Pipeline B (Lookahead).
 
-Bổ sung (v2 — sau sự cố "mất phụ đề gốc và dịch"):
-  * `StreamDemuxer` — bộ ghép nối byte LIÊN TỤC cho mảnh MSE bị cắt giữa cluster.
-    Đây là regression test cho nguyên nhân gốc: giải mã từng mảnh 32 KB độc lập chỉ
-    thu được ~35 % lượng audio.
+Regression test cho nguyên nhân gốc "mất phụ đề gốc và dịch": giải mã từng mảnh 32 KB độc lập
+(Giải pháp v1 `LookaheadDemuxer` + `TimelineAligner` trong `backend/core/`) chỉ thu được ~35 %
+lượng audio, vì mảnh bị cắt GIỮA cluster WebM / fragment fMP4 không tự parse được.
+Hai module v1 đó đã bị XOÁ ngày 2026-10-06 (không còn ai dùng trong runtime).
 """
 
 import io
 import time
 import numpy as np
 import pytest
-import soundfile as sf
-from backend.core.lookahead_demuxer import LookaheadDemuxer, DecodedAudioChunk
-from backend.core.timeline_aligner import TimelineAligner
 from backend.core.stream_demuxer import (
     StreamAudioChunk,
     StreamDemuxer,
@@ -21,97 +18,6 @@ from backend.core.stream_demuxer import (
     scan_mp4_boundaries,
     scan_webm_boundaries,
 )
-
-
-def create_synthetic_wav_bytes(duration_sec: float = 3.0, sr: int = 48000, freq: float = 440.0) -> bytes:
-    """Tạo byte WAV mẫu 48kHz stereo/mono để giả lập chunk từ trình duyệt."""
-    num_samples = int(sr * duration_sec)
-    t = np.linspace(0, duration_sec, num_samples, endpoint=False)
-    sine = (np.sin(2 * np.pi * freq * t) * 0.8).astype(np.float32)
-    buf = io.BytesIO()
-    sf.write(buf, sine, sr, format="WAV")
-    return buf.getvalue()
-
-
-def test_demuxer_decode_wav():
-    """Kiểm tra giải mã chunk và resample sang 16kHz mono float32."""
-    demuxer = LookaheadDemuxer(target_sample_rate=16000)
-    raw_wav = create_synthetic_wav_bytes(duration_sec=2.5, sr=48000)
-
-    chunk = demuxer.decode_chunk(raw_wav, timestamp_offset=10.0)
-    assert chunk is not None
-    assert chunk.sample_rate == 16000
-    assert chunk.channels == 1
-    assert abs(chunk.duration - 2.5) < 0.05
-    assert abs(chunk.pts_start - 10.0) < 0.01
-    assert abs(chunk.pts_end - 12.5) < 0.05
-    assert len(chunk.pcm) == pytest.approx(16000 * 2.5, abs=100)
-    assert chunk.pcm.dtype == np.float32
-    assert -1.05 <= np.max(chunk.pcm) <= 1.05
-
-
-def test_demuxer_speed_rtf():
-    """Đảm bảo tốc độ giải mã cực nhanh (RTF < 0.01, nhanh hơn 100x realtime)."""
-    demuxer = LookaheadDemuxer(target_sample_rate=16000)
-    raw_wav = create_synthetic_wav_bytes(duration_sec=10.0, sr=48000)
-
-    t0 = time.perf_counter()
-    chunk = demuxer.decode_chunk(raw_wav, timestamp_offset=0.0)
-    t1 = time.perf_counter()
-
-    assert chunk is not None
-    elapsed_sec = t1 - t0
-    rtf = elapsed_sec / 10.0
-    print(f"\n[DEMUX BENCHMARK] Decoded 10s in {elapsed_sec*1000:.2f}ms (RTF: {rtf:.5f}, {1/rtf:.1f}x RT)")
-    assert rtf < 0.01, f"Demuxer RTF quá cao: {rtf}"
-
-
-def test_timeline_aligner_stitching():
-    """Kiểm tra khả năng ghép nối 2 chunk liên tiếp và trích xuất lát cắt."""
-    aligner = TimelineAligner(sample_rate=16000)
-
-    # Tạo 2 chunk: [0.0s -> 5.0s] và [5.0s -> 10.0s]
-    pcm1 = np.ones(16000 * 5, dtype=np.float32) * 0.5
-    pcm2 = np.ones(16000 * 5, dtype=np.float32) * 0.8
-
-    chunk1 = DecodedAudioChunk(pts_start=0.0, pts_end=5.0, duration=5.0, pcm=pcm1)
-    chunk2 = DecodedAudioChunk(pts_start=5.0, pts_end=10.0, duration=5.0, pcm=pcm2)
-
-    aligner.add_chunk(chunk1)
-    aligner.add_chunk(chunk2)
-
-    buffered_min, buffered_max = aligner.get_buffered_range()
-    assert buffered_min == 0.0
-    assert buffered_max == 10.0
-
-    # Trích xuất đoạn giữa [2.0s -> 8.0s]
-    slice_out = aligner.extract_slice(start_pts=2.0, end_pts=8.0)
-    assert slice_out is not None
-    assert abs(slice_out.duration - 6.0) < 0.01
-    assert len(slice_out.pcm) == 16000 * 6
-
-
-def test_timeline_aligner_prune_and_reset():
-    """Kiểm tra chức năng dọn dẹp cache quá khứ và tua video reset."""
-    aligner = TimelineAligner(sample_rate=16000)
-
-    for i in range(10):
-        pcm = np.zeros(16000 * 2, dtype=np.float32)
-        chunk = DecodedAudioChunk(pts_start=i * 2.0, pts_end=(i + 1) * 2.0, duration=2.0, pcm=pcm)
-        aligner.add_chunk(chunk)
-
-    # Tổng cộng có 20s [0.0 -> 20.0]
-    assert aligner.get_buffered_range() == (0.0, 20.0)
-
-    # Prune tại current_time = 15.0s, giữ lại 6s trước đó -> cutoff = 9.0s
-    aligner.prune_past(current_time=15.0, keep_behind_sec=6.0)
-    buffered_min, buffered_max = aligner.get_buffered_range()
-    assert buffered_min >= 8.0
-    assert buffered_max == 20.0
-
-    # Reset khi seek
-    aligner.reset(target_time=50.0)
-    assert aligner.get_buffered_range() == (0.0, 0.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

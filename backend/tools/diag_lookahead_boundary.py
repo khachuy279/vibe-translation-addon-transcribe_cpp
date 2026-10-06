@@ -79,7 +79,6 @@ def make_chunker(pcm: np.ndarray) -> LookaheadChunker:
     return LookaheadChunker(
         timeline=tl,
         sample_rate=SR,
-        target_window_sec=float(la.batch_target_sec),
         min_window_sec=float(la.batch_min_sec),
         min_silence_ms=float(la.batch_min_silence_ms),
         strong_silence_ms=float(la.batch_strong_silence_ms),
@@ -327,7 +326,7 @@ def main() -> None:
         f"{la.batch_min_silence_ms:.0f}ms)"
     )
     print(
-        f"Cấu hình: target={la.batch_target_sec}s trần audio={la.batch_max_audio_sec}s "
+        f"Cấu hình: cỡ khối tối đa (trần audio)={la.batch_max_audio_sec}s "
         f"| ranh giới mạnh >= {la.batch_strong_silence_ms}ms "
         f"| ngưỡng lặng = p90 - {la.batch_silence_rel_db}dB"
     )

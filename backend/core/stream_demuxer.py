@@ -29,7 +29,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import av
 import numpy as np

@@ -1,11 +1,16 @@
 """Unit tests cho LookaheadChunker (Phase 2).
 
 Kiểm thử toàn diện các kịch bản:
-1. Có khoảng lặng tự nhiên VAD >= 250ms trong [T+12s, T+18s] -> cắt tại midpoint.
-2. Nói liên tục không có khoảng lặng -> fallback forced cut + 1.0s overlap.
+1. Có khoảng lặng tự nhiên >= 250ms sau `min_window_sec` -> cắt tại midpoint.
+2. Nói liên tục không có khoảng lặng -> fallback forced cut (kèm `overlap_sec` nếu được bật).
 3. Fast-Bootstrap sau khi tua video (Seek) -> cắt khối ngắn 3.0s - 4.0s.
-4. Điều kiện biên: Hết luồng (end_of_stream) và chờ nạp đệm (chưa đủ 12s).
+4. Điều kiện biên: Hết luồng (end_of_stream) và chờ nạp đệm (chưa đủ `min_window_sec`).
 5. Chuỗi đa khối (Multi-chunk sequence) trên dòng audio 40s liên tục.
+
+GHI chú 2026-10-06: các tham số `target_window_sec`, `max_window_sec`, `search_max_sec`,
+`adaptive_max_sec`, `adaptive_threshold_sec` từng được truyền vào đây nhưng `LookaheadChunker`
+chỉ nuốt qua `**kwargs` và KHÔNG bao giờ đọc — đã xoá khỏi test và khỏi constructor. Cỡ khối nay
+chỉ do `available_sec` và `max_audio_sec` quyết định.
 """
 
 from __future__ import annotations
@@ -52,9 +57,7 @@ class TestLookaheadChunker:
         chunker = LookaheadChunker(
             timeline=timeline,
             sample_rate=sr,
-            target_window_sec=15.0,
             min_window_sec=12.0,
-            max_window_sec=18.0,
             min_silence_ms=250.0,
         )
 
@@ -84,15 +87,12 @@ class TestLookaheadChunker:
         chunker = LookaheadChunker(
             timeline=timeline,
             sample_rate=sr,
-            target_window_sec=15.0,
             min_window_sec=12.0,
-            max_window_sec=18.0,
             min_silence_ms=250.0,
             overlap_sec=1.0,
             # Trần cứng = 18 s để giữ đúng kịch bản "không có khoảng lặng trong tầm với":
             # nay dải tìm mở hết cỡ tới trần ngân sách token nên phải khai báo rõ.
             max_audio_sec=18.0,
-            search_max_sec=18.0,
         )
 
         chunk = chunker.next_chunk(from_pts=0.0)
@@ -120,9 +120,8 @@ class TestLookaheadChunker:
 
         # (a) Có nới dải tìm kiếm ⇒ cắt tại khoảng lặng thật, khối dài hơn trần cũ
         wide = LookaheadChunker(
-            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
-            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
-            search_max_sec=30.0,
+            timeline=timeline, sample_rate=sr,
+            min_window_sec=12.0, min_silence_ms=250.0,
         )
         chunk = wide.next_chunk(from_pts=0.0)
         assert chunk is not None
@@ -134,9 +133,9 @@ class TestLookaheadChunker:
 
         # (b) Không nới dải (hành vi cũ) ⇒ không thấy khoảng lặng đó, phải cưỡng bức cắt
         narrow = LookaheadChunker(
-            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
-            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
-            max_audio_sec=18.0, search_max_sec=18.0,
+            timeline=timeline, sample_rate=sr,
+            min_window_sec=12.0, min_silence_ms=250.0,
+            max_audio_sec=18.0,
         )
         legacy = narrow.next_chunk(from_pts=0.0)
         assert legacy is not None
@@ -144,10 +143,12 @@ class TestLookaheadChunker:
         assert legacy.pts_end <= 18.05
 
     def test_adaptive_window_uses_available_buffer_up_to_token_budget(self, timeline):
-        """Cỡ khối THÍCH ỨNG theo bộ đệm: dồi dào ⇒ nhắm `target_window_sec`; trần cứng theo token.
+        """Cỡ khối THÍCH ỨNG theo bộ đệm: dồi dào ⇒ khối dài tới trần ngân sách token.
 
         ĐO THẬT 2026-10-04: YouTube giữ lookahead 100-118 s (popup "+117.95s") trong khi bộ cắt khối
-        chỉ gửi khối 12-18 s cho ASR ⇒ lãng phí phần lớn khoảng đệm. Nay khối nhắm ~25-28 s.
+        chỉ gửi khối 12-18 s cho ASR ⇒ lãng phí phần lớn khoảng đệm. Nay khối dài tối đa có thể.
+        (Tham số "độ dài mục tiêu" `target_window_sec` đã bị xoá 2026-10-06 — xem
+        `test_default_sizes_are_tuned_for_large_lookahead`.)
 
         TRẦN CỨNG `max_audio_sec`: `transcribe.dll` hardcode `k_max_new = 256` token cho Qwen3-ASR
         (`external/transcribe.cpp/src/arch/qwen3_asr/model.cpp`) và C ABI KHÔNG expose
@@ -163,13 +164,8 @@ class TestLookaheadChunker:
         chunker = LookaheadChunker(
             timeline=timeline,
             sample_rate=sr,
-            target_window_sec=25.0,
             min_window_sec=8.0,
-            max_window_sec=45.0,
             min_silence_ms=250.0,
-            search_max_sec=30.0,
-            adaptive_max_sec=30.0,
-            adaptive_threshold_sec=30.0,
             max_audio_sec=45.0,
         )
         chunk = chunker.next_chunk(from_pts=0.0)
@@ -184,9 +180,8 @@ class TestLookaheadChunker:
         timeline.clear()
         timeline.append(pts_start=0.0, pcm=np.concatenate([part1, gap, part2]))
         tight = LookaheadChunker(
-            timeline=timeline, sample_rate=sr, target_window_sec=25.0,
-            min_window_sec=8.0, max_window_sec=45.0, min_silence_ms=250.0,
-            search_max_sec=30.0, adaptive_max_sec=30.0, adaptive_threshold_sec=30.0,
+            timeline=timeline, sample_rate=sr,
+            min_window_sec=8.0, min_silence_ms=250.0,
             max_audio_sec=20.0,
         )
         tight_chunk = tight.next_chunk(from_pts=0.0)
@@ -195,11 +190,16 @@ class TestLookaheadChunker:
         assert tight.last_effective_target_sec <= 20.0
 
     def test_default_sizes_are_tuned_for_large_lookahead(self, timeline):
-        """Giá trị mặc định phải phản ánh lookahead lớn của YouTube (không còn 12-18 s)."""
+        """Giá trị mặc định phải phản ánh lookahead lớn của YouTube (không còn 12-18 s).
+
+        Cỡ khối nay là "TỐI ĐA CÓ THỂ": chỉ `available_sec` và `max_audio_sec` quyết định. Tham số
+        "độ dài mục tiêu" (`target_window_sec` / `config.lookahead.batch_target_sec`) đã bị XOÁ
+        2026-10-06 vì bị dòng kẹp theo dải tìm kiếm triệt tiêu ⇒ không bao giờ ảnh hưởng kết quả.
+        """
         chunker = LookaheadChunker(timeline=timeline)
-        assert chunker.target_window_sec >= 20.0
         assert chunker.min_window_sec <= 10.0
         assert chunker.max_audio_sec >= 30.0
+        assert not hasattr(chunker, "target_window_sec"), "tham số độ dài mục tiêu đã bị xoá"
         # `overlap_sec` mặc định cũ là 1.0 ⇒ nay 0.0 vì khối cắt tại khoảng lặng VAD, không lấy lùi.
         assert chunker.overlap_sec == 0.0, "không còn lấy lùi ⇒ không có gì để trừ chồng lấn"
 
@@ -216,8 +216,8 @@ class TestLookaheadChunker:
         timeline.append(pts_start=0.0, pcm=np.concatenate([part1, silence, part2]))
 
         chunker = LookaheadChunker(
-            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
-            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
+            timeline=timeline, sample_rate=sr,
+            min_window_sec=12.0, min_silence_ms=250.0,
         )
         chunk = chunker.next_chunk(from_pts=0.0)
         assert chunk is not None
@@ -238,8 +238,8 @@ class TestLookaheadChunker:
 
         timeline.append(pts_start=0.0, pcm=pcm)
         chunker = LookaheadChunker(
-            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
-            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
+            timeline=timeline, sample_rate=sr,
+            min_window_sec=12.0, min_silence_ms=250.0,
             min_rms_hold_ms=120.0,
         )
         chunk = chunker.next_chunk(from_pts=0.0)
@@ -306,9 +306,7 @@ class TestLookaheadChunker:
         chunker = LookaheadChunker(
             timeline=timeline,
             sample_rate=sr,
-            target_window_sec=15.0,
             min_window_sec=12.0,
-            max_window_sec=18.0,
             min_silence_ms=250.0,
         )
 
@@ -343,9 +341,9 @@ class TestLookaheadChunker:
         timeline.clear()
         timeline.append(pts_start=0.0, pcm=full_pcm)
         tight = LookaheadChunker(
-            timeline=timeline, sample_rate=sr, target_window_sec=15.0,
-            min_window_sec=12.0, max_window_sec=18.0, min_silence_ms=250.0,
-            max_audio_sec=18.0, search_max_sec=18.0,
+            timeline=timeline, sample_rate=sr,
+            min_window_sec=12.0, min_silence_ms=250.0,
+            max_audio_sec=18.0,
         )
         tight_chunk = tight.next_chunk(from_pts=0.0)
         assert tight_chunk is not None
