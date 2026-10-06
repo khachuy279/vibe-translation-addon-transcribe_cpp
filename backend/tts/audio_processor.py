@@ -12,7 +12,6 @@ import io
 from typing import Any, List, Union
 import numpy as np
 import soundfile as sf
-import torch
 from scipy import signal
 
 from backend.utils.logger import get_logger
@@ -40,7 +39,9 @@ class AudioProcessor:
                 # `np.asarray(..., dtype=...)` KHÔNG copy nếu dtype đã khớp; `.astype()`
                 # mặc định `copy=True` nên luôn tạo bản sao thừa (G-05 / audit Gemini).
                 arr = np.asarray(item, dtype=np.float32)
-            elif isinstance(item, torch.Tensor):
+            elif hasattr(item, "detach") and hasattr(item, "cpu"):
+                # Tensor-like (vd. torch.Tensor từ mock/legacy) — duck typing để module KHÔNG
+                # phải import torch (TTS chạy omnivoice.cpp native, không cần PyTorch runtime).
                 # `.cpu()` đã copy sang host; `.numpy()` là view trên bộ nhớ đó (zero-copy),
                 # còn `asarray` chỉ copy nếu dtype khác float32 (thường là float32 ⇒ 0 copy).
                 arr = np.asarray(item.detach().cpu().numpy(), dtype=np.float32)

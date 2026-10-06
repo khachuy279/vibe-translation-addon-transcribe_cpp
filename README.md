@@ -133,7 +133,7 @@ Khi người dùng TUA VIDEO (Seek trước / Seek sau):
 |---|---|
 | **OS** | Windows 10/11 64-bit |
 | **Python** | 3.10 – 3.13 |
-| **GPU** | NVIDIA RTX ≥ 6 GB VRAM (khuyến nghị 12–16 GB) |
+| **GPU** | NVIDIA RTX ≥ 8 GB VRAM (khuyến nghị 12–16 GB) |
 | **Driver NVIDIA** | ≥ 580 (cu130) hoặc ≥ 550 (cu124) |
 | **Trình duyệt** | Firefox (khuyến nghị) hoặc Chrome/Edge |
 | **RAM** | ≥ 8 GB trống |

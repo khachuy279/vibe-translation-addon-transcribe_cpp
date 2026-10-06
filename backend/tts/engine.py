@@ -23,7 +23,6 @@ from typing import Optional, Tuple, Any, Dict
 
 import numpy as np
 import soundfile as sf
-import torch
 
 from backend.config import config, MODELS_DIR
 from backend.tts.base import BaseTTSEngine
@@ -69,7 +68,6 @@ class OmniVoiceTTS(BaseTTSEngine):
 
     def __init__(self):
         self.sample_rate = 24000
-        self.device = config.tts.device if hasattr(config, "tts") and config.tts.device else ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = None  # Giữ cho mock testing hoặc legacy fallback
         self._is_loaded = False
         self._voice_prompt_cache: "OrderedDict[Tuple[str, str], Any]" = OrderedDict()  # LRU, max 8 entries

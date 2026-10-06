@@ -144,8 +144,8 @@ async def run_tts_benchmark():
     report_content = f"""# Báo Cáo Đo Lường & Kiểm Thử Phase 6: Module OmniVoice Clone TTS
 
 - **Thời gian thực hiện**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-- **Mô hình TTS**: `{config.tts.model}` (Native PyTorch)
-- **Thiết bị chạy**: `{tts.device}`
+- **Mô hình TTS**: `{config.tts.repo_id}/{config.tts.model_base}` (omnivoice.cpp GGUF native)
+- **Tokenizer**: `{config.tts.model_tokenizer}`
 - **Sampling Rate**: `24,000 Hz`
 - **Mẫu Giọng Mặc Định**: `{config.tts.default_voice}`
 

@@ -406,11 +406,13 @@ class TranslationConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    """Cấu hình tổng hợp giọng nói Voice Cloning OmniVoice."""
+    """Cấu hình tổng hợp giọng nói Voice Cloning OmniVoice (omnivoice.cpp GGUF native).
+
+    Chạy 100% C++ GGML trong process worker riêng — KHÔNG dùng PyTorch runtime. Model nạp
+    từ `repo_id` + `model_base`/`model_tokenizer` (xem `backend/tts/downloader.py`); thiết bị
+    GPU do backend GGML của worker tự chọn.
+    """
     enabled: bool = False
-    engine: str = "omnivoice"  # PyTorch native OmniVoice
-    model: str = "splendor1811/omnivoice-vietnamese"
-    device: str = "cuda:0"
     # A5 (audit Gemini, đã kiểm chứng): `speed != 1.0` BẬT một đường CHẬM —
     # `AudioProcessor.apply_time_stretch()` dùng Phase Vocoder `scipy.signal.stft/istft`
     # thuần CPU (~45-120 ms cho câu 3-5 s, đo theo báo cáo Gemini nhưng CHƯA đo lại ở đây).

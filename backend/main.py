@@ -142,7 +142,11 @@ def _log_torch_status_at_startup() -> None:
 
 
 def _torch_health_info() -> Dict[str, Any]:
-    """Khối `torch` cho `/health` — phát hiện sớm pip hạ torch xuống bản CPU-only."""
+    """Khối `torch` cho `/health` — phát hiện sớm pip hạ torch xuống bản CPU-only.
+
+    Phạm vi torch hiện nay: CHỈ còn ForcedAligner (Lookahead) và VAD Silero/FSMN/FireRed cần.
+    ASR (transcribe.dll), dịch (llama.cpp) và TTS (omnivoice.cpp worker) đều chạy GGML native.
+    """
     try:
         from backend.utils.env_check import torch_status
 
@@ -158,6 +162,48 @@ def _torch_health_info() -> Dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _tts_runtime_info() -> Dict[str, Any]:
+    """Khối `tts_runtime` cho `/health` — trạng thái TTS native, KHÔNG đụng tới torch.
+
+    Không khởi động worker (chỉ đọc trạng thái), không nạp model; VRAM đọc qua NVML nên
+    thấy cả phần do tiến trình con omnivoice.cpp chiếm.
+    """
+    info: Dict[str, Any] = {
+        "engine": "omnivoice.cpp",
+        "enabled": bool(config.tts.enabled),
+        "repo_id": config.tts.repo_id,
+        "model_base": config.tts.model_base,
+        "model_tokenizer": config.tts.model_tokenizer,
+    }
+    try:
+        from backend.tts.downloader import is_model_available
+
+        info["model_files_ready"] = bool(is_model_available())
+    except Exception as exc:  # noqa: BLE001
+        info["model_files_ready"] = None
+        info["model_files_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        from backend.tts.worker import TTSWorkerClient
+
+        client = TTSWorkerClient.get_instance()
+        info["worker_alive"] = client.is_worker_alive()
+        info["is_loaded"] = client.is_loaded
+        info["worker_pid"] = client._proc.pid if client.is_worker_alive() and client._proc else None
+    except Exception as exc:  # noqa: BLE001
+        info["worker_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        from backend.utils.gpu_mem import vram_info_mb
+
+        vram = vram_info_mb()
+        if vram:
+            info["gpu_free_mb"] = round(vram[0], 0)
+            info["gpu_total_mb"] = round(vram[1], 0)
+        info["tts_min_free_vram_mb"] = float(config.lookahead.tts_min_free_vram_mb)
+    except Exception:  # noqa: BLE001
+        pass
+    return info
 
 
 def _asr_runtime_info() -> Dict[str, Any]:
@@ -676,12 +722,14 @@ async def health_check():
         "protocol_version": config.ws.protocol_version,
         "asr_model": ModelRegistry.get_instance().get_active_model_key(),
         "asr_runtime": _asr_runtime_info(),
-        # Trạng thái torch (bản CUDA hay CPU-only) — để phát hiện sớm việc pip hạ torch,
-        # vì TTS/dịch cần torch CUDA còn ASR CUDA thì lấy runtime từ toolkit trong repo.
+        # Trạng thái torch (bản CUDA hay CPU-only) — để phát hiện sớm việc pip hạ torch.
+        # Torch nay CHỈ còn cần cho ForcedAligner (Lookahead) + VAD; ASR/dịch/TTS chạy GGML
+        # native và lấy CUDA runtime từ toolkit trong repo, KHÔNG phụ thuộc torch.
         "torch": _torch_health_info(),
         "vad_engine": config.vad.vad_engine,
         "translation_model": config.translation.base,
-        "tts_model": config.tts.model,
+        "tts_model": f"{config.tts.repo_id}/{config.tts.model_base}",
+        "tts_runtime": _tts_runtime_info(),
         "active_sessions": count_active_sessions(),
         # F-40: nếu event loop bị chặn, giá trị này tăng đều dù /health vẫn trả lời được
         # (FastAPI chạy trong loop nên thực tế nó chỉ nhảy vọt khi loop vừa thoát ra).
@@ -790,8 +838,10 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
         },
         "tts": {
             "enabled": config.tts.enabled,
-            "engine": config.tts.engine,
-            "model": config.tts.model,
+            "engine": "omnivoice.cpp",
+            "repo_id": config.tts.repo_id,
+            "model_base": config.tts.model_base,
+            "model_tokenizer": config.tts.model_tokenizer,
             "speed": config.tts.speed,
             "default_voice": config.tts.default_voice,
             "voices": VoiceManager.get_available_voices(),

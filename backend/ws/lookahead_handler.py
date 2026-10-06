@@ -38,6 +38,7 @@ import base64
 import hashlib
 import json
 import struct
+import sys
 import time
 import uuid
 from collections import deque
@@ -120,23 +121,26 @@ def _ends_sentence(text: str) -> bool:
 
 
 def _free_vram_mb() -> Optional[float]:
-    """VRAM trống (MB) của GPU đang dùng, hoặc None nếu không đo được (CPU/không có torch)."""
-    try:
-        import torch  # nội bộ, chỉ có khi TTS chạy được
+    """VRAM trống (MB) của GPU đang dùng, hoặc None nếu không đo được (không có GPU NVIDIA).
 
-        if not torch.cuda.is_available():
-            return None
-        free_bytes, _total = torch.cuda.mem_get_info()
-        return float(free_bytes) / (1024.0 * 1024.0)
-    except Exception:  # noqa: BLE001
-        return None
+    Đọc qua NVML (driver) — KHÔNG import torch, không tạo CUDA context, và thấy được cả VRAM
+    do TTS worker omnivoice.cpp / llama.cpp / transcribe.dll (native) chiếm.
+    """
+    from backend.utils.gpu_mem import free_vram_mb
+
+    return free_vram_mb()
 
 
 def _empty_torch_cache() -> None:
-    """Trả các khối đã cache của PyTorch về driver (giảm phân mảnh khi VRAM căng)."""
-    try:
-        import torch
+    """Trả các khối cache của PyTorch về driver — CHỈ khi torch ĐÃ được nạp sẵn.
 
+    TTS/dịch/ASR đều chạy native (GGML), nên torch chỉ còn trong tiến trình khi có module
+    khác dùng (vd. ForcedAligner của Lookahead). Không bao giờ import torch chỉ để dọn cache.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001

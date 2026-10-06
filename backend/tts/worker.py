@@ -162,15 +162,12 @@ class TTSWorkerClient:
             if os.path.isfile(cuda_dll):
                 env["GGML_BACKEND_PATH"] = cuda_dll
 
+            # KHÔNG import torch ở đây (chỉ để lấy `torch/lib` thì quá đắt). cudart/cublas cho
+            # `ggml-cuda.dll` đã có qua: (1) PATH kế thừa từ tiến trình chính sau
+            # `setup_cuda_dll_paths()`, (2) chính worker gọi lại `setup_cuda_dll_paths()` trong
+            # `_worker_loop` — hàm này quét `torch/lib`, `nvidia/*/bin`, toolkit CUDA trong repo
+            # và CUDA_PATH theo ĐƯỜNG DẪN, không import gói nào.
             extra_paths = [self._dll_dir]
-            try:
-                import torch
-
-                torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-                if os.path.isdir(torch_lib):
-                    extra_paths.append(torch_lib)
-            except Exception:
-                pass
             env["PATH"] = os.pathsep.join(extra_paths) + os.pathsep + env.get("PATH", "")
 
             proc = subprocess.Popen(
