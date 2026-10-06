@@ -484,7 +484,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
 
     // Sync ASR & VAD engines from backend
     const activeAsr = data.active_model || data.asr_engine || data.engine || "sensevoice";
-    const activeVad = data.vad_engine || "fsmn-vad";
+    const activeVad = data.vad_engine || "firered-vad";
     lastActiveAsr = activeAsr;
     lastActiveVad = activeVad;
 

@@ -36,14 +36,11 @@ apply_thread_limits()
 # Tắt thanh tiến trình tqdm của HuggingFace để không làm rác log console
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
-# Thiết lập giới hạn luồng PyTorch CPU sớm nhất có thể
-try:
-    import torch
-    torch.set_num_threads(2)
-    if hasattr(torch, "set_num_interop_threads"):
-        torch.set_num_interop_threads(2)
-except ImportError:
-    pass
+# ⚠️ KHÔNG import torch. Sau Giai đoạn 3 (2026-10-06), KHÔNG subsystem nào của backend cần
+# PyTorch: VAD chạy onnxruntime, ForcedAligner chạy GGUF qua CrispASR (tiến trình con), ASR
+# (transcribe.dll) / dịch (llama.cpp) / TTS (omnivoice.cpp) chạy GGML native. Trước đây khối
+# `torch.set_num_threads(2)` ở đây khiến PyTorch bị nạp ngay lúc khởi động (~1–2 s + vài trăm MB
+# RAM) chỉ để giới hạn luồng CPU. Giới hạn luồng native do `backend/__init__.py` lo.
 
 # Windows CUDA DLL setup
 from backend.utils.cuda import setup_cuda_dll_paths
@@ -112,56 +109,90 @@ def _log_asr_backend_at_startup() -> None:
         logger.debug(f"Bỏ qua ghi log backend ASR lúc khởi động: {exc}", extra={"module_tag": "MAIN"})
 
 
-def _log_torch_status_at_startup() -> None:
-    """Cảnh báo NGAY lúc khởi động nếu torch đã bị đổi sang bản CPU-only.
+def _log_runtime_status_at_startup() -> None:
+    """Log runtime native ngay lúc khởi động (onnxruntime cho VAD, CrispASR cho aligner).
 
-    VÌ SAO CẦN: interpreter Python dùng chung với nhiều gói khác có ràng buộc torch xung đột
-    (whisperx → `torch~=2.8.0`, compressed-tensors → `torch>=2.10.0`, torchvision cu130 →
-    `torch==2.12.0`). Một lệnh `pip install -U <gói chỉ phụ thuộc torch>` có thể khiến pip
-    chọn bản **CPU-only trên PyPI** và CUDA biến mất im lặng (đã xảy ra 2026-09-22 với
-    silero-vad 6.2.2). Log này biến sự cố im lặng thành cảnh báo đọc được ngay.
+    VÌ SAO CẦN: trước đây hàm này kiểm tra torch để phát hiện việc pip âm thầm hạ torch xuống bản
+    CPU-only. Sau Giai đoạn 3, **không subsystem nào cần torch** nên câu hỏi đó không còn ý nghĩa;
+    cái cần nhìn thấy ngay bây giờ là runtime THẬT của VAD và aligner.
     """
     try:
-        from backend.utils.env_check import torch_status
+        import onnxruntime as ort
 
-        status = torch_status()
-        if status["problems"]:
-            logger.warning(
-                f"[STARTUP] Môi trường torch có vấn đề: {' | '.join(status['problems'])} "
-                f"→ chạy `python -m backend.utils.env_check` để xem chi tiết.",
-                extra={"module_tag": "MAIN"},
+        logger.info(
+            f"[STARTUP] onnxruntime {ort.__version__} — VAD Silero + FireRed chạy ONNX "
+            f"(providers={ort.get_available_providers()})",
+            extra={"module_tag": "MAIN"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"[STARTUP] KHÔNG nạp được onnxruntime ({type(exc).__name__}: {exc}) — "
+            f"VAD sẽ suy giảm sang bộ dò năng lượng. Chạy `pip install onnxruntime`.",
+            extra={"module_tag": "MAIN"},
+        )
+    try:
+        from backend.asr.crispasr_aligner import available as _fa_available
+
+        ok, reason = _fa_available()
+        if ok:
+            logger.info(
+                "[STARTUP] ForcedAligner: CrispASR GGUF sẵn sàng",
+                extra={"module_tag": "ASR"},
             )
         else:
-            logger.info(
-                f"[STARTUP] torch {status['version']} (CUDA {status['cuda_build']}, "
-                f"{status['cuda_device_count']} GPU)",
-                extra={"module_tag": "MAIN"},
+            logger.warning(
+                f"[STARTUP] ForcedAligner CHƯA sẵn sàng ({reason}) — Pipeline B sẽ không có mốc "
+                f"từ. Chạy backend một lần để tự tải model/DLL.",
+                extra={"module_tag": "ASR"},
             )
     except Exception as exc:  # noqa: BLE001
-        logger.debug(f"Bỏ qua kiểm tra môi trường torch: {exc}", extra={"module_tag": "MAIN"})
+        logger.debug(f"Bỏ qua kiểm tra runtime aligner: {exc}", extra={"module_tag": "MAIN"})
+    if "torch" in sys.modules:  # pragma: no cover - chỉ xảy ra nếu ai đó cài torch thủ công
+        logger.warning(
+            "[STARTUP] torch CÓ MẶT trong tiến trình dù KHÔNG subsystem nào cần nó. "
+            "Có thể gỡ: `pip uninstall torch torchaudio transformers`.",
+            extra={"module_tag": "MAIN"},
+        )
 
 
-def _torch_health_info() -> Dict[str, Any]:
-    """Khối `torch` cho `/health` — phát hiện sớm pip hạ torch xuống bản CPU-only.
+def _vad_runtime_info() -> Dict[str, Any]:
+    """Khối `vad_runtime` cho `/health` — runtime THẬT của VAD + aligner (không torch).
 
-    Phạm vi torch hiện nay: CHỈ còn ForcedAligner (Lookahead) và VAD Silero/FSMN/FireRed cần.
-    ASR (transcribe.dll), dịch (llama.cpp) và TTS (omnivoice.cpp worker) đều chạy GGML native.
+    Thay cho khối `torch` trước đây: sau Giai đoạn 3, "torch có phải bản CUDA hay không" không
+    còn ảnh hưởng tới bất kỳ đường chạy nào.
     """
+    info: Dict[str, Any] = {
+        "engine": config.vad.vad_engine,
+        "torch_loaded": "torch" in sys.modules,
+    }
     try:
-        from backend.utils.env_check import torch_status
+        import onnxruntime as ort
 
-        st = torch_status()
-        return {
-            "version": st["version"],
-            "cuda_build": st["cuda_build"],
-            "cuda_available": st["cuda_available"],
-            "cuda_device_count": st["cuda_device_count"],
-            "torchaudio": st["torchaudio"],
-            "torchvision": st["torchvision"],
-            "problems": st["problems"],
-        }
+        info["onnxruntime"] = ort.__version__
+        info["providers"] = ort.get_available_providers()
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        info["onnxruntime"] = None
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        from backend.vad.engines import VADEngineFactory
+
+        info["engine_loaded"] = VADEngineFactory.is_cached(config.vad.vad_engine)
+        engine = VADEngineFactory.peek_engine(config.vad.vad_engine)
+        if engine is not None:
+            info["frame_samples"] = int(engine.frame_samples)
+            info["max_lookback_frames"] = int(engine.max_lookback_frames)
+            info["start_pad_ms"] = int(getattr(engine, "start_pad_ms", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        info["engine_loaded"] = None
+        info["engine_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        from backend.asr.crispasr_aligner import CrispASRAlignerClient
+
+        info["aligner_backend"] = config.forced_aligner.backend
+        info["aligner_worker_alive"] = CrispASRAlignerClient.get_instance().is_worker_alive
+    except Exception as exc:  # noqa: BLE001
+        info["aligner_error"] = f"{type(exc).__name__}: {exc}"
+    return info
 
 
 def _tts_runtime_info() -> Dict[str, Any]:
@@ -432,11 +463,9 @@ def _prewarm_vad_default() -> None:
         try:
             from backend.vad.engines.firered import FireRedVADEngine
             from backend.vad.engines.silero import SileroVADEngine
-            from backend.vad.engines.fsmn import FsmnVADEngine
 
             FireRedVADEngine.prepare_files()
             SileroVADEngine.prepare_files()
-            FsmnVADEngine.prepare_files()
         except Exception as prep_err:
             logger.warning(f"[STARTUP] Cảnh báo chuẩn bị file VAD: {prep_err}", extra={"module_tag": "VAD"})
 
@@ -478,6 +507,11 @@ def _prewarm_vad_others() -> None:
             if status == "ok":
                 logger.info(f"[STARTUP] Engine '{name}' nạp nền xong",
                             extra={"module_tag": "VAD"})
+            elif status.startswith("skipped"):
+                # Engine cần gói TUỲ CHỌN chưa cài. Sau Giai đoạn 3 cả hai engine đều chỉ cần
+                # onnxruntime nên nhánh này chỉ còn là lưới an toàn cho tương lai.
+                logger.info(f"[STARTUP] Bỏ qua engine '{name}' ({status})",
+                            extra={"module_tag": "VAD"})
             else:
                 logger.warning(f"[STARTUP] Engine '{name}' nạp nền thất bại: {status}",
                                extra={"module_tag": "VAD"})
@@ -501,15 +535,15 @@ def _verify_all_models_ready() -> Tuple[bool, List[str]]:
     vad_engine = (config.vad.vad_engine or "firered-vad").lower().strip()
     if vad_engine == "firered-vad":
         fr_dir = MODELS_DIR / "firered_stream" / "Stream-VAD"
-        if not (fr_dir / "cmvn.ark").is_file() or not (fr_dir / "model.pth.tar").is_file():
-            missing.append("VAD (FireRed: Stream-VAD/cmvn.ark hoặc model.pth.tar)")
+        if not (fr_dir / "cmvn.ark").is_file() or not (
+            fr_dir / "fireredvad_stream_vad_with_cache.onnx"
+        ).is_file():
+            missing.append(
+                "VAD (FireRed ONNX: Stream-VAD/cmvn.ark hoặc fireredvad_stream_vad_with_cache.onnx)"
+            )
     elif vad_engine == "silero-vad":
-        if not (MODELS_DIR / "silero_vad.jit").is_file():
-            missing.append("VAD (Silero: silero_vad.jit)")
-    elif vad_engine == "fsmn-vad":
-        fsmn_dir = MODELS_DIR / "fsmn_vad"
-        if not (fsmn_dir / "model.pt").is_file():
-            missing.append("VAD (FSMN: fsmn_vad/model.pt)")
+        if not (MODELS_DIR / "silero_vad.onnx").is_file():
+            missing.append("VAD (Silero ONNX: silero_vad.onnx)")
 
     # 2. ASR
     try:
@@ -522,13 +556,20 @@ def _verify_all_models_ready() -> Tuple[bool, List[str]]:
     except Exception as e:
         missing.append(f"ASR ({config.asr.active_model}: {e})")
 
-    # ForcedAligner (Lookahead offline_batch)
+    # ForcedAligner (Lookahead offline_batch) — chỉ còn MỘT runtime: CrispASR GGUF.
     if bool(getattr(config.lookahead, "enabled", True)):
-        fa_dir = MODELS_DIR / "Qwen3-ForcedAligner-0.6B"
-        if not (fa_dir / "config.json").is_file() or not (
-            (fa_dir / "model.safetensors").is_file() or any(fa_dir.glob("*.safetensors"))
-        ):
-            missing.append("ASR ForcedAligner (Qwen3-ForcedAligner-0.6B)")
+        from backend.utils.crispasr_native import available as _fa_available
+
+        ok, reason = _fa_available()
+        if not ok:
+            # KHÔNG chặn khởi động: Lookahead không có aligner thì extension tự chuyển sang
+            # Pipeline A (`lookahead_unavailable`), nên đây là cảnh báo chứ không phải điều kiện
+            # sống còn cho cả backend.
+            logger.warning(
+                f"[STARTUP] ForcedAligner chưa sẵn sàng ({reason}) — Pipeline B sẽ không có mốc từ. "
+                f"Backend sẽ tự tải model GGUF ở lần dùng đầu tiên.",
+                extra={"module_tag": "MAIN"},
+            )
 
     # 3. Translate
     try:
@@ -578,7 +619,7 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] Pre-warming pipeline: ASR, Translation, VAD, TTS...", extra={"module_tag": "MAIN"})
 
     _log_asr_backend_at_startup()
-    _log_torch_status_at_startup()
+    _log_runtime_status_at_startup()
 
     # Khôi phục trạng thái TTS & Lookahead từ cấu hình popup đã lưu (nếu có)
     saved_state = load_runtime_state()
@@ -722,10 +763,9 @@ async def health_check():
         "protocol_version": config.ws.protocol_version,
         "asr_model": ModelRegistry.get_instance().get_active_model_key(),
         "asr_runtime": _asr_runtime_info(),
-        # Trạng thái torch (bản CUDA hay CPU-only) — để phát hiện sớm việc pip hạ torch.
-        # Torch nay CHỈ còn cần cho ForcedAligner (Lookahead) + VAD; ASR/dịch/TTS chạy GGML
-        # native và lấy CUDA runtime từ toolkit trong repo, KHÔNG phụ thuộc torch.
-        "torch": _torch_health_info(),
+        # Runtime của VAD + aligner (onnxruntime / CrispASR GGUF). Không còn khối `torch`:
+        # sau Giai đoạn 3 KHÔNG subsystem nào cần PyTorch.
+        "vad_runtime": _vad_runtime_info(),
         "vad_engine": config.vad.vad_engine,
         "translation_model": config.translation.base,
         "tts_model": f"{config.tts.repo_id}/{config.tts.model_base}",
@@ -800,7 +840,6 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             "effective_silence_ms": config.vad.effective_silence_ms,
             "firered": config.vad.firered.model_dump(),
             "silero": config.vad.silero.model_dump(),
-            "fsmn": config.vad.fsmn.model_dump(),
         },
         # P2.x: thông số streaming để popup hiển thị/chỉnh được và client biết backend đang làm gì
         "streaming": {

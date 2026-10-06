@@ -123,28 +123,12 @@ def _ends_sentence(text: str) -> bool:
 def _free_vram_mb() -> Optional[float]:
     """VRAM trống (MB) của GPU đang dùng, hoặc None nếu không đo được (không có GPU NVIDIA).
 
-    Đọc qua NVML (driver) — KHÔNG import torch, không tạo CUDA context, và thấy được cả VRAM
-    do TTS worker omnivoice.cpp / llama.cpp / transcribe.dll (native) chiếm.
+    Đọc qua NVML (driver) — không tạo CUDA context, và thấy được cả VRAM do TTS worker
+    omnivoice.cpp / llama.cpp / transcribe.dll / CrispASR (native) chiếm.
     """
     from backend.utils.gpu_mem import free_vram_mb
 
     return free_vram_mb()
-
-
-def _empty_torch_cache() -> None:
-    """Trả các khối cache của PyTorch về driver — CHỈ khi torch ĐÃ được nạp sẵn.
-
-    TTS/dịch/ASR đều chạy native (GGML), nên torch chỉ còn trong tiến trình khi có module
-    khác dùng (vd. ForcedAligner của Lookahead). Không bao giờ import torch chỉ để dọn cache.
-    """
-    torch = sys.modules.get("torch")
-    if torch is None:
-        return
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 class LookaheadSessionState:
@@ -1665,9 +1649,11 @@ class LookaheadSessionState:
                     await self._yield_gpu_to_asr(float(la.tts_asr_yield_max_sec))
 
                 # 4. VRAM gần cạn ⇒ BỎ câu lồng tiếng (chống tràn VRAM).
+                # (Trước đây còn gọi `_empty_torch_cache()` ở đây; sau Giai đoạn 3 backend không
+                # dùng PyTorch nên không còn cache nào của torch để dọn — VRAM do các native
+                # engine giữ sẽ tự được trả khi chúng đóng model.)
                 free_mb = _free_vram_mb()
                 if free_mb is not None and free_mb < float(la.tts_min_free_vram_mb):
-                    _empty_torch_cache()
                     free_mb = _free_vram_mb()
                 if free_mb is not None and free_mb < float(la.tts_min_free_vram_mb):
                     self.tts_skipped += 1

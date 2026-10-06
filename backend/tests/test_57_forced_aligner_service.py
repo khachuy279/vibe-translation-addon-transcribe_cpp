@@ -5,10 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from backend.config import config
 from backend.asr.forced_aligner import (
     AlignedWord,
     ForcedAlignerService,
     SubtitleSentence,
+    is_aligner_kept_char,
 )
 
 
@@ -160,22 +162,26 @@ class TestForcedAlignerService:
         for s in subs:
             assert len(s.words) <= 9, s.text
 
-    def test_ensure_forced_aligner_model_local_path(self, tmp_path):
-        """Kiểm tra ensure_forced_aligner_model luôn trả về đường dẫn cục bộ khi đã có file."""
-        from backend.asr.forced_aligner import ensure_forced_aligner_model, ALIGNER_LOCAL_DIR
+    def test_aligner_service_singleton_va_duong_dan_model(self, tmp_path, monkeypatch):
+        """`ForcedAlignerService` là singleton; đường dẫn model do `crispasr_native` quyết định.
 
-        # 1. Thư mục giả lập đầy đủ file
-        fake_dir = tmp_path / "Qwen3-ForcedAligner-0.6B"
-        fake_dir.mkdir()
-        (fake_dir / "config.json").write_text("{}", encoding="utf-8")
-        (fake_dir / "model.safetensors").write_text("fake_weights", encoding="utf-8")
+        (Thay cho test `ensure_forced_aligner_model` cũ — hàm đó đã bị xoá cùng đường torch ở
+        Giai đoạn 3. Nay vị trí model GGUF do `backend/utils/crispasr_native.py` quản lý, có
+        env override `CRISPASR_ALIGNER_MODEL`.)
+        """
+        from backend.utils.crispasr_native import MODEL_FILENAME, aligner_model_path
 
-        resolved = ensure_forced_aligner_model(local_dir=fake_dir, allow_download=False)
-        assert resolved == fake_dir
+        assert ForcedAlignerService.get_instance() is ForcedAlignerService.get_instance()
 
-        # 2. ForcedAlignerService mặc định trỏ vào backend/models/Qwen3-ForcedAligner-0.6B
-        service = ForcedAlignerService()
-        assert service.model_path == ALIGNER_LOCAL_DIR
+        # Mặc định trỏ vào backend/models/<MODEL_FILENAME>.
+        monkeypatch.delenv("CRISPASR_ALIGNER_MODEL", raising=False)
+        default_path = aligner_model_path()
+        assert default_path.name == MODEL_FILENAME
+        assert default_path.parent.name == "models"
+
+        # Env override phải được tôn trọng (đường dùng cho test/đo A/B).
+        monkeypatch.setenv("CRISPASR_ALIGNER_MODEL", str(tmp_path / "custom.gguf"))
+        assert aligner_model_path() == tmp_path / "custom.gguf"
 
 
 class TestSourcePunctuationReattachment:
@@ -339,78 +345,70 @@ class TestSourcePunctuationReattachment:
         )
         assert fixed == subs
 
-    def test_real_upstream_tokenizer_explains_single_long_subtitle(self):
-        """GỐC RỄ, đo bằng TOKENIZER THẬT của upstream (không cần model).
+    def test_don_vi_theo_ky_tu_cjk_van_ngat_dung_3_cau(self):
+        """Đơn vị CJK theo KÝ TỰ (đúng thứ CrispASR sinh ra) vẫn gom đúng 3 câu tiếng Nhật.
 
-        `language="English"` ⇒ `tokenize_space_lang` + `split_segment_with_chinese` gộp cả cụm
-        kana thành token, nên dấu `？`/`。` rơi vào GIỮA token ⇒ tầng gom câu KHÔNG thấy dấu kết
-        câu ở cuối token nào ⇒ không ngắt được; bước gộp mảnh cuối (rule 3) lại gộp về một ⇒ cả
-        khối 3 câu thành MỘT phụ đề dài (đúng ảnh chụp của người dùng).
-        `language="Japanese"` (nagisa) cho 28 từ đúng ⇒ 3 phụ đề.
+        BỐI CẢNH: upstream `Qwen3-ForcedAligner` tách tiếng Nhật theo TỪ bằng `nagisa`; bản GGUF
+        của CrispASR tách **từng ký tự** cho CJK. Test này chốt rằng việc đổi đơn vị KHÔNG làm
+        hỏng tầng gom câu — dấu câu vẫn được gắn lại và 3 câu vẫn ra 3 phụ đề.
+
+        (Thay cho test cũ `test_real_upstream_tokenizer_explains_single_long_subtitle`, vốn dùng
+        tokenizer của cây vendored `backend/asr/qwen_asr/` đã bị xoá ở Giai đoạn 3.)
         """
-        pytest.importorskip("nagisa")
-        proc_mod = pytest.importorskip(
-            "backend.asr.qwen_asr.inference.qwen3_forced_aligner"
-        )
-        processor = proc_mod.Qwen3ForceAlignProcessor()
         text = (
             "ほら、あれ温泉街じゃない？"
             "うわ、なんかお土産屋とか書いてあるよ。"
             "ああ、なんか温泉の香りしてきた。"
         )
-
-        def group_with(language: str):
-            words, _ = processor.encode_timestamp(text, language)
-            step = 6.4 / max(1, len(words))
-            items = [
-                AlignedWord(text=w, start_time=i * step, end_time=(i + 1) * step)
-                for i, w in enumerate(words)
-            ]
-            merged = ForcedAlignerService.merge_source_text(items, text)
-            return ForcedAlignerService.group_words_to_subtitles(
-                merged, language=language, max_words=10, max_duration_sec=4.5,
-                max_chars=45, min_words=2, defer_words=3,
-                sentence_max_words=24, sentence_max_duration_sec=8.0,
-            )
-
-        wrong = group_with("English")
-        assert len(wrong) == 1, "Bản CŨ: cả khối thành một phụ đề (đây là lỗi)"
-        assert " " in wrong[0].text, "chọn sai ngôn ngữ ⇒ text còn bị nối bằng KHOẢNG TRẮNG"
-
-        right = group_with("Japanese")
-        assert [s.text for s in right] == [
+        # Đơn vị y như CrispASR trả: mỗi KÝ TỰ "được giữ" là một đơn vị, và dấu câu đi kèm được
+        # DÍNH vào đơn vị liền trước (`tokenise_display_words` của CrispASR làm đúng vậy).
+        units: list[str] = []
+        for ch in text:
+            if ch.strip() and is_aligner_kept_char(ch):
+                units.append(ch)
+            elif units:
+                units[-1] += ch  # dấu câu/khoảng trắng dính vào đơn vị trước
+        step = 6.4 / len(units)
+        items = [
+            AlignedWord(text=u, start_time=i * step, end_time=(i + 1) * step)
+            for i, u in enumerate(units)
+        ]
+        merged = ForcedAlignerService.merge_source_text(items, text)
+        subs = ForcedAlignerService.group_words_to_subtitles(
+            merged, language="Japanese", max_words=10, max_duration_sec=4.5,
+            max_chars=45, min_words=2, defer_words=3,
+            sentence_max_words=24, sentence_max_duration_sec=8.0,
+        )
+        assert [s.text for s in subs] == [
             "ほら、あれ温泉街じゃない？",
             "うわ、なんかお土産屋とか書いてあるよ。",
             "ああ、なんか温泉の香りしてきた。",
-        ], [s.text for s in right]
+        ], [s.text for s in subs]
 
     def test_align_service_attaches_punctuation_end_to_end(self, monkeypatch):
-        """`ForcedAlignerService.align()` phải tự gắn dấu câu (không cần model thật)."""
+        """`ForcedAlignerService.align()` phải tự gắn dấu câu (không cần model/GPU thật).
+
+        Stub CLIENT của CrispASR (`_client()`) trả về đúng dạng thô mà ABI C trả
+        (`[{text, t0, t1}]`, KHÔNG có dấu câu) ⇒ kiểm được rằng `align()` tự gọi
+        `merge_source_text` để gắn dấu câu trở lại.
+        """
         from backend.asr.forced_aligner import ForcedAlignerService as SVC
 
+        # Văn bản KHÔNG dấu câu — đúng thứ model aligner trả về.
         raw = [
-            ("You", 0.0, 0.3),
-            ("took", 0.3, 0.6),
-            ("ballet", 0.6, 1.0),
-            ("God", 1.2, 1.5),
+            {"text": "You", "t0": 0.0, "t1": 0.3},
+            {"text": "took", "t0": 0.3, "t1": 0.6},
+            {"text": "ballet", "t0": 0.6, "t1": 1.0},
+            {"text": "God", "t0": 1.2, "t1": 1.5},
         ]
 
-        class _Item:
-            def __init__(self, text, start, end):
-                self.text, self.start_time, self.end_time = text, start, end
-
-        class _Result:
-            def __init__(self):
-                self.items = [_Item(*r) for r in raw]
-
-        class _StubAligner:
-            def align(self, audio, text, language):
-                return [_Result()]
+        class _StubClient:
+            def align(self, pcm, text, t_offset=0.0):
+                return raw
 
         svc = SVC()
-        monkeypatch.setattr(svc, "load_model", lambda: _StubAligner())
-        monkeypatch.setattr(svc, "_is_warmed", True, raising=False)
-        monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+        monkeypatch.setattr(SVC, "is_ready", staticmethod(lambda: (True, "")))
+        monkeypatch.setattr(svc, "_client", lambda: _StubClient())
 
         words = svc.align(
             np.zeros(16000, dtype=np.float32),
@@ -419,3 +417,15 @@ class TestSourcePunctuationReattachment:
         )
         assert [w.text for w in words] == ["You", "took", "ballet.", "God,"]
         assert any(w.text.endswith(".") for w in words), "phải có dấu kết câu để tầng gom câu dùng"
+
+    def test_align_bao_loi_ro_khi_runtime_chua_san_sang(self, monkeypatch):
+        """Runtime chưa sẵn sàng ⇒ `align()` ném lỗi CÓ HƯỚNG DẪN, không trả rỗng im lặng."""
+        from backend.asr.forced_aligner import ForcedAlignerService as SVC
+
+        svc = SVC()
+        monkeypatch.setattr(SVC, "is_ready", staticmethod(lambda: (False, "chưa có model GGUF")))
+
+        with pytest.raises(RuntimeError) as exc:
+            svc.align(np.zeros(16000, dtype=np.float32), "hello world", "English")
+        assert "chưa có model GGUF" in str(exc.value)
+        assert "qwen3-forced-aligner" in str(exc.value), "thông báo phải chỉ chỗ tải model"

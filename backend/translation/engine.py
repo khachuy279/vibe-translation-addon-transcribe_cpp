@@ -456,12 +456,8 @@ class GGUFTranslator(BaseTranslator):
             if old_llm is not None:
                 self.__class__._release_llm(old_llm)
             gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            # KHÔNG còn `torch.cuda.empty_cache()` ở đây: sau Giai đoạn 3 backend không dùng
+            # PyTorch. `_release_llm(old_llm)` ngay trên đã đóng `llama.dll` và trả VRAM về driver.
             logger.info(f"Đã giải phóng model dịch cũ khỏi VRAM trước khi nạp '{new_key}'", extra={"module_tag": "TRANSLATE"})
 
             # Bước 3: Nạp model mới vào VRAM đã được giải phóng

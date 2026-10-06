@@ -1,6 +1,6 @@
 # Báo Cáo Đo Lường & Kiểm Thử Phase 2: Module VAD Streaming Độc Lập
 
-- **Thời gian thực hiện**: 2026-09-22 09:03:09
+- **Thời gian thực hiện**: 2026-10-06 21:22:17
 - **Kiến trúc**: `report/audit/19_KE_HOACH_VIET_LAI_VAD.md` — mỗi engine dùng đúng
   API docs (`FireRedStreamVad` / `VADIterator` / `AutoModel.generate`), processor chỉ
   chuyển tiếp audio nguyên bản khi engine phát `START`/`END`.
@@ -12,38 +12,30 @@
 
 | Engine | File Audio | Thời lượng | Hop | Trần pre-roll | Avg Chunk (µs) | p95 Chunk (µs) | RTF | Starts | Ends |
 |---|---|---|---|---|---|---|---|---|---|
-| `firered-vad` | `00_ingress_stream.wav` | 332.03s | 10.0 ms | 13 frame | 6754.4 µs | 7900.1 µs | 0.3378 | 153 | 153 |
-| `firered-vad` | `Chinese_fast_speed_11s.wav` | 11.38s | 10.0 ms | 13 frame | 6309.4 µs | 7083.9 µs | 0.3161 | 1 | 0 |
-| `firered-vad` | `Chinese_noise_28s.wav` | 28.26s | 10.0 ms | 13 frame | 6635.9 µs | 7475.2 µs | 0.3319 | 2 | 1 |
-| `firered-vad` | `Cross_lingual_English_French_Italian_Spanish_6s.wav` | 6.23s | 10.0 ms | 13 frame | 6686.4 µs | 7476.7 µs | 0.3349 | 5 | 4 |
-| `firered-vad` | `English_low_speech_quality_19s.wav` | 19.02s | 10.0 ms | 13 frame | 6865.6 µs | 7604.7 µs | 0.3434 | 7 | 7 |
-| `firered-vad` | `English_multiple_kinds_of_noise_88s.wav` | 88.19s | 10.0 ms | 13 frame | 6902.9 µs | 7670.6 µs | 0.3453 | 13 | 12 |
-| `firered-vad` | `Japanese_5s.wav` | 5.08s | 10.0 ms | 13 frame | 6745.0 µs | 7644.7 µs | 0.3374 | 1 | 1 |
-| `firered-vad` | `Russian_4s.wav` | 4.76s | 10.0 ms | 13 frame | 6930.5 µs | 7582.4 µs | 0.3466 | 1 | 1 |
-| `fsmn-vad` | `00_ingress_stream.wav` | 332.03s | 60.0 ms | 11 frame | 1413.1 µs | 4529.0 µs | 0.0707 | 77 | 77 |
-| `fsmn-vad` | `Chinese_fast_speed_11s.wav` | 11.38s | 60.0 ms | 11 frame | 1230.2 µs | 3919.7 µs | 0.0617 | 1 | 0 |
-| `fsmn-vad` | `Chinese_noise_28s.wav` | 28.26s | 60.0 ms | 11 frame | 1320.9 µs | 4229.1 µs | 0.0661 | 1 | 0 |
-| `fsmn-vad` | `Cross_lingual_English_French_Italian_Spanish_6s.wav` | 6.23s | 60.0 ms | 11 frame | 1394.8 µs | 4497.0 µs | 0.0699 | 1 | 0 |
-| `fsmn-vad` | `English_low_speech_quality_19s.wav` | 19.02s | 60.0 ms | 11 frame | 1351.0 µs | 4288.4 µs | 0.0676 | 7 | 6 |
-| `fsmn-vad` | `English_multiple_kinds_of_noise_88s.wav` | 88.19s | 60.0 ms | 11 frame | 1330.7 µs | 4300.0 µs | 0.0666 | 14 | 13 |
-| `fsmn-vad` | `Japanese_5s.wav` | 5.08s | 60.0 ms | 11 frame | 1407.0 µs | 4370.9 µs | 0.0704 | 1 | 0 |
-| `fsmn-vad` | `Russian_4s.wav` | 4.76s | 60.0 ms | 11 frame | 1416.0 µs | 4407.4 µs | 0.0709 | 1 | 0 |
-| `silero-vad` | `00_ingress_stream.wav` | 332.03s | 32.0 ms | 2 frame | 558.1 µs | 980.8 µs | 0.028 | 118 | 118 |
-| `silero-vad` | `Chinese_fast_speed_11s.wav` | 11.38s | 32.0 ms | 2 frame | 666.5 µs | 972.7 µs | 0.0335 | 1 | 0 |
-| `silero-vad` | `Chinese_noise_28s.wav` | 28.26s | 32.0 ms | 2 frame | 608.0 µs | 966.6 µs | 0.0305 | 1 | 0 |
-| `silero-vad` | `Cross_lingual_English_French_Italian_Spanish_6s.wav` | 6.23s | 32.0 ms | 2 frame | 739.9 µs | 1024.6 µs | 0.0371 | 5 | 4 |
-| `silero-vad` | `English_low_speech_quality_19s.wav` | 19.02s | 32.0 ms | 2 frame | 593.3 µs | 973.1 µs | 0.0297 | 7 | 7 |
-| `silero-vad` | `English_multiple_kinds_of_noise_88s.wav` | 88.19s | 32.0 ms | 2 frame | 556.9 µs | 970.9 µs | 0.0279 | 18 | 17 |
-| `silero-vad` | `Japanese_5s.wav` | 5.08s | 32.0 ms | 2 frame | 814.8 µs | 1029.8 µs | 0.0408 | 2 | 2 |
-| `silero-vad` | `Russian_4s.wav` | 4.76s | 32.0 ms | 2 frame | 813.0 µs | 981.7 µs | 0.0407 | 1 | 1 |
+| `firered-vad` | `00_ingress_stream.wav` | 332.03s | 10.0 ms | 13 frame | 1608.6 µs | 1772.0 µs | 0.0805 | 153 | 153 |
+| `firered-vad` | `Chinese_fast_speed_11s.wav` | 11.38s | 10.0 ms | 13 frame | 1614.5 µs | 1892.5 µs | 0.0809 | 1 | 0 |
+| `firered-vad` | `Chinese_noise_28s.wav` | 28.26s | 10.0 ms | 13 frame | 1612.5 µs | 1755.2 µs | 0.0807 | 2 | 1 |
+| `firered-vad` | `Cross_lingual_English_French_Italian_Spanish_6s.wav` | 6.23s | 10.0 ms | 13 frame | 1629.2 µs | 1810.5 µs | 0.0816 | 5 | 4 |
+| `firered-vad` | `English_low_speech_quality_19s.wav` | 19.02s | 10.0 ms | 13 frame | 1598.3 µs | 1715.6 µs | 0.08 | 7 | 7 |
+| `firered-vad` | `English_multiple_kinds_of_noise_88s.wav` | 88.19s | 10.0 ms | 13 frame | 1610.5 µs | 1781.9 µs | 0.0806 | 13 | 12 |
+| `firered-vad` | `Japanese_5s.wav` | 5.08s | 10.0 ms | 13 frame | 1582.5 µs | 1692.0 µs | 0.0792 | 1 | 1 |
+| `firered-vad` | `Russian_4s.wav` | 4.76s | 10.0 ms | 13 frame | 1695.2 µs | 2159.1 µs | 0.0848 | 1 | 1 |
+| `silero-vad` | `00_ingress_stream.wav` | 332.03s | 32.0 ms | 2 frame | 107.8 µs | 228.4 µs | 0.0054 | 118 | 118 |
+| `silero-vad` | `Chinese_fast_speed_11s.wav` | 11.38s | 32.0 ms | 2 frame | 103.0 µs | 187.9 µs | 0.0052 | 1 | 0 |
+| `silero-vad` | `Chinese_noise_28s.wav` | 28.26s | 32.0 ms | 2 frame | 105.4 µs | 226.6 µs | 0.0053 | 1 | 0 |
+| `silero-vad` | `Cross_lingual_English_French_Italian_Spanish_6s.wav` | 6.23s | 32.0 ms | 2 frame | 111.7 µs | 231.0 µs | 0.0056 | 5 | 4 |
+| `silero-vad` | `English_low_speech_quality_19s.wav` | 19.02s | 32.0 ms | 2 frame | 110.4 µs | 231.8 µs | 0.0055 | 7 | 7 |
+| `silero-vad` | `English_multiple_kinds_of_noise_88s.wav` | 88.19s | 32.0 ms | 2 frame | 107.8 µs | 226.2 µs | 0.0054 | 18 | 17 |
+| `silero-vad` | `Japanese_5s.wav` | 5.08s | 32.0 ms | 2 frame | 105.5 µs | 198.7 µs | 0.0053 | 2 | 2 |
+| `silero-vad` | `Russian_4s.wav` | 4.76s | 32.0 ms | 2 frame | 102.8 µs | 192.4 µs | 0.0052 | 1 | 1 |
 
 ## 2. Bảng Xếp Hạng Hiệu Năng VAD (RTF & Latency)
 
 | Engine VAD | RTF Trung Bình | Đặc Điểm |
 |---|---|---|
-| **`firered-vad`** | **0.3367** | Cửa sổ 400 mẫu / hop 160 mẫu (10 ms). Trần pre-roll 13 frame (`pad_start_frame + min_speech_frame`); đo được thực xả 12 frame. |
-| **`silero-vad`** | **0.0335** | 512 mẫu (32 ms)/frame, `VADIterator` với `min_silence_duration_ms`/`speech_pad_ms`. |
-| **`fsmn-vad`** | **0.068** | Chunk 60 ms, `generate(cache=…, is_final=False, chunk_size=60)`; trần pre-roll 11 frame (`window_size_ms + sil_to_speech_time_thres + lookback_time_start_point`). |
+| **`firered-vad`** | **0.081** | Cửa sổ 400 mẫu / hop 160 mẫu (10 ms). Trần pre-roll 13 frame (`pad_start_frame + min_speech_frame`); đo được thực xả 12 frame. |
+| **`silero-vad`** | **0.0054** | 512 mẫu (32 ms)/frame, `VADIterator` với `min_silence_duration_ms`/`speech_pad_ms`. |
+| **`fsmn-vad`** | **0** | Chunk 60 ms, `generate(cache=…, is_final=False, chunk_size=60)`; trần pre-roll 11 frame (`window_size_ms + sil_to_speech_time_thres + lookback_time_start_point`). |
 
 ## 3. Kết Luận Nghiệm Thu Phase 2
 

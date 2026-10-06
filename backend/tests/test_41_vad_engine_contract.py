@@ -15,6 +15,7 @@ Chạy: `pytest -m slow backend/tests/test_41_vad_engine_contract.py -q`
 """
 
 from pathlib import Path
+import importlib.util
 import time
 
 import numpy as np
@@ -25,9 +26,9 @@ from backend.config import config
 from backend.vad.engines import VADEngineFactory
 from backend.vad.processor import VADStreamProcessor
 
-ENGINES = ["firered-vad", "silero-vad", "fsmn-vad"]
+ENGINES = ["firered-vad", "silero-vad"]
 
-_HOP_SAMPLES = {"firered-vad": 160, "silero-vad": 512, "fsmn-vad": 960}
+_HOP_SAMPLES = {"firered-vad": 160, "silero-vad": 512}
 
 _SILENCE_HEAD_SEC = 0.5
 _SILENCE_TAIL_SEC = 2.0
@@ -141,29 +142,52 @@ def _run(engine_name: str, pcm_bytes: bytes, *, threshold=None, silence_ms=None)
 def test_config_3_engine_khop_docs():
     """Khóa yêu cầu "mỗi VAD có cấu hình GIỐNG docs" vào CI.
 
-    So trực tiếp với nguồn chân lý của từng thư viện:
-      * `fireredvad.FireRedStreamVadConfig` (dataclass) — riêng `speech_threshold` là ghi đè
+    So trực tiếp với nguồn chân lý của từng engine:
+      * FireRed: dataclass `FireRedStreamVadConfig` của upstream — đọc THẲNG từ
+        `external/FireRedVAD/fireredvad/stream_vad.py` khi có (không import ⇒ không cần torch),
+        kèm bảng mặc định chép tay làm nguồn dự phòng. Riêng `speech_threshold` là ghi đè
         CÓ CHỦ ĐÍCH theo ví dụ CLI/README (0.4 thay vì 0.5 của dataclass);
-      * `silero_vad.VADIterator.__init__` (signature), `sampling_rate` không phơi ra vì
-        pipeline cố định 16 kHz;
-      * `config.yaml` của checkpoint `funasr/fsmn-vad` (VADXOptions).
+      * Silero: signature `SileroVADIterator.__init__` — bản port chính xác
+        `silero_vad.VADIterator` (`backend/vad/silero_onnx.py`); `sampling_rate` không phơi ra
+        vì pipeline cố định 16 kHz.
+
+    `fsmn-vad` KHÔNG còn (đã xoá ở Giai đoạn 3 cùng PyTorch) nên không còn phần VADXOptions.
 
     Không cần nạp model ⇒ chạy ở tầng A (không có marker `slow`).
+    Không import `fireredvad`/`silero_vad`/`funasr` ⇒ chạy được trong môi trường KHÔNG có torch.
     """
-    import dataclasses
     import inspect
-
-    import yaml
+    import re
 
     from backend.config import config as app_config
 
     # ── FireRed ──────────────────────────────────────────────────────────────
-    from fireredvad import FireRedStreamVadConfig
+    # Mặc định của `FireRedStreamVadConfig` (upstream `fireredvad/stream_vad.py`).
+    fire_docs = {
+        "use_gpu": False,
+        "smooth_window_size": 5,
+        "speech_threshold": 0.5,
+        "pad_start_frame": 5,
+        "min_speech_frame": 8,
+        "max_speech_frame": 2000,
+        "min_silence_frame": 20,
+        "chunk_max_frame": 30000,
+    }
+    upstream_src = PROJECT_ROOT / "external" / "FireRedVAD" / "fireredvad" / "stream_vad.py"
+    if upstream_src.is_file():
+        # Bảo đảm bảng chép tay ở trên không bị lệch khỏi nguồn thật khi có sẵn checkout.
+        body = upstream_src.read_text(encoding="utf-8", errors="replace")
+        block = body.split("class FireRedStreamVadConfig:", 1)[-1].split("def __post_init__", 1)[0]
+        for name, default in fire_docs.items():
+            m = re.search(rf"^\s+{name}\s*:\s*[^=]+=\s*([^\s#]+)", block, re.MULTILINE)
+            assert m, f"không đọc được `{name}` từ {upstream_src}"
+            assert m.group(1) == str(default), (
+                f"FireRed.{name}: nguồn upstream={m.group(1)!r} nhưng test đang ghi {default!r}"
+            )
 
-    docs = {f.name: f.default for f in dataclasses.fields(FireRedStreamVadConfig)}
     ours = app_config.vad.firered.model_dump()
-    assert set(ours) == set(docs), f"tập field khác docs: {set(ours) ^ set(docs)}"
-    for name, default in docs.items():
+    assert set(ours) == set(fire_docs), f"tập field khác docs: {set(ours) ^ set(fire_docs)}"
+    for name, default in fire_docs.items():
         if name == "speech_threshold":
             assert ours[name] == 0.4, (
                 "`speech_threshold` là ghi đè có chủ đích theo ví dụ CLI/README của "
@@ -172,12 +196,26 @@ def test_config_3_engine_khop_docs():
             continue
         assert ours[name] == default, f"FireRed.{name}: backend={ours[name]!r} docs={default!r}"
 
+    # Bản port ONNX phải nhận ĐÚNG bộ tham số của upstream (không thêm/bớt field nào).
+    # `intra_op_threads` là tham số RIÊNG của onnxruntime (không thuộc cấu hình model) nên loại ra.
+    from backend.vad.engines.firered_onnx import FireRedStreamVadOnnx
+
+    _ORT_ONLY = {"intra_op_threads"}
+    ported = {
+        k
+        for k in inspect.signature(FireRedStreamVadOnnx.__init__).parameters
+        if k not in ("self", "model_dir") and k not in _ORT_ONLY
+    }
+    assert ported == set(fire_docs) - {"use_gpu", "chunk_max_frame"}, (
+        f"FireRed port ONNX lệch tham số so với docs: {ported ^ (set(fire_docs) - {'use_gpu', 'chunk_max_frame'})}"
+    )
+
     # ── Silero ───────────────────────────────────────────────────────────────
-    from silero_vad import VADIterator
+    from backend.vad.silero_onnx import SileroVADIterator
 
     params = {
         k: v.default
-        for k, v in inspect.signature(VADIterator.__init__).parameters.items()
+        for k, v in inspect.signature(SileroVADIterator.__init__).parameters.items()
         if k != "self" and v.default is not inspect.Parameter.empty
     }
     ours = app_config.vad.silero.model_dump()
@@ -190,20 +228,13 @@ def test_config_3_engine_khop_docs():
         "VADIterator chỉ nhận 8000/16000; pipeline phải giữ đúng 16 kHz"
     )
 
-    # ── FSMN ─────────────────────────────────────────────────────────────────
-    ckpt = yaml.safe_load(
-        (PROJECT_ROOT / "backend" / "models" / "fsmn_vad" / "config.yaml").read_text(encoding="utf-8")
+    # ── Chỉ còn HAI engine, cả hai đều không cần PyTorch ─────────────────────
+    from backend.vad import SUPPORTED_VAD_ENGINES
+
+    assert set(SUPPORTED_VAD_ENGINES) == {"firered-vad", "silero-vad"}, (
+        f"chỉ còn 2 engine VAD (đều ONNX); đang có {SUPPORTED_VAD_ENGINES}"
     )
-    docs = ckpt["model_conf"]
-    ours = app_config.vad.fsmn.model_dump()
-    for name in ("max_end_silence_time", "speech_noise_thres", "speech_to_sil_time_thres",
-                 "sil_to_speech_time_thres", "window_size_ms", "lookback_time_start_point",
-                 "lookahead_time_end_point", "output_frame_probs"):
-        assert ours[name] == docs[name], f"FSMN.{name}: backend={ours[name]!r} docs={docs[name]!r}"
-    assert ours["chunk_size_ms"] == 60, (
-        "`chunk_size_ms` = mặc định của wrapper streaming chính thức "
-        "`funasr.models.fsmn_vad_streaming.dynamic_vad.DynamicStreamingVAD`"
-    )
+    assert not hasattr(app_config.vad, "fsmn"), "config FSMN phải đã bị xoá cùng engine"
 
     # ── Mặc định KHÔNG ghi đè (để engine dùng đúng docs) ─────────────────────
     assert app_config.vad.threshold is None
@@ -338,14 +369,10 @@ def test_chieu_silence_va_threshold_xuong_field_native(engine_name):
         post = state.engine_state.vad.postprocessor
         assert post.speech_threshold == pytest.approx(0.77)
         assert post.min_silence_frame == 70, "700 ms / 10 ms mỗi frame = 70 frame"
-    elif engine_name == "silero-vad":
+    else:
         it = state.engine_state.iterator
         assert it.threshold == pytest.approx(0.77)
         assert it.min_silence_samples == pytest.approx(16000 * 0.7)
-    else:
-        stats = state.engine_state.cache["stats"]
-        assert stats.speech_noise_thres == pytest.approx(0.77)
-        assert stats.max_end_sil_frame_cnt_thresh == 700 - config.vad.fsmn.speech_to_sil_time_thres
 
     # `silence_ms=None` ⇒ quay về đúng mặc định trong config của engine (đúng docs).
     state_default = engine.create_initial_state(threshold=None, silence_ms=None)
@@ -353,18 +380,12 @@ def test_chieu_silence_va_threshold_xuong_field_native(engine_name):
         post = state_default.engine_state.vad.postprocessor
         assert post.min_silence_frame == config.vad.firered.min_silence_frame
         assert post.speech_threshold == pytest.approx(config.vad.firered.speech_threshold)
-    elif engine_name == "silero-vad":
+    else:
         it = state_default.engine_state.iterator
         assert it.min_silence_samples == pytest.approx(
             config.vad.silero.min_silence_duration_ms * 16.0
         )
         assert it.threshold == pytest.approx(config.vad.silero.threshold)
-    else:
-        stats = state_default.engine_state.cache["stats"]
-        assert stats.max_end_sil_frame_cnt_thresh == (
-            config.vad.fsmn.max_end_silence_time - config.vad.fsmn.speech_to_sil_time_thres
-        )
-        assert stats.speech_noise_thres == pytest.approx(config.vad.fsmn.speech_noise_thres)
 
 
 @pytest.mark.slow
@@ -384,14 +405,10 @@ def test_doi_silence_giua_phien_co_hieu_luc_ngay(engine_name, stream):
         post = proc._state.engine_state.vad.postprocessor
         assert post.min_silence_frame == 140
         assert post.speech_threshold == pytest.approx(0.55)
-    elif engine_name == "silero-vad":
+    else:
         it = proc._state.engine_state.iterator
         assert it.min_silence_samples == pytest.approx(16000 * 1.4)
         assert it.threshold == pytest.approx(0.55)
-    else:
-        stats = proc._state.engine_state.cache["stats"]
-        assert stats.max_end_sil_frame_cnt_thresh == 1400 - config.vad.fsmn.speech_to_sil_time_thres
-        assert stats.speech_noise_thres == pytest.approx(0.55)
 
 
 @pytest.mark.slow
@@ -408,7 +425,7 @@ def test_silence_bang_0_nghia_la_dung_mac_dinh_engine():
 
 
 #: Mặc định im lặng trong docs của từng engine (ms) — dùng để kiểm chế độ `silence=0`.
-_DOCS_SILENCE_MS = {"firered-vad": 200, "silero-vad": 100, "fsmn-vad": 800}
+_DOCS_SILENCE_MS = {"firered-vad": 200, "silero-vad": 100}
 
 
 def _run_silence_case(engine_name: str, pcm_bytes: bytes, silence_ms):
@@ -470,13 +487,10 @@ def test_vad_silence_bang_0_dung_mac_dinh_docs(engine_name, stream):
     print(f"[{engine_name}] VAD Silence=0 (docs) → chốt sau {silent_ms:.0f} ms im lặng "
           f"(mặc định docs: {_DOCS_SILENCE_MS[engine_name]} ms, hop {hop_ms:.0f} ms)")
 
-    # FSMN ở chế độ docs chưa bật `output_frame_probs` nên "bằng chứng" = state của engine
-    # (flip đúng frame END) ⇒ phép đo này bằng 0, không dùng để so sánh được.
-    if engine_name != "fsmn-vad":
-        assert silent_ms < 700 - 2 * hop_ms, (
-            f"{engine_name}: mặc định docs ({silent_ms:.0f} ms) không ngắn hơn mức ghi đè 700 ms "
-            f"⇒ ghi đè không có tác dụng"
-        )
+    assert silent_ms < 700 - 2 * hop_ms, (
+        f"{engine_name}: mặc định docs ({silent_ms:.0f} ms) không ngắn hơn mức ghi đè 700 ms "
+        f"⇒ ghi đè không có tác dụng"
+    )
 
 
 @pytest.mark.slow
@@ -519,7 +533,7 @@ def test_threshold_tu_popup_toi_field_native_qua_session(engine_name):
 
     Chuỗi: popup `vadThreshold` → `SessionState.apply_config` → `VADProcessor.update_config`
     → `engine.is_speech(threshold=…)` → field native (`postprocessor.speech_threshold` /
-    `VADIterator.threshold` / FSMN `stats.speech_noise_thres`).
+    `VADIterator.threshold`).
 
     Trả lời trực tiếp câu hỏi "threshold của `SileroVADConfig` có được popup chỉnh không":
     CÓ — nhưng qua ĐƯỜNG GHI ĐÈ (`VADConfig.threshold` / `vad_threshold` của phiên); còn
@@ -553,7 +567,6 @@ def test_threshold_tu_popup_toi_field_native_qua_session(engine_name):
     # Config native vẫn giữ mặc định docs (popup KHÔNG ghi vào config, chỉ ghi đè runtime).
     assert app_config.vad.silero.threshold == 0.5
     assert app_config.vad.firered.speech_threshold == 0.4
-    assert app_config.vad.fsmn.speech_noise_thres == 0.6
 
 
 # ─────────────────────────────────────────────── 5. đổi engine giữa câu

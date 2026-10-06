@@ -5,34 +5,40 @@
 #     pip install -r backend/requirements.txt
 #
 # File này cài được MỘT LẦN cho toàn bộ backend (ASR + VAD + dịch + TTS + WebSocket).
-#   * torch / torchaudio : PyPI chỉ có bản CPU ⇒ cần `--extra-index-url` của PyTorch.
-#   * llama-cpp-python   : PyPI **chỉ có sdist** (pip sẽ tự build ~10 phút, cần MSVC + nvcc và
-#                          ra bản CPU-only nếu thiếu CMAKE_ARGS). Wheel Windows dựng sẵn nằm ở
-#                          index `whl/cpu` của tác giả abetlen — file này cài bản **CPU ~7 MB**
-#                          để lấy **BINDING** (thuần ctypes, không có native code). Còn DLL CUDA
-#                          thật nằm trong repo tại `backend/bin/llama/` và engine dịch trỏ tới
-#                          bằng env `LLAMA_CPP_LIB_PATH`. ⇒ KHÔNG cần build gì cả.
 #
-# PHIÊN BẢN ĐÃ ĐO THỰC TẾ — lấy từ một **venv trắng + clone sạch** chạy đúng lệnh
-# `pip install -r backend/requirements.txt` (2026-09-23, RTX 5060 Ti, Windows 11, Python 3.13.14):
+# ⚠️ KHÔNG CÒN PYTORCH (Giai đoạn 3, 2026-10-06). Mọi subsystem chạy runtime native:
+#     VAD (Silero + FireRed)      → onnxruntime
+#     ForcedAligner               → GGUF Q4_K qua CrispASR (`backend/bin/crispasr/`, tiến trình con)
+#     ASR                         → transcribe.dll (transcribe.cpp)
+#     Dịch                        → llama.dll (llama.cpp)
+#     TTS                         → omnivoice.dll (omnivoice.cpp)
+#   ⇒ đã gỡ `torch`, `torchaudio`, `transformers`, `nagisa`, `soynlp`, `omnivoice`, `fireredvad`,
+#     `silero-vad`, `funasr` và cả `--extra-index-url https://download.pytorch.org/whl/cu130`.
+#   ⇒ cũng không còn cảnh "pip âm thầm hạ torch xuống bản CPU-only" mà `constraints.txt` sinh ra
+#     để chống. Kiểm chứng môi trường sạch: `python -m backend.utils.env_check`.
+#
+#   * llama-cpp-python : PyPI **chỉ có sdist** (pip sẽ tự build ~10 phút, cần MSVC + nvcc và ra bản
+#                        CPU-only nếu thiếu CMAKE_ARGS). Wheel Windows dựng sẵn nằm ở index
+#                        `whl/cpu` của tác giả abetlen — file này cài bản **CPU ~7 MB** để lấy
+#                        **BINDING** (thuần ctypes, không có native code). DLL CUDA thật nằm trong
+#                        repo tại `backend/bin/llama/` và engine dịch trỏ tới bằng env
+#                        `LLAMA_CPP_LIB_PATH`. ⇒ KHÔNG cần build gì cả.
+#
+# PHIÊN BẢN ĐÃ ĐO THỰC TẾ — venv trắng + clone sạch, `pip install -r backend/requirements.txt`
+# (2026-09-23, RTX 5060 Ti, Windows 11, Python 3.13.14; danh sách torch ở dòng dưới là LỊCH SỬ,
+#  nay không còn được cài):
 #     fastapi 0.141.1 · uvicorn 0.53.0 · pydantic 2.13.5 · numpy 2.5.3 · scipy 1.18.1
-#     torch 2.14.0+cu130 · torchaudio 2.11.0+cu130 · llama-cpp-python 0.3.35 (binding CPU 7 MB)
+#     llama-cpp-python 0.3.35 (binding CPU 7 MB)
 #     transcribe-cpp 0.2.3 · transcribe-cpp-native 0.2.3 · onnxruntime 1.30.0
-#     omnivoice 0.2.1 · fireredvad 0.0.2 · silero-vad 6.2.3 · funasr 1.4.16
 #     huggingface-hub 1.32.0 · soundfile 0.14.0 · cryptography 50.0.1 · psutil 7.2.2
-#   (torchvision KHÔNG được cài — không subsystem nào cần; xem `backend/constraints.txt`.)
+#     (trước đây còn: torch 2.14.0+cu130 · torchaudio 2.11.0+cu130 · omnivoice 0.2.1 ·
+#      fireredvad 0.0.2 · silero-vad 6.2.3 · funasr 1.4.16)
 #
-# Các dòng dưới là KHOẢNG (`>=`) nên pip luôn lấy bản mới nhất khớp. Muốn GHIM đúng bộ đã đo
-# (chống pip âm thầm hạ torch xuống bản CPU-only), thêm `-c`:
+# Các dòng dưới là KHOẢNG (`>=`) nên pip luôn lấy bản mới nhất khớp. Muốn GHIM đúng bộ đã đo,
+# thêm `-c`:
 #     pip install -r backend/requirements.txt -c backend/constraints.txt
-#
-# Ghi chú về CUDA: torch ở đây dùng CUDA 13.0 (cu130) để khớp driver mới. Nếu driver của
-# bạn chỉ hỗ trợ CUDA 12.x, đổi index/phiên bản torch bên dưới sang cu124 (xem README mục
-# "Cài đặt chi tiết"). Riêng llama.cpp KHÔNG bị ảnh hưởng: DLL của nó nằm sẵn trong
-# `backend/bin/llama/` nên không còn cảnh 2 bộ DLL CUDA cùng nằm trong một tiến trình.
 # ============================================================================
 
---extra-index-url https://download.pytorch.org/whl/cu130
 # Wheel binding của llama.cpp (xem ghi chú đầu file); chỉ chứa binding + DLL CPU không dùng tới.
 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 # ---------------------------------------------------------------- llama.cpp (dịch GGUF)
@@ -93,33 +99,60 @@ transcribe-cpp-native==0.2.3
 llama-cpp-python==0.3.35
 
 # ------------------------------------------------------------------- TTS (OmniVoice)
-# kéo theo torch/torchaudio (>=2.4) + transformers + librosa + pydub
-torch>=2.4
-torchaudio>=2.4
-omnivoice>=0.2.1
+# Runtime TTS là **omnivoice.cpp** (native, `backend/bin/omnivoice/omnivoice.dll`) chạy trong
+# PROCESS WORKER riêng — backend **KHÔNG** import gói Python `omnivoice`.
+# ⚠️ ĐÃ GỠ gói `omnivoice` khỏi requirements (2026-10-06): metadata của nó khai báo cứng
+#    `torch>=2.4` + `torchaudio>=2.4` + `transformers` + `accelerate` + `gradio` + `librosa`
+#    + `webdataset`, tức nó là lý do CHÍNH khiến PyTorch nằm trong môi trường dù TTS native
+#    không dùng tới. Kiểm chứng: `grep -r "import omnivoice" backend/` ⇒ 0 kết quả.
+#
+# ═══════════════════════════════════════════════════════════════════════════════════════════
+# GIAI ĐOẠN 3 (2026-10-06): KHÔNG còn `torch`, `torchaudio`, `transformers`, `nagisa`, `soynlp`.
+# Không subsystem nào của backend cần PyTorch nữa:
+#   * VAD (Silero + FireRed)             → onnxruntime
+#   * ForcedAligner (Qwen3-ForcedAligner)→ GGUF Q4_K qua CrispASR, tiến trình con
+#   * ASR / dịch / TTS                   → transcribe.dll / llama.dll / omnivoice.dll (GGML)
+# Đã gỡ luôn `--extra-index-url https://download.pytorch.org/whl/cu130` ở đầu file.
+# Kiểm chứng môi trường sạch: `python -m backend.utils.env_check` và
+#   `pytest backend/tests/test_63_vad_audio_integrity.py backend/tests/test_64_crispasr_aligner.py`
+# ═══════════════════════════════════════════════════════════════════════════════════════════
 
-# --------------------------------------- Timer SEG: Qwen3-ForcedAligner (tuỳ chọn)
-# Timer mốc cắt `segmentation.timer_engine="qwen3-aligner"` chạy Qwen3-ForcedAligner-0.6B
-# bằng transformers NATIVE (`backend/asr/aligner_timer.py`) ⇒ **KHÔNG** cần gói `qwen-asr`
-# (gói đó ghim `transformers==4.57.6`, xung đột trực tiếp với `transformers>=5.3.0` mà
-# omnivoice/TTS yêu cầu — xem `report/audit/26_KHA_THI_QWEN3_ASR_TRANSFORMERS.md`).
-#   * nagisa: BẮT BUỘC cho tiếng Nhật — `split_words_for_alignment(..., "Japanese")` nạp từ
-#     điển nagisa và lần gọi ĐẦU TIÊN tốn ~1,5 s (đã đo). Thiếu gói ⇒ ImportError ⇒ timer
-#     tiếng Nhật hỏng hoàn toàn.
-#   * soynlp: tương tự cho tiếng Hàn.
-#   * Chỉ cần khi bật engine timer aligner; vẫn cài mặc định vì repo này dùng tiếng Nhật.
-nagisa==0.3.0
-soynlp==0.0.493
+# ------------------------------------------------------------------- VAD (onnxruntime)
+# VAD chạy 100% bằng ONNX Runtime — KHÔNG cần PyTorch:
+#   * `firered-vad` (MẶC ĐỊNH): `fireredvad_stream_vad_with_cache.onnx` (2,3 MB, upstream
+#     FireRedTeam phát hành chính thức) + frontend fbank `kaldi-native-fbank` + `cmvn.ark`.
+#   * `silero-vad`: `silero_vad.onnx` (2,33 MB, model v5 chính thức).
+#   Kiểm chứng: `pytest -m slow backend/tests/test_62_vad_onnx_parity.py`
+#              `pytest -m slow backend/tests/test_63_vad_audio_integrity.py`
+onnxruntime>=1.17          # BẮT BUỘC — runtime của cả 2 engine VAD
+kaldi-native-fbank>=1.15   # frontend fbank 80 chiều cho FireRed (thuần C++, không kéo torch)
+kaldiio>=2.18              # đọc `cmvn.ark`
+
+# ── Engine `fsmn-vad` (Alibaba FunASR) ĐÃ BỊ XOÁ ở Giai đoạn 3 ──────────────────────────────
+# Nó là engine duy nhất còn cần `funasr` → `torch`. FunASR CÓ hỗ trợ export ONNX (`FsmnStack` /
+# `FSMNExport` / `export_meta.py`), nhưng chạy được còn phải vendor frontend fbank+LFR+CMVN và
+# máy trạng thái streaming (`funasr/models/fsmn_vad_streaming/model.py` ~52 KB + `dynamic_vad.py`)
+# — không tương xứng cho một engine KHÔNG mặc định và đã bị FireRed/Silero lấn át. Muốn khôi phục
+# thì export ONNX rồi viết engine mới theo khuôn `backend/vad/engines/firered_onnx.py`.
+
+# ── ForcedAligner (Lookahead): KHÔNG cần gói Python nào ─────────────────────────────────────
+# Model `Qwen3-ForcedAligner-0.6B-q4_k.gguf` (~500 MB) tự tải từ `cstr/qwen3-forced-aligner-0.6b-GGUF`;
+# runtime là `crispasr.dll` trong `backend/bin/crispasr/` (xem `backend/utils/crispasr_native.py`).
+# `nagisa`/`soynlp` đã bị gỡ cùng đường torch: bản GGUF của CrispASR tự tách đơn vị theo CHỮ VIẾT
+# (CJK/Hangul từng ký tự, Latin theo khoảng trắng) chứ không nhận tên ngôn ngữ.
+
+# --------------------------------------- Timer SEG: Qwen3-ForcedAligner (ĐÃ GỠ)
+# Khối này trước đây cài `nagisa` + `soynlp` cho `backend/asr/aligner_timer.py` — file đó KHÔNG
+# còn tồn tại trong repo, và timer aligner đã bị gỡ cùng Giai đoạn 3. Hai gói này cũng chỉ phục vụ
+# đường torch của ForcedAligner (nagisa tách từ tiếng Nhật, soynlp tách từ tiếng Hàn); bản GGUF của
+# CrispASR tự tách đơn vị theo chữ viết nên không cần.
 
 # ------------------------------------------------------------------------- VAD engine
-fireredvad>=0.0.2           # mặc định (FireRed Stream-VAD)
-silero-vad>=5.1             # tuỳ chọn
-# ⚠️ silero-vad 6.2.2 `import onnxruntime` NGAY Ở CẤP MODULE (`silero_vad/utils_vad.py`) dù ta
-# chỉ dùng đường JIT ⇒ thiếu gói này thì engine Silero không nạp được:
-#     [VAD] Engine 'silero-vad' nạp nền thất bại: ModuleNotFoundError: No module named 'onnxruntime'
-# (metadata của silero-vad KHÔNG khai báo onnxruntime — đây là thiếu sót của gói.)
-onnxruntime>=1.17
-funasr>=1.1                 # tuỳ chọn (FSMN-VAD) — khá nặng, kéo modelscope/omegaconf
+# Cả hai engine VAD nay chỉ cần `onnxruntime` + `kaldi-native-fbank` + `kaldiio` (xem mục
+# "VAD (onnxruntime)" phía trên). Phần fbank/CMVN/postprocessor của FireRed đã được vendor vào
+# `backend/vad/engines/firered_onnx.py` (Apache-2.0, ghi rõ nguồn).
+# ⚠️ ĐÃ GỠ: `fireredvad`, `silero-vad` (cả hai `import torch` ở CẤP MODULE), `funasr`, và
+#    `torch`/`torchaudio`/`transformers`/`nagisa`/`soynlp`/`omnivoice`.
 
 # ------------------------------------------------------------------ Tải model / giọng
 huggingface_hub>=0.23

@@ -7,6 +7,9 @@ external/
 debug/
 scratch/
 
+# 1b. Khảo sát/so sánh thư viện ngoài (clone tạm để đọc mã nguồn, ~200 MB)
+.research/
+
 # 2. Models & Model Weights (large files > 50MB)
 backend/models/
 models/
@@ -94,6 +97,16 @@ runtime_state.json
 external/cuda-toolkit/
 external/build-cuda/
 external/build-tmp/
+
+# 11. DLL CrispASR (Forced Aligner) — KHÔNG commit, tự tải khi thiếu
+# `backend/bin/crispasr/ggml-cuda.dll` nặng 149,6 MB > giới hạn 100 MB/file của GitHub,
+# nên bản CUDA không thể nằm trong lịch sử git (push sẽ bị từ chối).
+# `backend/utils/crispasr_native.py::ensure_lib_files()` tự tải gói
+# `crispasr-windows-x86_64-cuda13-non-cuda.zip` (ghim v0.8.41) từ GitHub Releases, giải nén
+# đúng 5 DLL và xác thực SHA-256 của cả gói lẫn từng DLL. Bản clone sạch vì thế vẫn chạy được
+# aligner mà không cần Git LFS.
+# VẪN commit `LICENSE` + `THIRD_PARTY_NOTICES.txt` (nghĩa vụ ghi nguồn Apache-2.0).
+backend/bin/crispasr/*.dll
 
 
 # 10. WAV

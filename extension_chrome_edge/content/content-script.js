@@ -6,11 +6,13 @@
 
   // ── Unified WebSocket Configuration Builder ─────────────────────────────
   // G9/G10: KHÔNG gửi giá trị mặc định cứng cho `translationModel` / `vadEngine` nữa.
-  // Trước đây client luôn gửi "xiaomi" và "fsmn-vad":
+  // Trước đây client luôn gửi "xiaomi" và một tên VAD engine cứng:
   //   - "xiaomi" (MiLMMT) không có file GGUF cục bộ -> khi backend xử lý thật sẽ lỗi.
-  //   - "fsmn-vad" khác engine mặc định của backend (fired-vad) -> mỗi lần content
+  //   - tên VAD engine cứng khác mặc định của backend -> mỗi lần content
   //     script khởi động lại ghi đè VAD engine và kích hoạt đường nạp model trên hot path.
   // Nay chỉ gửi khi người dùng THỰC SỰ chọn; bỏ trống thì backend giữ mặc định của nó.
+  // (Backend chỉ còn 2 engine, đều chạy onnxruntime: `firered-vad` mặc định và `silero-vad`.
+  //  Engine `fsmn-vad` đã bị xoá ở Giai đoạn 3 cùng PyTorch.)
   // F-30: extension này khai báo giao thức v3 ⇒ backend gửi payload GỌN (một tên cho mỗi
   // giá trị, không còn `original`/`ui_text`/`utteranceId`/`stableText`…).
   const PROTOCOL_VERSION = 3;

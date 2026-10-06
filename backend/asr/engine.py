@@ -492,12 +492,9 @@ class TranscribeEngine(BaseASREngine):
                 pass
         del old_session, old_model
         gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # KHÔNG còn `torch.cuda.empty_cache()` ở đây: sau Giai đoạn 3 backend không dùng PyTorch.
+        # VRAM của model ASR nằm trong `transcribe.dll` (ggml/CUDA), và `old_model.close()` ngay
+        # trên đã trả nó về driver — dọn cache của torch chỉ có tác dụng khi chính torch giữ VRAM.
         logger.info(f"Đã giải phóng model ASR cũ khỏi VRAM trước khi nạp '{model_key}'", extra={"module_tag": "ASR"})
 
         # Bước 2: Nạp model mới vào VRAM đã được giải phóng

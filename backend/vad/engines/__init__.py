@@ -7,10 +7,11 @@ from backend.config import config
 from backend.utils.logger import logger
 from backend.vad.base import BaseVADEngine
 from backend.vad.engines.firered import FireRedVADEngine
-from backend.vad.engines.fsmn import FsmnVADEngine
 from backend.vad.engines.silero import SileroVADEngine
 
-SUPPORTED_VAD_ENGINES: Tuple[str, ...] = ("firered-vad", "fsmn-vad", "silero-vad")
+#: Cả hai engine đều chạy onnxruntime, KHÔNG cần PyTorch. `fsmn-vad` đã bị xoá ở Giai đoạn 3 —
+#: xem ghi chú ở `backend/vad/base.py::SUPPORTED_VAD_ENGINES`.
+SUPPORTED_VAD_ENGINES: Tuple[str, ...] = ("firered-vad", "silero-vad")
 
 
 class VADEngineFactory:
@@ -26,11 +27,9 @@ class VADEngineFactory:
 
     @classmethod
     def _factory_for(cls, engine: str):
-        if engine == "firered-vad":
-            return FireRedVADEngine
         if engine == "silero-vad":
             return SileroVADEngine
-        return FsmnVADEngine
+        return FireRedVADEngine
 
     @classmethod
     def get_engine(cls, engine_name: str) -> BaseVADEngine:
@@ -101,10 +100,18 @@ class VADEngineFactory:
             key = (name or "").lower().strip()
             if key not in SUPPORTED_VAD_ENGINES:
                 continue
+            factory = cls._factory_for(key)
+            # Engine cần gói TUỲ CHỌN chưa cài (vd. FSMN → funasr/PyTorch): báo "skipped" thay
+            # vì để lỗi bật lên ở MỖI lần khởi động. Người dùng vẫn chọn được trong popup —
+            # khi đó engine báo lỗi có hướng dẫn cụ thể.
+            ok, reason = factory.available()
+            if not ok:
+                results[key] = f"skipped: {reason}"
+                continue
             try:
                 engine = cls.get_engine(key)
-                # `create_initial_state` cũng tốn thời gian (Silero nạp JIT model) nên warm
-                # luôn một lần rồi bỏ state — state thật là per-session.
+                # `create_initial_state` cũng tốn thời gian nên warm luôn một lần rồi bỏ state —
+                # state thật là per-session.
                 engine.create_initial_state(threshold=threshold, silence_ms=silence_ms)
                 results[key] = "ok"
             except Exception as exc:  # noqa: BLE001
@@ -122,7 +129,6 @@ __all__ = [
     "BaseVADEngine",
     "FireRedVADEngine",
     "SileroVADEngine",
-    "FsmnVADEngine",
     "VADEngineFactory",
     "SUPPORTED_VAD_ENGINES",
 ]

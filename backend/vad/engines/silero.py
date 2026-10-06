@@ -1,29 +1,30 @@
-"""Engine Silero VAD v5/v6 (TorchScript JIT) — dùng đúng API trong docs.
+"""Engine Silero VAD v5 — chạy bằng **onnxruntime** (không còn PyTorch).
 
-    from silero_vad import load_silero_vad, VADIterator
+    from backend.vad.silero_onnx import SileroVadOnnx, SileroVADIterator
 
-    model = load_silero_vad()
-    vad_iterator = VADIterator(model, threshold=0.5, sampling_rate=16000,
-                               min_silence_duration_ms=100, speech_pad_ms=30)
-    for chunk in audio:            # 512 mẫu @ 16 kHz
-        speech_dict = vad_iterator(chunk)
+    model = SileroVadOnnx(Path("backend/models/silero_vad.onnx"))
+    it = SileroVADIterator(model, threshold=0.5, sampling_rate=16000,
+                           min_silence_duration_ms=100, speech_pad_ms=30)
+    for frame in audio:            # 512 mẫu @ 16 kHz
+        res = it(frame)            # {'start': …} | {'end': …} | None
 
 Ghi chú thiết kế:
 
-* `VADIterator` **không** trả xác suất (chỉ trả `{'start': …}`, `{'end': …}` hoặc
-  `None`), nên cần một wrapper mỏng ghi lại giá trị mà model trả về. Wrapper chỉ ĐỌC và
-  uỷ quyền mọi thuộc tính khác (`reset_states`, tham số…) cho model thật ⇒ không đổi hành
-  vi của thư viện.
-* Model Silero **có state nội bộ** (`reset_states()` ghi vào chính model), nên mỗi phiên
-  phải có model riêng: `create_initial_state()` nạp JIT (~93 ms, 2,3 MB) cho từng phiên.
+* `SileroVADIterator` là **bản port chính xác** `silero_vad.VADIterator` (xem
+  `backend/vad/silero_onnx.py`) — giữ nguyên mọi ngưỡng, kể cả hằng số trễ `threshold - 0.15`
+  mà upstream hardcode. Đổi bất kỳ nhánh nào là đổi hành vi cắt câu.
+* Model ONNX cho **cùng xác suất từng frame** với model JIT cũ (`max|Δp| ≤ 2e-6`, 0 frame lệch
+  quyết định trên 3.797 cửa sổ — `backend/tests/test_62_vad_onnx_parity.py`).
+* State do caller giữ (không giấu trong model) nên `create_initial_state()` **không phải nạp
+  model riêng cho từng phiên** như bản JIT (trước đây ~93 ms/phiên, 2,3 MB/phiên).
 * Input phải là float32 trong [-1, 1] đúng `frame_samples = 512` mẫu ⇒
-  `int16.astype(float32) / 32768.0` tạo **bản sao** (không đụng vào buffer của processor).
+  `int16.astype(float32) / 32768.0` tạo **bản sao**, KHÔNG đụng vào buffer của processor
+  (audio tới ASR phải nguyên byte — xem hợp đồng ở `backend/vad/base.py`).
 """
 
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
-import shutil
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -36,49 +37,28 @@ from backend.vad.base import (
     VADResult,
     VADStreamState,
 )
+from backend.vad.silero_onnx import (
+    WINDOW_SAMPLES,
+    SileroVADIterator,
+    SileroVadOnnx,
+    ensure_silero_onnx_model,
+)
 from backend.utils.logger import logger
 
 #: VADIterator chỉ nhận 512 mẫu @ 16 kHz (32 ms).
-WINDOW_SAMPLES = 512
 WINDOW_MS = 32
-
-
-class _ProbProbe:
-    """Wrapper CHỈ-ĐỌC quanh model Silero để ghi lại xác suất của frame vừa xử lý.
-
-    `VADIterator` không trả xác suất nên đây là cách duy nhất để có `probability` cho
-    log/metric mà KHÔNG tự tính lại model. Mọi truy cập khác được chuyển tiếp nguyên vẹn
-    cho model thật (`__getattr__`), nên `VADIterator.reset_states()` vẫn gọi đúng
-    `model.reset_states()`.
-    """
-
-    def __init__(self, model: Any):
-        self._model = model
-        self.last_prob: float = 0.0
-
-    def __call__(self, x, sr: int):
-        out = self._model(x, sr)
-        try:
-            self.last_prob = float(out.item())
-        except Exception:  # noqa: BLE001 - chỉ là thông tin phụ
-            self.last_prob = 0.0
-        return out
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._model, name)
 
 
 @dataclass
 class _Session:
-    """State riêng của Silero cho 1 phiên: model JIT + `VADIterator` + bộ đếm frame."""
+    """State riêng của Silero cho 1 phiên: iterator ONNX + bộ đếm frame."""
 
-    iterator: Any
-    probe: _ProbProbe
+    iterator: SileroVADIterator
     frames: int = 0
 
 
 class SileroVADEngine(BaseVADEngine):
-    """Engine Silero VAD chính thức (JIT)."""
+    """Engine Silero VAD chính thức (ONNX Runtime)."""
 
     name = "silero-vad"
     default_threshold = 0.5
@@ -99,7 +79,7 @@ class SileroVADEngine(BaseVADEngine):
         self.start_pad_ms = int(cfg.speech_pad_ms)
 
         logger.info(
-            f"Silero-VAD sẵn sàng (cửa sổ {WINDOW_SAMPLES} mẫu, model={self.model_path})",
+            f"Silero-VAD sẵn sàng (ONNX, cửa sổ {WINDOW_SAMPLES} mẫu, model={self.model_path})",
             extra={"module_tag": "VAD"},
         )
 
@@ -107,46 +87,33 @@ class SileroVADEngine(BaseVADEngine):
     def _resolve_model_path(self, explicit_path: Optional[Union[str, Path]]) -> Path:
         if explicit_path and Path(explicit_path).exists():
             return Path(explicit_path)
-        return MODELS_DIR / "silero_vad.jit"
+        return MODELS_DIR / "silero_vad.onnx"
 
     @classmethod
     def prepare_files(cls) -> None:
-        """Đảm bảo file `silero_vad.jit` có trong `backend/models` (ưu tiên offline)."""
-        target = MODELS_DIR / "silero_vad.jit"
-        if target.exists():
-            return
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        """Đảm bảo `silero_vad.onnx` có trong `backend/models` (ưu tiên offline, rồi mới tải)."""
         try:
-            import importlib.resources as impresources
-
-            src = str(impresources.files("silero_vad.data").joinpath("silero_vad.jit"))
-            shutil.copy(src, target)
-            logger.info(f"Đã sao chép silero_vad.jit từ package vào {target}",
-                        extra={"module_tag": "VAD"})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"Không thể copy bundled silero_vad.jit ({exc}); sẽ dùng model của package.",
-                extra={"module_tag": "VAD"},
-            )
+            ensure_silero_onnx_model(MODELS_DIR / "silero_vad.onnx")
+        except FileNotFoundError as exc:
+            # Không ném ở đây: `VADEngineFactory` log cảnh báo rồi vẫn thử dựng engine để
+            # thông báo lỗi cụ thể hơn (xem `get_engine`).
+            logger.warning(str(exc), extra={"module_tag": "VAD"})
 
     def _ensure_model_file(self) -> None:
-        """Đảm bảo file `silero_vad.jit` có trong `backend/models` (ưu tiên offline)."""
+        """Đảm bảo file `silero_vad.onnx` có trong `backend/models` (ưu tiên offline)."""
         self.prepare_files()
 
-    def _load_model(self) -> Any:
-        """Nạp model JIT: CHỈ nạp từ file cục bộ trong backend/models."""
-        from silero_vad.utils_vad import init_jit_model
-
-        if not self.model_path.exists():
+    def _load_model(self) -> SileroVadOnnx:
+        """Nạp model ONNX: CHỈ nạp từ file cục bộ trong backend/models."""
+        if not self.model_path.is_file():
             self._ensure_model_file()
-
-        if self.model_path.exists():
-            return init_jit_model(str(self.model_path))
-
-        raise FileNotFoundError(
-            f"Không tìm thấy file model silero_vad.jit tại {self.model_path}! "
-            "Hãy đảm bảo file nằm trong backend/models."
-        )
+        if not self.model_path.is_file():
+            raise FileNotFoundError(
+                f"Không tìm thấy file model silero_vad.onnx tại {self.model_path}! "
+                "Hãy chạy `python -m backend.main` một lần để tự tải, hoặc copy thủ công vào "
+                f"{self.model_path.parent}."
+            )
+        return SileroVadOnnx(self.model_path)
 
     # ------------------------------------------------------------------ config
     def _resolve_effective(self, threshold: Optional[float], silence_ms: Optional[int]):
@@ -161,15 +128,12 @@ class SileroVADEngine(BaseVADEngine):
         threshold: Optional[float] = None,
         silence_ms: Optional[int] = None,
     ) -> VADStreamState:
-        from silero_vad import VADIterator
-
         cfg = config.vad.silero
         eff_threshold, eff_silence_ms = self._resolve_effective(threshold, silence_ms)
 
         model = self._load_model()
-        probe = _ProbProbe(model)
-        iterator = VADIterator(
-            model=probe,
+        iterator = SileroVADIterator(
+            model=model,
             threshold=eff_threshold,
             sampling_rate=16000,
             min_silence_duration_ms=eff_silence_ms,
@@ -177,7 +141,7 @@ class SileroVADEngine(BaseVADEngine):
         )
 
         state = VADStreamState()
-        state.engine_state = _Session(iterator=iterator, probe=probe)
+        state.engine_state = _Session(iterator=iterator)
         return state
 
     # ------------------------------------------------------------------ streaming
@@ -197,20 +161,19 @@ class SileroVADEngine(BaseVADEngine):
         self._sync_runtime_config(session.iterator, eff_threshold, eff_silence_ms)
 
         # Bản sao float32 [-1, 1] chuẩn docs; KHÔNG đụng vào mảng Int16 của processor.
+        # (Hợp đồng: audio tới ASR phải nguyên byte ⇒ mọi chuyển đổi đều tạo bản sao.)
         samples = frame_int16.astype(np.float32) / 32768.0
 
-        import torch
-
-        with torch.no_grad():
-            res = session.iterator(torch.from_numpy(samples))
+        res = session.iterator(samples)
 
         session.frames += 1
         # `is_speech` = BẰNG CHỨNG của riêng frame này (xác suất ≥ ngưỡng), KHÔNG phải
         # `iterator.triggered` (triggered giữ nguyên True suốt `min_silence_samples` nên
         # không dùng để đếm im lặng được).
+        last_prob = float(session.iterator.last_prob)
         result = VADResult(
-            probability=float(session.probe.last_prob),
-            is_speech=float(session.probe.last_prob) >= eff_threshold,
+            probability=last_prob,
+            is_speech=last_prob >= eff_threshold,
         )
         if res:
             if "start" in res:
@@ -227,9 +190,5 @@ class SileroVADEngine(BaseVADEngine):
 
     @staticmethod
     def _sync_runtime_config(iterator: Any, threshold: float, silence_ms: int) -> None:
-        """Áp cấu hình runtime lên `VADIterator` đang chạy."""
-        if float(getattr(iterator, "threshold", threshold)) != float(threshold):
-            iterator.threshold = float(threshold)
-        min_silence_samples = 16000 * float(silence_ms) / 1000.0
-        if float(getattr(iterator, "min_silence_samples", min_silence_samples)) != min_silence_samples:
-            iterator.min_silence_samples = min_silence_samples
+        """Áp cấu hình runtime lên iterator đang chạy."""
+        SileroVADIterator._sync_runtime_config(iterator, threshold, silence_ms)

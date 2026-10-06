@@ -23,13 +23,14 @@ VÌ SAO CHỌN SILERO (đo thật trên máy chuẩn, RTX 5060 Ti)
 | Engine | Cách chạy | Chi phí cho 90 s audio | Hệ số |
 |---|---|---|---|
 | `firered-vad` | `is_speech()` từng frame 10 ms | 28 700 ms | **0.31× thời gian thực** |
-| `silero-vad` | từng cửa sổ 512 mẫu | 1 001 ms | 90× thời gian thực |
-| `silero-vad` | **gọi theo LÔ** (256 cửa sổ/lần) | **127 ms** | **~700× thời gian thực** |
+| `silero-vad` (JIT, cũ) | từng cửa sổ 512 mẫu | 1 001 ms | 90× thời gian thực |
+| `silero-vad` (JIT, cũ) | **gọi theo LÔ** (256 cửa sổ/lần) | **127 ms** | **~700× thời gian thực** |
+| `silero-vad` (**ONNX**, nay) | từng cửa sổ 512 mẫu | **~380 ms** | **~230× thời gian thực** |
 
 ⚠️ Dòng "theo LÔ" ở bảng trên chỉ là SỐ ĐO ĐỘNG CƠ, **không phải cách module này chạy**: gọi lô > 1
 làm state nội bộ của Silero được xử lý khác và kết quả ĐỔI HẲN, nên `SILERO_BATCH_WINDOWS` bị KHOÁ
-bằng 1 (xem chú thích tại hằng số đó). Chi phí thật của đường batch=1 là ~90× thời gian thực — vẫn
-thừa sức quét toàn vùng tìm kiếm.
+bằng 1 (xem chú thích tại hằng số đó). Đường ONNX hiện tại chạy **tuần tự từng cửa sổ** và đo được
+~230× thời gian thực — vẫn thừa sức quét toàn vùng tìm kiếm, đồng thời bỏ được PyTorch.
 
 FireRed bị chi phối bởi chi phí gọi model cho TỪNG frame 10 ms ⇒ không thể quét toàn vùng tìm kiếm
 cho mỗi khối, còn Silero trả xác suất cho cả dải cửa sổ ⇒ quét được **toàn bộ** vùng tìm kiếm với
@@ -172,46 +173,34 @@ class VADSilenceScanner:
     def _load_model(self):
         if self._model is not None:
             return self._model
-        from silero_vad.utils_vad import init_jit_model
+        from backend.vad.silero_onnx import SileroVadOnnx, ensure_silero_onnx_model
 
-        path = Path(MODELS_DIR) / "silero_vad.jit"
-        if not path.exists():
-            try:
-                from backend.vad.engines import SileroVADEngine
-
-                SileroVADEngine.prepare_files()
-            except Exception:  # noqa: BLE001
-                pass
-        if not path.exists():
+        path = Path(MODELS_DIR) / "silero_vad.onnx"
+        if not path.is_file():
+            ensure_silero_onnx_model(path)
+        if not path.is_file():
             raise FileNotFoundError(f"Không thấy model Silero VAD tại {path}")
-        model = init_jit_model(str(path))
+        # ONNX Runtime chạy CPU: model chỉ 2,3 MB và đo được ~230× thời gian thực trên CPU,
+        # nên không cần (và không nên) chiếm VRAM. `self._use_gpu` giữ lại chỉ để tương thích
+        # config; có bật cũng không đổi đường chạy.
+        self._model = SileroVadOnnx(path)
         if self._use_gpu:
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    model = model.cuda()
-            except Exception:  # noqa: BLE001
-                pass
-        self._model = model
-        return model
+            logger.info(
+                "Bộ dò khoảng lặng: Silero ONNX chạy trên CPU (onnxruntime), bỏ qua use_gpu=True.",
+                extra={"module_tag": "VAD"},
+            )
+        return self._model
 
     def prewarm(self) -> None:
-        """Nạp model + chạy thử một lô nhỏ (BLOCKING — gọi từ thread nền)."""
+        """Nạp model + chạy thử một cửa sổ (BLOCKING — gọi từ thread nền)."""
         try:
             model = self._load_model()
-            import torch
-
-            dummy = torch.zeros(SILERO_BATCH_WINDOWS, SILERO_WINDOW_SAMPLES)
-            if self._use_gpu:
-                dummy = dummy.cuda()
-            with torch.no_grad():
-                model.reset_states()
-                model(dummy, self.sample_rate)
+            dummy = np.zeros((1, SILERO_WINDOW_SAMPLES), dtype=np.float32)
+            model.probabilities(dummy)
             self.vad_unavailable_reason = ""
             logger.info(
-                f"Bộ dò khoảng lặng: Silero VAD sẵn sàng (ngưỡng={self.threshold}, "
-                f"lô={SILERO_BATCH_WINDOWS} cửa sổ, min_silence={self.min_silence_ms:.0f}ms).",
+                f"Bộ dò khoảng lặng: Silero VAD (ONNX) sẵn sàng (ngưỡng={self.threshold}, "
+                f"từng cửa sổ {SILERO_WINDOW_SAMPLES} mẫu, min_silence={self.min_silence_ms:.0f}ms).",
                 extra={"module_tag": "VAD"},
             )
         except Exception as exc:  # noqa: BLE001
@@ -312,10 +301,11 @@ class VADSilenceScanner:
 
         `prime`: audio NGAY TRƯỚC `samples` (bội số của 512). Model được chạy qua phần mồi trước
         (bỏ kết quả) để state ấm đúng như khi chạy streaming liên tục — xem `SILERO_PRIME_WINDOWS`.
+
+        Đường ONNX chạy **tuần tự từng cửa sổ** (batch = 1) đúng như trước: gộp lô làm state LSTM
+        của Silero được xử lý khác và kết quả đổi hẳn (xem `SILERO_BATCH_WINDOWS`).
         """
         try:
-            import torch
-
             model = self._load_model()
         except Exception as exc:  # noqa: BLE001
             if not self.vad_unavailable_reason:
@@ -325,38 +315,30 @@ class VADSilenceScanner:
         n_win = samples.size // SILERO_WINDOW_SAMPLES
         if n_win <= 0:
             return np.zeros(0, dtype=np.float32)
-        windows = torch.from_numpy(np.ascontiguousarray(samples[: n_win * SILERO_WINDOW_SAMPLES])).reshape(
+
+        windows = np.ascontiguousarray(samples[: n_win * SILERO_WINDOW_SAMPLES], dtype=np.float32).reshape(
             n_win, SILERO_WINDOW_SAMPLES
         )
-        if self._use_gpu:
-            windows = windows.cuda()
 
         prime_windows = None
         if prime is not None and prime.size >= SILERO_WINDOW_SAMPLES:
             n_prime = prime.size // SILERO_WINDOW_SAMPLES
-            prime_windows = torch.from_numpy(
-                np.ascontiguousarray(prime[: n_prime * SILERO_WINDOW_SAMPLES])
+            prime_windows = np.ascontiguousarray(
+                prime[: n_prime * SILERO_WINDOW_SAMPLES], dtype=np.float32
             ).reshape(n_prime, SILERO_WINDOW_SAMPLES)
-            if self._use_gpu:
-                prime_windows = prime_windows.cuda()
 
-        probs: List[np.ndarray] = []
         t0 = time.perf_counter()
         with self._lock:
-            with torch.no_grad():
-                model.reset_states()
-                if prime_windows is not None:
-                    # Chỉ để ĐẨY STATE, không lấy xác suất của phần mồi.
-                    for i in range(0, prime_windows.shape[0], SILERO_BATCH_WINDOWS):
-                        model(prime_windows[i : i + SILERO_BATCH_WINDOWS], self.sample_rate)
-                for i in range(0, n_win, SILERO_BATCH_WINDOWS):
-                    chunk = windows[i : i + SILERO_BATCH_WINDOWS]
-                    out = model(chunk, self.sample_rate)
-                    probs.append(out.detach().reshape(-1).cpu().numpy().astype(np.float32))
+            model.reset()
+            if prime_windows is not None:
+                # Chỉ để ĐẨY STATE, không lấy xác suất của phần mồi. Đây là lý do state tường
+                # minh của ONNX quan trọng: `reset()` + chạy mồi cho kết quả y hệt bản JIT.
+                model.probabilities(prime_windows)
+            probs = model.probabilities(windows) if n_win else np.zeros(0, dtype=np.float32)
         # `last_scan_ms` bao gồm cả phần mồi (đó là chi phí thật của lần quét này).
         self.last_scan_ms = (time.perf_counter() - t0) * 1000.0
         self.last_scanned_sec += n_win * SILERO_WINDOW_SAMPLES / float(self.sample_rate)
-        return np.concatenate(probs) if probs else np.zeros(0, dtype=np.float32)
+        return np.asarray(probs, dtype=np.float32)
 
     def _energy_speech_mask(self, pcm: np.ndarray) -> np.ndarray:
         """Đường DỰ PHÒNG khi không có VAD: năng lượng tương đối (chỉ để không chặn pipeline)."""

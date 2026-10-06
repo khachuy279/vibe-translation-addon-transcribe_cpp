@@ -112,10 +112,10 @@ test("updateConfig đẩy thiết lập mới sang backend", () => {
   const { client, ws } = makeClient(env);
   ws.open();
 
-  client.updateConfig({ type: "set_config", vadEngine: "fsmn-vad", minWordsToCommit: 6 });
+  client.updateConfig({ type: "set_config", vadEngine: "silero-vad", minWordsToCommit: 6 });
   const msg = ws.jsonSent().filter((m) => m.type === "set_config").pop();
   assert.ok(msg, "Không gửi set_config");
-  assert.equal(msg.vadEngine, "fsmn-vad");
+  assert.equal(msg.vadEngine, "silero-vad");
   assert.equal(msg.minWordsToCommit, 6);
   client.disconnect();
 });

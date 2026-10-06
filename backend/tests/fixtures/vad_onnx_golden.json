@@ -1,0 +1,250 @@
+{
+  "_doc": "Kỳ vọng vàng cho VAD ONNX. Chụp từ engine ONNX SAU KHI đã chứng minh bit-tương-đương với đường torch (max|Δp| ≤ 2e-6, 0 frame lệch quyết định trên 16.418 frame). Dùng để bắt hồi quy mà KHÔNG cần PyTorch.",
+  "max_seconds": 30.0,
+  "engines": {
+    "Japanese_5s.wav": {
+      "silero-vad": {
+        "hop_samples": 512,
+        "frames": 158,
+        "events": [
+          [
+            16,
+            "START",
+            2
+          ],
+          [
+            92,
+            "END",
+            0
+          ],
+          [
+            93,
+            "START",
+            2
+          ],
+          [
+            155,
+            "END",
+            0
+          ]
+        ],
+        "prob_sha256": "06108a8c68f7d76aa7d9fb789ee985233beaf82efc1584bd5804f90902a55dde",
+        "prob_sum_round6": 130.5705
+      },
+      "firered-vad": {
+        "hop_samples": 160,
+        "frames": 508,
+        "events": [
+          [
+            61,
+            "START",
+            12
+          ],
+          [
+            499,
+            "END",
+            0
+          ]
+        ],
+        "prob_sha256": "e4087a08b58ead19d135e936517442ecbf1a64b04698326c853cb1807d89923a",
+        "prob_sum_round6": 403.31
+      }
+    },
+    "Chinese_noise_28s.wav": {
+      "silero-vad": {
+        "hop_samples": 512,
+        "frames": 883,
+        "events": [
+          [
+            2,
+            "START",
+            2
+          ]
+        ],
+        "prob_sha256": "efe166ee2cae4a1dc600a625e229f81c5762599e20f7be2774a3b51c5b3ab54c",
+        "prob_sum_round6": 872.5751
+      },
+      "firered-vad": {
+        "hop_samples": 160,
+        "frames": 2825,
+        "events": [
+          [
+            9,
+            "START",
+            7
+          ],
+          [
+            2001,
+            "END",
+            0
+          ],
+          [
+            2002,
+            "START",
+            0
+          ]
+        ],
+        "prob_sha256": "0687368d8bcdcdce47a757e3d681ec178fd39bfce95ea1292721407b4a63ea44",
+        "prob_sum_round6": 2726.536
+      }
+    },
+    "English_low_speech_quality_19s.wav": {
+      "silero-vad": {
+        "hop_samples": 512,
+        "frames": 594,
+        "events": [
+          [
+            42,
+            "START",
+            2
+          ],
+          [
+            117,
+            "END",
+            0
+          ],
+          [
+            146,
+            "START",
+            2
+          ],
+          [
+            166,
+            "END",
+            0
+          ],
+          [
+            184,
+            "START",
+            2
+          ],
+          [
+            284,
+            "END",
+            0
+          ],
+          [
+            319,
+            "START",
+            2
+          ],
+          [
+            379,
+            "END",
+            0
+          ],
+          [
+            415,
+            "START",
+            2
+          ],
+          [
+            456,
+            "END",
+            0
+          ],
+          [
+            513,
+            "START",
+            2
+          ],
+          [
+            525,
+            "END",
+            0
+          ],
+          [
+            561,
+            "START",
+            2
+          ],
+          [
+            584,
+            "END",
+            0
+          ]
+        ],
+        "prob_sha256": "fae6216b4dae26db8458521b67debd403969c70859d13b3a07e08b8b1bedce9e",
+        "prob_sum_round6": 284.9119
+      },
+      "firered-vad": {
+        "hop_samples": 160,
+        "frames": 1902,
+        "events": [
+          [
+            9,
+            "START",
+            7
+          ],
+          [
+            39,
+            "END",
+            0
+          ],
+          [
+            117,
+            "START",
+            12
+          ],
+          [
+            401,
+            "END",
+            0
+          ],
+          [
+            467,
+            "START",
+            12
+          ],
+          [
+            544,
+            "END",
+            0
+          ],
+          [
+            598,
+            "START",
+            12
+          ],
+          [
+            919,
+            "END",
+            0
+          ],
+          [
+            1033,
+            "START",
+            12
+          ],
+          [
+            1238,
+            "END",
+            0
+          ],
+          [
+            1247,
+            "START",
+            8
+          ],
+          [
+            1646,
+            "END",
+            0
+          ],
+          [
+            1799,
+            "START",
+            12
+          ],
+          [
+            1880,
+            "END",
+            0
+          ]
+        ],
+        "prob_sha256": "266e422a389c6c02db1dabef4aa4be98ecd5cdf7506ba22ebfd3f0bbb6588c1c",
+        "prob_sum_round6": 1180.59
+      }
+    }
+  }
+}

@@ -1,119 +1,117 @@
-"""Kiểm tra môi trường Python của dự án — chống việc pip âm thầm hạ torch CUDA.
+"""Kiểm tra môi trường runtime của dự án — KHÔNG còn liên quan tới PyTorch.
 
-BỐI CẢNH (đã xảy ra 2026-09-22): interpreter Python dùng CHUNG với nhiều gói khác có ràng
-buộc torch xung đột (whisperx 3.8.6 → `torch~=2.8.0`; compressed-tensors → `torch>=2.10.0`;
-torchvision cu130 → `torch==2.12.0`). Chỉ cần `pip install -U silero-vad` (metadata chỉ ghi
-`torch`, không giới hạn) là pip phân giải lại và lấy **torch CPU-only từ PyPI**
-(`2.12.0+cu130` → `2.9.1+cpu`) ⇒ CUDA của ASR/TTS/dịch biến mất mà không có lỗi rõ ràng.
+BỐI CẢNH: trước Giai đoạn 3 (2026-10-06), module này tồn tại để chống việc pip âm thầm hạ `torch`
+xuống bản CPU-only (`silero-vad` chỉ khai `torch` không giới hạn ⇒ pip phân giải lại và lấy bản
+CPU từ PyPI ⇒ CUDA của ASR/TTS/dịch biến mất im lặng). Sau khi VAD chuyển sang **onnxruntime** và
+ForcedAligner chuyển sang **GGUF/CrispASR**, **không subsystem nào cần PyTorch** nên toàn bộ logic
+đó đã bị xoá. Nay module kiểm tra đúng những runtime thật sự có mặt:
+
+* `onnxruntime` + file model ONNX của VAD (Silero / FireRed) — BẮT BUỘC.
+* DLL CrispASR + model GGUF của ForcedAligner — cần cho Pipeline B (Lookahead).
+* `llama_cpp` (binding + DLL CUDA trong `backend/bin/llama/`) — engine dịch.
+* binding `transcribe-cpp` — backend ASR native.
 
 Module này cung cấp:
-* `torch_status()` — ảnh chụp nhanh trạng thái torch (version, bản CUDA, khả dụng GPU, các
-  cặp version lệch nhau). Dùng cho log lúc khởi động và `/health`.
+* `runtime_status()` — ảnh chụp nhanh trạng thái runtime.
 * `check_environment()` — danh sách vấn đề (rỗng = OK).
 * CLI: `python -m backend.utils.env_check` → in báo cáo, exit code 1 nếu có vấn đề.
-
-Không import `torch` ở cấp module (nặng) — chỉ import trong hàm.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-#: Bộ ba torch/torchaudio/torchvision mà dự án đã đo và khoá trong `backend/constraints.txt`.
-#: ⚠️ Số phiên bản KHÔNG bằng nhau: index cu130 chỉ có torchaudio tới 2.11.x (torchaudio đi sau
-#: torch một bậc) ⇒ torch 2.12.0 + torchaudio 2.11.0 + torchvision 0.27.0 là bộ hợp lệ.
-EXPECTED_CUDA_TRIO = ("2.14.0+cu130", "2.11.0+cu130", "0.29.0+cu130")
+from backend.config import MODELS_DIR
+
+#: Các engine VAD và file model ONNX tương ứng (đều BẮT BUỘC cho engine đang chọn).
+_VAD_MODEL_FILES: Dict[str, List[str]] = {
+    "firered-vad": ["firered_stream/Stream-VAD/cmvn.ark",
+                    "firered_stream/Stream-VAD/fireredvad_stream_vad_with_cache.onnx"],
+    "silero-vad": ["silero_vad.onnx"],
+}
 
 
-def cuda_tag(version: Optional[str]) -> Optional[str]:
-    """Tag CUDA của một bản phát hành: `'2.12.0+cu130'` → `'+cu130'`; bản CPU → `None`."""
-    text = str(version or "")
-    idx = text.find("+cu")
-    return text[idx:] if idx >= 0 else None
+def _find_spec(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
-def torch_status() -> Dict[str, Any]:
-    """Ảnh chụp nhanh trạng thái torch. Không ném lỗi nếu thiếu torch."""
+def runtime_status() -> Dict[str, Any]:
+    """Ảnh chụp nhanh trạng thái runtime. Không ném lỗi khi thiếu gói."""
     status: Dict[str, Any] = {
-        "installed": False,
-        "version": None,
-        "cuda_build": None,          # torch.version.cuda (None = bản CPU-only)
-        "cuda_available": False,
-        "torchaudio": None,
-        "torchvision": None,
-        "cuda_device_count": 0,
+        "python": sys.version.split()[0],
+        "onnxruntime": None,
+        "onnxruntime_providers": [],
+        "vad_engine": None,
+        "vad_models_present": None,
+        "aligner_backend": None,
+        "aligner_ready": False,
+        "aligner_reason": "",
+        "llama_cpp": _find_spec("llama_cpp"),
+        "transcribe_cpp": _find_spec("transcribe_cpp"),
+        #: Chỉ để báo cáo. Sau Giai đoạn 3 nó PHẢI là False.
+        "torch_installed": _find_spec("torch"),
         "problems": [],
     }
-    try:
-        import torch  # noqa: PLC0415
-    except Exception as exc:  # noqa: BLE001
-        status["problems"].append(f"không import được torch: {type(exc).__name__}: {exc}")
-        return status
 
-    status["installed"] = True
-    status["version"] = getattr(torch, "__version__", None)
-    status["cuda_build"] = getattr(torch.version, "cuda", None)
     try:
-        status["cuda_available"] = bool(torch.cuda.is_available())
-        status["cuda_device_count"] = int(torch.cuda.device_count()) if status["cuda_available"] else 0
-    except Exception as exc:  # noqa: BLE001
-        status["problems"].append(f"torch.cuda lỗi: {type(exc).__name__}: {exc}")
+        from backend.config import config
 
-    for mod_name in ("torchaudio", "torchvision"):
+        status["vad_engine"] = config.vad.vad_engine
+        status["aligner_backend"] = getattr(config.forced_aligner, "backend", None)
+    except Exception as exc:  # noqa: BLE001
+        status["problems"].append(f"không đọc được config: {type(exc).__name__}: {exc}")
+
+    # ── onnxruntime (runtime của VAD) ────────────────────────────────────────────
+    if not _find_spec("onnxruntime"):
+        status["problems"].append(
+            "thiếu `onnxruntime` ⇒ KHÔNG engine VAD nào chạy được (cả Silero lẫn FireRed đều chạy "
+            "ONNX). Sửa: `pip install onnxruntime`."
+        )
+    else:
         try:
-            mod = __import__(mod_name)
-            status[mod_name] = getattr(mod, "__version__", None)
+            import onnxruntime as ort  # noqa: PLC0415
+
+            status["onnxruntime"] = ort.__version__
+            status["onnxruntime_providers"] = list(ort.get_available_providers())
         except Exception as exc:  # noqa: BLE001
-            status[mod_name] = None
-            # Có cài nhưng import hỏng = dấu hiệu lệch bộ (vd torchvision cu130 với torch CPU).
-            try:
-                import importlib.util  # noqa: PLC0415
+            status["problems"].append(f"onnxruntime cài rồi nhưng lỗi khi nạp: {type(exc).__name__}: {exc}")
 
-                if importlib.util.find_spec(mod_name) is not None:
-                    status["problems"].append(
-                        f"{mod_name} đã cài nhưng import lỗi ({type(exc).__name__}: {exc}) "
-                        "⇒ thường là lệch bộ CUDA/CPU."
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-
-    # ── Các bất thường hay gặp ────────────────────────────────────────────────
-    if not status["cuda_build"]:
-        status["problems"].append(
-            "torch đang là bản CPU-only (torch.version.cuda = None) ⇒ TTS/dịch/ASR-CUDA mất GPU. "
-            "Xem README mục 'Nâng cấp gói phụ thuộc mà không phá torch CUDA'."
-        )
-    elif not status["cuda_available"]:
-        status["problems"].append(
-            f"torch có bản CUDA {status['cuda_build']} nhưng torch.cuda.is_available() = False "
-            "(driver/CUDA runtime không khớp)."
-        )
-
-    version = str(status["version"] or "")
-    torch_tag = cuda_tag(version)
-
-    # So theo TAG CUDA, KHÔNG so số phiên bản: torchaudio/torchvision hợp lệ khi lệch số
-    # (torchaudio 2.11.0 đi cùng torch 2.12.0) nhưng BẮT BUỘC cùng bộ CUDA.
-    for name in ("torchaudio", "torchvision"):
-        got = status.get(name)
-        if not got:
-            continue
-        tag = cuda_tag(got)
-        if torch_tag and not tag:
+    # ── file model VAD của engine đang chọn ──────────────────────────────────────
+    engine = (status["vad_engine"] or "firered-vad").lower().strip()
+    expected = _VAD_MODEL_FILES.get(engine, [])
+    if expected:
+        missing = [f for f in expected if not (Path(MODELS_DIR) / f).is_file()]
+        status["vad_models_present"] = not missing
+        if missing:
             status["problems"].append(
-                f"{name} {got} là bản CPU trong khi torch là bản CUDA {torch_tag} ⇒ cài lại cùng bộ "
-                "(`torch==2.12.0+cu130 torchaudio==2.11.0+cu130 torchvision==0.27.0+cu130`)."
+                f"thiếu file model ONNX cho VAD '{engine}': {', '.join(missing)} ⇒ engine sẽ không "
+                f"nạp được. Chạy backend một lần để tự tải."
             )
-        elif tag and not torch_tag:
+
+    # ── CrispASR aligner (Pipeline B) ────────────────────────────────────────────
+    try:
+        from backend.utils.crispasr_native import available as _fa_available  # noqa: PLC0415
+
+        ok, reason = _fa_available()
+        status["aligner_ready"] = bool(ok)
+        status["aligner_reason"] = reason
+        if not ok:
+            # KHÔNG phải "problem" cứng: thiếu aligner thì extension tự chuyển sang Pipeline A.
             status["problems"].append(
-                f"{name} {got} là bản CUDA nhưng torch {version} là bản CPU ⇒ lệch bộ, cài lại cả ba."
+                f"ForcedAligner (Lookahead) chưa sẵn sàng: {reason} ⇒ Pipeline B không có mốc từ, "
+                f"extension sẽ dùng Pipeline A."
             )
-        elif tag and torch_tag and tag != torch_tag:
-            status["problems"].append(
-                f"{name} {got} dùng {tag} còn torch dùng {torch_tag} ⇒ lệch bộ CUDA."
-            )
+    except Exception as exc:  # noqa: BLE001
+        status["aligner_reason"] = f"{type(exc).__name__}: {exc}"
+        status["problems"].append(f"không kiểm tra được runtime CrispASR: {type(exc).__name__}: {exc}")
+
     return status
 
 
@@ -123,22 +121,14 @@ def check_llama_cpp() -> Optional[str]:
     Hai lớp lỗi đã gặp thực tế:
 
     1. **Thiếu runtime CUDA**: `llama.dll` → `ggml.dll` → `ggml-cuda.dll` cần
-       `cudart64_1x.dll`/`cublas64_1x.dll` (major theo wheel: cu124 → bản 12, cu130 → bản 13).
-       Phải gọi `setup_cuda_dll_paths()` TRƯỚC khi import (đúng như `backend/asr/native.py`
-       làm) — nếu không, DLL nằm trong `torch/lib` hoặc `site-packages/nvidia/*/bin` cũng
-       không được tìm thấy.
+       `cudart64_13.dll`/`cublas64_13.dll`/`cublasLt64_13.dll`. Phải gọi `setup_cuda_dll_paths()`
+       TRƯỚC khi import (đúng như `backend/asr/native.py` làm).
     2. **Wheel build bằng AVX-512**: import được nhưng `llama_init_from_model` nổ
        `OSError: [WinError -1073741795] Windows Error 0xc000001d` (STATUS_ILLEGAL_INSTRUCTION)
-       trên CPU không có AVX-512 (đo thực: Ryzen 5 5600X; wheel 0.3.35-cu130 chứa 7.177 lệnh
-       `zmm`, wheel 0.3.22-cu124 chứa 0). Lớp này KHÔNG thể phát hiện bằng import — xem
-       hướng dẫn trong README mục Khắc phục sự cố.
+       trên CPU không có AVX-512. Lớp này KHÔNG thể phát hiện bằng import — xem README mục
+       Khắc phục sự cố.
     """
-    try:
-        import importlib.util  # noqa: PLC0415
-
-        if importlib.util.find_spec("llama_cpp") is None:
-            return None
-    except Exception:  # noqa: BLE001
+    if not _find_spec("llama_cpp"):
         return None
 
     # BẮT BUỘC: đăng ký đường dẫn DLL CUDA (và chọn thư mục DLL llama.cpp) trước khi nạp
@@ -157,9 +147,9 @@ def check_llama_cpp() -> Optional[str]:
     except Exception as exc:  # noqa: BLE001
         return (
             f"llama.cpp: không import được llama_cpp ({type(exc).__name__}: {exc}). Kiểm tra: "
-            "`backend/bin/llama/llama.dll` có tồn tại không (bundle CUDA đi kèm repo), và "
-            "runtime CUDA 13 (`cudart64_13.dll`/`cublas64_13.dll`/`cublasLt64_13.dll`) có "
-            "trong `torch/lib` hoặc `backend/bin/` không. Nếu lỗi xuất hiện ở bước NẠP MODEL "
+            "`backend/bin/llama/llama.dll` có tồn tại không (bundle CUDA đi kèm repo), và runtime "
+            "CUDA 13 (`cudart64_13.dll`/`cublas64_13.dll`/`cublasLt64_13.dll`) có trong "
+            "`external/cuda-toolkit` hoặc `backend/bin/` không. Nếu lỗi xuất hiện ở bước NẠP MODEL "
             "với `0xc000001d` thì đó là STATUS_ILLEGAL_INSTRUCTION do AVX-512 — bản trong "
             "`backend/bin/llama/` đã tắt AVX-512 nên không gặp."
         )
@@ -173,46 +163,20 @@ def check_asr_binding() -> Optional[str]:
     `/health → asr_runtime.devices = "n/a"`, và cảnh báo "không backend nào trong ('cuda',
     'vulkan') khả dụng" dù `backend/bin/ggml-cuda.dll` còn nguyên.
     """
-    try:
-        import importlib.util  # noqa: PLC0415
-
-        if importlib.util.find_spec("transcribe_cpp") is not None:
-            return None
-        if importlib.util.find_spec("transcribe_cpp_native") is None:
-            return None  # không dùng ASR native → không phải vấn đề của checker này
-        return (
-            "thiếu binding `transcribe-cpp` (chỉ có `transcribe-cpp-native`) ⇒ backend không có "
-            "backend ASR nào (devices=n/a). Sửa: `pip install \"transcribe-cpp>=0.2.3\"`."
-        )
-    except Exception:  # noqa: BLE001
+    if _find_spec("transcribe_cpp"):
         return None
-
-
-def check_silero_onnxruntime() -> Optional[str]:
-    """`silero-vad` ≥ 6.2 import `onnxruntime` ở cấp module ⇒ thiếu là engine Silero chết.
-
-    Không phải lỗi của dự án mà là thiếu sót metadata của gói (không khai báo onnxruntime dù
-    chỉ dùng đường JIT). Đã gặp: `Engine 'silero-vad' nạp nền thất bại: ModuleNotFoundError`.
-    """
-    try:
-        import importlib.util  # noqa: PLC0415
-
-        if importlib.util.find_spec("silero_vad") is None:
-            return None
-        if importlib.util.find_spec("onnxruntime") is not None:
-            return None
-        return (
-            "có `silero-vad` nhưng thiếu `onnxruntime` (silero-vad ≥ 6.2 import ở cấp module) ⇒ "
-            "engine Silero không nạp được. Sửa: `pip install onnxruntime`."
-        )
-    except Exception:  # noqa: BLE001
-        return None
+    if not _find_spec("transcribe_cpp_native"):
+        return None  # không dùng ASR native → không phải vấn đề của checker này
+    return (
+        "thiếu binding `transcribe-cpp` (chỉ có `transcribe-cpp-native`) ⇒ backend không có "
+        "backend ASR nào (devices=n/a). Sửa: `pip install \"transcribe-cpp>=0.2.3\"`."
+    )
 
 
 def check_environment() -> List[str]:
     """Danh sách vấn đề của môi trường (rỗng = OK)."""
-    problems = list(torch_status().get("problems") or [])
-    for extra in (check_llama_cpp(), check_asr_binding(), check_silero_onnxruntime()):
+    problems = list(runtime_status().get("problems") or [])
+    for extra in (check_llama_cpp(), check_asr_binding()):
         if extra:
             problems.append(extra)
     return problems
@@ -220,28 +184,32 @@ def check_environment() -> List[str]:
 
 def format_report(status: Optional[Dict[str, Any]] = None) -> str:
     """Báo cáo nhiều dòng cho người đọc (dùng cho CLI và log)."""
-    status = status or torch_status()
+    st = status or runtime_status()
     lines = [
-        "== Môi trường Python của dự án ==",
-        f"torch        : {status['version']}  (bản CUDA: {status['cuda_build'] or 'CPU-only'})",
-        f"torch.cuda   : available={status['cuda_available']} devices={status['cuda_device_count']}",
-        f"torchaudio   : {status['torchaudio']}",
-        f"torchvision  : {status['torchvision']}",
-        f"bộ khoá      : {' · '.join(EXPECTED_CUDA_TRIO)} (backend/constraints.txt)",
+        "== Môi trường runtime của dự án (không còn PyTorch) ==",
+        f"python        : {st['python']}",
+        f"onnxruntime   : {st['onnxruntime'] or 'THIẾU'}  ({', '.join(st['onnxruntime_providers']) or 'n/a'})",
+        f"VAD engine    : {st['vad_engine']}  (model ONNX đủ: {st['vad_models_present']})",
+        f"aligner       : {st['aligner_backend']}  (sẵn sàng: {st['aligner_ready']}"
+        + (f" — {st['aligner_reason']}" if st.get("aligner_reason") else "")
+        + ")",
+        f"llama_cpp     : {'cài rồi' if st['llama_cpp'] else 'THIẾU'}",
+        f"transcribe-cpp: {'cài rồi' if st['transcribe_cpp'] else 'THIẾU'}",
+        f"torch         : {'CÒN CÀI (không subsystem nào cần)' if st['torch_installed'] else 'không có (đúng)'}",
     ]
-    problems = list(status["problems"])
+    problems = list(st["problems"])
     llama = check_llama_cpp()
     if llama:
         problems.append(llama)
     asr_binding = check_asr_binding()
     if asr_binding:
         problems.append(asr_binding)
-    silero = check_silero_onnxruntime()
-    if silero:
-        problems.append(silero)
-    lines.append(f"llama_cpp    : {'OK' if llama is None else 'LỖI (xem bên dưới)'}")
-    lines.append(f"ASR binding  : {'OK' if asr_binding is None else 'THIẾU transcribe-cpp'}")
-    lines.append(f"silero/onnx  : {'OK' if silero is None else 'THIẾU onnxruntime'}")
+    lines.append(f"llama_cpp nạp : {'OK' if llama is None else 'LỖI (xem bên dưới)'}")
+    lines.append(f"ASR binding   : {'OK' if asr_binding is None else 'THIẾU transcribe-cpp'}")
+    if st["torch_installed"]:
+        lines.append(
+            "GỢI Ý: gỡ PyTorch để nhẹ môi trường — `pip uninstall torch torchaudio transformers`."
+        )
     if problems:
         lines.append("VẤN ĐỀ:")
         lines.extend(f"  - {p}" for p in problems)
@@ -252,12 +220,13 @@ def format_report(status: Optional[Dict[str, Any]] = None) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI: in báo cáo; `--json` để lấy máy đọc; exit 1 nếu có vấn đề."""
-    argv = list(sys.argv[1:] if argv is None else argv)
-    status = torch_status()
-    if "--json" in argv:
+    args = list(sys.argv[1:] if argv is None else argv)
+    status = runtime_status()
+    if "--json" in args:
         status["llama_cpp_error"] = check_llama_cpp()
+        status["asr_binding_error"] = check_asr_binding()
         print(json.dumps(status, ensure_ascii=False, indent=2))
-        return 1 if (status["problems"] or status["llama_cpp_error"]) else 0
+        return 1 if (status["problems"] or status["llama_cpp_error"] or status["asr_binding_error"]) else 0
     print(format_report(status))
     return 1 if check_environment() else 0
 

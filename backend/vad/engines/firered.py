@@ -1,26 +1,21 @@
-"""Engine FireRed-VAD (DFSMN SOTA Streaming VAD — Xiaohongshu / FireRedTeam).
+"""Engine FireRed-VAD (DFSMN SOTA Streaming VAD — Xiaohongshu / FireRedTeam) — **ONNX, không torch**.
 
-Bản viết lại dùng **đúng API công khai trong docs** của gói `fireredvad`:
-
-    from fireredvad import FireRedStreamVad, FireRedStreamVadConfig
-
-    vad_config = FireRedStreamVadConfig(
-        use_gpu=False, smooth_window_size=5, speech_threshold=0.4,
-        pad_start_frame=5, min_speech_frame=8, max_speech_frame=2000,
-        min_silence_frame=20, chunk_max_frame=30000)
-    stream_vad = FireRedStreamVad.from_pretrained("pretrained_models/FireRedVAD/Stream-VAD", vad_config)
+Trước đây engine này dùng gói `fireredvad`, mà gói đó `import torch` **ngay ở cấp module**
+(`fireredvad/core/detect_model.py`, `audio_feat.py`, `stream_vad.py`) ⇒ nó là lý do chính khiến
+PyTorch buộc phải có mặt trong môi trường runtime. Nay toàn bộ đường suy luận chạy bằng
+onnxruntime với model ONNX **chính thức** của upstream
+(`fireredvad_stream_vad_with_cache.onnx`); xem `backend/vad/engines/firered_onnx.py`.
 
 Hình học frame (upstream `fireredvad/core/constants.py`, không đổi được):
     FRAME_LENGTH_SAMPLE = 400 (cửa sổ 25 ms) · FRAME_SHIFT_SAMPLE = 160 (hop 10 ms)
 
-Vì `AudioFeat.extract()` tạo `OnlineFbank` MỚI mỗi lần gọi với `snip_edges=True`, một
-cửa sổ 400 mẫu cho ĐÚNG 1 frame — nên engine tự gom cửa sổ trượt 400 mẫu (KHÔNG zero-pad
-như bản cũ: frame đầu tiên chỉ được phát khi đã có đủ 400 mẫu THẬT, giống hệt
-`vad_framewise` của upstream) rồi gọi `detect_frame()` mỗi 160 mẫu.
+Vì `KaldifeatFbank` tạo `OnlineFbank` MỚI mỗi lần gọi với `snip_edges=True`, một cửa sổ 400 mẫu
+cho ĐÚNG 1 frame — nên engine tự gom cửa sổ trượt 400 mẫu (KHÔNG zero-pad: frame đầu tiên chỉ
+được phát khi đã có đủ 400 mẫu THẬT, giống hệt `vad_framewise` của upstream) rồi gọi
+`detect_frame()` mỗi 160 mẫu.
 
-State (`FireRedStreamVad`) gồm model caches + postprocessor nên **phải tạo mới cho mỗi
-phiên**; trọng số chỉ 2,3 MB nên chi phí chấp nhận được (đo trong
-`backend/tests/test_41_vad_engine_contract.py`).
+Tương đương với bản torch: đo trên 12.621 frame của 4 file audio cho `max|Δp| ≤ 1e-6` và
+**0 frame lệch quyết định** tại ngưỡng 0.30/0.40/0.50 (`backend/tests/test_62_vad_onnx_parity.py`).
 """
 
 from dataclasses import dataclass, field
@@ -37,16 +32,18 @@ from backend.vad.base import (
     VADResult,
     VADStreamState,
 )
+from backend.vad.engines.firered_onnx import (
+    FRAME_LENGTH_SAMPLE,
+    FRAME_SHIFT_SAMPLE,
+    FireRedStreamVadOnnx,
+    ensure_firered_onnx_files,
+)
 from backend.utils.logger import logger
-
-#: Hình học frame của upstream (`fireredvad/core/constants.py`).
-FRAME_LENGTH_SAMPLE = 400   # cửa sổ 25 ms
-FRAME_SHIFT_SAMPLE = 160    # hop 10 ms
 
 
 @dataclass
 class _Session:
-    """State riêng của FireRed cho 1 phiên: model VAD + bộ gom cửa sổ 400 mẫu."""
+    """State riêng của FireRed cho 1 phiên: model ONNX + bộ gom cửa sổ 400 mẫu."""
 
     vad: Any
     pending: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int16))
@@ -70,7 +67,7 @@ class _Session:
 
 
 class FireRedVADEngine(BaseVADEngine):
-    """Engine VAD FireRed sử dụng gói `fireredvad` theo đúng docs."""
+    """Engine VAD FireRed sử dụng model ONNX (onnxruntime)."""
 
     name = "firered-vad"
     default_threshold = 0.4
@@ -92,7 +89,7 @@ class FireRedVADEngine(BaseVADEngine):
         self.start_pad_ms = int(round(int(cfg.pad_start_frame) * self.frame_samples / 16000.0 * 1000.0))
 
         logger.info(
-            f"FireRed-VAD sẵn sàng (cửa sổ {FRAME_LENGTH_SAMPLE} mẫu, hop {FRAME_SHIFT_SAMPLE} mẫu, "
+            f"FireRed-VAD sẵn sàng (ONNX, cửa sổ {FRAME_LENGTH_SAMPLE} mẫu, hop {FRAME_SHIFT_SAMPLE} mẫu, "
             f"model_dir={self.model_dir})",
             extra={"module_tag": "VAD"},
         )
@@ -111,17 +108,9 @@ class FireRedVADEngine(BaseVADEngine):
 
     @staticmethod
     def _ensure_files_in(model_dir: Path) -> None:
-        """Tự động tải model từ HuggingFace nếu chưa tồn tại cục bộ."""
+        """Đảm bảo `cmvn.ark` + `fireredvad_stream_vad_with_cache.onnx` tồn tại."""
         model_dir.mkdir(parents=True, exist_ok=True)
-        cmvn_file = model_dir / "cmvn.ark"
-        model_file = model_dir / "model.pth.tar"
-
-        if not cmvn_file.exists() or not model_file.exists():
-            from huggingface_hub import hf_hub_download
-            logger.info("Đang tải model FireRed Stream-VAD từ HuggingFace...", extra={"module_tag": "VAD"})
-            parent_dir = model_dir.parent
-            hf_hub_download("FireRedTeam/FireRedVAD", "Stream-VAD/cmvn.ark", local_dir=str(parent_dir))
-            hf_hub_download("FireRedTeam/FireRedVAD", "Stream-VAD/model.pth.tar", local_dir=str(parent_dir))
+        ensure_firered_onnx_files(model_dir)
 
     def _ensure_model_files(self) -> None:
         """Giữ lại cho tương thích: uỷ quyền cho `_ensure_files_in`."""
@@ -129,7 +118,7 @@ class FireRedVADEngine(BaseVADEngine):
 
     # ------------------------------------------------------------------ config
     def _resolve_effective(self, threshold: Optional[float], silence_ms: Optional[int]):
-        """Giải giá trị đang có hiệu lực: knob phiên (nếu có) hay mặc định config engine."""
+        """Giải giá trị đang có hiệu lực: knob phiên (hệ số) hay mặc định config engine."""
         cfg = config.vad.firered
         eff_threshold = float(threshold) if threshold is not None else float(cfg.speech_threshold)
         if silence_ms is None:
@@ -139,21 +128,18 @@ class FireRedVADEngine(BaseVADEngine):
             eff_silence_frames = max(1, int(round(float(silence_ms) / 10.0)))
         return eff_threshold, eff_silence_frames
 
-    def _build_config(self, threshold: Optional[float], silence_ms: Optional[int]):
-        """Dựng `FireRedStreamVadConfig` từ config backend (khớp 1-1 field của docs)."""
-        from fireredvad import FireRedStreamVadConfig
-
+    def _build_vad(self, threshold: Optional[float], silence_ms: Optional[int]) -> FireRedStreamVadOnnx:
+        """Dựng `FireRedStreamVadOnnx` từ config backend (khớp 1-1 field của upstream)."""
         cfg = config.vad.firered
         eff_threshold, eff_silence_frames = self._resolve_effective(threshold, silence_ms)
-        return FireRedStreamVadConfig(
-            use_gpu=bool(cfg.use_gpu),
+        return FireRedStreamVadOnnx(
+            self.model_dir,
             smooth_window_size=int(cfg.smooth_window_size),
             speech_threshold=eff_threshold,
             pad_start_frame=int(cfg.pad_start_frame),
             min_speech_frame=int(cfg.min_speech_frame),
             max_speech_frame=int(cfg.max_speech_frame),
             min_silence_frame=eff_silence_frames,
-            chunk_max_frame=int(cfg.chunk_max_frame),
         )
 
     def create_initial_state(
@@ -161,13 +147,8 @@ class FireRedVADEngine(BaseVADEngine):
         threshold: Optional[float] = None,
         silence_ms: Optional[int] = None,
     ) -> VADStreamState:
-        from fireredvad import FireRedStreamVad
-
-        vad_config = self._build_config(threshold, silence_ms)
-        stream_vad = FireRedStreamVad.from_pretrained(str(self.model_dir), vad_config)
-
         state = VADStreamState()
-        state.engine_state = _Session(vad=stream_vad)
+        state.engine_state = _Session(vad=self._build_vad(threshold, silence_ms))
         return state
 
     # ------------------------------------------------------------------ streaming
@@ -180,7 +161,7 @@ class FireRedVADEngine(BaseVADEngine):
     ) -> VADResult:
         session: Optional[_Session] = state.engine_state
         if session is None:
-            session = _Session(vad=self.create_initial_state(threshold, silence_ms).engine_state.vad)
+            session = self.create_initial_state(threshold, silence_ms).engine_state
             state.engine_state = session
 
         eff_threshold, eff_silence_frames = self._resolve_effective(threshold, silence_ms)

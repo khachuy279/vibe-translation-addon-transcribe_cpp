@@ -1,10 +1,16 @@
 """Qwen3ForcedAligner: Engine căn chỉnh mốc thời gian từ/ký tự (Word Timestamps) cho Pipeline B.
 
+Runtime: **Qwen3-ForcedAligner-0.6B bản GGUF (CrispASR)** — C++/ggml, chạy trong tiến trình con,
+**KHÔNG cần PyTorch**. Xem `backend/utils/crispasr_native.py` để biết vì sao phải cách ly tiến
+trình (xung đột `ggml*.dll` theo tên module trên Windows).
+
 Đặc tính kỹ thuật:
-- Non-Autoregressive (NAR) single-forward pass siêu tốc (~30-100ms trên GPU).
-- Độ chính xác AAS 32-52ms, hỗ trợ 11 ngôn ngữ (Anh, Nhật, Trung, Pháp, Đức, Tây Ban Nha, Ý, Nga, Hàn...).
-- Thread-safe singleton với `_infer_lock`.
-- Hỗ trợ prewarm lúc khởi động để triệt tiêu độ trễ 2.9s JIT kernel ban đầu.
+- Non-Autoregressive (NAR) single-forward pass siêu tốc — đo được RTF 0,0062–0,0109 trên RTX 5060 Ti
+  (khối 28 s mất ~195–307 ms).
+- Hỗ trợ 11 ngôn ngữ (Anh, Nhật, Trung, Pháp, Đức, Tây Ban Nha, Ý, Nga, Hàn...). Cách tách đơn vị
+  do CrispASR quyết định theo CHỮ VIẾT (CJK/Hangul từng ký tự, Latin theo khoảng trắng).
+- Thread-safe singleton.
+- Prewarm lúc khởi động để triệt tiêu độ trễ nạp model + warmup CUDA graph (~0,13–0,84 s).
 - Tích hợp bộ gom câu phụ đề theo dấu câu và độ dài (Punctuation-guided Sentence Grouping).
 """
 
@@ -22,51 +28,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import torch
 
 from backend.utils.logger import get_logger
 
 logger = get_logger("asr.forced_aligner")
 
-# Tương thích transformers v5: đăng ký lại default RoPE nếu thiếu
-try:
-    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════════════════
+# KHÔNG còn `torch` / `transformers` / `qwen_asr` trong file này.
+#
+# LỊCH SỬ: tới Giai đoạn 2, aligner có hai đường — `transformers` + PyTorch (đọc snapshot
+# safetensors) và CrispASR GGUF. Giai đoạn 3 (2026-10-06) đã XOÁ hẳn đường torch cùng cây
+# vendored `backend/asr/qwen_asr/`, vì VAD đã chuyển sang onnxruntime nên đây là thứ cuối cùng
+# còn kéo PyTorch (~2,7 GB đĩa + 1–2 s khởi động) trong khi bản GGUF cho kết quả tương đương.
+# ══════════════════════════════════════════════════════════════════════════════════════════
 
-    def _default_rope_init(config=None, device=None, seq_len=None, **kwargs):
-        base = getattr(config, "rope_theta", 10000.0)
-        head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
-        dim = head_dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
-        return inv_freq, 1.0
-
-    if "default" not in ROPE_INIT_FUNCTIONS:
-        ROPE_INIT_FUNCTIONS["default"] = _default_rope_init
-except Exception:
-    pass
-
-# Đảm bảo đường dẫn tới qwen_asr (nội bộ hoặc ngoài repo) được nạp
+# Đảm bảo đường dẫn tới `backend/asr` được nạp (một số công cụ import trực tiếp module con).
 CURRENT_DIR = Path(__file__).resolve().parent
-if (CURRENT_DIR / "qwen_asr").exists() and str(CURRENT_DIR) not in sys.path:
+if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 REPO_ROOT = CURRENT_DIR.parent.parent
-QWEN_ASR_DIR = REPO_ROOT / "qwen3-asr" / "Qwen3-ASR"
-if QWEN_ASR_DIR.exists() and str(QWEN_ASR_DIR) not in sys.path:
-    sys.path.insert(0, str(QWEN_ASR_DIR))
-
-try:
-    from qwen_asr import Qwen3ForcedAligner
-except ImportError:
-    try:
-        from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
-    except ImportError:
-        try:
-            from backend.asr.qwen_asr import Qwen3ForcedAligner
-        except ImportError:
-            try:
-                from backend.asr.qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
-            except ImportError:
-                Qwen3ForcedAligner = None
 
 _ALIGNER_LANG_MAP: Dict[str, str] = {
     "en": "English",
@@ -327,65 +308,23 @@ class SubtitleSentence:
 
 
 MODELS_DIR = REPO_ROOT / "backend" / "models"
-ALIGNER_LOCAL_DIR = MODELS_DIR / "Qwen3-ForcedAligner-0.6B"
-ALIGNER_DEFAULT_REPO_ID = "Qwen/Qwen3-ForcedAligner-0.6B"
-
-
-def ensure_forced_aligner_model(
-    local_dir: Optional[Union[str, Path]] = None,
-    repo_id: str = ALIGNER_DEFAULT_REPO_ID,
-    allow_download: bool = True,
-) -> Path:
-    """Đảm bảo thư mục model Qwen3-ForcedAligner-0.6B tồn tại trong `backend/models`.
-
-    Nếu chưa có, tự động tải snapshot từ Hugging Face về `backend/models/Qwen3-ForcedAligner-0.6B`.
-    Luôn trả về đường dẫn cục bộ để `from_pretrained` nạp offline.
-    """
-    target_path = Path(local_dir) if local_dir else ALIGNER_LOCAL_DIR
-    config_file = target_path / "config.json"
-    model_file = target_path / "model.safetensors"
-
-    if target_path.exists() and config_file.exists() and (model_file.exists() or any(target_path.glob("*.safetensors"))):
-        return target_path
-
-    if not allow_download:
-        raise FileNotFoundError(
-            f"Chưa có thư mục model ForcedAligner cục bộ tại {target_path} và allow_download=False"
-        )
-
-    logger.info(
-        f"Chưa có model Qwen3-ForcedAligner-0.6B tại {target_path}. Bắt đầu tự động tải từ Hugging Face ({repo_id})...",
-        extra={"module_tag": "ASR"},
-    )
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=str(target_path),
-        )
-        logger.info(
-            f"Tải Qwen3-ForcedAligner-0.6B về {target_path} hoàn tất.",
-            extra={"module_tag": "ASR"},
-        )
-    except Exception as exc:
-        logger.error(
-            f"Lỗi khi tải Qwen3-ForcedAligner-0.6B về {target_path}: {exc}",
-            extra={"module_tag": "ASR"},
-        )
-        raise
-
-    return target_path
 
 
 class ForcedAlignerService:
-    """Singleton quản lý mô hình Qwen3-ForcedAligner-0.6B trên GPU, luôn đọc từ backend/models."""
+    """Singleton căn chỉnh mốc thời gian bằng **Qwen3-ForcedAligner-0.6B bản GGUF (CrispASR)**.
+
+    ⚠️ Sau Giai đoạn 3 (2026-10-06) chỉ còn MỘT runtime: GGUF Q4_K chạy trên CrispASR (C++/ggml)
+    trong TIẾN TRÌNH CON — xem `backend/utils/crispasr_native.py`. Đường `transformers` + PyTorch
+    đã bị XOÁ hoàn toàn cùng cây vendored `backend/asr/qwen_asr/`; lý do: VAD đã chuyển sang
+    onnxruntime nên aligner là thứ cuối cùng còn kéo PyTorch (~2,7 GB đĩa + 1–2 s khởi động) trong
+    khi bản GGUF cho kết quả tương đương (cùng số câu, cùng nội dung phụ đề) và tốc độ ngang GPU.
+
+    Tầng này giữ nguyên: `AlignedWord`, `SubtitleSentence`, `merge_source_text`,
+    `group_words_to_subtitles`, `split_oversized_sentences`, `split_subtitles_by_clause_comma`.
+    """
 
     _instance: Optional["ForcedAlignerService"] = None
-    _shared_aligner: Optional[Any] = None
     _shared_lock = threading.RLock()
-    _infer_lock = threading.RLock()
 
     @classmethod
     def get_instance(cls) -> "ForcedAlignerService":
@@ -394,137 +333,131 @@ class ForcedAlignerService:
                 cls._instance = ForcedAlignerService()
             return cls._instance
 
-    def __init__(
-        self,
-        model_path: Optional[Union[str, Path]] = None,
-        repo_id: str = ALIGNER_DEFAULT_REPO_ID,
-    ):
-        self.model_path = Path(model_path) if model_path else ALIGNER_LOCAL_DIR
+    def __init__(self, model_path: Optional[Union[str, Path]] = None, repo_id: str = ""):
+        # `model_path`/`repo_id` giữ lại chỉ để tương thích chữ ký cũ (test/công cụ). Đường GGUF
+        # lấy vị trí model từ `backend/utils/crispasr_native.py` (có env override riêng).
+        self.model_path = Path(model_path) if model_path else None
         self.repo_id = repo_id
         self._is_warmed = False
 
-    def load_model(self) -> Any:
-        """Nạp mô hình lên GPU từ backend/models (idempotent, thread-safe)."""
-        with self._shared_lock:
-            if self.__class__._shared_aligner is not None:
-                return self.__class__._shared_aligner
+    # ------------------------------------------------------------------ vòng đời
+    @staticmethod
+    def _client():
+        from backend.asr.crispasr_aligner import CrispASRAlignerClient
 
-            if Qwen3ForcedAligner is None:
-                raise RuntimeError("qwen_asr hoặc Qwen3ForcedAligner chưa được cài đặt trong môi trường!")
+        return CrispASRAlignerClient.get_instance()
 
-            # Đảm bảo model đã có trong backend/models
-            resolved_path = ensure_forced_aligner_model(self.model_path, repo_id=self.repo_id)
+    @staticmethod
+    def is_ready() -> Tuple[bool, str]:
+        """Runtime căn chỉnh đã dùng được chưa: `(ok, lý do)`."""
+        from backend.utils.crispasr_native import available
 
-            t0 = time.perf_counter()
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-
-            logger.info(
-                f"Bắt đầu nạp ForcedAligner từ '{resolved_path}' (device={device}, dtype={dtype})...",
-                extra={"module_tag": "ASR"},
-            )
-            aligner = Qwen3ForcedAligner.from_pretrained(
-                str(resolved_path),
-                dtype=dtype,
-                device_map=device,
-            )
-            self.__class__._shared_aligner = aligner
-            logger.info(
-                f"Nạp ForcedAligner hoàn tất trong {time.perf_counter() - t0:.2f}s.",
-                extra={"module_tag": "ASR"},
-            )
-            return self.__class__._shared_aligner
+        return available()
 
     def prewarm(self) -> None:
-        """Chạy prewarm một audio ngắn để loại bỏ 2.9s JIT compilation của PyTorch/CUDA."""
-        with self._shared_lock:
-            if self._is_warmed:
-                return
-            try:
-                aligner = self.load_model()
-                t0 = time.perf_counter()
-                t_arr = np.linspace(0, 1.0, 16000, endpoint=False)
-                dummy_pcm = (0.2 * np.sin(2 * np.pi * 220.0 * t_arr)).astype(np.float32)
-                dummy_text = "Hello world."
-                with self._infer_lock:
-                    _ = aligner.align(
-                        audio=(dummy_pcm, 16000),
-                        text=dummy_text,
-                        language="English",
-                    )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                self._is_warmed = True
-                logger.info(
-                    f"Prewarm ForcedAligner hoàn tất trong {time.perf_counter() - t0:.2f}s.",
-                    extra={"module_tag": "ASR"},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"Prewarm ForcedAligner lỗi (bỏ qua): {exc}", extra={"module_tag": "ASR"})
+        """Nạp model GGUF + warmup CUDA graph trong tiến trình con (blocking).
+
+        Đo được 127–839 ms — nhanh hơn 1,6 s nạp + 0,5 s prewarm của đường torch trước đây.
+        """
+        try:
+            t0 = time.perf_counter()
+            self._client().prewarm()
+            self._is_warmed = True
+            logger.info(
+                f"Prewarm ForcedAligner (CrispASR GGUF) hoàn tất trong {time.perf_counter() - t0:.2f}s.",
+                extra={"module_tag": "ASR"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Prewarm ForcedAligner lỗi (bỏ qua): {exc}", extra={"module_tag": "ASR"})
 
     def align(
         self,
         audio: Union[np.ndarray, Tuple[np.ndarray, int], str],
         text: str,
-        language: str = "English",
+        language: str = "English",  # noqa: ARG002 - giữ chữ ký cũ; GGUF tự nhận diện theo chữ viết
         attach_source_punctuation: bool = True,
     ) -> List[AlignedWord]:
-        """Căn chỉnh thời gian từng từ.
+        """Căn chỉnh thời gian từng đơn vị.
 
         Args:
-            audio: numpy array 16kHz float32, hoặc tuple (pcm, sr), hoặc file path.
+            audio: numpy array 16 kHz float32, hoặc tuple `(pcm, sr)`, hoặc đường dẫn file.
             text: Văn bản nhận dạng từ ASR.
-            language: Ngôn ngữ (e.g. 'English', 'Japanese', 'Chinese'...).
-            attach_source_punctuation: Gắn DẤU CÂU của `text` trở lại từng từ (MẶC ĐỊNH BẬT).
-                Bắt buộc bật nếu tầng trên ngắt câu theo dấu câu — xem `merge_source_text`.
+            language: GIỮ LẠI CHO TƯƠNG THÍCH. Bản GGUF của CrispASR tự quyết định cách tách đơn vị
+                theo **chữ viết** (CJK/Hangul tách từng ký tự, hệ Latin tách theo khoảng trắng) chứ
+                không nhận tên ngôn ngữ như upstream dùng `nagisa`/`soynlp`.
+            attach_source_punctuation: Gắn DẤU CÂU của `text` trở lại từng đơn vị (MẶC ĐỊNH BẬT).
 
         Returns:
-            Danh sách AlignedWord(text, start_time, end_time).
+            Danh sách `AlignedWord(text, start_time, end_time)`.
+
+        Raises:
+            RuntimeError: runtime CrispASR chưa sẵn sàng (thiếu DLL hoặc model GGUF).
         """
         clean_text = (text or "").strip()
         if not clean_text:
             return []
 
-        aligner = self.load_model()
-        if not self._is_warmed:
-            self.prewarm()
-
-        # Chuẩn hóa audio input
-        if isinstance(audio, np.ndarray):
-            audio_input: Any = (audio.astype(np.float32), 16000)
-        else:
-            audio_input = audio
-
-        with self._infer_lock:
-            t0 = time.perf_counter()
-            results = aligner.align(
-                audio=audio_input,
-                text=clean_text,
-                language=language,
+        ok, reason = self.is_ready()
+        if not ok:
+            raise RuntimeError(
+                f"ForcedAligner chưa sẵn sàng: {reason}\n"
+                f"  • Model GGUF (~500 MB) sẽ được tự tải ở lần chạy đầu; hoặc tải thủ công từ "
+                f"`https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF`.\n"
+                f"  • DLL CrispASR nằm ở `backend/bin/crispasr/` (xem `backend/utils/crispasr_native.py`)."
             )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        raw_items = results[0].items if results else []
+        pcm = self._normalize_audio(audio)
+
+        t0 = time.perf_counter()
+        raw = self._client().align(pcm, clean_text, 0.0)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
         words = [
             AlignedWord(
-                text=str(getattr(item, "text", "")),
-                start_time=float(getattr(item, "start_time", 0.0)),
-                end_time=float(getattr(item, "end_time", 0.0)),
+                text=str(it.get("text", "")),
+                start_time=float(it.get("t0", 0.0)),
+                end_time=float(it.get("t1", 0.0)),
             )
-            for item in raw_items
+            for it in raw
         ]
-        # ⚠️ BẮT BUỘC: model đã BỎ HẾT dấu câu khi tokenize (xem `is_aligner_kept_char`), nên nếu
+        # ⚠️ BẮT BUỘC: model BỎ HẾT dấu câu khi tokenize (xem `is_aligner_kept_char`), nên nếu
         # không gắn lại thì tầng gom câu không thấy dấu câu nào ⇒ phụ đề bị chẻ theo trần từ và
-        # thiếu cả dấu câu (sự cố 2026-10-02).
+        # thiếu cả dấu câu (sự cố 2026-10-02). CrispASR ĐÃ tự gắn dấu câu vào đơn vị hiển thị
+        # (`tokenise_display_words` + `restore_text`), nhưng `merge_source_text` khớp theo chuỗi ký
+        # tự "được giữ" nên idempotent — giữ lại để hành vi phụ đề không đổi.
         if attach_source_punctuation:
             words = ForcedAlignerService.merge_source_text(words, clean_text)
         logger.debug(
-            f"Forced alignment ({language}): {len(words)} từ trong {elapsed_ms:.1f}ms",
+            f"Căn chỉnh (CrispASR GGUF): {len(words)} đơn vị trong {elapsed_ms:.1f}ms",
             extra={"module_tag": "ASR"},
         )
         return words
+
+    @staticmethod
+    def _normalize_audio(audio: Union[np.ndarray, Tuple[np.ndarray, int], str]) -> np.ndarray:
+        """Đưa đầu vào về PCM float32 mono 16 kHz (đường tiện lợi cho công cụ/CLI)."""
+        if isinstance(audio, str):
+            import soundfile as sf
+
+            data, sr = sf.read(audio, dtype="float32", always_2d=True)
+            pcm = data[:, 0]
+            if sr != 16000:
+                from math import gcd
+
+                from scipy.signal import resample_poly
+
+                g = gcd(int(sr), 16000)
+                pcm = resample_poly(pcm, 16000 // g, int(sr) // g).astype(np.float32)
+        elif isinstance(audio, tuple):
+            pcm, sr = audio[0], int(audio[1])
+            if sr != 16000:
+                raise ValueError(f"ForcedAligner cần 16 kHz, nhận {sr} Hz")
+        else:
+            pcm = audio
+        arr = np.asarray(pcm, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = arr[:, 0]
+        return np.ascontiguousarray(arr, dtype=np.float32)
 
     @staticmethod
     def merge_source_text(
@@ -1035,12 +968,17 @@ class ForcedAlignerService:
         return out
 
     def unload_model(self) -> None:
-        """Giải phóng ForcedAligner khỏi GPU."""
-        with self._shared_lock:
-            with self._infer_lock:
-                self.__class__._shared_aligner = None
-                self._is_warmed = False
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                logger.info("Đã giải phóng ForcedAligner khỏi GPU.", extra={"module_tag": "ASR"})
+        """Giải phóng model aligner (trả VRAM).
+
+        Sau Giai đoạn 3 chỉ còn đường GGUF: model nằm trong TIẾN TRÌNH CON của CrispASR. Gọi
+        `free()` để DLL giải phóng context đang cache; muốn trả sạch 100% VRAM thì tắt hẳn worker
+        (`CrispASRAlignerClient.get_instance().shutdown()`).
+        """
+        try:
+            from backend.asr.crispasr_aligner import CrispASRAlignerClient
+
+            CrispASRAlignerClient.get_instance().free()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Giải phóng aligner lỗi: {exc}", extra={"module_tag": "ASR"})
+        self._is_warmed = False
+        logger.info("Đã giải phóng ForcedAligner khỏi VRAM.", extra={"module_tag": "ASR"})

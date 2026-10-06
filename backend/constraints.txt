@@ -1,46 +1,31 @@
 # ============================================================================
-# Ràng buộc phiên bản CUDA cho môi trường của dự án (constraints, KHÔNG phải requirements)
+# Ràng buộc phiên bản cho môi trường của dự án (constraints, KHÔNG phải requirements)
 #
 # Dùng:
 #   pip install -r backend/requirements.txt -c backend/constraints.txt
-#   pip install -U <gói> -c backend/constraints.txt \
-#       --extra-index-url https://download.pytorch.org/whl/cu130
 #
-# VÌ SAO CẦN:
-#   Interpreter Python này dùng CHUNG với nhiều gói khác, và các ràng buộc torch của chúng
-#   xung đột nhau:
-#     * whisperx 3.8.6          -> torch~=2.8.0,  torchvision~=0.23.0
-#     * compressed-tensors 0.18 -> torch>=2.10.0
-#     * torchvision 0.27.0+cu130-> torch==2.12.0
-#   Khi pip cài một gói chỉ phụ thuộc "torch" KHÔNG giới hạn (silero-vad 6.2.2 ghi
-#   `Requires: packaging, torch, torchaudio`), resolver có thể chọn bản torch **CPU-only
-#   trên PyPI** ⇒ CUDA biến mất (đã xảy ra 2026-09-22: 2.12.0+cu130 -> 2.9.1+cpu, kéo
-#   theo torchaudio 2.9.1, để lại torchvision 0.27.0+cu130 mồ côi).
+# ════════════════════════════════════════════════════════════════════════════
+# GIAI ĐOẠN 3 (2026-10-06) — ĐÃ GỠ TOÀN BỘ GHIM TORCH
+# ════════════════════════════════════════════════════════════════════════════
+# File này trước đây tồn tại để chống việc pip âm thầm hạ `torch` xuống bản CPU-only, vì
+# interpreter dùng chung với nhiều gói có ràng buộc torch xung đột nhau:
+#     whisperx 3.8.6           -> torch~=2.8.0
+#     compressed-tensors 0.18  -> torch>=2.10.0
+#     torchvision 0.27.0+cu130 -> torch==2.12.0
+# và `silero-vad` chỉ khai `torch` KHÔNG giới hạn ⇒ resolver chọn bản CPU trên PyPI ⇒ CUDA biến
+# mất im lặng (đã xảy ra 2026-09-22: torch 2.12.0+cu130 -> 2.9.1+cpu).
 #
-#   Có file này, pip sẽ **BÁO LỖI** (ResolutionImpossible) thay vì âm thầm hạ torch.
-#   Đó là hành vi mong muốn: hỏng to và rõ còn hơn mất GPU im lặng.
+# Nay **KHÔNG subsystem nào của backend cần PyTorch**:
+#   * VAD (Silero + FireRed) → onnxruntime
+#   * ForcedAligner (Qwen3-ForcedAligner-0.6B) → GGUF Q4_K qua CrispASR (tiến trình con)
+#   * ASR → transcribe.dll · dịch → llama.dll · TTS → omnivoice.dll (đều GGML native)
+# nên cả vấn đề lẫn cách chống đều không còn. `--extra-index-url` của PyTorch trong
+# `requirements.txt` cũng đã bị gỡ.
 #
-# ⚠️ LƯU Ý PHIÊN BẢN (đã kiểm bằng `pip index versions … --index-url .../whl/cu130`):
-#    index cu130 có torchaudio TỚI 2.11.0+cu130 (KHÔNG có 2.12.x trở lên) — torchaudio đi sau
-#    torch. Bộ đúng đang dùng: torch 2.14.0 + torchaudio 2.11.0 + torchvision 0.29.0
-#    (torch 2.14 ↔ torchvision 0.29; torch 2.12 ↔ torchvision 0.27).
-#    Đừng "sửa cho khớp số": torchaudio 2.14.0+cu130 KHÔNG tồn tại và pip sẽ báo
-#    "Could not find a version that satisfies the requirement".
-#
-#    ⚠️ torchvision KHÔNG được `backend/requirements.txt` cài (không subsystem nào cần);
-#    dòng ghim bên dưới chỉ để nếu có gói khác kéo nó vào thì pip chọn đúng bản CUDA khớp torch.
-#
-#    Muốn nâng lên mới hơn: đối chiếu cả ba bằng
-#      pip index versions <gói> --index-url https://download.pytorch.org/whl/cu130
-#    rồi chọn bộ ba cùng tag CUDA.
-#
-# ⚠️ Khi nâng torch có chủ đích: sửa cả 3 dòng dưới cho khớp bộ CUDA (cùng tag `+cuXXX`),
-#    sửa `EXPECTED_CUDA_TRIO` trong `backend/utils/env_check.py`, rồi chạy lại
-#    `python -m backend.utils.env_check`.
+# Nếu ai đó CỐ Ý cài torch cho việc riêng, đừng thêm lại ghim ở đây: nó không còn ảnh hưởng tới
+# bất kỳ đường chạy nào của backend (kiểm chứng: `python -m backend.utils.env_check` báo
+# `torch: CÒN CÀI (không subsystem nào cần)`).
 # ============================================================================
-torch==2.14.0+cu130
-torchaudio==2.11.0+cu130
-torchvision==0.29.0+cu130
 
 # llama.cpp: cài BINDING từ wheel CPU 7 MB (`whl/cpu` của abetlen), DLL CUDA nằm trong repo.
 # Lý do ghim 0.3.22 trước đây (wheel 0.3.25–0.3.35 dính AVX-512) đã hết: DLL CPU của wheel
@@ -52,6 +37,4 @@ torchvision==0.29.0+cu130
 #       decode 67,6 tok/s · prefill 2.710 tok/s · nạp model 2,26 s · offloaded 33/33 layers
 #       `CUDA : ARCHS = 1200 | BLACKWELL_NATIVE_FP4 = 1`
 #   (wheel cu124 dựng sẵn trước đây: decode 48,3 tok/s · nạp model 4,33 s)
-#   KHÔNG cần `nvidia-cuda-runtime-cu12` / `nvidia-cublas-cu12`: DLL chỉ phụ thuộc
-#   `cublas64_13.dll` / `cudart64_13.dll`, đã có trong `torch/lib` (hoặc chép vào backend/bin/).
 llama-cpp-python==0.3.35

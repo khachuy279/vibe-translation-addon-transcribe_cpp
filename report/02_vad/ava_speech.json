@@ -8,7 +8,7 @@
     "labels": 98,
     "frame_ms": 10
   },
-  "generated_at": "2026-09-22 08:50:25",
+  "generated_at": "2026-10-06 21:24:55",
   "engines": {
     "firered-vad": {
       "engine": "firered-vad",
@@ -16,12 +16,12 @@
       "pre_roll_frames": 13,
       "starts": 123,
       "ends": 122,
-      "elapsed_sec": 190.3,
-      "rtf": 0.3172,
+      "elapsed_sec": 49.2,
+      "rtf": 0.082,
       "integrity": {
-        "frames": 44959,
+        "frames": 44958,
         "mismatches": 0,
-        "bytes": 14386880
+        "bytes": 14386560
       },
       "metrics": {
         "frames": 60000,
@@ -58,8 +58,8 @@
       "pre_roll_frames": 2,
       "starts": 121,
       "ends": 120,
-      "elapsed_sec": 13.7,
-      "rtf": 0.0229,
+      "elapsed_sec": 3.2,
+      "rtf": 0.0053,
       "integrity": {
         "frames": 7120,
         "mismatches": 0,
@@ -96,35 +96,35 @@
     },
     "fsmn-vad": {
       "engine": "fsmn-vad",
-      "hop_samples": 960,
-      "pre_roll_frames": 11,
-      "starts": 98,
-      "ends": 97,
-      "elapsed_sec": 38.5,
-      "rtf": 0.0641,
+      "hop_samples": 160,
+      "pre_roll_frames": 13,
+      "starts": 123,
+      "ends": 122,
+      "elapsed_sec": 48.7,
+      "rtf": 0.0812,
       "integrity": {
-        "frames": 5763,
+        "frames": 44958,
         "mismatches": 0,
-        "bytes": 11064960
+        "bytes": 14386560
       },
       "metrics": {
         "frames": 60000,
         "speech_gt_pct": 73.18,
-        "speech_pred_pct": 57.63,
-        "accuracy": 0.7083,
-        "precision": 0.8818,
-        "recall": 0.6944,
-        "f1": 0.777,
+        "speech_pred_pct": 74.93,
+        "accuracy": 0.8782,
+        "precision": 0.907,
+        "recall": 0.9288,
+        "f1": 0.9178,
         "gt_segments": 46,
-        "pred_segments": 59,
-        "onset_median_ms": 815.0,
-        "onset_p90_ms": 9100.0
+        "pred_segments": 123,
+        "onset_median_ms": 100.0,
+        "onset_p90_ms": 2085.0
       },
       "recall_by_class": {
-        "CLEAN_SPEECH": 1.0,
-        "SPEECH_WITH_NOISE": 0.6574,
+        "CLEAN_SPEECH": 0.9404,
+        "SPEECH_WITH_NOISE": 0.9466,
         "SPEECH_WITH_MUSIC": 0.0,
-        "false_alarm_on_no_speech": 0.254
+        "false_alarm_on_no_speech": 0.2597
       },
       "floors": {
         "f1": 0.7,

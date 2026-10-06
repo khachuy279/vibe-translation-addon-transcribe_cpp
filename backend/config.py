@@ -114,42 +114,23 @@ class SileroVADConfig(BaseModel):
     speech_pad_ms: int = 30
 
 
-class FsmnVADConfig(BaseModel):
-    """Cấu hình FSMN-VAD (Alibaba FunASR) — khớp `VADXOptions` + đường streaming.
-
-    Nguồn: `funasr/models/fsmn_vad_streaming/model.py` (VADXOptions) và ví dụ streaming
-    chính thức (`DynamicStreamingVAD.feed`):
-        model.generate(input=[chunk], cache=cache, is_final=False, chunk_size=<ms>, ...)
-
-    `chunk_size_ms` CHÍNH LÀ `chunk_size` truyền vào `generate()` (đơn vị ms) — cũng là
-    bước nhảy frame của engine (60 ms = 960 mẫu @16 kHz).
-    """
-    chunk_size_ms: int = 60
-    speech_noise_thres: float = 0.6
-    max_end_silence_time: int = 800
-    speech_to_sil_time_thres: int = 150
-    sil_to_speech_time_thres: int = 150
-    window_size_ms: int = 200
-    #: Điểm bắt đầu được lùi lại bao nhiêu ms (`do_extend`, mặc định bật ở VADXOptions).
-    #: ẢNH HƯỞNG TRỰC TIẾP tới pre-roll: engine phải giữ đủ audio để xả lại phần này.
-    lookback_time_start_point: int = 200
-    #: Điểm kết thúc được nhìn trước bao nhiêu ms (`do_extend`).
-    lookahead_time_end_point: int = 100
-    dynamic_silence: bool = False    # ngưỡng cố định = hành vi docs gốc (không lịch động)
-    output_frame_probs: bool = False # bật nếu muốn probability thật (tốn thêm CPU)
-
-
 class VADConfig(BaseModel):
-    """Cấu hình tổng hợp cho Voice Activity Detection (mỗi engine một config riêng)."""
+    """Cấu hình tổng hợp cho Voice Activity Detection (mỗi engine một config riêng).
+
+    Hai engine khả dụng — CẢ HAI chạy onnxruntime, KHÔNG cần PyTorch:
+      * `firered-vad` (mặc định): `FireRedVADConfig`
+      * `silero-vad`: `SileroVADConfig`
+
+    `fsmn-vad` đã bị xoá cùng Giai đoạn 3 "loại bỏ PyTorch" (xem `backend/vad/base.py`).
+    """
     enabled: bool = True
-    vad_engine: str = "firered-vad"  # firered-vad, silero-vad, fsmn-vad
+    vad_engine: str = "firered-vad"  # firered-vad | silero-vad
     sample_rate: int = 16000
     # ── HAI KNOB CHUNG CỦA POPUP — được CHIẾU xuống field native của engine đang chọn ──
     # (bảng chiếu: report/audit/19_KE_HOACH_VIET_LAI_VAD.md §2.2)
-    #   threshold           -> firered.speech_threshold | silero.threshold | fsmn.speech_noise_thres
+    #   threshold           -> firered.speech_threshold | silero.threshold
     #   silence_duration_ms -> firered.min_silence_frame = round(ms/10)
     #                          | silero.min_silence_duration_ms
-    #                          | fsmn.max_end_silence_time
     # ⚠️ Mặc định của CẢ HAI là `None` = **KHÔNG ghi đè**: dùng đúng giá trị mặc định của
     # từng engine (đúng docs). Đây cũng là mặc định của popup — "⏱️ VAD Silence = 0/off"
     # nghĩa là để chính VAD quyết định (0 gửi từ popup cũng được quy về None).
@@ -158,7 +139,6 @@ class VADConfig(BaseModel):
 
     firered: FireRedVADConfig = Field(default_factory=FireRedVADConfig)
     silero: SileroVADConfig = Field(default_factory=SileroVADConfig)
-    fsmn: FsmnVADConfig = Field(default_factory=FsmnVADConfig)
 
     @property
     def engine_config(self) -> Any:
@@ -166,8 +146,6 @@ class VADConfig(BaseModel):
         key = (self.vad_engine or "firered-vad").lower().strip()
         if key == "silero-vad":
             return self.silero
-        if key == "fsmn-vad":
-            return self.fsmn
         return self.firered
 
     @property
@@ -178,7 +156,7 @@ class VADConfig(BaseModel):
         cfg = self.engine_config
         return float(getattr(cfg, "speech_threshold", None)
                      or getattr(cfg, "threshold", None)
-                     or getattr(cfg, "speech_noise_thres", 0.5))
+                     or 0.5)
 
     @property
     def effective_silence_ms(self) -> Optional[int]:
@@ -588,6 +566,34 @@ class LookaheadConfig(BaseModel):
     tts_slow_warn_ms: int = 4000
 
 
+class ForcedAlignerConfig(BaseModel):
+    """Cấu hình engine căn chỉnh mốc thời gian từ (Pipeline B / Lookahead).
+
+    Có HAI đường chạy cùng một model `Qwen3-ForcedAligner-0.6B`:
+
+    * `"crispasr"` (**mặc định từ 2026-10-06**) — bản **GGUF Q4_K** chạy trên CrispASR (C++/ggml)
+      trong MỘT TIẾN TRÌNH CON. KHÔNG cần PyTorch. Đo thật: khối 28,26 s mất 195–307 ms
+      (RTF 0,0069–0,0109) — ngang đường torch trên GPU; nạp model 127–839 ms (torch: 1,6 s nạp
+      + 0,5 s prewarm). A/B ở tầng phụ đề cho **cùng số câu và cùng nội dung** trên tiếng Nhật,
+      Trung, Anh (`backend/tests/test_64_crispasr_aligner.py`).
+    * `"torch"` — `transformers` + PyTorch, đọc snapshot safetensors trong
+      `backend/models/Qwen3-ForcedAligner-0.6B/`. Kéo theo `torch`, `transformers`, `nagisa`,
+      `soynlp` và cây vendored `backend/asr/qwen_asr/`. Vẫn giữ làm **ĐƯỜNG DỰ PHÒNG**: nếu thiếu
+      DLL/model GGUF thì `ForcedAlignerService` tự rơi về đây kèm cảnh báo, Pipeline B không hỏng.
+
+    Vì sao `"crispasr"` phải là TIẾN TRÌNH CON: xem `backend/utils/crispasr_native.py` (Windows
+    phân giải DLL theo TÊN MODULE ⇒ bộ `ggml*.dll` thứ ba trong cùng tiến trình gây `0xc0000139`).
+
+    Muốn quay lại đường cũ: đặt `forced_aligner.backend = "torch"` (không cần sửa mã).
+    """
+    #: `"crispasr"` (mặc định, không cần PyTorch) hoặc `"torch"` (dự phòng).
+    backend: str = "crispasr"
+    #: Tự động tải file GGUF (~500 MB) khi thiếu.
+    auto_download: bool = True
+    #: Số luồng CPU cho nhánh CrispASR (không ảnh hưởng khi chạy CUDA).
+    n_threads: int = 8
+
+
 class AppConfig(BaseModel):
     """Cấu hình gốc toàn hệ thống Backend."""
     ws: WSConfig = Field(default_factory=WSConfig)
@@ -600,6 +606,7 @@ class AppConfig(BaseModel):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     gpu: GpuConfig = Field(default_factory=GpuConfig)
     lookahead: LookaheadConfig = Field(default_factory=LookaheadConfig)
+    forced_aligner: ForcedAlignerConfig = Field(default_factory=ForcedAlignerConfig)
 
     def hot_reload(self, updates: Dict[str, Any]) -> None:
         """Cập nhật cấu hình runtime nhanh chóng không cần khởi động lại server."""

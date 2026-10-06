@@ -21,7 +21,15 @@ from typing import Any, Deque, Optional, Tuple
 import numpy as np
 
 
-SUPPORTED_VAD_ENGINES = ("firered-vad", "silero-vad", "fsmn-vad")
+#: Hai engine VAD duy nhất — CẢ HAI chạy bằng onnxruntime, KHÔNG cần PyTorch.
+#:
+#: `fsmn-vad` (Alibaba FunASR) đã bị XOÁ (2026-10-06) cùng Giai đoạn 3 "loại bỏ PyTorch": nó là
+#: engine duy nhất còn cần `funasr` → `torch`. FunASR CÓ hỗ trợ export ONNX (`FsmnStack` /
+#: `FSMNExport` / `export_meta.py`), nhưng để chạy được còn phải vendor frontend fbank+LFR+CMVN và
+#: máy trạng thái streaming (`funasr/models/fsmn_vad_streaming/model.py` ~52 KB + `dynamic_vad.py`)
+#: — không tương xứng cho một engine KHÔNG mặc định và đã bị FireRed/Silero lấn át. Muốn khôi phục
+#: thì export ONNX rồi viết engine mới theo khuôn `engines/firered_onnx.py`.
+SUPPORTED_VAD_ENGINES = ("firered-vad", "silero-vad")
 
 #: Giá trị hợp lệ của `VADResult.event`.
 EVENT_START = "START"
@@ -148,6 +156,16 @@ class BaseVADEngine(ABC):
     frame_samples: int = 160
     #: Trần số frame pre-roll (đệm trước START) mà engine có thể yêu cầu xả lại.
     max_lookback_frames: int = 0
+
+    @classmethod
+    def available(cls) -> Tuple[bool, str]:
+        """Engine có dùng được trong môi trường hiện tại không: `(ok, lý do)`.
+
+        Mặc định `(True, "")` — engine chỉ cần những gì đã có sẵn trong repo. Engine phụ thuộc
+        gói TUỲ CHỌN override hàm này để `VADEngineFactory.prewarm_engines()` bỏ qua thay vì
+        báo lỗi ở mỗi lần khởi động (xem `FsmnVADEngine`).
+        """
+        return True, ""
 
     @classmethod
     def prepare_files(cls) -> None:

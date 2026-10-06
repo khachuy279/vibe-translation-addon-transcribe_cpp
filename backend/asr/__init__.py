@@ -3,10 +3,11 @@
 import os
 import sys
 
-# Đảm bảo thư mục backend/asr nằm trong sys.path để vendor package qwen_asr có thể import trực tiếp
-_ASR_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.isdir(os.path.join(_ASR_DIR, "qwen_asr")) and _ASR_DIR not in sys.path:
-    sys.path.insert(0, _ASR_DIR)
+# ⚠️ CẢNH BÁO DLL: `bootstrap()` dưới đây nạp `transcribe.dll`, kéo theo `backend/bin/ggml*.dll`
+# vào TIẾN TRÌNH NÀY. Windows phân giải DLL theo TÊN MODULE, nên bất kỳ thư viện nào khác cũng
+# mang `ggml.dll`/`ggml-base.dll` (llama.cpp, CrispASR) sẽ bind nhầm nếu nạp chung tiến trình.
+# Đó là lý do phần CrispASR nằm ở `backend/utils/crispasr_native.py` và chạy trong TIẾN TRÌNH CON
+# — xem docstring đầu file đó.
 
 # PHẢI chạy trước mọi import chạm tới `transcribe_cpp`: `backend/asr/adapters.py` và
 # `backend/asr/engine.py` đều import nó ở cấp module, và `import transcribe_cpp` sẽ dlopen

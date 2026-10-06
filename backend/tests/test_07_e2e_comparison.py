@@ -32,7 +32,6 @@ from typing import List, Dict, Any
 
 import numpy as np
 import soundfile as sf
-import torch
 
 # Đảm bảo đường dẫn import
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -275,7 +274,7 @@ async def main():
 - **Thời gian thực hiện**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - **Hệ điều hành**: Windows 11
 - **Phần cứng**: NVIDIA GPU CUDA / Vulkan (RTX 5060 Ti)
-- **Chuỗi Pipeline**: Audio Ingress -> Circular Ring Buffer -> VAD Streaming -> transcribe.cpp ASR -> Commit Manager -> Local GGUF Translation -> PyTorch OmniVoice TTS -> WebSocket Safe Handler.
+- **Chuỗi Pipeline**: Audio Ingress -> Circular Ring Buffer -> VAD Streaming -> transcribe.cpp ASR -> Commit Manager -> Local GGUF Translation -> OmniVoice TTS (omnivoice.cpp native) -> WebSocket Safe Handler.
 
 ---
 
@@ -367,7 +366,7 @@ async def main():
    - ✅ **Phase 3**: Module ASR Streaming (`transcribe.cpp`) + nhịp preview cố định + cửa sổ preview.
    - ✅ **Phase 4**: Module Commit Manager 4 bậc (đã WIRE vào runtime) + trim trùng ranh giới.
    - ✅ **Phase 5**: Module Dịch Thuật Local GGUF (Hunyuan-MT2 7B qua Llama.cpp) + streaming token.
-   - ✅ **Phase 6**: Module OmniVoice Clone TTS (PyTorch Native Voice Cloning).
+   - ✅ **Phase 6**: Module OmniVoice Clone TTS (omnivoice.cpp native).
    - ✅ **Phase 7**: WebSocket Server WSS, Fast Cleanup (<200ms) & Đối Đầu E2E **có pacing**.
 
 2. Mã nguồn nằm gọn trong `/backend`, sẵn sàng vận hành cho **sử dụng cá nhân 1 phiên**.

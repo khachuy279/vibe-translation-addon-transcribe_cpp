@@ -55,26 +55,13 @@ def setup_llama_cpp_dll_path() -> Optional[str]:
 
 
 def _configure_alloc_conf() -> None:
-    """Đặt biến cấu hình allocator của torch ĐÚNG TÊN theo phiên bản.
+    """DEPRECATED — không còn tác dụng sau Giai đoạn 3.
 
-    Torch đổi tên `PYTORCH_CUDA_ALLOC_CONF` → `PYTORCH_ALLOC_CONF` và cảnh báo deprecation
-    khi thấy biến CŨ còn được đặt:
-        `[W...] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead`
-    (ĐO THỰC: cảnh báo này xuất hiện với **torch 2.9.1** ⇒ mốc đổi tên là 2.9, KHÔNG phải 2.12.)
-
-    Cách chọn: torch ≥ 2.9 → CHỈ đặt tên mới (torch cũ hơn không biết biến này nên sẽ bỏ qua);
-    torch < 2.9 → đặt tên cũ. Dùng `importlib.metadata` để biết phiên bản mà KHÔNG import torch.
+    Trước đây hàm này đặt `PYTORCH_ALLOC_CONF` cho allocator của torch. Backend nay KHÔNG dùng
+    PyTorch nên không cần; giữ lại như một no-op có tên để tránh phá vỡ import cũ, và để ghi rõ
+    lý do biến mất.
     """
-    name = "PYTORCH_CUDA_ALLOC_CONF"
-    try:
-        from importlib.metadata import version as _pkg_version
-
-        parts = _pkg_version("torch").split("+")[0].split(".")
-        if (int(parts[0]), int(parts[1])) >= (2, 9):
-            name = "PYTORCH_ALLOC_CONF"
-    except Exception:  # noqa: BLE001 - thiếu torch/chuỗi lạ → giữ tên cũ
-        pass
-    os.environ.setdefault(name, "expandable_segments:True")
+    return None
 
 
 _configure_alloc_conf()
@@ -117,7 +104,7 @@ def setup_cuda_dll_paths() -> None:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Bỏ qua backend/bin cho CUDA DLLs: {e}", extra={"module_tag": "CORE"})
 
-        # 1. Tìm trong site-packages (torch, llama_cpp, nvidia)
+        # 1. Tìm trong site-packages (llama_cpp, nvidia)
         try:
             import site
             site_packages_dirs = [p for p in (site.getsitepackages() + [site.USER_SITE]) if p]
@@ -125,9 +112,8 @@ def setup_cuda_dll_paths() -> None:
                 if not os.path.exists(sp):
                     continue
 
-                torch_lib = os.path.join(sp, "torch", "lib")
-                if os.path.isdir(torch_lib):
-                    dll_dirs.add(os.path.abspath(torch_lib))
+                # (Đã bỏ nhánh quét `torch/lib` ở đây: sau Giai đoạn 3 backend không dùng PyTorch,
+                #  và runtime CUDA đến từ toolkit trong repo — xem BƯỚC 2b.)
 
                 # `backend/bin/llama/` là kho DLL llama.cpp (engine dịch).
                 llama_repo_dir = llama_cpp_lib_dir()
