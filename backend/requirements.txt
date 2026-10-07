@@ -88,8 +88,8 @@ orjson>=3.9                 # TUỲ CHỌN — thiếu thì backend tự fallbac
 # entry point `transcribe_cpp.native`.
 # ⚠️ PHẢI cài CẢ HAI: `-native` chỉ là thư viện; thiếu binding `transcribe-cpp` thì backend
 # báo `transcribe_cpp package chưa được cài đặt!` và **không có backend ASR nào** (devices=n/a).
-transcribe-cpp==0.2.3
-transcribe-cpp-native==0.2.3
+transcribe-cpp==0.3.1
+transcribe-cpp-native==0.3.1
 
 # ------------------------------------------------------------------ Dịch (llama.cpp GGUF)
 # Lấy BINDING từ wheel CPU 7 MB (index khai ở đầu file). `--only-binary` để pip KHÔNG tự build
