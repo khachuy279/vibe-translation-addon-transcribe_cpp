@@ -41,9 +41,16 @@ from typing import Any, Dict, List, Optional
 # Template CHÍNH THỨC (bản EN) — NGUYÊN VĂN từ docs/prompts.md
 # --------------------------------------------------------------------------- #
 
+# Hướng dẫn đại từ nhân xưng khi dịch sang tiếng Việt (khi không rõ giới tính/tuổi tác)
+_PRONOUN_GUIDANCE_VI = (
+    "Requirements: never use the word mình anywhere; strictly translate first-person pronouns as tôi, "
+    "second-person pronouns as bạn, and we as chúng ta. "
+)
+
 # Loại 1: Dịch mặc định (Index-Translate)
 TEMPLATE_DEFAULT = (
     "Translate the following text into {target_lang}. "
+    "{pronoun_guidance}"
     "Output the translation directly, without any explanation:\n\n"
     "{source_text}"
 )
@@ -52,15 +59,16 @@ TEMPLATE_DEFAULT = (
 TEMPLATE_TERMINOLOGY = (
     "Translate the following subtitles into {target_lang}. "
     "Requirements: keep terminology consistent across sentences "
-    "(fixed rendering for {term}), preserve structure and placeholders:\n\n"
+    "(fixed rendering for {term}), {pronoun_guidance}preserve structure and placeholders:\n\n"
     "{source_text}"
 )
 
-# Loại 3: Dữ liệu có cấu trúc (Index-Translate)
+# Loại 3: Dữ liệu có cấu trúc (Index-Translate - tối ưu phụ đề hội thoại video)
 TEMPLATE_STRUCTURED = (
     "Translate the following {format_type} data into {target_lang}: "
-    "translate only user-facing text fields; never alter the structure, "
-    "keys, or placeholders:\n\n"
+    "translate user-facing text fields into natural, spoken {target_lang} suitable for video subtitles (conversational tone, contextual nuance); "
+    "{pronoun_guidance}"
+    "never alter the structure, keys, or placeholders:\n\n"
     "{source_text}"
 )
 
@@ -124,6 +132,8 @@ class PromptStrategy:
         source_lang: str,
         target_lang: str,
         format_type: str = "JSON",
+        context: str = "",
+        use_context: bool = False,
     ) -> str:
         raise NotImplementedError
 
@@ -159,15 +169,18 @@ class PipelineAPromptStrategy(PromptStrategy):
         tgt = resolve_lang_name(target_lang)
         source_text = (text or "").strip()
 
+        pronoun_guide = _PRONOUN_GUIDANCE_VI if tgt == "Vietnamese" else ""
         if term and str(term).strip():
             instruction = TEMPLATE_TERMINOLOGY.format(
                 target_lang=tgt,
                 term=str(term).strip(),
+                pronoun_guidance=pronoun_guide,
                 source_text=source_text,
             )
         else:
             instruction = TEMPLATE_DEFAULT.format(
                 target_lang=tgt,
+                pronoun_guidance=pronoun_guide,
                 source_text=source_text,
             )
 
@@ -183,9 +196,11 @@ class PipelineAPromptStrategy(PromptStrategy):
         source_lang: str,
         target_lang: str,
         format_type: str = "JSON",
+        context: str = "",
+        use_context: bool = False,
     ) -> str:
         return PipelineBPromptStrategy().build_batch_prompt(
-            sentences, source_lang, target_lang, format_type
+            sentences, source_lang, target_lang, format_type, context, use_context
         )
 
 
@@ -196,6 +211,7 @@ class PipelineBPromptStrategy(PromptStrategy):
     tuân thủ chuẩn Bilibili instTrans: giữ nguyên key số, cấu trúc và placeholder.
     Dịch gộp toàn bộ các câu trong một khối ASR thành 1 lần gọi LLM duy nhất,
     tối đa hóa tính liền mạch ngữ cảnh hội thoại và tiết kiệm 60-70% thời gian GPU.
+    Hỗ trợ kế thừa khối ngữ cảnh hội thoại gần nhất (cross-block context injection).
     """
 
     def build_prompt(
@@ -217,16 +233,25 @@ class PipelineBPromptStrategy(PromptStrategy):
         source_lang: str,
         target_lang: str,
         format_type: str = "JSON",
+        context: str = "",
+        use_context: bool = False,
     ) -> str:
         tgt = resolve_lang_name(target_lang)
         data: Dict[str, Any] = {str(i + 1): (s or "").strip() for i, s in enumerate(sentences)}
         json_text = json.dumps(data, ensure_ascii=False, indent=2)
 
-        user_content = TEMPLATE_STRUCTURED.format(
+        pronoun_guide = _PRONOUN_GUIDANCE_VI if tgt == "Vietnamese" else ""
+        instruction = TEMPLATE_STRUCTURED.format(
             format_type=format_type,
             target_lang=tgt,
+            pronoun_guidance=pronoun_guide,
             source_text=json_text,
         )
+
+        user_content = instruction
+        if context and use_context:
+            user_content = f"{_CONTEXT_HEADER}\n{context.strip()}\n\n{instruction}"
+
         return _wrap_chat(user_content, self._NO_THINK_PREFIX)
 
 

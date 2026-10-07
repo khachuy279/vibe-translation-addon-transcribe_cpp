@@ -41,14 +41,14 @@ def test_translation_registry_and_prompts():
     # Kiểm tra prompt builder Pipeline A (đơn câu)
     strategy_a = get_prompt_strategy("pipeline_a")
     prompt_a = strategy_a.build_prompt("Hello world", source_lang="en", target_lang="vi")
-    assert "Translate the user's text" in prompt_a
+    assert "Translate the following text into Vietnamese" in prompt_a
     assert "Vietnamese" in prompt_a
     assert "<think>" in prompt_a
 
     # Kiểm tra prompt builder Pipeline B (batch JSON instTrans)
     strategy_b = get_prompt_strategy("pipeline_b")
     prompt_b = strategy_b.build_batch_prompt(["Hello", "World"], source_lang="en", target_lang="vi")
-    assert "Translate the following subtitle JSON data" in prompt_b
+    assert "Translate the following JSON data into Vietnamese" in prompt_b
     assert '"1": "Hello"' in prompt_b
     assert '"2": "World"' in prompt_b
 

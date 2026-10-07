@@ -599,12 +599,13 @@ class GGUFTranslator(BaseTranslator):
         texts: List[str],
         source_lang: str = "auto",
         target_lang: str = "vi",
+        context: str = "",
     ) -> List[str]:
         """Dịch gộp cả danh sách câu (cho Pipeline B) qua JSON instTrans trong 1 lần gọi GPU duy nhất."""
         if not texts:
             return []
         if len(texts) == 1:
-            res = self._translate_sync(texts[0], source_lang=source_lang, target_lang=target_lang)
+            res = self._translate_sync(texts[0], source_lang=source_lang, target_lang=target_lang, context=context)
             return [res.get("translated_text") or texts[0]]
 
         try:
@@ -621,11 +622,14 @@ class GGUFTranslator(BaseTranslator):
         if prompt_fn is None:
             # Fallback nếu strategy không hỗ trợ batch
             return [
-                self._translate_sync(t, source_lang=source_lang, target_lang=target_lang).get("translated_text") or t
+                self._translate_sync(t, source_lang=source_lang, target_lang=target_lang, context=context).get("translated_text") or t
                 for t in texts
             ]
 
-        batch_prompt = built_strategy.build_batch_prompt(texts, source_lang, target_lang)
+        use_ctx = bool(context and context.strip())
+        batch_prompt = built_strategy.build_batch_prompt(
+            texts, source_lang, target_lang, context=context, use_context=use_ctx
+        )
         max_tokens = min(1536, max(256, len(texts) * 80))
         kwargs = {
             "max_tokens": max_tokens,
@@ -641,7 +645,9 @@ class GGUFTranslator(BaseTranslator):
             if llm is None:
                 return list(texts)
             if shared_key != built_key and hasattr(strategy, "build_batch_prompt"):
-                batch_prompt = strategy.build_batch_prompt(texts, source_lang, target_lang)
+                batch_prompt = strategy.build_batch_prompt(
+                    texts, source_lang, target_lang, context=context, use_context=use_ctx
+                )
 
             try:
                 output = llm(batch_prompt, **kwargs)
@@ -649,7 +655,7 @@ class GGUFTranslator(BaseTranslator):
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Lỗi suy luận batch LLM: {exc}, fallback dịch từng câu", extra={"module_tag": "TRANSLATE"})
                 return [
-                    self._translate_sync(t, source_lang=source_lang, target_lang=target_lang).get("translated_text") or t
+                    self._translate_sync(t, source_lang=source_lang, target_lang=target_lang, context=context).get("translated_text") or t
                     for t in texts
                 ]
 
@@ -662,7 +668,7 @@ class GGUFTranslator(BaseTranslator):
             extra={"module_tag": "TRANSLATE"},
         )
         return [
-            self._translate_sync(t, source_lang=source_lang, target_lang=target_lang).get("translated_text") or t
+            self._translate_sync(t, source_lang=source_lang, target_lang=target_lang, context=context).get("translated_text") or t
             for t in texts
         ]
 
@@ -671,6 +677,7 @@ class GGUFTranslator(BaseTranslator):
         texts: List[str],
         source_lang: str = "auto",
         target_lang: str = "vi",
+        context: str = "",
     ) -> List[str]:
         """Async wrapper cho translate_batch_sync chạy trên thread pool với GPU arbiter."""
         loop = asyncio.get_running_loop()
@@ -681,6 +688,7 @@ class GGUFTranslator(BaseTranslator):
             texts,
             source_lang,
             target_lang,
+            context,
         )
 
     # ------------------------------------------------------------------ streaming

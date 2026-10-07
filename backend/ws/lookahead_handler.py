@@ -1474,10 +1474,24 @@ class LookaheadSessionState:
 
                 candidate_subs.append((idx, sub, pts_start, pts_end))
 
-            # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu
+            # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu (kèm ngữ cảnh các câu gần nhất sạch ảo giác)
             candidate_texts = [sub.text for _, sub, _, _ in candidate_subs]
+            recent_ctx_list = []
+            for u in reversed(self._recent_utterances[-8:]):
+                orig = (u.get("text") or "").strip()
+                trans = (u.get("translated") or "").strip()
+                if not orig or is_repetition_hallucination(orig, min_reps=3):
+                    continue
+                if trans and is_repetition_hallucination(trans, min_reps=3):
+                    continue
+                recent_ctx_list.append(f"{orig} -> {trans}" if trans else orig)
+                if len(recent_ctx_list) >= 2:
+                    break
+            recent_ctx_list.reverse()
+            batch_context = "\n".join(recent_ctx_list)
+
             t_tr = time.perf_counter()
-            translated_texts = await self._translate_batch(candidate_texts)
+            translated_texts = await self._translate_batch(candidate_texts, context=batch_context)
             tr_ms = (time.perf_counter() - t_tr) * 1000.0
 
             if candidate_subs:
@@ -1783,7 +1797,7 @@ class LookaheadSessionState:
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def _translate_batch(self, texts: List[str]) -> List[str]:
+    async def _translate_batch(self, texts: List[str], context: str = "") -> List[str]:
         """Dịch gộp cả khối câu phụ đề qua Batch Context Translation (Pipeline B)."""
         if not texts:
             return []
@@ -1792,11 +1806,14 @@ class LookaheadSessionState:
             return list(texts)
         try:
             if hasattr(engine, "translate_batch"):
-                return await engine.translate_batch(texts, self.source_lang, self.target_lang)
+                try:
+                    return await engine.translate_batch(texts, self.source_lang, self.target_lang, context=context)
+                except TypeError:
+                    return await engine.translate_batch(texts, self.source_lang, self.target_lang)
             # Fallback nếu engine không có translate_batch
             results = []
             for t in texts:
-                res = await self._translate(t)
+                res = await self._translate(t, context=context)
                 results.append(res or t)
             return results
         except Exception as exc:  # noqa: BLE001
