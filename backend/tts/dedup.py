@@ -4,10 +4,15 @@ Chức năng:
 - Ngăn chặn phát âm lại các câu đã được phát gần đây (Exact Duplicate & Substring Overlap).
 - Chuẩn hóa khoảng trắng, dấu câu trước khi so khớp hash.
 - Duy trì lịch sử trượt giới hạn (sliding window) bảo toàn bộ nhớ.
+
+QUY TẮC CHUẨN HOÁ dùng CHUNG với `core/dedup.py` và `translation/dedup.py`
+(`normalize_for_dedup`). Trước đây bản ở đây chỉ bỏ dấu câu ở HAI ĐẦU, nên
+"Xin chào, các bạn" và "Xin chào các bạn" không được coi là trùng.
 """
 
-import re
 from typing import List, Set
+
+from backend.core.dedup import normalize_for_dedup
 
 
 class TTSDedupState:
@@ -19,15 +24,8 @@ class TTSDedupState:
         self._history_set: Set[str] = set()
 
     def _normalize(self, text: str) -> str:
-        """Chuẩn hóa câu văn để so sánh: chữ thường, xóa khoảng trắng thừa và dấu câu biên."""
-        if not text:
-            return ""
-        norm = text.strip().lower()
-        # Loại bỏ dấu câu ở đầu và cuối
-        norm = re.sub(r"^[^\w\s]+|[^\w\s]+$", "", norm)
-        # Gộp khoảng trắng liên tiếp
-        norm = re.sub(r"\s+", " ", norm)
-        return norm
+        """Uỷ quyền cho `core.dedup.normalize_for_dedup` (một quy tắc DUY NHẤT)."""
+        return normalize_for_dedup(text)
 
     def is_duplicate(self, text: str) -> bool:
         """Kiểm tra xem câu văn có bị trùng lặp với các câu vừa phát âm hay không."""

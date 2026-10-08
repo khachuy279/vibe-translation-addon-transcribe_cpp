@@ -99,6 +99,21 @@
 
 ## 5. Chồng chéo chức năng
 
+**TRẠNG THÁI TỪNG MỤC** (cập nhật 2026-10-08):
+
+| Mục | Nội dung | Trạng thái |
+|---|---|---|
+| 5.1 | SHA-256 cài 5 lần | ✅ xong (P2-bis) |
+| 5.2 | 4 bộ tải riêng + lỗ hổng SHA của diarization | ✅ xong (P1 + P3-bis) |
+| 5.3 | Đọc RSS 2 lần | ✅ xong (P2-bis) |
+| 5.4 | Định dạng khung audio 4 lần | ✅ xong (P3-ter) |
+| 5.5 | 3 bộ dedup, 3 quy tắc chuẩn hoá | ✅ xong (chuẩn hoá hợp nhất; chiến lược khớp giữ riêng có chủ đích) |
+| 5.6 | `popup.js` trùng lặp | ✅ xong một phần (P3; 2 cặp `handle*Switch` cố ý không gộp) |
+| 5.7 | Pipeline A vs B trùng lặp | ❌ **CHƯA** — gồm chính sách hàng đợi TTS ngược nhau |
+| 5.8 | `model_status` 18 dict literal | ✅ xong (P3-ter) |
+| 5.9 | Parse config lặp | ❌ **CHƯA** — xem chi tiết bên dưới |
+| 5.10 | Khác | ❌ **CHƯA** (một phần đã xử lý ở P3) |
+
 ### 5.1 SHA-256 cài 5 lần ở 4 module
 `utils/crispasr_native.py:112` (`_sha256_file`) · `utils/crispasr_native.py:175` (nội tuyến) ·
 `vad/silero_onnx.py:114` (`_sha256`) · `vad/engines/firered_onnx.py:313` (`_sha256_of`, **chết**) ·
@@ -128,15 +143,27 @@ Khác biệt **duy nhất**: `K32GetProcessMemoryInfo` vs `psapi.GetProcessMemor
 `[4 byte LE header len][JSON][PCM]` được dựng lại ở: `lib/frame-builder.js:12-43` (chuẩn, live) ·
 `lib/lookahead-client.js:629` · `lib/ws-client.js:332-343` (*không thể chạy*) · `background/service-worker.js:273` (*không thể chạy*).
 
-### 5.5 Ba bộ dedup với BA quy tắc chuẩn hoá khác nhau
-| Module | Chuẩn hoá | Ngữ nghĩa |
+### 5.5 Ba bộ dedup với BA quy tắc chuẩn hoá khác nhau — ✅ ĐÃ HỢP NHẤT
+
+| Module | Chuẩn hoá TRƯỚC | Ngữ nghĩa khớp (giữ nguyên) |
 |---|---|---|
 | `core/dedup.py:19` `normalize_for_dedup` | bỏ dấu câu (kể cả CJK) + lower + gộp space | 3 tầng: exact + substring ≥0.85 + Jaccard ≥0.80, cửa sổ thời gian |
-| `translation/dedup.py:33` `_key` | **chỉ `strip().lower()`** | exact match, TTL 10 s |
+| `translation/dedup.py:33` `_key` | **chỉ `strip().lower()`** | exact match, TTL 10 s + cache bản dịch |
 | `tts/dedup.py:21` `_normalize` | lower + bỏ dấu câu **ở hai ĐẦU** + gộp space | exact + tiền tố/hậu tố ≥8 ký tự |
 
-⇒ Cùng một câu có dấu câu cuối sẽ được lọc **khác nhau** ở đường dịch và đường TTS. Chưa xác nhận là bug,
-nhưng là điểm không nhất quán cần biết.
+**Hệ quả đo được trước khi sửa:** cùng câu `"Xin chào, các bạn!"` so với `"Xin chào các bạn"` cho **ba kết luận khác nhau** — `core` nói trùng, `tts` nói trùng, `translation` nói KHÔNG trùng. Dấu câu từ ASR vốn không đáng tin (aligner bỏ hết khi tokenize), nên bỏ dấu câu khi so trùng là quy tắc đúng cho cả ba tầng.
+
+**ĐÃ SỬA:** `translation/dedup._key` và `tts/dedup._normalize` nay uỷ quyền cho `core.dedup.normalize_for_dedup`. Kiểm chứng: 11 mẫu (dấu câu cuối, dấu câu GIỮA, CJK, khoảng trắng thừa, gạch nối, rỗng) cho kết quả **đồng nhất 100 %** ở cả ba lối vào.
+
+**CHIẾN LƯỢC KHỚP thì CỐ Ý KHÔNG GỘP** — ba bộ phục vụ ba mục đích khác nhau ở ba tầng pipeline (chống hallucination / tránh dịch lại / tránh phát lại) với vòng đời khác nhau (cửa sổ thời gian / TTL / số câu). Gộp chúng thành một lớp sẽ là abstraction giả và có thể đổi hành vi lọc.
+
+**Test hồi quy:** `backend/tests/test_72_dedup_normalization.py` — 15 test, gồm:
+- bất biến CHÍNH: ba lối vào chuẩn hoá cho cùng kết quả trên 11 mẫu;
+- cùng câu khác dấu câu ⇒ trùng ở **cả ba** tầng (trước đây chỉ 2/3);
+- câu khác thật sự vẫn được chấp nhận (chuẩn hoá mạnh hơn không được gây dương tính giả);
+- chốt mã nguồn: `translation/dedup.py` và `tts/dedup.py` không được chứa `re.sub` (tự chuẩn hoá trở lại).
+  Đã kiểm chứng guard **FAIL thật** khi ép `tts/dedup.py` quay về quy tắc cũ, và pass lại sau khi khôi phục.
+
 
 ### 5.6 `popup.js` trùng lặp ~200 dòng bên trong một file
 `waitForAsrActivation` (`:725-770`) vs `waitForTranslationActivation` (`:774-819`) — **83 % giống** ·
@@ -156,11 +183,17 @@ nhưng là điểm không nhất quán cần biết.
 `session.py` 12 chỗ (`:251,272,280,290,297,303,326,348,356,366,373,379`) + `lookahead_handler.py` 6 chỗ (`:516,527,531,554,559,563`),
 trong khi `serializers.make_model_status_msg` (`:173`) đã tồn tại nhưng **chỉ test dùng**.
 
-### 5.9 Parse config lặp
-`min_words_to_commit`: **5 chỗ** (`main.py:1013,1147`, `session.py:503`, `lookahead_handler.py:475,2125`) ·
-VAD `"0 = tắt" → None`: **4 chỗ** · clamp `lookaheadSyncOffsetMs`: **2 chỗ** (`:588-594`, `:2131-2136`) ·
+### 5.9 Parse config lặp — ❌ **CHƯA SỬA** (đã kiểm chứng lại 2026-10-08)
+
+`min_words_to_commit`: **5 chỗ** (`main.py:1013,1147,1202`, `session.py:480`, `lookahead_handler.py:482,2125`) ·
+VAD `"0 = tắt" → None`: **3 chỗ** (`main.py:1012`, `session.py:408`, `lookahead_handler.py:496`) ·
+alias `vad_threshold if not None else threshold`: **3 chỗ** (`session.py:402`, `lookahead_handler.py:383,491`) ·
+clamp `lookaheadSyncOffsetMs`: **2 chỗ** (`lookahead_handler.py:591`, `:2131`) ·
 `main.py:1138-1170` lặp lại bảng alias của `SessionConfigPayload` (`session.py:37-77`) ·
 Pipeline B parse payload **2 lần** (`apply_config` và `apply_init`).
+
+⚠️ Đáng chú ý: `lookahead_handler.py:482-485` và `:2125-2127` **trùng nhau y hệt TRONG cùng một file**
+(5 dòng × 2). Đây là chỗ dễ sửa nhất và nên làm trước.
 
 ### 5.10 Khác
 - `main.py:112-175` `_log_runtime_status_at_startup()` cài lại `env_check.runtime_status()`.

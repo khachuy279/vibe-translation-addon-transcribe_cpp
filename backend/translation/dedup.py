@@ -4,11 +4,19 @@ FIX-05 (2026-02): trước đây câu trùng bị **bỏ qua im lặng** (`retur
 Client đã nhận `utterance_update(is_final=True, translated="...")` ⇒ phụ đề gốc treo
 vĩnh viễn ở dấu "・・・" cho tới khi có câu final kế tiếp. Module này nay giữ luôn
 **bản dịch của câu vừa dịch** để lần trùng sau có thể TÁI DÙNG thay vì bỏ trắng.
+
+QUY TẮC CHUẨN HOÁ dùng CHUNG với `core/dedup.py` và `tts/dedup.py`
+(`normalize_for_dedup`): bỏ dấu câu + chữ thường + gộp khoảng trắng. Trước đây mỗi module
+tự chuẩn hoá một kiểu, nên "Xin chào các bạn!" bị coi là trùng ở đường TTS nhưng KHÔNG
+trùng ở đường dịch. Dấu câu từ ASR vốn không đáng tin (aligner bỏ hết khi tokenize) nên
+bỏ nó khi so trùng là quy tắc đúng cho cả ba tầng.
 """
 
 from collections import deque
 import time
 from typing import Deque, Dict, Optional, Tuple
+
+from backend.core.dedup import normalize_for_dedup
 
 
 class TranslationDedupState:
@@ -31,7 +39,8 @@ class TranslationDedupState:
     # ------------------------------------------------------------------ nội bộ
     @staticmethod
     def _key(text: str) -> str:
-        return text.strip().lower()
+        """Khoá so trùng — uỷ quyền cho `core.dedup.normalize_for_dedup` (một quy tắc DUY NHẤT)."""
+        return normalize_for_dedup(text)
 
     def _prune(self, now: float) -> None:
         while self._history and (now - self._history[0][0] > self.cache_ttl_sec):
@@ -50,6 +59,9 @@ class TranslationDedupState:
             return True
 
         clean = self._key(text)
+        # Câu chỉ có dấu câu ⇒ không có gì để dịch ⇒ coi như trùng (giống `core/dedup`).
+        if not clean:
+            return True
         now = time.time()
         self._prune(now)
 
