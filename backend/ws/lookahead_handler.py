@@ -2161,26 +2161,43 @@ class LookaheadSessionState:
 
     # ────────────────────────────────────────────────────────── cấu hình phiên
     def apply_init(self, data: Dict[str, Any]) -> None:
+        """Áp cấu hình khởi tạo phiên (message `lookahead_init`).
+
+        PHẢI chạy TRƯỚC `init_components()`: hàm đó đọc `self._parsed_config` để dựng VAD
+        theo đúng thông số popup.
+
+        Trước đây hàm này gán `source_lang`/`target_lang` **HAI lần** — một lần từ raw `data`,
+        rồi lại từ `parsed` (đọc CÙNG khoá, nên lần hai chỉ ghi đè bằng đúng giá trị đó) — và
+        đồng bộ ngôn ngữ xuống engine TRƯỚC khi có giá trị cuối cùng. Nay parse trước, chọn
+        giá trị một lần, rồi mới đồng bộ engine. Xem
+        `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.9.
+        """
         la = config.lookahead
-        self.source_lang = str(data.get("source_lang") or self.source_lang or "auto")
-        self.target_lang = str(data.get("target_lang") or self.target_lang or "vi")
-        try:
-            lead = float(data.get("lead_time", la.lead_time_sec))
-        except (TypeError, ValueError):
-            lead = float(la.lead_time_sec)
-        self.lead_time = max(float(la.min_lead_time_sec), min(float(la.max_lead_time_sec), lead))
-        if self.asr_engine is not None:
-            self.asr_engine.set_language(self.source_lang)
 
         # Cấu hình ĐẦY ĐỦ từ popup (VAD engine/threshold/silence, phân câu, model ASR/dịch…).
         # `buildWsConfig()` phía Extension gửi kèm trong `lookahead_init`.
         parsed = self._parse_config(data)
         if parsed is not None:
             self._parsed_config = parsed
-            if parsed.source_lang:
-                self.source_lang = str(parsed.source_lang)
-            if parsed.target_lang:
-                self.target_lang = str(parsed.target_lang)
+
+        # Ngôn ngữ: payload đã bao CẢ snake_case lẫn alias camelCase (`sourceLang`), nên chỉ cần
+        # nó + giá trị hiện có của phiên + mặc định.
+        self.source_lang = str(
+            (parsed.source_lang if parsed else None) or self.source_lang or "auto"
+        )
+        self.target_lang = str(
+            (parsed.target_lang if parsed else None) or self.target_lang or "vi"
+        )
+        if self.asr_engine is not None:
+            self.asr_engine.set_language(self.source_lang)
+
+        try:
+            lead = float(data.get("lead_time", la.lead_time_sec))
+        except (TypeError, ValueError):
+            lead = float(la.lead_time_sec)
+        self.lead_time = max(float(la.min_lead_time_sec), min(float(la.max_lead_time_sec), lead))
+
+        if parsed is not None:
             requested = parsed.asr_model or parsed.asr_engine or parsed.model_id
             if requested:
                 self._requested_asr_model = str(requested).strip().lower()

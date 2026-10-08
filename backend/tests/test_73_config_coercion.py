@@ -131,25 +131,52 @@ def test_lookahead_khong_con_trung_trong_cung_file() -> None:
     )
 
 
+def test_apply_init_chi_ap_ngon_ngu_mot_lan() -> None:
+    """`apply_init` từng gán source/target lang HAI lần và `set_language` trước giá trị cuối."""
+    src = (BACKEND / "ws" / "lookahead_handler.py").read_text(encoding="utf-8")
+    body = _block_until_next(src, "def apply_init", markers=_PY_METHOD_END)
+    assert body.count("self.source_lang =") == 1, "`source_lang` phải được gán ĐÚNG một lần"
+    assert body.count("self.target_lang =") == 1, "`target_lang` phải được gán ĐÚNG một lần"
+    assert body.count("set_language(") == 1, "`set_language` phải chỉ gọi một lần, sau giá trị cuối"
+    assert body.count("_parse_config(") == 1, "payload phải chỉ được parse một lần"
+
+
+def test_apply_init_parse_truoc_khi_dung_components() -> None:
+    """`init_components` đọc `self._parsed_config`, nên `apply_init` phải chạy TRƯỚC nó."""
+    src = (BACKEND / "ws" / "lookahead_handler.py").read_text(encoding="utf-8")
+    assert src.index("session.apply_init(data)") < src.index("session.init_components("), (
+        "`apply_init` phải được gọi trước `init_components` — nếu không VAD sẽ dựng bằng "
+        "thông số mặc định thay vì thông số popup"
+    )
+
+
 # ──────────────────────────────────────────────── §5.10 chốt mã nguồn
 
 
-def _block_until_next_top_level(src: str, header: str, *, indent: str) -> str:
-    """Cắt đoạn từ `header` tới khai báo kế tiếp cùng cấp (để guard chỉ soi MỘT hàm).
+#: Marker "khai báo kế tiếp" cho từng ngôn ngữ. Phải xét CẢ mốc LÙI cấp, vì có hàm là thứ cuối
+#: của class/module (ví dụ `apply_init`).
+_PY_METHOD_END = ("\n    def ", "\n    async def ", "\n    @", "\ndef ", "\nasync def ", "\nclass ", "\n@")
+_PY_TOPLEVEL_END = ("\ndef ", "\nasync def ", "\nclass ", "\n@")
+_JS_FUNCTION_END = ("\n  function ", "\n  async function ", "\n})();")
 
-    Cần thiết vì cùng một chuỗi có thể xuất hiện hợp lệ ở hàm khác — ví dụ payload của
+
+def _block_until_next(src: str, header: str, *, markers: tuple[str, ...]) -> str:
+    """Cắt đoạn từ `header` tới marker khai báo kế tiếp GẦN NHẤT.
+
+    Cần thiết vì cùng một chuỗi có thể xuất hiện hợp lệ ở hàm khác — payload của
     `handleEngineSwitch` cũng gửi `split_on_stability`, và `_vad_runtime_info` cũng
     `import onnxruntime`.
     """
     start = src.index(header)
-    nxt = src.find(f"\n{indent}def " if indent == "" else f"\n{indent}function ", start + len(header))
-    return src[start:] if nxt == -1 else src[start:nxt]
+    after = start + len(header)
+    positions = [p for marker in markers if (p := src.find(marker, after)) != -1]
+    return src[start:] if not positions else src[start:min(positions)]
 
 
 def test_main_dung_env_check_thay_vi_tu_kiem_tra() -> None:
     """`main.py` không được tự kiểm tra onnxruntime/aligner chỉ để LOG trạng thái khởi động."""
     src = (BACKEND / "main.py").read_text(encoding="utf-8")
-    body = _block_until_next_top_level(src, "def _log_runtime_status_at_startup", indent="")
+    body = _block_until_next(src, "def _log_runtime_status_at_startup", markers=_PY_TOPLEVEL_END)
     assert "env_check.runtime_status()" in body, (
         "`_log_runtime_status_at_startup` phải đọc từ `env_check.runtime_status()`"
     )
@@ -168,7 +195,7 @@ def test_popup_khong_ghi_alias_snake_case_thua() -> None:
     thẳng cho backend, nên không được tính là vi phạm.
     """
     src = (ROOT / "extension_src" / "popup" / "popup.js").read_text(encoding="utf-8")
-    body = _block_until_next_top_level(src, "function getSettings()", indent="  ")
+    body = _block_until_next(src, "function getSettings()", markers=_JS_FUNCTION_END)
     for stale in (
         "silence_duration_ms:",
         "vad_threshold:",

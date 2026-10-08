@@ -220,9 +220,30 @@ Nay mọi quy ước nằm ở **`backend/ws/session.py`** (cạnh `SessionConfi
 Kiểm chứng: `min(1500`, `raw_ms if raw_ms > 0 else`, `vad_threshold if … else …threshold` đều còn
 **0 lần** ngoài `session.py`; `_batch_sub_opts["min_words"]` chỉ còn **1 chỗ gán**.
 
-**CHƯA làm (ghi lại để không quên):** `main.py:1138-1180` vẫn dựng `session_payload` thủ công thay vì
-dùng `SessionConfigPayload` + `model_dump()`; Pipeline B vẫn parse payload **2 lần**
-(`apply_config` và `apply_init`). Hai việc này cần đụng vào hợp đồng alias của payload nên tách riêng.
+**✅ ĐÃ LÀM NỐT (2026-10-08).**
+
+1. **`main.py` không còn dựng `session_payload` thủ công.** Nay gọi
+   `session_payload_from_rest(req)` — hàm này loại 4 trường REST-only, đổi
+   `stability_duration_ms` → `stability_duration_sec`, rồi **validate qua
+   `SessionConfigPayload`**. Kiểm chứng: `main.py` còn **0** dòng gán `session_payload[...]`.
+   Khối 39 dòng viết tay → 1 dòng gọi hàm.
+
+2. **`apply_init` không còn áp ngôn ngữ hai lần.** Trước đây hàm gán `source_lang`/`target_lang`
+   từ raw `data`, rồi gán LẠI từ `parsed` (đọc CÙNG khoá), và đồng bộ ngôn ngữ xuống engine
+   TRƯỚC khi có giá trị cuối cùng. Nay: parse một lần → chọn giá trị một lần → mới đồng bộ engine.
+   `set_language` và `_parse_config` mỗi thứ đúng **1 lần** trong thân hàm.
+
+> **⚠️ ĐÍNH CHÍNH về cách hiểu "parse payload 2 lần".** Câu cũ *"Pipeline B parse payload 2 lần
+> (`apply_config` và `apply_init`)"* **gây hiểu nhầm**: `apply_init` phục vụ message
+> `lookahead_init` (L2293) còn `apply_config` phục vụ `set_config` (L2352) — **hai loại message
+> KHÁC NHAU**, không phải cùng một payload bị parse hai lần. Việc parse mỗi message một lần là
+> ĐÚNG. Trùng lặp thật nằm ở **thân `apply_init`** (gán ngôn ngữ 2 lần) và đã sửa ở mục 2.
+
+**Test hồi quy:** `test_75_session_payload_contract.py` (9 test — kiểm chứng **hành vi** của
+`session_payload_from_rest`: mọi khoá đầu ra đều được payload hiểu, ms→giây đúng, không lẫn trường
+REST-only, bỏ trường None, round-trip lại được; + chốt `main.py` không quay lại dict viết tay) và
+`test_73` thêm 2 test cho `apply_init` (gán ngôn ngữ 1 lần; `apply_init` phải chạy TRƯỚC
+`init_components` vì `init_components` đọc `self._parsed_config`).
 
 > **⚠️ BUG TÌM THẤY KHI RÀ CHÍNH MỤC NÀY (đã vá).** Vì `SessionConfigPayload` khai
 > `extra="ignore"`, mọi khoá `main.py` gửi mà payload KHÔNG hiểu đều bị **nuốt im lặng** — không
@@ -522,21 +543,20 @@ giúp mọi test hiện/ sau này không phải tự nhớ thứ tự nạp củ
 - chốt `setUint32(0,` chỉ có trong `frame-builder.js`;
 - kiểm chứng **hành vi thật** của `frame-builder.js` dưới Node (bố cục 4 byte LE + JSON + PCM khớp).
 
-### CÒN LẠI (đã kiểm chứng lại 2026-10-08 — chỉ còn 2 mục, đều KHÔNG thuần cơ học)
+### CÒN LẠI — ✅ KHÔNG CÒN VIỆC NÀO (đã kiểm chứng lại 2026-10-08)
 
-- **`main.py:1139-1180` dựng `session_payload` thủ công** thay vì dùng `SessionConfigPayload`.
-  KHÔNG phải refactor cơ học: `SwitchModelRequest` (19 field) và `SessionConfigPayload` (29 field)
-  **không trùng tập** — `lookahead_enabled` không có trong payload, còn `stability_duration_ms`
-  khác ĐƠN VỊ (`_sec` vs `_ms`). Chính sự lệch này đã gây ra bug **`stability_duration_ms` bị nuốt
-  im lặng** (xem §5.9). Làm refactor này phải xử lý 2 field lệch trước.
-- **Pipeline B parse payload 2 lần** (`apply_config` + `apply_init`) với phần xử lý chồng nhau
-  (source/target lang, requested model). `apply_init` chỉ áp MỘT PHẦN vì lúc đó VAD processor
-  chưa tồn tại nên không gọi thẳng `_apply_config_sync` được.
+Toàn bộ §5 đã xử lý xong. Ba mục **cố ý KHÔNG gộp** (khác biệt là có chủ đích, đã ghi lý do vào
+docstring từng chỗ):
+- **Chính sách hàng đợi TTS** ngược nhau giữa Pipeline A (GỘP) và B (BỎ CŨ NHẤT) — xem §5.7.
+- **`send_json` 3 lớp** và **`_schedule_*_model_switch` × 2** — xem §5.7.
+- **`handleEngineSwitch` / `handleTranslationModelSwitch`** — chỉ giống ~33 %; gộp sẽ cần "spec"
+  6–7 trường, tức abstraction giả (xem §P3).
+- **Hai bộ tách câu** (`core/hypothesis` vs `asr/forced_aligner`) — phục vụ hai mục đích khác nhau
+  (xem §5.10).
 
-**Đã xử lý xong (trước đây nằm trong danh sách này — mục đã cũ):**
-- ~~3 bộ dedup khác quy tắc chuẩn hoá~~ → ✅ hợp nhất (`eaaef2e`)
-- ~~Chính sách hàng đợi TTS ngược nhau~~ → ✅ xác nhận là **CỐ Ý**, đã ghi lý do vào docstring cả hai hàm
-- `handleEngineSwitch` / `handleTranslationModelSwitch` → vẫn **cố ý không gộp** (chỉ giống ~33 %, xem §P3)
+`main.py` vẫn còn một điểm nhỏ **không thuộc §5**: trường `lookahead_enabled` của
+`SwitchModelRequest` không được dùng ở đâu trong đường phiên (chỉ có ở config toàn cục) — đã ghi
+vào `_REST_ONLY_FIELDS` kèm lý do.
 
 ### P2-quater — Đấu dây 6 id mồ côi trong popup ✅ XONG
 

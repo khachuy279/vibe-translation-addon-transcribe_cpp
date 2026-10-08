@@ -58,7 +58,7 @@ from backend.tts import VoiceManager, OmniVoiceTTS, get_tts_engine
 from backend.core.metrics import metrics_collector
 from backend.ws.handler import handle_ws
 from backend.ws.lookahead_handler import handle_lookahead_ws
-from backend.ws.session import clamp_min_words, off_means_none_ms
+from backend.ws.session import SessionConfigPayload, clamp_min_words, off_means_none_ms
 from backend.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -408,6 +408,38 @@ class SwitchModelRequest(BaseModel):
     tts_voice: Optional[str] = None
     tts_speed: Optional[float] = None
     lookahead_enabled: Optional[bool] = None
+
+
+#: Trường của `SwitchModelRequest` KHÔNG đi vào payload cấu hình phiên, kèm lý do:
+#:   * `model_id` / `asr_engine` / `translation_model` — việc đổi model do
+#:     `_schedule_asr_model_switch` / `_schedule_translation_model_switch` lo (cần nạp nền +
+#:     thông báo trạng thái cho client), KHÔNG áp qua `apply_config`.
+#:   * `lookahead_enabled` — chỉ có ở config TOÀN CỤC; `SessionConfigPayload` không có trường này.
+_REST_ONLY_FIELDS = frozenset({"model_id", "asr_engine", "translation_model", "lookahead_enabled"})
+
+
+def session_payload_from_rest(req: "SwitchModelRequest") -> dict:
+    """Chuyển `SwitchModelRequest` (REST) thành payload mà `SessionConfigPayload` hiểu.
+
+    THAY cho khối 15 dòng gán từng khoá vào dict viết tay. Hai điểm KHÁC nhau giữa
+    request và payload được xử lý tường minh ở đây:
+      * `stability_duration_ms` (mili-giây) → `stability_duration_sec` (giây) — cùng đơn vị với
+        `stabilityDurationSec` mà extension gửi qua WS;
+      * các trường trong `_REST_ONLY_FIELDS` bị loại.
+
+    Đi qua `SessionConfigPayload.model_validate(...)` để **CHỐT HỢP ĐỒNG**: một khoá sai tên sẽ
+    lộ ra ngay (test_75 quét chính hàm này) thay vì bị `extra="ignore"` nuốt im lặng — đúng loại
+    bug `stability_duration_ms` đã xảy ra. Xem
+    `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.9.
+    """
+    candidate = {
+        k: v
+        for k, v in req.model_dump(exclude_none=True).items()
+        if k not in _REST_ONLY_FIELDS and k != "stability_duration_ms"
+    }
+    if req.stability_duration_ms is not None:
+        candidate["stability_duration_sec"] = max(0.0, float(req.stability_duration_ms) / 1000.0)
+    return SessionConfigPayload.model_validate(candidate).model_dump(exclude_none=True)
 
 
 def _prewarm_forced_aligner() -> None:
@@ -1136,45 +1168,7 @@ async def update_backend_config(req: SwitchModelRequest):
 
     # P1.10: đẩy các thay đổi vào phiên ĐANG CHẠY (trước đây REST chỉ đổi config toàn
     # cục, còn SessionState giữ snapshot cũ nên thay đổi không có hiệu lực).
-    session_payload: Dict[str, Any] = {}
-    if req.vad_engine is not None:
-        session_payload["vad_engine"] = req.vad_engine
-    if req.vad_threshold is not None:
-        session_payload["vad_threshold"] = req.vad_threshold
-    if req.silence_duration_ms is not None:
-        # 0 = "off": gửi nguyên 0 xuống phiên, `SessionState.apply_config` quy về None
-        # (= dùng mặc định của engine).
-        session_payload["silence_duration_ms"] = int(req.silence_duration_ms)
-    if req.min_words_to_commit is not None:
-        session_payload["min_words_to_commit"] = req.min_words_to_commit
-    if req.stability_duration_ms is not None:
-        # ⚠️ Payload phiên dùng `stability_duration_sec` (GIÂY), cùng đơn vị với
-        # `stabilityDurationSec` mà extension gửi qua WS. Trước đây chỗ này gửi thẳng khoá
-        # `stability_duration_ms` (mili-giây) — nhưng `SessionConfigPayload` khai
-        # `extra="ignore"` và không có field/alias nào tên đó, nên khoá ấy bị **NUỐT IM LẶNG**:
-        # slider "Stable for (ms)" đổi ở popup thì `config.sentence` TOÀN CỤC được cập nhật
-        # (dòng trên), còn phiên ĐANG CHẠY thì không nhận gì qua đường REST.
-        session_payload["stability_duration_sec"] = max(0.0, float(req.stability_duration_ms) / 1000.0)
-    if req.stability_min_duration_sec is not None:
-        session_payload["stability_min_duration_sec"] = float(req.stability_min_duration_sec)
-    if req.stability_min_words is not None:
-        session_payload["stability_min_words"] = int(req.stability_min_words)
-    if req.split_on_stability is not None:
-        session_payload["split_on_stability"] = bool(req.split_on_stability)
-    if req.trace_stability is not None:
-        session_payload["trace_stability"] = bool(req.trace_stability)
-    if req.hold_short_sentence is not None:
-        session_payload["hold_short_sentence"] = bool(req.hold_short_sentence)
-    if req.target_lang is not None:
-        session_payload["target_lang"] = req.target_lang
-    if req.source_lang is not None:
-        session_payload["source_lang"] = req.source_lang
-    if req.tts_enabled is not None:
-        session_payload["tts_enabled"] = req.tts_enabled
-    if req.tts_voice is not None:
-        session_payload["tts_voice"] = req.tts_voice
-    if req.tts_speed is not None:
-        session_payload["tts_speed"] = req.tts_speed
+    session_payload = session_payload_from_rest(req)
 
     from backend.ws.handler import get_active_sessions
     applied_to_sessions = 0
