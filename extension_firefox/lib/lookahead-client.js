@@ -15,6 +15,16 @@
  *  - Chuyển tiếp `lookahead_unavailable` để content script tự động quay về Pipeline A.
  */
 
+// Trình duyệt: manifest nạp `lib/frame-builder.js` TRƯỚC file này trong cùng
+// `content_scripts.js[]`, nên `buildBinaryAudioPacket` đã là biến toàn cục.
+//
+// Node (test): mô phỏng ĐÚNG thứ tự đó. Nếu thiếu, `_sendAudioBinaryFrame` ném ReferenceError
+// và test sẽ TREO thay vì báo lỗi rõ ràng (đã xảy ra thật với `buffer-interceptor.test.js`
+// khi chỗ dựng khung được hợp nhất về `frame-builder.js`). Khối này không chạy trong trình duyệt.
+if (typeof module !== "undefined" && module.exports && typeof buildBinaryAudioPacket !== "function") {
+  require("./frame-builder.js");
+}
+
 class LookaheadClient {
   constructor(options = {}) {
     this.serverUrl = options.serverUrl || "wss://localhost:8765/ws/lookahead";
@@ -620,19 +630,15 @@ class LookaheadClient {
     //: dedup, nếu không nó bị bỏ và vùng đã tải trước không bao giờ có phụ đề.
     if (meta?.refetched) hdrObj.refetched = true;
 
-    const hdrBytes = new TextEncoder().encode(JSON.stringify(hdrObj));
-    const hdrLen = hdrBytes.length;
-
-    // Cấu trúc: [4-byte uint32 header length] + [Header JSON Bytes] + [Audio Bytes]
-    const packet = new Uint8Array(4 + hdrLen + rawBytes.byteLength);
-    const view = new DataView(packet.buffer);
-    view.setUint32(0, hdrLen, true);
-    packet.set(hdrBytes, 4);
-    packet.set(new Uint8Array(rawBytes), 4 + hdrLen);
+    // Dùng CHUNG bộ dựng khung với `frame-builder.js` — manifest nạp file đó TRƯỚC file này
+    // trong cùng `content_scripts.js[]`. Trước đây chỗ này tự dựng lại `[4B len][JSON][PCM]`,
+    // tức là bản thứ 4 của cùng một định dạng ⇒ sửa một nơi là lệch ba nơi còn lại.
+    // Trả về ArrayBuffer (không phải Uint8Array) — dùng trực tiếp làm payload.
+    const packet = buildBinaryAudioPacket(hdrObj, rawBytes);
 
     if (this.port) {
       try {
-        this.port.postMessage({ action: "SEND_RAW_BINARY", buffer: packet.buffer });
+        this.port.postMessage({ action: "SEND_RAW_BINARY", buffer: packet });
         this._noteFrameSent(rawBytes, meta);
       } catch (e) {
         this.diag.framesBlocked += 1;
@@ -643,7 +649,7 @@ class LookaheadClient {
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
-        this.ws.send(packet.buffer);
+        this.ws.send(packet);
         this._noteFrameSent(rawBytes, meta);
       } catch (e) {
         this.diag.framesBlocked += 1;

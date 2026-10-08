@@ -29,6 +29,7 @@ from backend.asr.registry import ModelRegistry
 from backend.core.metrics import metrics_collector
 from backend.vad.processor import VADProcessor
 from backend.ws.connection import SafeWebSocketConnection
+from backend.ws.serializers import make_model_status_msg
 from backend.utils.logger import get_logger
 
 logger = get_logger("ws.session")
@@ -228,11 +229,9 @@ class SessionState:
         clean_key = (model_key or "").strip().lower()
         if not registry.has_model(clean_key):
             logger.warning(f"Model ASR '{model_key}' không có trong catalog — bỏ qua.", extra={"module_tag": "WS"})
-            self._spawn(self.send_json({
-                "type": "model_status", "stage": "asr",
-                "state": "error", "model": model_key,
-                "message": "Không có trong models.yaml",
-            }))
+            self._spawn(self.send_json(
+                make_model_status_msg("asr", "error", model_key, "Không có trong models.yaml")
+            ))
             return
 
         try:
@@ -249,41 +248,37 @@ class SessionState:
                 f"hiện tại '{config.asr.active_model}'.",
                 extra={"module_tag": "WS"},
             )
-            self._spawn(self.send_json({
-                "type": "model_status", "stage": "asr",
-                "state": "error", "model": clean_key,
-                "message": f"Chưa có file GGUF cục bộ: {model_path}",
-            }))
+            self._spawn(self.send_json(
+                make_model_status_msg("asr", "error", clean_key, f"Chưa có file GGUF cục bộ: {model_path}")
+            ))
             return
 
         if asr_lifecycle.is_busy() and not asr_lifecycle.is_busy(clean_key):
-            self._spawn(self.send_json({
-                "type": "model_status", "stage": "asr",
-                "state": "error", "model": clean_key,
-                "message": f"Đang tải/nạp model ASR khác ({asr_lifecycle.status().get('model')})",
-            }))
+            self._spawn(self.send_json(
+                make_model_status_msg(
+                    "asr", "error", clean_key,
+                    f"Đang tải/nạp model ASR khác ({asr_lifecycle.status().get('model')})",
+                )
+            ))
             return
 
         self.config["asr_engine"] = clean_key
 
         async def _run() -> None:
-            await self.send_json({
-                "type": "model_status", "stage": "asr",
-                "state": "downloading" if needs_download else "loading", "model": clean_key,
-            })
+            await self.send_json(
+                make_model_status_msg(
+                    "asr", "downloading" if needs_download else "loading", clean_key
+                )
+            )
             try:
                 await asr_lifecycle.activate_model(clean_key)
                 logger.info(f"Session {self.session_id[:8]}: Swapped ASR -> '{clean_key}'", extra={"module_tag": "WS"})
-                await self.send_json({
-                    "type": "model_status", "stage": "asr",
-                    "state": "ready", "model": clean_key,
-                })
+                await self.send_json(make_model_status_msg("asr", "ready", clean_key))
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Chuyển ASR model sang '{clean_key}' thất bại: {exc}", exc_info=True, extra={"module_tag": "WS"})
-                await self.send_json({
-                    "type": "model_status", "stage": "asr",
-                    "state": "error", "model": clean_key, "message": str(exc),
-                })
+                await self.send_json(
+                    make_model_status_msg("asr", "error", clean_key, str(exc))
+                )
 
         self._spawn(_run())
 
@@ -303,11 +298,12 @@ class SessionState:
         info = registry.get_model(canonical)
         if info is None or not registry.is_known(model_request):
             logger.warning(f"Model dịch '{model_request}' không có trong catalog — bỏ qua.", extra={"module_tag": "WS"})
-            self._spawn(self.send_json({
-                "type": "model_status", "stage": "translation",
-                "state": "error", "model": model_request,
-                "message": "Không có trong translation_models.yaml",
-            }))
+            self._spawn(self.send_json(
+                make_model_status_msg(
+                    "translation", "error", model_request,
+                    "Không có trong translation_models.yaml",
+                )
+            ))
             return
 
         # Kiểm tra file trước để báo lỗi rõ thay vì nạp thất bại giữa đường (G9).
@@ -325,41 +321,41 @@ class SessionState:
                         f"hiện tại '{config.translation.base}'.",
                 extra={"module_tag": "WS"},
             )
-            self._spawn(self.send_json({
-                "type": "model_status", "stage": "translation",
-                "state": "error", "model": canonical,
-                "message": f"Chưa có file GGUF cục bộ: {gguf_path}",
-            }))
+            self._spawn(self.send_json(
+                make_model_status_msg(
+                    "translation", "error", canonical, f"Chưa có file GGUF cục bộ: {gguf_path}"
+                )
+            ))
             return
 
         if trans_lifecycle.is_busy() and not trans_lifecycle.is_busy(canonical):
-            self._spawn(self.send_json({
-                "type": "model_status", "stage": "translation",
-                "state": "error", "model": canonical,
-                "message": f"Đang tải/nạp model dịch khác ({trans_lifecycle.status().get('model')})",
-            }))
+            self._spawn(self.send_json(
+                make_model_status_msg(
+                    "translation", "error", canonical,
+                    f"Đang tải/nạp model dịch khác ({trans_lifecycle.status().get('model')})",
+                )
+            ))
             return
 
         self.config["translation_model"] = canonical
 
         async def _run() -> None:
-            await self.send_json({
-                "type": "model_status", "stage": "translation",
-                "state": "downloading" if needs_download else "loading", "model": canonical,
-            })
+            await self.send_json(
+                make_model_status_msg(
+                    "translation", "downloading" if needs_download else "loading", canonical
+                )
+            )
             try:
                 await trans_lifecycle.activate_model(canonical)
                 logger.info(f"Session {self.session_id[:8]}: Swapped translation -> '{canonical}'", extra={"module_tag": "WS"})
-                await self.send_json({
-                    "type": "model_status", "stage": "translation",
-                    "state": "ready", "model": canonical,
-                })
+                await self.send_json(
+                    make_model_status_msg("translation", "ready", canonical)
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Chuyển model dịch sang '{canonical}' thất bại: {exc}", exc_info=True, extra={"module_tag": "WS"})
-                await self.send_json({
-                    "type": "model_status", "stage": "translation",
-                    "state": "error", "model": canonical, "message": str(exc),
-                })
+                await self.send_json(
+                    make_model_status_msg("translation", "error", canonical, str(exc))
+                )
 
         self._spawn(_run())
 

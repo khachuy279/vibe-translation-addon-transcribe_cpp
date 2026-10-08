@@ -74,6 +74,7 @@ from backend.core.vad_silence import VADSilenceScanner
 from backend.diarization import DiarizationService, assign_speakers_to_subtitles
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import SessionConfigPayload
+from backend.ws.serializers import make_model_status_msg
 from backend.utils.logger import get_logger
 from backend.utils.text_repetition import is_repetition_hallucination
 
@@ -519,7 +520,7 @@ class LookaheadSessionState:
             return
 
         async def _run() -> None:
-            await self.send_json({"type": "model_status", "stage": "asr", "state": "loading", "model": clean})
+            await self.send_json(make_model_status_msg("asr", "loading", clean))
             try:
                 if asr_lifecycle.needs_download(clean) and not asr_lifecycle.auto_download_enabled():
                     raise RuntimeError("Chưa có file GGUF cục bộ và auto_download đang tắt")
@@ -530,13 +531,10 @@ class LookaheadSessionState:
                 if self.asr_engine is not None:
                     self.asr_engine.model_key = clean
                     self.asr_engine.model_info = registry.get_model_info(clean) or {}
-                await self.send_json({"type": "model_status", "stage": "asr", "state": "ready", "model": clean})
+                await self.send_json(make_model_status_msg("asr", "ready", clean))
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Đổi model ASR Lookahead sang '{clean}' thất bại: {exc}", extra={"module_tag": "WS"})
-                await self.send_json({
-                    "type": "model_status", "stage": "asr", "state": "error",
-                    "model": clean, "message": str(exc),
-                })
+                await self.send_json(make_model_status_msg("asr", "error", clean, str(exc)))
 
         self._spawn(_run())
 
@@ -557,18 +555,17 @@ class LookaheadSessionState:
             return
 
         async def _run() -> None:
-            await self.send_json({"type": "model_status", "stage": "translation", "state": "loading", "model": canonical})
+            await self.send_json(make_model_status_msg("translation", "loading", canonical))
             try:
                 if trans_lifecycle.needs_download(canonical) and not trans_lifecycle.auto_download_enabled():
                     raise RuntimeError("Chưa có file GGUF cục bộ và auto_download đang tắt")
                 await trans_lifecycle.activate_model(canonical)
-                await self.send_json({"type": "model_status", "stage": "translation", "state": "ready", "model": canonical})
+                await self.send_json(make_model_status_msg("translation", "ready", canonical))
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"Đổi model dịch Lookahead sang '{canonical}' thất bại: {exc}", extra={"module_tag": "WS"})
-                await self.send_json({
-                    "type": "model_status", "stage": "translation", "state": "error",
-                    "model": canonical, "message": str(exc),
-                })
+                await self.send_json(
+                    make_model_status_msg("translation", "error", canonical, str(exc))
+                )
 
         self._spawn(_run())
 

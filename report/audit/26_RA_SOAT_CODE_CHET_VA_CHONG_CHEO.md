@@ -383,13 +383,50 @@ báo "thiếu module_tag", vì bộ phân giải AST chỉ đọc được liter
 default literal**. Kết luận: giữ tham số nhưng cho default hợp lệ (`"MAIN"`), và mọi caller trong
 repo đều truyền tag riêng (`"ASR"` cho CrispASR, `"VAD"` cho 2 đường ONNX).
 
+### P3-ter — Hợp nhất định dạng khung audio + gói `model_status` ✅ XONG
+
+**1. Khung audio** `[4B header_len][JSON header][PCM]` từ **4 nơi → 1**:
+
+| Nơi | Trước | Sau |
+|---|---|---|
+| `lib/frame-builder.js` | bản chuẩn | **vẫn là bản duy nhất** |
+| `lib/lookahead-client.js` | tự dựng lại (4 dòng) | gọi `buildBinaryAudioPacket(hdrObj, rawBytes)` |
+| `lib/ws-client.js` | fallback không thể chạy | đã xoá ở P2-ter |
+| `background/service-worker.js` | fallback không thể chạy | đã xoá ở P2-ter |
+
+Kiểm chứng: `setUint32(0,` (dấu hiệu ghi độ dài header) giờ chỉ còn ở `frame-builder.js:38`.
+
+⚠️ **Một cái bẫy đã sập và được sửa:** `lookahead-client.js` nay phụ thuộc biến toàn cục
+`buildBinaryAudioPacket`. Trình duyệt luôn có (manifest nạp `frame-builder.js` trước), nhưng
+`buffer-interceptor.test.js` cũng `require("../lib/lookahead-client.js")` mà **không** nạp
+`frame-builder.js` ⇒ test đó **TREO** (không phải fail — một test bị `◖` treo, che mất nguyên nhân)
+thay vì báo lỗi rõ. Cách sửa: cho `lookahead-client.js` tự nạp phụ thuộc **khi chạy dưới Node**:
+
+```js
+if (typeof module !== "undefined" && module.exports && typeof buildBinaryAudioPacket !== "function") {
+  require("./frame-builder.js");
+}
+```
+
+Khối này không chạy trong trình duyệt (cùng pattern với `module.exports` đã có ở cuối file), và
+giúp mọi test hiện/ sau này không phải tự nhớ thứ tự nạp của manifest.
+
+**2. Gói `model_status`** từ **18 dict literal → 1 hàm**:
+`serializers.make_model_status_msg(stage, state, model, message)` nay được dùng ở cả 12 chỗ trong
+`session.py` và 6 chỗ trong `lookahead_handler.py` (trước đây hàm này **chỉ test dùng**). Cả hai file
+đã import hàm; `session.py` bỏ hẳn 12 khối dict 4 dòng.
+
+**Test hồi quy:** `backend/tests/test_71_shared_payload_builders.py` — 5 test, gồm:
+- chốt `"type": "model_status"` không được xuất hiện ngoài `serializers.py` (đã kiểm chứng guard
+  FAIL khi chèn literal giả vào `text_repetition.py`, và pass lại sau khi khôi phục);
+- chốt `setUint32(0,` chỉ có trong `frame-builder.js`;
+- kiểm chứng **hành vi thật** của `frame-builder.js` dưới Node (bố cục 4 byte LE + JSON + PCM khớp).
+
 ### CÒN LẠI (chưa làm — cần quyết định, không thuần cơ học)
 
-- **Định dạng khung audio** còn 1 bản nữa ở `lookahead-client.js:629` (không dùng `frame-builder.js`).
 - **3 bộ dedup với 3 quy tắc chuẩn hoá KHÁC NHAU** — hợp nhất đòi hỏi chọn ngữ nghĩa đúng, có thể đổi hành vi lọc ⇒ cần người quyết.
 - **Chính sách hàng đợi TTS ngược nhau** giữa Pipeline A (gộp) và B (bỏ cũ nhất) — cần chọn một.
-- `make_model_status_msg` vs 18 dict literal rải ở `session.py`/`lookahead_handler.py`.
-- `handleEngineSwitch` / `handleTranslationModelSwitch` — **cố ý không gộp** (xem §P3).
+- `handleEngineSwitch` / `handleTranslationModelSwitch` — **cố ý không gộp** (chỉ giống ~33 %, xem §P3).
 
 ### P2-quater — Đấu dây 6 id mồ côi trong popup ✅ XONG
 
