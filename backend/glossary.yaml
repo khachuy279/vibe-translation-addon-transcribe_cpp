@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Glossary tên riêng / thuật ngữ cho tầng dịch
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Khoá  = chuỗi XUẤT HIỆN NGUYÊN VĂN trong văn bản NGUỒN (tiếng Nhật/Trung/Anh…).
+# Giá trị = cách dịch CỐ ĐỊNH mà model bắt buộc phải dùng.
+#
+# Cơ chế: mỗi mục khớp được đưa vào prompt dưới dạng "Fixed renderings — use these EXACTLY".
+# Khớp theo CHUỖI CON, nên `美咲` cũng khớp trong `美咲さん` ⇒ model chỉ cần ghép kính ngữ.
+#
+# File được đọc lại TỰ ĐỘNG khi mtime đổi — sửa xong không cần restart backend.
+# Có thể ghi đè theo phiên bằng `config.translation.glossary` (dict, ưu tiên cao hơn file này).
+#
+# ════════════════════════════════════════════════════════════════════════════
+# QUAN TRỌNG: bạn KHÔNG cần khai tên riêng ở đây nữa.
+# ════════════════════════════════════════════════════════════════════════════
+# `backend/translation/romaji.py` tự suy cách viết romaji cho tên riêng **ngay từ chuỗi nguồn**
+# (dùng `pykakasi`, thuần Python):
+#
+#     美咲 -> Misaki      田中 -> Tanaka      佐藤 -> Sato      桜井 -> Sakurai
+#     ミサキ -> Misaki    長谷川 -> Hasegawa   林 -> Hayashi
+#
+# Vì đây là hàm XÁC ĐỊNH của văn bản nguồn (không phải của bản dịch), cùng một tên luôn ra cùng
+# một cách viết ở mọi khối — nhất quán mà KHÔNG cần lưu trạng thái, KHÔNG cần "học".
+# Đo thật (Qwen3.5-4B, file này RỖNG, xem report/13 §P4.2b):
+#     không suy tên: 2/4 tên đúng  (田中 -> "Thầy Trung", 美咲 -> "cô Mai" — Hán-Việt hoá)
+#     có suy tên:    4/4 tên đúng  (Tanaka, Misaki, Sato, Sakurai)
+#
+# ⇒ Chỉ khai tay khi bạn MUỐN KHÁC ĐI, ví dụ:
+#     * tên ngoại lai bị phiên âm theo kana: メアリー -> "Mearii" (bạn muốn "Mary")
+#     * cách đọc nanori hiếm:                 一 -> "Ichi"   (bạn muốn "Hajime")
+#     * giữ nguyên kính ngữ Nhật:             田中 -> "Tanaka-san"
+#     * thuật ngữ chuyên ngành, không phải tên riêng.
+# Mục khai tay LUÔN đè lên kết quả suy tự động.
+# Tắt hẳn suy tự động: `config.translation.glossary_derive_names = false`.
+
+terms:
+  # ── Mặc định TRỐNG: tên riêng đã được suy tự động từ nguồn (xem khối giải thích ở trên). ──
+  # Bỏ dấu # ở các dòng dưới để dùng.
+
+  # ── Ví dụ khai tay (đè lên kết quả suy tự động): ──
+  # 美咲: Misaki
+  # 田中: Tanaka
+  # メアリー: Mary            # kana cho "mearii", nhưng bạn muốn "Mary"
+  # 田中: Tanaka-san          # giữ kính ngữ Nhật thay vì "Anh Tanaka"
+
+  # ── Thuật ngữ chuyên ngành cũng dùng chung cơ chế này, ví dụ: ──
+  # 株式会社: công ty cổ phần
+  # 先輩: tiền bối

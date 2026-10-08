@@ -10,6 +10,7 @@ Hỗ trợ:
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import inspect
 import json
 import logging
 import os
@@ -54,8 +55,67 @@ from backend.translation.prompts import get_prompt_strategy
 from backend.utils.model_download import ensure_model_file
 from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TRANSLATION
 from backend.utils.text_repetition import collapse_repetitions
+from backend.translation.glossary import get_glossary
+from backend.translation.pronoun_guard import contains_replaceable_minh, enforce_no_minh
 
 _TRANS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="translation_worker")
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """True nếu `fn` nhận được keyword `name` (kể cả qua `**kwargs`)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # callable dựng bằng C / không introspection được
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _build_batch_prompt(strategy, sentences, source_lang, target_lang, *, context, use_context, terms):
+    """Gọi `build_batch_prompt` kèm gợi ý glossary — chịu được strategy cũ chưa có tham số `terms`.
+
+    Prompt strategy tự viết (fake trong test, plugin bên thứ ba) có thể chưa có `terms`.
+    Thiếu nó KHÔNG phải lỗi chí mạng (chỉ mất gợi ý tên riêng) nên fallback về chữ ký cũ
+    thay vì làm chết đường dịch. Dùng `inspect` (không phải try/except TypeError) để tránh
+    gọi hàm HAI lần khi lỗi TypeError phát sinh từ bên trong thân hàm.
+    """
+    if terms and _accepts_kwarg(strategy.build_batch_prompt, "terms"):
+        return strategy.build_batch_prompt(
+            sentences, source_lang, target_lang,
+            context=context, use_context=use_context, terms=terms,
+        )
+    return strategy.build_batch_prompt(
+        sentences, source_lang, target_lang, context=context, use_context=use_context
+    )
+
+
+def _build_single_prompt(strategy, *, text, source_lang, target_lang, context, use_context, term):
+    """Như `_build_batch_prompt` nhưng cho đường dịch từng câu (Pipeline A)."""
+    if term and _accepts_kwarg(strategy.build_prompt, "term"):
+        return strategy.build_prompt(
+            text=text, source_lang=source_lang, target_lang=target_lang,
+            context=context, use_context=use_context, term=term,
+        )
+    return strategy.build_prompt(
+        text=text, source_lang=source_lang, target_lang=target_lang,
+        context=context, use_context=use_context,
+    )
+
+
+def _enforce_pronouns(text: str, cfg: Any, *, log: bool = True) -> str:
+    """Hậu kiểm ràng buộc đại từ (P4.1). Tắt được bằng `cfg.enforce_pronoun_policy`."""
+    if not text or not getattr(cfg, "enforce_pronoun_policy", True):
+        return text
+    if not contains_replaceable_minh(text):
+        return text
+    fixed = enforce_no_minh(text)
+    if fixed != text and log:
+        logger.info(
+            f"Ép ràng buộc đại từ: đã thay 'mình' -> 'tôi' ({text.count('mình')} chỗ).",
+            extra={"module_tag": "TRANSLATE"},
+        )
+    return fixed
 
 
 def _parse_batch_json(raw_text: str, expected_count: int) -> Optional[List[str]]:
@@ -347,12 +407,17 @@ class GGUFTranslator(BaseTranslator):
             ),
             "stop": strategy.get_stop_tokens(),
         }
-        prompt = strategy.build_prompt(
+        # P4.2: Pipeline A chỉ nhận mục glossary khớp CHÍNH câu này (đổ vào template
+        # `terminology` của upstream). Pipeline B dùng khối ràng buộc cuối prompt thay thế.
+        term_hint = get_glossary().terms_for_single(text, cfg)
+        prompt = _build_single_prompt(
+            strategy,
             text=text,
             source_lang=source_lang,
             target_lang=target_lang,
             context=context,
             use_context=cfg.use_context,
+            term=term_hint,
         )
         return prompt, kwargs
 
@@ -554,6 +619,8 @@ class GGUFTranslator(BaseTranslator):
             # Dọn dẹp khoảng trắng + gộp cụm lặp: model dịch cũng "kẹt vòng" khi đầu vào là
             # chuỗi lặp (ca thật: ASR trả 'ha ha ha…' ⇒ dịch trả về ~150 lần 'ha' trong 2395 ms).
             clean_out = collapse_repetitions(raw_text.replace("<|im_end|>", "").strip())
+            # P4.1: hậu kiểm đại từ — ràng buộc ở prompt không đủ (xem pronoun_guard).
+            clean_out = _enforce_pronouns(clean_out, cfg)
 
             return {
                 "translated_text": clean_out,
@@ -627,8 +694,11 @@ class GGUFTranslator(BaseTranslator):
             ]
 
         use_ctx = bool(context and context.strip())
-        batch_prompt = built_strategy.build_batch_prompt(
-            texts, source_lang, target_lang, context=context, use_context=use_ctx
+        # P4.2: gợi ý glossary tính MỘT lần cho cả khối (tên riêng + thuật ngữ khớp).
+        terms = get_glossary().build_hint(texts, built_cfg)
+        batch_prompt = _build_batch_prompt(
+            built_strategy, texts, source_lang, target_lang,
+            context=context, use_context=use_ctx, terms=terms,
         )
         max_tokens = min(1536, max(256, len(texts) * 80))
         kwargs = {
@@ -645,12 +715,15 @@ class GGUFTranslator(BaseTranslator):
             if llm is None:
                 return list(texts)
             if shared_key != built_key and hasattr(strategy, "build_batch_prompt"):
-                batch_prompt = strategy.build_batch_prompt(
-                    texts, source_lang, target_lang, context=context, use_context=use_ctx
+                batch_prompt = _build_batch_prompt(
+                    strategy, texts, source_lang, target_lang,
+                    context=context, use_context=use_ctx, terms=terms,
                 )
 
             try:
                 output = llm(batch_prompt, **kwargs)
+                # logger.info(f"Prompt: {batch_prompt}", extra={"module_tag": "TRANSLATE"})
+                # logger.info(f"Output: {output}", extra={"module_tag": "TRANSLATE"})
                 raw_text = output["choices"][0].get("text", "")
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Lỗi suy luận batch LLM: {exc}, fallback dịch từng câu", extra={"module_tag": "TRANSLATE"})
@@ -661,7 +734,17 @@ class GGUFTranslator(BaseTranslator):
 
         parsed = _parse_batch_json(raw_text, len(texts))
         if parsed is not None and len(parsed) == len(texts):
-            return parsed
+            # P4.1: hậu kiểm đại từ trên cả khối (một log cho cả khối, không spam từng câu).
+            if not getattr(cfg, "enforce_pronoun_policy", True):
+                return parsed
+            fixed = [_enforce_pronouns(s, cfg, log=False) for s in parsed]
+            fixed_count = sum(1 for a, b in zip(parsed, fixed) if a != b)
+            if fixed_count:
+                logger.info(
+                    f"Ép ràng buộc đại từ (batch {len(texts)} câu): đã sửa {fixed_count} câu.",
+                    extra={"module_tag": "TRANSLATE"},
+                )
+            return fixed
 
         logger.warning(
             f"Parse JSON batch thất bại ({len(raw_text)} chars), fallback dịch tuần tự từng câu. Raw: {raw_text[:200]!r}",
@@ -735,7 +818,9 @@ class GGUFTranslator(BaseTranslator):
                 acc += piece
                 # Gộp cụm lặp NGAY trên bản streaming: nếu model kẹt vòng thì phụ đề không
                 # phình thành một bức tường chữ (và độ dài hiển thị bị chặn trên).
-                yield collapse_repetitions(acc)
+                # P4.1: ép ràng buộc đại từ ngay trên partial — client thay thế cả chuỗi mỗi
+                # lần nhận nên bản sửa luôn thắng bản cũ (không cần chờ tới câu cuối).
+                yield _enforce_pronouns(collapse_repetitions(acc), cfg, log=False)
             if not acc:
                 return
 

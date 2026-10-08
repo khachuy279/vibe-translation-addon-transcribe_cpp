@@ -31,6 +31,7 @@
 #     llama-cpp-python 0.3.35 (binding CPU 7 MB)
 #     transcribe-cpp 0.2.3 · transcribe-cpp-native 0.2.3 · onnxruntime 1.30.0
 #     huggingface-hub 1.32.0 · soundfile 0.14.0 · cryptography 50.0.1 · psutil 7.2.2
+#     pykakasi 2.3.0 (romaji tên riêng, P4.2b — thêm 2026-10-07)
 #     (trước đây còn: torch 2.14.0+cu130 · torchaudio 2.11.0+cu130 · omnivoice 0.2.1 ·
 #      fireredvad 0.0.2 · silero-vad 6.2.3 · funasr 1.4.16)
 #
@@ -157,6 +158,19 @@ kaldiio>=2.18              # đọc `cmvn.ark`
 # ------------------------------------------------------------------ Tải model / giọng
 huggingface_hub>=0.23
 datasets>=2.18              # TUỲ CHỌN — chỉ cần cho backend/voices/wav_downloader.py
+
+# ------------------------------------------------- Tên riêng: romaji hoá (glossary P4.2b)
+# Vì sao cần: `美咲さん` bị model bịa thành `Meisaka` / `Misa` / `Miaki-san` tuỳ model
+# (đo thật ở report/12_qwen35_translation_ab). Cách viết một tên Nhật là HÀM XÁC ĐỊNH của
+# CHUỖI NGUỒN, không phải của bản dịch — nên suy trực tiếp từ nguồn thay vì "học" từ bản dịch
+# (lấy bản dịch của chính model làm chuẩn chỉ khoá cứng sai số của nó; xem report/13).
+# `backend/translation/romaji.py` dùng kiểu `passport` (dành cho TÊN NGƯỜI: 佐藤 -> Sato,
+# không phải `Satou` như hepburn).
+#
+# Thuần Python, không kéo torch/transformers. TỰ CHỌN: thiếu gói này thì `romaji.py` tự lùi về
+# bảng kana thuần Python — vẫn romaji hoá được katakana/hiragana (`ミサキ -> Misaki`), chỉ chịu
+# thua kanji. Backend không hỏng, chỉ mất phần suy tên từ kanji.
+pykakasi>=2.2
 
 # ------------------------------------------------------------------ Lookahead Video Buffering
 

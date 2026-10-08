@@ -2,7 +2,7 @@ default_model: index-translate-9b
 
 models:
   index-translate-2b:
-    name: Index-Translate-2B (Bilibili IndexTeam)
+    name: Index-Translate-2B (Q8_0)
     model: IndexTeam/Index-Translate-2B-GGUF
     gguf_file: Index-Translate-2B.Q8_0.gguf
     temperature: 0.0
@@ -11,15 +11,11 @@ models:
     repetition_penalty: 1.0
     prompt_style: index
     aliases:
-      - index-translate
       - index-2b
-      - index
-      - index-mt-2b
-      - index2b
     description: Siêu nhẹ 2B (en/ja/zh/vi..., ~2.2GB Q8_0)
 
   index-translate-9b:
-    name: Index-Translate-9B (Bilibili IndexTeam)
+    name: Index-Translate-9B (Q4_K_M)
     model: IndexTeam/Index-Translate-9B-GGUF
     gguf_file: Index-Translate-9B.Q4_K_M.gguf
     temperature: 0.0
@@ -29,6 +25,4 @@ models:
     prompt_style: index
     aliases:
       - index-9b
-      - index-mt-9b
-      - index9b
     description: Chất lượng cao 9B (en/ja/zh/vi..., ~5.5GB Q4_K_M)

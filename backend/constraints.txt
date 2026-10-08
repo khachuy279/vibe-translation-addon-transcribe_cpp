@@ -38,3 +38,8 @@
 #       `CUDA : ARCHS = 1200 | BLACKWELL_NATIVE_FP4 = 1`
 #   (wheel cu124 dựng sẵn trước đây: decode 48,3 tok/s · nạp model 4,33 s)
 llama-cpp-python==0.3.35
+
+# Romaji hoá tên riêng Nhật (glossary P4.2b, `backend/translation/romaji.py`).
+# Thuần Python + từ điển đóng gói sẵn; kéo theo `deprecated` + `wrapt`. Ghim để cách viết tên
+# không đổi giữa các máy — đây là thứ ảnh hưởng trực tiếp tới phụ đề hiển thị cho người xem.
+pykakasi==2.3.0

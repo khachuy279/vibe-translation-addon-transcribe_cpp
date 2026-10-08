@@ -28,6 +28,15 @@ Các lỗi đã sửa so với bản cũ:
   ⇒ template ``structured`` chuẩn: ``{format_type}`` + ``"never alter the structure, keys, or placeholders"``.
 * Bổ sung loại ``terminology`` (ràng buộc thuật ngữ) trước đây **hoàn toàn thiếu**.
 
+Phần mở rộng của repo này (KHÔNG thuộc upstream) — bổ sung P4.1/P4.2 ngày 2026-10-07:
+
+* ``_PRONOUN_GUIDANCE_VI`` được siết: nêu đích danh ``chúng mình``/``bọn mình``/``tụi mình``
+  và ánh xạ đại từ nguồn tiếng Nhật, vì bản cũ bị Index-Translate-9B bỏ qua trong log thật.
+* Pipeline B có thêm khối **ràng buộc cứng** đặt SAU payload JSON (``_build_batch_constraints``)
+  kèm gợi ý glossary tên riêng/thuật ngữ từ ``backend/translation/glossary.py``.
+  Đây là sai lệch CHỦ Ý so với upstream, đánh đổi lấy việc tuân thủ ràng buộc; đã đo lại
+  bằng A/B trước khi bật (xem ``report/13_pronoun_and_glossary``).
+
 Ghi chú thiết kế: ``source_lang`` vẫn được nhận trong signature để giữ tương thích
 ngược cho ``engine.py``, nhưng **không** được nhúng vào prompt — cả 3 template chính
 thức đều không có placeholder ngôn ngữ nguồn (model tự nhận diện), thêm vào sẽ lệch spec.
@@ -42,9 +51,21 @@ from typing import Any, Dict, List, Optional
 # --------------------------------------------------------------------------- #
 
 # Hướng dẫn đại từ nhân xưng khi dịch sang tiếng Việt (khi không rõ giới tính/tuổi tác)
+#
+# P4.1 (2026-10-07): siết ràng buộc. Bản cũ chỉ nói "never use the word mình anywhere" và
+# Index-Translate-9B **vẫn vi phạm** (`"tôi còn nói là mình chắc chắn…"` — log thật). Bản mới
+# (a) gọi tên đích danh các dạng ghép ("chúng mình", "bọn mình", "tụi mình") vì model rất hay
+# coi đó là ngoại lệ, (b) nêu ví dụ đại từ NGUỒN tiếng Nhật để model ánh xạ đúng, thay vì chỉ
+# mô tả trừu tượng bằng tiếng Anh.
+#
+# Ràng buộc ở prompt vẫn chỉ là HY VỌNG — bảo đảm nằm ở `pronoun_guard.enforce_no_minh()`,
+# được engine gọi trên mọi đầu ra.
 _PRONOUN_GUIDANCE_VI = (
-    "Requirements: never use the word mình anywhere; strictly translate first-person pronouns as tôi, "
-    "second-person pronouns as bạn, and we as chúng ta. "
+    "Requirements: NEVER output the Vietnamese word \"mình\" in any form — not as a standalone "
+    "pronoun, and not inside \"chúng mình\", \"bọn mình\" or \"tụi mình\"; "
+    "translate first-person pronouns (私, 僕, 俺, 自分) strictly as \"tôi\", "
+    "second-person pronouns (あなた, 君, お前) strictly as \"bạn\", and \"we\" as \"chúng ta\". "
+    "If the source sentence lacks an explicit subject, do NOT invent or assume one (keep it impersonal without arbitrarily adding pronouns). "
 )
 
 # Loại 1: Dịch mặc định (Index-Translate)
@@ -74,6 +95,33 @@ TEMPLATE_STRUCTURED = (
 
 #: Tiêu đề khối ngữ cảnh tham chiếu (phần mở rộng của repo này, KHÔNG thuộc upstream).
 _CONTEXT_HEADER = "Reference translations for context:"
+
+#: Khối ràng buộc CỨNG cho Pipeline B, chèn **SAU** payload JSON.
+#:
+#: Vì sao đặt SAU payload chứ không nhét thêm vào câu lệnh phía trên: model sinh token theo
+#: thứ tự, phần nằm gần lượt `assistant` nhất có trọng số cao nhất (recency). Ràng buộc đại từ
+#: ở bản cũ nằm lọt giữa câu lệnh tiếng Anh và đã bị model bỏ qua trong log thật.
+#:
+#: Chỉ áp cho Pipeline B. Pipeline A (dịch từng câu, ưu tiên độ trễ) đã được siết ngay trong
+#: `_PRONOUN_GUIDANCE_VI` và được `pronoun_guard` hậu kiểm ở tầng engine.
+_BATCH_CONSTRAINTS_HEADER = (
+    "\n\nHard constraints — the answer is REJECTED if any of these is violated:\n"
+    "- Reply with the JSON object ONLY: no markdown fence, no commentary, no extra keys.\n"
+    "- NEVER write the Vietnamese word \"mình\" — not standalone, nor in \"chúng mình\", "
+    "\"bọn mình\", \"tụi mình\". First person = \"tôi\", second person = \"bạn\", we = \"chúng tôi\".\n"
+    "- If the source sentence does not specify a subject, DO NOT add or invent a subject in the translation (keep it impersonal).\n"
+    "- Keep the SAME speaker and the SAME pronouns as the reference context above."
+)
+
+
+def _build_batch_constraints(terms: str = "") -> str:
+    """Khối ràng buộc cuối prompt batch; `terms` là gợi ý glossary (có thể rỗng)."""
+    block = _BATCH_CONSTRAINTS_HEADER
+    for line in (terms or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            block += f"\n- {stripped}"
+    return block
 
 
 _LANG_NAME_MAP = {
@@ -134,6 +182,7 @@ class PromptStrategy:
         format_type: str = "JSON",
         context: str = "",
         use_context: bool = False,
+        terms: str = "",
     ) -> str:
         raise NotImplementedError
 
@@ -198,9 +247,10 @@ class PipelineAPromptStrategy(PromptStrategy):
         format_type: str = "JSON",
         context: str = "",
         use_context: bool = False,
+        terms: str = "",
     ) -> str:
         return PipelineBPromptStrategy().build_batch_prompt(
-            sentences, source_lang, target_lang, format_type, context, use_context
+            sentences, source_lang, target_lang, format_type, context, use_context, terms
         )
 
 
@@ -212,6 +262,10 @@ class PipelineBPromptStrategy(PromptStrategy):
     Dịch gộp toàn bộ các câu trong một khối ASR thành 1 lần gọi LLM duy nhất,
     tối đa hóa tính liền mạch ngữ cảnh hội thoại và tiết kiệm 60-70% thời gian GPU.
     Hỗ trợ kế thừa khối ngữ cảnh hội thoại gần nhất (cross-block context injection).
+
+    P4.1/P4.2 (2026-10-07): sau payload JSON có thêm khối **ràng buộc cứng** (`terms` là gợi ý
+    glossary tên riêng/thuật ngữ). Đặt SAU payload vì lý do recency — xem
+    `_BATCH_CONSTRAINTS_HEADER`.
     """
 
     def build_prompt(
@@ -235,6 +289,7 @@ class PipelineBPromptStrategy(PromptStrategy):
         format_type: str = "JSON",
         context: str = "",
         use_context: bool = False,
+        terms: str = "",
     ) -> str:
         tgt = resolve_lang_name(target_lang)
         data: Dict[str, Any] = {str(i + 1): (s or "").strip() for i, s in enumerate(sentences)}
@@ -247,6 +302,10 @@ class PipelineBPromptStrategy(PromptStrategy):
             pronoun_guidance=pronoun_guide,
             source_text=json_text,
         )
+
+        # Khối ràng buộc đứng SAU payload (recency). `terms` rỗng ⇒ khối vẫn có, chỉ thiếu
+        # dòng glossary — ràng buộc đại từ và "chỉ trả JSON" luôn được áp.
+        instruction += _build_batch_constraints(terms)
 
         user_content = instruction
         if context and use_context:

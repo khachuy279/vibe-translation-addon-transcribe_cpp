@@ -31,6 +31,9 @@ PROJECT_ROOT = BACKEND_DIR.parent
 MODELS_DIR = BACKEND_DIR / "models"
 MODELS_YAML_PATH = BACKEND_DIR / "models.yaml"
 TRANSLATION_MODELS_YAML_PATH = BACKEND_DIR / "translation_models.yaml"
+#: Glossary tên riêng/thuật ngữ (tuỳ chọn) — đọc lại tự động khi file đổi, xem
+#: `backend/translation/glossary.py`.
+GLOSSARY_PATH = BACKEND_DIR / "glossary.yaml"
 VOICES_DIR = BACKEND_DIR / "voices"
 
 # Danh sách ngôn ngữ ASR được hỗ trợ
@@ -381,6 +384,32 @@ class TranslationConfig(BaseModel):
     # HuggingFace (repo ghi trong translation_models.yaml). Tải chạy ở luồng nền, KHÔNG
     # bao giờ chạy trên hot path dịch từng câu; tắt bằng cách đặt false.
     auto_download: bool = True
+
+    # ── Ràng buộc đại từ (P4.1) ───────────────────────────────────────────────
+    #: Ép "không dùng đại từ *mình*" ở TẦNG VĂN BẢN, không chỉ ở prompt.
+    #:
+    #: Vì sao cần: prompt đã ghi rõ `never use the word mình anywhere` nhưng
+    #: Index-Translate-9B vẫn trả "tôi còn nói là **mình** chắc chắn…" (log thật 2026-10-07).
+    #: Ràng buộc ở prompt là hy vọng; hậu kiểm là bảo đảm. Xem
+    #: `backend/translation/pronoun_guard.py` — chỉ thay khi "mình" là ĐẠI TỪ NGÔI THỨ NHẤT,
+    #: giữ nguyên "một mình", "chính mình", "tự mình", "nhà mình", "mình ơi"…
+    enforce_pronoun_policy: bool = True
+
+    # ── Glossary tên riêng / thuật ngữ (P4.2) ─────────────────────────────────
+    #: File YAML chứa bảng "nguồn -> cách dịch cố định" (xem `backend/glossary.yaml`).
+    #: Đọc lại tự động khi mtime đổi. Đặt chuỗi rỗng để tắt hẳn nguồn này.
+    glossary_file: str = str(GLOSSARY_PATH)
+    #: Bảng glossary bổ sung ở tầng runtime (dict). Ưu tiên CAO HƠN file — dùng khi cần
+    #: ghi đè theo phiên mà không muốn sửa file trên đĩa.
+    glossary: Dict[str, str] = Field(default_factory=dict)
+    #: Suy **romaji** cho tên riêng CHƯA khai trong glossary, ngay từ chuỗi nguồn
+    #: (`backend/translation/romaji.py`): `美咲 -> Misaki`, `ミサキ -> Misaki`.
+    #:
+    #: Đây là hàm XÁC ĐỊNH của văn bản nguồn nên cùng một tên luôn ra cùng cách viết ở mọi
+    #: khối — nhất quán mà KHÔNG cần lưu trạng thái, KHÔNG cần "học" từ bản dịch.
+    #: Mục khai tay trong `glossary`/`glossary_file` luôn ĐÈ lên kết quả suy tự động.
+    #: Tắt để quay lại hành vi chỉ-ràng-buộc-nhất-quán (A/B: report/13 §nghiệm thu).
+    glossary_derive_names: bool = True
 
 
 class TTSConfig(BaseModel):
