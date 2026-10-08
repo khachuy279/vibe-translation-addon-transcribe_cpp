@@ -319,14 +319,29 @@ trong service worker (không thể chạy), `SubtitleTimelineQueue.stats()` (19 
 và `window.__bsLookaheadVerbose` (API nói dối: cờ `verbose` không được đọc ở đâu).
 
 **CÒN LẠI của P2 (chưa làm, cần quyết định riêng):**
-- HTML/CSS chết: 6 id trong `popup.html` (`lookaheadStatusDot`, `lookaheadSyncGroup`, `stableToggleRow`,
-  `stableTraceToggleRow`, `duckingSliderRow`, `translationOnceToggleRow`). ⚠️ **KHÔNG xoá vội**: các hàng
-  này vẫn HIỆN trong UI nhưng thiếu handler JS ⇒ đây là **lỗ hổng UX**, không phải markup chết. Cần quyết
-  định: thêm handler hay bỏ hàng.
 - Hợp nhất chồng chéo còn lại (§5): 3 bộ tải `urllib`, định dạng khung audio (còn ở `lookahead-client.js`),
   **3 bộ dedup với 3 quy tắc chuẩn hoá khác nhau** (đây là quyết định ngữ nghĩa, không phải cơ học),
   chính sách hàng đợi TTS ngược nhau, `make_model_status_msg` vs 18 dict literal,
   `popup.js` ~200 dòng lặp (`waitFor*`/`render*`/`monitor*`).
+
+### P2-quater — Đấu dây 6 id mồ côi trong popup ✅ XONG
+
+Phát hiện: **6/78 id** trong `popup.html` không được `popup.js` lẫn `popup.css` nhắc tới. Đây không
+phải "markup chết" mà là **điều khiển ma** — hiện ra nhưng không làm gì:
+
+| Id | Vấn đề thật | Cách xử lý |
+|---|---|---|
+| `stableToggleRow` | Bấm cả HÀNG không có gì xảy ra, trong khi `showOriginalToggleRow`/`ttsToggleRow` bấm được ⇒ cùng một UI, hai hành vi | Đấu dây qua `wireToggleRow` |
+| `stableTraceToggleRow` | nt | nt |
+| `translationOnceToggleRow` | nt | nt |
+| `duckingSliderRow` | Slider "Original audio %" vẫn kéo được khi Auto-Ducking = Off ⇒ điều khiển vô tác dụng | Ẩn khi ducking Off (`updateDuckingUi`) |
+| `lookaheadSyncGroup` | Slider đồng bộ vẫn chỉnh được khi chạy Pipeline A, nhưng `lookaheadSyncOffsetMs` **chỉ** được `ws/lookahead_handler.py` đọc | Thêm `pipelineBOnlyGroups`: làm mờ + ghi chú khi không phải Pipeline B |
+| `lookaheadStatusDot` | **Không phải lỗi** — màu chấm do CSS quyết định qua `.lookahead-status.is-ready/is-low/is-off`. Thêm JS sẽ là LẶP logic | **Xoá id thừa** (giữ class) |
+
+Đồng thời gộp 2 handler bấm-hàng trùng lặp thành một helper `wireToggleRow` (5 hàng dùng chung).
+
+**Test hồi quy:** `backend/tests/test_69_popup_ids_wired.py` — bắt buộc mọi id phải được đấu dây (JS),
+style (CSS), hoặc bị xoá. Đã kiểm chứng guard thật sự FAIL khi chèn một id mồ côi giả tạo.
 
 ### P2-bis — Hợp nhất chồng chéo ✅ XONG (phần cơ học)
 

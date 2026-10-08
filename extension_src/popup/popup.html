@@ -70,7 +70,9 @@
     <!-- Trạng thái buffer Lookahead thay cho HUD nổi trên trang -->
     <div class="setting-group">
       <div class="lookahead-status" id="lookaheadStatus">
-        <span class="lookahead-status-dot" id="lookaheadStatusDot"></span>
+        <!-- Màu chấm do CSS quyết định qua `.lookahead-status.is-ready|is-low|is-off`
+             (class đặt trên #lookaheadStatus) — KHÔNG cần JS, nên không có id ở đây. -->
+        <span class="lookahead-status-dot"></span>
         <span id="lookaheadStatusText">Lookahead: not yet checked</span>
       </div>
     </div>

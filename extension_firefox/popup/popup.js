@@ -59,6 +59,14 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   ].map((id) => document.getElementById(id)).filter(Boolean);
   const PIPELINE_A_ONLY_HINT =
     "Chỉ áp dụng cho Pipeline A (Realtime Streaming). Tắt Lookahead Video Buffering để chỉnh.";
+  //: Ngược lại với `pipelineAOnlyGroups`: các tuỳ chỉnh CHỈ dành cho Pipeline B (Lookahead).
+  //: "Synchronize subtitles / dubbing" gửi `lookaheadSyncOffsetMs`, mà backend chỉ đọc nó trong
+  //: `ws/lookahead_handler.py` (Pipeline A không dùng) ⇒ chạy Pipeline A thì slider vô tác dụng.
+  const pipelineBOnlyGroups = ["lookaheadSyncGroup"]
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+  const PIPELINE_B_ONLY_HINT =
+    "Chỉ áp dụng cho Pipeline B (Lookahead Video Buffering). Bật Lookahead để chỉnh.";
   //: Timer làm mới trạng thái Lookahead khi popup đang mở.
   let lookaheadStatusTimer = null;
   //: Trạng thái Pipeline và tính khả dụng Lookahead
@@ -66,6 +74,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   let isLookaheadUnavailable = false; // true khi video không hỗ trợ MSE / không khả dụng
   // Chẩn đoán: log mỗi nhịp preview ([SEG_TRACE]) — mặc định TẮT.
   const chkStableTrace = document.getElementById("chkStableTrace");
+  //: Hàng bọc công tắc — bấm cả hàng cũng bật/tắt (xem `wireToggleRow`).
+  const stableToggleRow = document.getElementById("stableToggleRow");
+  const stableTraceToggleRow = document.getElementById("stableTraceToggleRow");
+  const translationOnceToggleRow = document.getElementById("translationOnceToggleRow");
   const valMinWords = document.getElementById("valMinWords");
   const selSourceLang = document.getElementById("selSourceLang");
   const selTargetLang = document.getElementById("selTargetLang");
@@ -95,6 +107,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   const selTtsDucking = document.getElementById("selTtsDucking");
   const rangeDuckingLevel = document.getElementById("rangeDuckingLevel");
   const valDuckingLevel = document.getElementById("valDuckingLevel");
+  const duckingSliderRow = document.getElementById("duckingSliderRow");
 
   let availableVoices = [];
   let savedPreferredVoiceId = null;
@@ -282,6 +295,35 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (valLookaheadSync && rangeLookaheadSync) valLookaheadSync.textContent = rangeLookaheadSync.value;
     // Vô hiệu/mở lại nhóm tuỳ chỉnh CHỈ dành cho Pipeline A theo trạng thái Lookahead.
     updatePipelineAOnlyUi();
+    updateDuckingUi();
+  }
+
+  /**
+   * Hàng "Original audio %" CHỈ có nghĩa khi Auto-Ducking BẬT.
+   *
+   * VÌ SAO CẦN ẨN: `rangeDuckingLevel` điều khiển mức âm lượng tiếng gốc khi lồng tiếng. Nếu
+   * người dùng đặt Auto-Ducking = Off thì slider vẫn kéo được nhưng KHÔNG có tác dụng nào —
+   * đúng loại "điều khiển ma" mà ghi chú ở `pipelineAOnlyGroups` muốn tránh.
+   */
+  function updateDuckingUi() {
+    if (!duckingSliderRow) return;
+    const duckingOn = !selTtsDucking || selTtsDucking.value === "true";
+    duckingSliderRow.style.display = duckingOn ? "" : "none";
+  }
+
+  /**
+   * Bấm vào CẢ HÀNG để bật/tắt công tắc của hàng đó.
+   *
+   * Bấm trực tiếp vào `.switch` thì nhường cho chính công tắc xử lý (nếu không sẽ lật 2 lần).
+   * Dùng chung cho mọi `.toggle-row` để 5 hàng có cùng một hành vi.
+   */
+  function wireToggleRow(row, checkbox) {
+    if (!row || !checkbox) return;
+    row.addEventListener("click", (e) => {
+      if (e.target.closest(".switch")) return;
+      checkbox.checked = !checkbox.checked;
+      checkbox.dispatchEvent(new Event("change"));
+    });
   }
 
   /**
@@ -318,6 +360,10 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     pipelineAOnlyGroups.forEach((el) => {
       el.style.opacity = editable ? "1" : "0.45";
       el.title = isPipelineB ? PIPELINE_A_ONLY_HINT : "";
+    });
+    pipelineBOnlyGroups.forEach((el) => {
+      el.style.opacity = isPipelineB ? "1" : "0.45";
+      el.title = isPipelineB ? "" : PIPELINE_B_ONLY_HINT;
     });
     ["pipelineAOnlyNote", "pipelineAOnlyNote2"].forEach((id) => {
       const note = document.getElementById(id);
@@ -1367,15 +1413,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   if (chkTranslationOnce) chkTranslationOnce.onchange = () => onSettingChange(true);
   if (chkShowOriginal) chkShowOriginal.onchange = () => onSettingChange(true);
 
-  if (showOriginalToggleRow && chkShowOriginal) {
-    showOriginalToggleRow.addEventListener("click", (e) => {
-      if (e.target.closest(".switch")) {
-        return;
-      }
-      chkShowOriginal.checked = !chkShowOriginal.checked;
-      chkShowOriginal.dispatchEvent(new Event("change"));
-    });
-  }
+  //: Bấm vào cả hàng để bật/tắt — 5 hàng công tắc dùng chung một hành vi.
+  wireToggleRow(showOriginalToggleRow, chkShowOriginal);
+  wireToggleRow(stableToggleRow, chkStableCut);
+  wireToggleRow(stableTraceToggleRow, chkStableTrace);
+  wireToggleRow(translationOnceToggleRow, chkTranslationOnce);
 
   function syncTtsConfig(enabled) {
     const payload = {
@@ -1411,16 +1453,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     });
   }
 
-  const ttsToggleRow = document.getElementById("ttsToggleRow");
-  if (ttsToggleRow && chkEnableTts) {
-    ttsToggleRow.addEventListener("click", (e) => {
-      if (e.target.closest(".switch")) {
-        return;
-      }
-      chkEnableTts.checked = !chkEnableTts.checked;
-      chkEnableTts.dispatchEvent(new Event("change"));
-    });
-  }
+  wireToggleRow(document.getElementById("ttsToggleRow"), chkEnableTts);
 
   if (selTtsVoice) {
     selTtsVoice.onchange = () => {
@@ -1430,6 +1463,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   }
   if (selTtsSpeed) selTtsSpeed.onchange = onSettingChange;
   if (selTtsDucking) selTtsDucking.onchange = onSettingChange;
+  if (selTtsDucking) selTtsDucking.addEventListener("change", updateDuckingUi);
   if (rangeDuckingLevel) rangeDuckingLevel.oninput = onSettingChange;
 
   function setUI(active, audioRate = null, pipeline = null) {
