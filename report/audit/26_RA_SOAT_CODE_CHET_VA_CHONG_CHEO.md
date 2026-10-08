@@ -352,9 +352,39 @@ ngôn ngữ; bản dịch chỉ gửi `translation_model` và không fetch lại
 trường — tức là **abstraction giả**, khó đọc hơn hai hàm tường minh. Đây là cùng loại lỗi với
 "chồng chéo chức năng", chỉ ngược chiều.
 
+### P3-bis — Hợp nhất 3 bộ tải `urllib` ✅ XONG
+
+Ba đường tải khác nhau về hình dạng, nay cùng đi qua hai helper dùng chung trong
+`backend/utils/model_download.py`:
+
+| | Trước | Sau |
+|---|---|---|
+| `utils/crispasr_native.py` | `urlopen` + hash gói + ghi zip tạm 157 MB + giải nén | `fetch_verified_bytes([BUNDLE_URL], …)` + giải nén **trong RAM** (`io.BytesIO`) — bỏ hẳn file zip tạm |
+| `vad/silero_onnx.py` | `urlopen` trong vòng lặp nhiều URL + min-size + ghi `.onnx.part` | `fetch_verified_bytes(SILERO_ONNX_URLS, …, min_bytes=…)` + `write_bytes_atomic` |
+| `vad/engines/firered_onnx.py` | `urlopen` + hash + ghi `.part` | `fetch_verified_bytes([url], …)` + `write_bytes_atomic` |
+
+**Hai helper mới:**
+- `fetch_verified_bytes(urls, expected_sha256, *, label, module_tag, timeout_sec, min_bytes)`
+  — thử lần lượt các URL ứng viên, trả bản **đầu tiên khớp SHA-256**; trả `None` nếu hỏng hết
+  (**không ném**, vì hai đường hiện có hai hợp đồng khác nhau: CrispASR ném, VAD trả `False`).
+- `write_bytes_atomic(target, data)` — ghi qua `.part` rồi `replace()`, không để lại file dở dang.
+
+**Kiểm chứng:** `urlopen` giờ chỉ xuất hiện **1 lần** trong toàn bộ backend (trong `model_download.py`).
+Đã xoá kèm: `crispasr_native` bỏ import `urllib.*`, `silero_onnx` bỏ `urllib.*`,
+`firered_onnx` bỏ `urllib.*` + hàm `_sha256_of_bytes` (nay mồ côi).
+
+**Test hồi quy:** `backend/tests/test_70_shared_download_helper.py` — 6 test, gồm chốt mã nguồn
+(`urlopen` phải đúng 1 chỗ, đã kiểm chứng guard FAIL khi chèn chỗ thứ hai) và 4 test HÀNH VI
+(hash sai ⇒ từ chối; URL hỏng ⇒ thử URL dự phòng; `min_bytes` chặn file cụt; không để lại `.part`).
+
+**Một va chạm test đáng ghi lại:** bản đầu tôi đặt `module_tag: str = "DL"` → `test_20` báo
+"module_tag ngoài danh sách chuẩn". Sửa thành **bắt buộc** truyền `module_tag` thì `test_20` lại
+báo "thiếu module_tag", vì bộ phân giải AST chỉ đọc được literal / hằng cấp module / **tham số có
+default literal**. Kết luận: giữ tham số nhưng cho default hợp lệ (`"MAIN"`), và mọi caller trong
+repo đều truyền tag riêng (`"ASR"` cho CrispASR, `"VAD"` cho 2 đường ONNX).
+
 ### CÒN LẠI (chưa làm — cần quyết định, không thuần cơ học)
 
-- **3 bộ tải `urllib`** (`crispasr_native`, `silero_onnx`, `firered_onnx`) → hợp nhất về `utils/model_download`.
 - **Định dạng khung audio** còn 1 bản nữa ở `lookahead-client.js:629` (không dùng `frame-builder.js`).
 - **3 bộ dedup với 3 quy tắc chuẩn hoá KHÁC NHAU** — hợp nhất đòi hỏi chọn ngữ nghĩa đúng, có thể đổi hành vi lọc ⇒ cần người quyết.
 - **Chính sách hàng đợi TTS ngược nhau** giữa Pipeline A (gộp) và B (bỏ cũ nhất) — cần chọn một.

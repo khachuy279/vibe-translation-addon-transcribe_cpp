@@ -33,8 +33,6 @@ from __future__ import annotations
 import enum
 import math
 import threading
-import urllib.error
-import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,7 +42,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from backend.utils.logger import logger
-from backend.utils.model_download import sha256_bytes as _shared_sha256_bytes
+from backend.utils.model_download import fetch_verified_bytes, write_bytes_atomic
 
 #: Hình học frame của upstream (`fireredvad/core/constants.py`) — KHÔNG đổi được.
 FRAME_LENGTH_SAMPLE = 400   # cửa sổ 25 ms
@@ -313,44 +311,13 @@ class StreamVadPostprocessor:
 # =========================================================================== model files
 def _download(url: str, target: Path, expected_sha256: str) -> bool:
     """Tải 1 file + xác thực SHA-256. Trả `False` (không ném) nếu hỏng."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".part")
-    try:
-        logger.info(f"Đang tải {target.name} từ {url} ...", extra={"module_tag": "VAD"})
-        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 - URL hằng số
-            data = resp.read()
-        digest = _sha256_of_bytes(data)
-        if digest != expected_sha256:
-            logger.warning(
-                f"{target.name} tải về có SHA-256 {digest} khác giá trị mong đợi "
-                f"{expected_sha256} — TỪ CHỐI dùng file này.",
-                extra={"module_tag": "VAD"},
-            )
-            return False
-        tmp.write_bytes(data)
-        tmp.replace(target)
-        logger.info(
-            f"Đã tải {target.name} ({len(data) / 1e6:.2f} MB, sha256 khớp)",
-            extra={"module_tag": "VAD"},
-        )
-        return True
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logger.warning(
-            f"Không tải được {target.name} từ {url}: {type(exc).__name__}: {exc}",
-            extra={"module_tag": "VAD"},
-        )
+    data = fetch_verified_bytes(
+        [url], expected_sha256, label=target.name, timeout_sec=120, module_tag="VAD"
+    )
+    if data is None:
         return False
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-
-
-def _sha256_of_bytes(data: bytes) -> str:
-    """SHA-256 của buffer. Uỷ quyền cho helper DÙNG CHUNG ở `backend.utils.model_download`."""
-    return _shared_sha256_bytes(data)
+    write_bytes_atomic(target, data)
+    return True
 
 
 def ensure_firered_onnx_files(model_dir: Path, *, allow_download: bool = True) -> None:

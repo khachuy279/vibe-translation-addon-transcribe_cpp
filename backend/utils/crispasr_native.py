@@ -44,7 +44,7 @@ import numpy as np
 from backend.config import BACKEND_DIR, MODELS_DIR
 from backend.utils.logger import logger
 from backend.utils.model_download import (
-    sha256_bytes as _shared_sha256_bytes,
+    fetch_verified_bytes,
     sha256_file as _shared_sha256_file,
 )
 
@@ -147,8 +147,7 @@ def ensure_lib_files(
 
     Trả về thư mục DLL. Ném `FileNotFoundError` nếu thiếu và không được phép/khoong tải được.
     """
-    import urllib.error
-    import urllib.request
+    import io
     import zipfile
 
     target = Path(lib_dir) if lib_dir else (Path(BACKEND_DIR) / "bin" / _DLL_DIR_NAME)
@@ -164,22 +163,22 @@ def ensure_lib_files(
         )
 
     target.mkdir(parents=True, exist_ok=True)
-    zip_path = target / ".bundle.download.zip"
     try:
         logger.info(
             f"Thiếu DLL CrispASR — đang tải {BUNDLE_ASSET} (~157 MB) từ GitHub Releases...",
             extra={"module_tag": _TAG},
         )
-        with urllib.request.urlopen(BUNDLE_URL, timeout=300) as resp:  # noqa: S310 - URL hằng số
-            data = resp.read()
-        digest = _shared_sha256_bytes(data)
-        if digest != BUNDLE_SHA256:
+        data = fetch_verified_bytes(
+            [BUNDLE_URL], BUNDLE_SHA256, label=BUNDLE_ASSET, timeout_sec=300, module_tag=_TAG
+        )
+        if data is None:
             raise RuntimeError(
-                f"Gói DLL tải về có SHA-256 {digest} khác giá trị mong đợi {BUNDLE_SHA256} — TỪ CHỐI."
+                f"Không tải được gói DLL (mạng hỏng, hoặc SHA-256 không khớp {BUNDLE_SHA256})."
             )
-        zip_path.write_bytes(data)
 
-        with zipfile.ZipFile(zip_path) as zf:
+        # Giải nén NGAY TRONG RAM: `data` vốn đã nằm trọn trong bộ nhớ, ghi thêm một file zip
+        # tạm ~157 MB chỉ để đọc lại là lãng phí.
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = {n.split("/")[-1]: n for n in zf.namelist()}
             for name in REQUIRED_DLLS:
                 src = names.get(name)
@@ -197,19 +196,13 @@ def ensure_lib_files(
             extra={"module_tag": _TAG},
         )
         return target
-    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
         raise FileNotFoundError(
             f"Không tải được DLL CrispASR: {type(exc).__name__}: {exc}\n"
             f"  • Tải thủ công `{BUNDLE_ASSET}` từ {BUNDLE_URL},\n"
             f"    giải nén và chép {', '.join(REQUIRED_DLLS)} vào {target}.\n"
             f"  • Hoặc đặt `{ENV_LIB_DIR}` trỏ tới thư mục đã có `crispasr.dll`."
         ) from exc
-    finally:
-        if zip_path.exists():
-            try:
-                zip_path.unlink()
-            except OSError:
-                pass
 
 
 # =========================================================================== đường dẫn

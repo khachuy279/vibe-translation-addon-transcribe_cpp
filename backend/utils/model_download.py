@@ -21,7 +21,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from backend.config import MODELS_DIR
 from backend.utils.logger import logger
@@ -96,6 +96,90 @@ def verify_sha256(path: Path, expected_hex: str) -> bool:
         return sha256_file(path) == expected
     except OSError:
         return False
+
+
+def fetch_verified_bytes(
+    urls: Sequence[str],
+    expected_sha256: str,
+    *,
+    label: str,
+    module_tag: str = "MAIN",
+    timeout_sec: float = 120.0,
+    min_bytes: int = 0,
+) -> Optional[bytes]:
+    """Tải bytes từ danh sách URL ỨNG VIÊN, trả về bản ĐẦU TIÊN khớp SHA-256.
+
+    DÙNG CHUNG cho mọi đường tải `urllib` trong repo (CrispASR, Silero ONNX, FireRed ONNX).
+    Trước đây mỗi module tự viết lại vòng `urlopen` + kiểm hash + ghi file ⇒ lệch nhau về
+    timeout, về thông báo lỗi, và có nơi quên xác thực hẳn.
+
+    Trả `None` nếu MỌI URL đều hỏng / quá nhỏ / sai hash — **KHÔNG ném**. Caller tự quyết định
+    ném `FileNotFoundError` hay trả `False`, vì hai đường hiện có hai hợp đồng khác nhau.
+
+    `min_bytes` > 0 để chặn file cụt (dùng cho Silero ONNX).
+
+    `module_tag` phải nằm trong danh sách chuẩn (`backend/tests/test_20_logging_convention.py`).
+    Mặc định `"MAIN"` chỉ để an toàn — mọi caller trong repo đều truyền tag của module mình
+    (CrispASR / `"VAD"`) để log còn truy được nguồn.
+    """
+    import urllib.error
+    import urllib.request
+
+    candidates = list(urls)
+    for url in candidates:
+        try:
+            logger.info(f"Đang tải {label} từ {url} ...", extra={"module_tag": module_tag})
+            with urllib.request.urlopen(url, timeout=timeout_sec) as resp:  # noqa: S310 - URL hằng số
+                data = resp.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.warning(
+                f"Không tải được {label} từ {url}: {type(exc).__name__}: {exc}",
+                extra={"module_tag": module_tag},
+            )
+            continue
+
+        if min_bytes and len(data) < min_bytes:
+            logger.warning(
+                f"{label} tải từ {url} về file quá nhỏ ({len(data)} byte < {min_bytes}) — bỏ qua.",
+                extra={"module_tag": module_tag},
+            )
+            continue
+
+        digest = sha256_bytes(data)
+        if digest != (expected_sha256 or "").strip().lower():
+            logger.warning(
+                f"{label} tải từ {url} có SHA-256 {digest} khác giá trị mong đợi "
+                f"{expected_sha256} — TỪ CHỐI dùng file này.",
+                extra={"module_tag": module_tag},
+            )
+            continue
+
+        logger.info(
+            f"Đã tải {label} ({len(data) / 1e6:.2f} MB, sha256 khớp)",
+            extra={"module_tag": module_tag},
+        )
+        return data
+
+    logger.warning(
+        f"Không có URL nào dùng được cho {label} (đã thử {len(candidates)}).",
+        extra={"module_tag": module_tag},
+    )
+    return None
+
+
+def write_bytes_atomic(target: Path, data: bytes) -> None:
+    """Ghi `data` xuống `target` qua file tạm rồi `replace()` — không để lại file dở dang."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".part")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(target)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _mb(num_bytes: Optional[float]) -> Optional[float]:

@@ -30,15 +30,17 @@ State (`state`, `context`) do **caller sở hữu** thay vì giấu trong model 
 from __future__ import annotations
 
 import threading
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
 from backend.utils.logger import logger
-from backend.utils.model_download import sha256_bytes as _shared_sha256_bytes
+from backend.utils.model_download import (
+    fetch_verified_bytes,
+    sha256_bytes as _shared_sha256_bytes,
+    write_bytes_atomic,
+)
 
 #: Cửa sổ bắt buộc của Silero @16 kHz (32 ms) — KHÔNG đổi được.
 WINDOW_SAMPLES = 512
@@ -118,46 +120,18 @@ def _sha256(data: bytes) -> str:
 
 def _download_onnx(target: Path) -> bool:
     """Tải model ONNX từ nguồn chính thức + xác thực SHA-256. Trả `False` nếu mọi URL hỏng."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".onnx.part")
-    for url in SILERO_ONNX_URLS:
-        try:
-            logger.info(f"Đang tải Silero VAD ONNX từ {url} ...", extra={"module_tag": "VAD"})
-            with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: S310 - URL hằng số
-                data = resp.read()
-            if len(data) < _MIN_VALID_BYTES:
-                logger.warning(
-                    f"Tải Silero ONNX từ {url} về file quá nhỏ ({len(data)} byte) — bỏ qua.",
-                    extra={"module_tag": "VAD"},
-                )
-                continue
-            digest = _sha256(data)
-            if digest != EXPECTED_SHA256:
-                logger.warning(
-                    f"Silero ONNX tải từ {url} có SHA-256 {digest} khác giá trị mong đợi "
-                    f"{EXPECTED_SHA256} — TỪ CHỐI dùng file này.",
-                    extra={"module_tag": "VAD"},
-                )
-                continue
-            tmp.write_bytes(data)
-            tmp.replace(target)
-            logger.info(
-                f"Đã tải Silero VAD ONNX về {target} ({len(data) / 1e6:.2f} MB, sha256 khớp)",
-                extra={"module_tag": "VAD"},
-            )
-            return True
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.warning(
-                f"Không tải được Silero ONNX từ {url}: {type(exc).__name__}: {exc}",
-                extra={"module_tag": "VAD"},
-            )
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-    return False
+    data = fetch_verified_bytes(
+        SILERO_ONNX_URLS,
+        EXPECTED_SHA256,
+        label="Silero VAD ONNX",
+        timeout_sec=60,
+        min_bytes=_MIN_VALID_BYTES,
+        module_tag="VAD",
+    )
+    if data is None:
+        return False
+    write_bytes_atomic(target, data)
+    return True
 
 
 def ensure_silero_onnx_model(target: Optional[Path] = None, *, allow_download: bool = True) -> Path:
