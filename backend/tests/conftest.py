@@ -20,6 +20,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from backend.tests.bench_report_paths import (  # noqa: E402
+    WRITE_BENCH_REPORT_ENV,
+    report_tree_digest,
+    resolve_report_dir,
+    write_real_bench_reports,
+)
+
 from backend.utils.cuda import setup_cuda_dll_paths
 setup_cuda_dll_paths()
 
@@ -45,7 +52,6 @@ except Exception:
     pass
 
 WAV_TEST_DIR = _PROJECT_ROOT / "wav_test"
-REPORT_DIR = _PROJECT_ROOT / "report"
 
 # Bản GỐC của hai method bị guard autouse thay thế (xem `allow_real_translation_methods`).
 # Phải lấy trước khi guard chạy — tức ngay lúc import conftest.
@@ -127,8 +133,56 @@ def wav_test_dir() -> Path:
 
 
 @pytest.fixture
-def report_dir() -> Path:
-    return REPORT_DIR
+def report_dir(tmp_path) -> Path:
+    """Thư mục gốc để test ghi báo cáo benchmark.
+
+    MẶC ĐỊNH là thư mục TẠM của pytest (`tmp_path`). Trước 2026-10-08 fixture này
+    trả thẳng `report/` thật, nên `test_04_commit_logic` — test DUY NHẤT ghi báo cáo
+    mà KHÔNG có marker `slow`, tức chạy trong mọi lần `pytest` mặc định — ghi đè
+    `report/04_commit_logic/report.md` đã commit. Hệ quả: cây làm việc luôn bẩn sau
+    mỗi lần chạy test, và một lần báo cáo đó suýt bị commit nhầm.
+
+    Muốn CẬP NHẬT báo cáo đã commit thì bật cờ tường minh:
+
+        $env:WRITE_BENCH_REPORT = "1"; pytest -m slow
+
+    `test_06_tts_benchmark` / `test_07_e2e_comparison` không dùng fixture này: chúng
+    ghi báo cáo trong `main()` — chỉ chạy khi gọi tay `python -m backend.tests.test_06…`,
+    không bao giờ được pytest thu thập, nên vẫn ghi thẳng vào `report/` là đúng.
+    """
+    return resolve_report_dir(tmp_path)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_report_tree():
+    """Chốt: `pytest` chạy MẶC ĐỊNH không được sửa báo cáo benchmark đã commit.
+
+    Đây là rào chắn ở tầng thấp nhất: nó không quan tâm test dùng fixture nào hay
+    ghi bằng cách nào, chỉ so cây báo cáo trước và sau cả phiên test. Nhờ vậy nó bắt
+    được cả những đường ghi trong tương lai mà `report_dir` không kiểm soát.
+
+    Bỏ qua khi `WRITE_BENCH_REPORT` được bật (lúc đó ghi vào `report/` là chủ ý).
+    """
+    if write_real_bench_reports():
+        yield
+        return
+
+    before = report_tree_digest()
+    yield
+    after = report_tree_digest()
+    if before == after:
+        return
+
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    modified = sorted(k for k in before if k in after and before[k] != after[k])
+    raise AssertionError(
+        "Phiên pytest MẶC ĐỊNH đã sửa báo cáo benchmark đã commit "
+        f"(thêm={added} xoá={removed} sửa={modified}). "
+        "Test KHÔNG được ghi vào báo cáo đã commit khi chưa được yêu cầu: hãy lấy "
+        "đường dẫn từ fixture `report_dir` (mặc định trỏ vào tmp), hoặc đặt "
+        f"{WRITE_BENCH_REPORT_ENV}=1 nếu thật sự muốn cập nhật báo cáo."
+    )
 
 
 def _snapshot(obj: Any) -> Dict[str, Any]:

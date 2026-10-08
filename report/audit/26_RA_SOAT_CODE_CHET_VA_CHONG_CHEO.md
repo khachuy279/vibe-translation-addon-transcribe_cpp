@@ -543,7 +543,10 @@ giúp mọi test hiện/ sau này không phải tự nhớ thứ tự nạp củ
 - chốt `setUint32(0,` chỉ có trong `frame-builder.js`;
 - kiểm chứng **hành vi thật** của `frame-builder.js` dưới Node (bố cục 4 byte LE + JSON + PCM khớp).
 
-### CÒN LẠI — ✅ KHÔNG CÒN VIỆC NÀO (đã kiểm chứng lại 2026-10-08)
+### CÒN LẠI — ✅ KHÔNG CÒN VIỆC NÀO TRONG §5 (đã kiểm chứng lại 2026-10-08)
+
+> **Đính chính cùng ngày:** đúng sau khi mục này được viết, một lỗi **ngoài §5** lộ ra —
+> test ghi đè báo cáo đã commit. Xem **§P2-quinquies**. Câu "không còn việc nào" chỉ đúng cho §5.
 
 Toàn bộ §5 đã xử lý xong. Ba mục **cố ý KHÔNG gộp** (khác biệt là có chủ đích, đã ghi lý do vào
 docstring từng chỗ):
@@ -596,7 +599,57 @@ dùng: khối HTML comment `#lblActiveModel` + `popup.js:70` + 3 nhánh `if` + 5
 **GIỮ LẠI có chủ đích:** `stream_reset` (backend gửi, extension không nhận) — `test_21_seek_reset.py:143`
 khẳng định đây là hành vi CÓ CHỦ ĐÍCH. Client bỏ qua một thông báo thông tin không biến nó thành code chết.
 
-### Bốn bài học đo được (đã trả giá để biết)
+### P2-quinquies — Test ghi đè báo cáo ĐÃ COMMIT ✅ XONG
+
+**Phát hiện 2026-10-08, SAU khi mục "CÒN LẠI" ở trên được viết.** Đây không phải code chết mà là
+một lỗi vệ sinh repo, lộ ra qua hậu quả: nó suýt làm bẩn một commit.
+
+`conftest.report_dir` trả thẳng `report/` — cây **đã được git track**. Trong 6 test ghi báo cáo
+benchmark, `test_04_commit_logic` là test **duy nhất không có marker `slow`**:
+
+| Test | Marker | Chạy trong `pytest` mặc định? | Ghi vào |
+|---|---|---|---|
+| `test_01_core_audio` | `slow` | không | `report/01_core_audio/report.md` |
+| `test_02_vad_benchmark` | `slow` | không | `report/02_vad/report.md` |
+| `test_03_asr_benchmark` | `slow` | không | `report/03_asr/report.md` |
+| **`test_04_commit_logic`** | **(không có)** | **CÓ** | **`report/04_commit_logic/report.md`** |
+| `test_05_translation_benchmark` | `slow` | không | `report/05_translation/report.md` |
+| `test_43_vad_ava_speech` | `slow` | không | `report/02_vad/ava_speech_report.md` |
+
+Báo cáo chứa dòng `Thời gian thực hiện`, nên **mỗi lần chạy `pytest` mặc định là file đổi nội dung**.
+Hậu quả thật đã xảy ra: `report/04_commit_logic/report.md` lọt vào commit và phải `git commit --amend`
+để loại ra.
+
+`test_06_tts_benchmark` / `test_07_e2e_comparison` **không** thuộc nhóm này: chúng ghi báo cáo trong
+`main()`, không hàm `test_*` nào ghi — pytest không bao giờ thu thập chúng. Ghi thẳng vào `report/`
+khi chạy tay `python -m backend.tests.test_06…` là **đúng**, giữ nguyên.
+
+**Cách sửa:** `report_dir` mặc định trỏ vào thư mục TẠM; muốn cập nhật báo cáo đã commit phải bật cờ
+tường minh `WRITE_BENCH_REPORT=1`. Logic tách ra `backend/tests/bench_report_paths.py` vì
+`backend/tests/` không phải package (không có `__init__.py`) — import `conftest` từ test sẽ chạy nó
+**lần thứ hai**, lặp lại toàn bộ thiết lập DLL/model.
+
+**Hai lớp guard, cả hai đã được chứng minh là THẬT SỰ đổ khi tái tạo bug:**
+
+1. `backend/tests/test_76_bench_report_isolation.py` — chốt hàm phân giải đường dẫn (cả hai nhánh),
+   và chốt `test_04` phải lấy đường dẫn từ fixture chứ không tự dựng hằng số trỏ vào `report/`.
+2. Fixture session autouse `_guard_real_report_tree` trong `conftest.py` — băm **toàn bộ** cây
+   `report/` trước và sau phiên test, đổ nếu có gì thay đổi. Nó không quan tâm test ghi bằng cách
+   nào hay dùng fixture gì, nên bắt được cả những đường ghi trong tương lai mà `report_dir` không
+   kiểm soát.
+
+**Kiểm chứng ngược (falsification):** tạm sửa `resolve_report_dir` trả về cây thật ⇒ guard đổ đúng
+`AssertionError: … sửa=['04_commit_logic\\report.md']`; khôi phục ⇒ xanh lại. Nhánh opt-in cũng đã
+kiểm: bật `WRITE_BENCH_REPORT=1` thì guard **bỏ qua** và báo cáo được ghi vào `report/` thật như chủ ý.
+
+**Một false positive đã gặp và đã sửa (đáng ghi lại).** Bản đầu của guard băm **cả cây** `report/`.
+Nó báo động sai ngay ở lần chạy đầy đủ đầu tiên — vì chính người viết đang sửa
+`report/audit/26_…md` trong lúc suite chạy. Sửa tài liệu phân tích là việc bình thường, không được
+làm đỏ bộ test. Guard nay chỉ canh **7 thư mục báo cáo benchmark** (`01_core_audio` … `07_final_e2e_comparison`),
+đúng tập mà test có thể ghi ra; tài liệu do người viết nằm ngoài phạm vi. Đã kiểm chứng lại: sửa
+`report/audit/**` giữa lúc suite chạy **không** còn gây đỏ, còn tái tạo bug cũ thì guard vẫn đổ.
+
+### Năm bài học đo được (đã trả giá để biết)
 
 1. **Đếm bằng regex là SAI.** Bản đầu của bộ dò tính cả comment/docstring là "tham chiếu". Hậu quả:
    `native_bundle_source`, `build_glossary_hint`, `import_error`, `has_voice`, `restore` bị ẩn khỏi báo cáo.
@@ -614,4 +667,9 @@ khẳng định đây là hành vi CÓ CHỦ ĐÍCH. Client bỏ qua một thôn
    đỏ ngay. Đã khôi phục kèm comment cảnh báo. Cùng lớp lỗi với `supportsGainDucking` (bài học 2):
    **API công khai tồn tại để bên ngoài dùng, kể cả khi bên ngoài đó là test.**
    → Quy tắc rút ra: trước khi xoá bất kỳ symbol nào của extension, bắt buộc grep **cả `backend/tests/`**.
+5. **Test không được ghi vào artifact đã commit.** `test_04_commit_logic` ghi đè
+   `report/04_commit_logic/report.md` trong mọi lần `pytest` mặc định, chỉ vì nó thiếu marker `slow`
+   mà 5 test anh em đều có. Không test nào đỏ, không ai báo — nó chỉ lộ ra khi `git status` bẩn và
+   một báo cáo đo lường suýt vào commit. ⇒ Báo cáo benchmark phải ghi vào thư mục tạm theo mặc định,
+   và chỉ ghi vào cây thật khi có cờ tường minh (xem §P2-quinquies).
 
