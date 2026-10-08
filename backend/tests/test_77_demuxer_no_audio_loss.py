@@ -149,3 +149,62 @@ def test_ket_qua_fallback_khong_duoc_vut_pcm_cua_duong_chuan(fmp4_40s, monkeypat
         f"trả về chỉ còn {got_span:.2f}s — `return per_frag` đã vứt `chunks`"
     )
     assert any(c.pts_start >= 38.0 for c in chunks), "PCM của đường dự phòng phải được giữ"
+
+
+# ── 3. `tfdt` phải quy đổi theo TIMESCALE của track ───────────────────────────
+
+def test_quy_doi_tfdt_theo_timescale_cua_track(fmp4_40s, monkeypatch):
+    """`tfdt` chia cho TIMESCALE của track, KHÔNG chia cho sample rate.
+
+    Log thật 2026-10-08 (xhamster, fMP4 muxed AV1+AAC): bộ đệm chỉ giữ ~100 s audio
+    nhưng `tfdt` quy ra tới 180 s. Vì mốc bị thổi phồng, điều kiện "còn audio phía
+    trước chưa lấy" (`_last_pts < last_tfdt - 2`) LUÔN đúng ⇒ đường giải mã từng-fragment
+    chạy trên MỌI mảnh, mở container cho từng mảnh mà không bao giờ ra PCM, và sàn quét
+    bị đẩy vượt xa mốc đã phát (cơ chế cứu hộ tự vô hiệu hoá).
+    """
+    init, frags = fmp4_40s
+    av = pytest.importorskip("av")
+
+    base = _demux_with_buffer(init, frags, last_pts=0.0)
+    ts_base = base._audio_timescale()
+    assert ts_base > 0, "phải đọc được timescale của track audio từ init segment"
+
+    container = av.open(io.BytesIO(init))
+    try:
+        expect = int(round(1.0 / float(container.streams.audio[0].time_base)))
+    finally:
+        container.close()
+    assert ts_base == expect, (
+        f"timescale phải lấy từ `mdhd`/`stream.time_base` ({expect}), không phải "
+        f"sample rate — đang trả {ts_base}"
+    )
+
+    # Nhân đôi timescale ⇒ CÙNG `tfdt` thô nhưng số giây phải GIẢM một nửa.
+    ranges_base = base._fragment_byte_ranges()
+    assert ranges_base, "điều kiện dựng: phải đọc được cặp moof+mdat"
+
+    doubled = _demux_with_buffer(init, frags, last_pts=0.0)
+    monkeypatch.setattr(doubled, "_audio_timescale", lambda: ts_base * 2)
+    ranges_double = doubled._fragment_byte_ranges()
+    assert ranges_double, "điều kiện dựng: phải đọc được cặp moof+mdat"
+
+    assert ranges_double[-1][2] == pytest.approx(ranges_base[-1][2] / 2.0, rel=0.02), (
+        f"`tfdt` không bám theo timescale: {ranges_base[-1][2]:.2f}s → "
+        f"{ranges_double[-1][2]:.2f}s khi timescale gấp đôi"
+    )
+    assert base._last_audio_tfdt_sec() == pytest.approx(ranges_base[-1][2], rel=0.02), (
+        "`_last_audio_tfdt_sec` phải dùng CÙNG cách quy đổi với `_fragment_byte_ranges`"
+    )
+
+
+def test_doi_init_thi_bo_cache_timescale(fmp4_40s):
+    """Init segment mới ⇒ bỏ cache timescale/sample rate (nếu không, quy đổi sai đơn vị)."""
+    init, _frags = fmp4_40s
+    demux = StreamDemuxer(target_sample_rate=16000)
+    demux._set_init(init)
+    assert demux._audio_timescale() > 0
+    assert demux._cached_timescale > 0
+
+    demux._set_init(init + b"\x00\x00\x00\x08free")
+    assert demux._cached_timescale == 0, "cache timescale phải bị xoá khi init đổi"
+    assert demux._cached_sample_rate == 0, "cache sample rate phải bị xoá khi init đổi"

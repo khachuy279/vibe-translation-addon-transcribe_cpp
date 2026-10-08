@@ -137,3 +137,69 @@ sửa** với đúng thông điệp ở §3, **xanh sau khi sửa**.
 4. **Deadlock cần được nhìn như deadlock.** `giải mã 0.00x` không có nghĩa "backend chậm" mà có
    nghĩa "backend sẽ không bao giờ nhận thêm gì nữa" — vì nguồn cấp dữ liệu phụ thuộc chính
    thứ đang bị chặn.
+
+---
+
+## 7. Hồi quy phát hiện thêm khi chạy lại (cùng ngày) — timescale của `tfdt`
+
+Sau khi sửa §4, phiên chạy **thành công** (video phát, phụ đề ra, `decoded` tăng đều
+4 → 11 → 14 → 16 → 19 → 21 → 24). Nhưng log mới lộ ra vấn đề thứ ba, qua chính dòng cảnh báo
+vừa thêm ở §4 — nó bắn **ở MỌI mảnh**:
+
+```
+[WARNING] Giải mã từng-fragment không ra PCM cho vùng 12.01s→15.00s (1 mảnh) …
+[WARNING] Giải mã từng-fragment không ra PCM cho vùng 16.00s→22.50s (1 mảnh) …
+[WARNING] Giải mã từng-fragment không ra PCM cho vùng 20.01s→30.00s (2 mảnh) …
+[WARNING] Giải mã từng-fragment không ra PCM cho vùng 100.01s→180.00s (2 mảnh) …
+```
+
+### Bằng chứng định lượng
+
+- Trần bộ đệm ghép nối là **8 MB**, mảnh ≈ 1,42 MB ⇒ bộ đệm chỉ giữ được **~5–6 mảnh ≈ 22 s**.
+- `_last_pts` = 100,01 s (đúng, vì lấy từ PTS frame thật).
+- Nhưng `recovered_frontier` = **180,00 s** ⇒ bộ đệm được cho là kéo dài tới 180 s, **cách mốc
+  đã phát 80 s** — trong khi thực tế chỉ ~22 s.
+
+Kết luận: **`tfdt` bị quy ra giây bằng một timescale NHỎ HƠN timescale thật.**
+
+### Nguyên nhân
+
+`_fragment_byte_ranges` và `_last_audio_tfdt_sec` đều dùng:
+
+```python
+scale = 1.0 / self._audio_sample_rate()      # (TRƯỚC KHI SỬA)
+```
+
+tức **giả định timescale của track == sample rate**. Hai đại lượng đó chỉ tình cờ bằng nhau với
+AAC thường do FFmpeg đóng gói. Với **HE-AAC/SBR** (sample rate lõi báo bằng một nửa timescale —
+ví dụ lõi 24 kHz, timescale 48 kHz) và với nhiều bộ đóng gói tuỳ biến, chúng **khác nhau**.
+
+### Hậu quả (ba tầng)
+
+1. `tfdt` thổi phồng ⇒ điều kiện "còn audio phía trước chưa lấy" (`_last_pts < last_tfdt − 2`)
+   **luôn đúng** ⇒ đường giải mã từng-fragment chạy trên **mọi** mảnh, mở container cho từng
+   mảnh mà không bao giờ ra PCM — **tốn CPU vô ích trên mỗi mảnh**.
+2. **Sàn quét bị đẩy vượt xa mốc đã phát** (tới 180 s trong khi mới phát 100 s) ⇒ cơ chế cứu hộ
+   **tự vô hiệu hoá**: nếu đường giải mã nối-liền hỏng ở vùng 100–180 s thì nhánh dự phòng đã
+   "quét qua" vùng đó rồi và sẽ không bao giờ xét lại.
+3. Cảnh báo nhiễu ở mọi mảnh, che mất cảnh báo thật.
+
+### Cách sửa
+
+Thêm `_audio_timescale()` đọc **timescale thật** của track từ container
+(`stream.time_base` của PyAV, tức box `mdhd`) thay vì suy từ sample rate; chỉ dự phòng về
+sample rate khi không đọc được. Cache timescale/sample rate được **xoá khi init segment đổi**
+(`_set_init`) — nếu không, đổi nguồn giữa phiên sẽ quy đổi sai đơn vị.
+
+**Test hồi quy:**
+
+- `test_quy_doi_tfdt_theo_timescale_cua_track` — timescale phải lấy từ container, và nhân đôi
+  timescale phải làm số giây giảm một nửa.
+- `test_doi_init_thi_bo_cache_timescale` — init mới phải xoá cache.
+
+### Mức độ chắc chắn
+
+Hệ số lệch được **suy từ log** (`recovered_frontier` 180 s so với bộ đệm thật ~22 s quanh
+`_last_pts` 100 s), **không đo trực tiếp** bằng cách đọc `mdhd` của luồng xhamster. Nếu chạy lại
+mà cảnh báo §7 vẫn bắn ở mọi mảnh, thì giả thuyết timescale chưa đúng và cần đọc `tfdt`/`mdhd`
+thô của luồng đó để chốt.

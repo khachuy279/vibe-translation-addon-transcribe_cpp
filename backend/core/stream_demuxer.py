@@ -391,6 +391,8 @@ class StreamDemuxer:
         self._frag_times_cache: Optional[List[Tuple[float, int]]] = None
         self._frag_times_key: int = -1
         self._cached_sample_rate: int = 0
+        #: Timescale của track audio (đơn vị `tfdt`) — xem `_audio_timescale`.
+        self._cached_timescale: int = 0
         self._offsets_cache: List[int] = []
         self._offsets_key: int = -1
 
@@ -420,6 +422,18 @@ class StreamDemuxer:
         if self._browser_axis_bias is not None:
             return float(self._browser_axis_bias)
         return float(self._latest_ts_offset)
+
+    def _set_init(self, init_part: bytes) -> None:
+        """Gán init segment MỚI và bỏ cache suy ra từ nó.
+
+        Cache `sample_rate`/`timescale` được đọc từ chính `_init`; init đổi (SourceBuffer
+        mới, nguồn nạp lại) mà giữ cache thì mọi `tfdt` sau đó quy đổi sai đơn vị.
+        """
+        if init_part == self._init:
+            return
+        self._init = init_part
+        self._cached_sample_rate = 0
+        self._cached_timescale = 0
 
     def reset(self, epoch: Optional[int] = None, min_pts: Optional[float] = None) -> None:
         """Xoá sạch trạng thái (tua video / đổi SourceBuffer / init segment mới)."""
@@ -528,14 +542,14 @@ class StreamDemuxer:
             if treat_as_init and self._init != raw_bytes:
                 init_part, media_part = _split_init_media(raw_bytes, container)
                 if init_part:
-                    self._init = init_part
+                    self._set_init(init_part)
                 if media_part:
                     self._media.extend(media_part)
             elif self._init and raw_bytes.startswith(EBML_MAGIC):
                 # Init đến lần nữa (replay sau khi kết nối lại) — thay thế, không nhân đôi.
                 init_part, media_part = _split_init_media(raw_bytes, container)
                 if init_part:
-                    self._init = init_part
+                    self._set_init(init_part)
                 if media_part:
                     self._media.extend(media_part)
             else:
@@ -1104,15 +1118,8 @@ class StreamDemuxer:
             return float("-inf")
         if not times:
             return float("-inf")
-        sr = 0
-        try:
-            container = av.open(io.BytesIO(self._init))
-            if container.streams.audio:
-                sr = int(container.streams.audio[0].codec_context.sample_rate or 0)
-            container.close()
-        except Exception:  # noqa: BLE001
-            sr = 0
-        scale = 1.0 / float(sr) if sr > 0 else 1.0
+        ts = self._audio_timescale()
+        scale = 1.0 / float(ts) if ts > 0 else 1.0
         return max(d for d, _t in times) * scale + self._axis_offset()
 
     def _decode_fragments_individually(self) -> List[StreamAudioChunk]:
@@ -1247,8 +1254,8 @@ class StreamDemuxer:
         từng mảnh sẽ luôn quét các mảnh ĐẦU bộ đệm và không bao giờ tới phần đang cần).
         """
         buf = bytes(self._media)
-        sr = self._audio_sample_rate()
-        scale = (1.0 / float(sr)) if sr > 0 else 1.0
+        ts = self._audio_timescale()
+        scale = (1.0 / float(ts)) if ts > 0 else 1.0
         times = self._audio_fragment_times()
         audio_track = self._dominant_audio_track(times)
         first_needed = self._last_pts - 0.05
@@ -1339,7 +1346,11 @@ class StreamDemuxer:
         return offsets[idx]
 
     def _audio_sample_rate(self) -> int:
-        """Sample rate của track audio (timescale của `tfdt`), 0 nếu chưa đọc được."""
+        """Sample rate của track audio, 0 nếu chưa đọc được.
+
+        ⚠️ Đây là SAMPLE RATE, **không** phải timescale của `tfdt`. Muốn quy đổi `tfdt`
+        sang giây phải dùng `_audio_timescale()` — xem chú thích ở đó.
+        """
         if self._cached_sample_rate:
             return self._cached_sample_rate
         try:
@@ -1354,6 +1365,40 @@ class StreamDemuxer:
         except Exception:  # noqa: BLE001
             pass
         return self._cached_sample_rate
+
+    def _audio_timescale(self) -> int:
+        """Timescale THẬT của track audio — đơn vị của `baseMediaDecodeTime` (`tfdt`).
+
+        Vì sao KHÔNG dùng `codec_context.sample_rate`: hai đại lượng này chỉ tình cờ bằng
+        nhau với AAC thường do FFmpeg đóng gói. Với HE-AAC/SBR (sample rate báo bằng một
+        nửa timescale) và với nhiều bộ đóng gói tuỳ biến, chúng KHÁC nhau. Quy đổi `tfdt`
+        bằng sample rate làm mốc thời gian bị thổi phồng.
+
+        Đo thật 2026-10-08 (xhamster, fMP4 muxed AV1+AAC): bộ đệm chỉ giữ ~100 s audio
+        nhưng `tfdt` quy ra tới **180 s**. Hệ quả: điều kiện "còn audio phía trước chưa lấy"
+        (`_last_pts < last_tfdt - 2`) LUÔN đúng ⇒ đường giải mã từng-fragment chạy trên MỌI
+        mảnh, mở container cho từng mảnh mà không bao giờ ra PCM, và sàn quét (`_indiv_scan_floor`)
+        bị đẩy vượt xa mốc đã phát — tức cơ chế cứu hộ tự vô hiệu hoá.
+
+        `stream.time_base` của PyAV (đọc từ `mdhd` của track) mới là nguồn sự thật.
+        """
+        if self._cached_timescale:
+            return self._cached_timescale
+        try:
+            container = av.open(io.BytesIO(self._init))
+            try:
+                if container.streams.audio:
+                    tb = float(container.streams.audio[0].time_base or 0.0)
+                    if tb > 0:
+                        self._cached_timescale = int(round(1.0 / tb))
+            finally:
+                container.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._cached_timescale:
+            # Dự phòng cuối: sample rate (đúng cho phần lớn AAC do FFmpeg đóng gói).
+            self._cached_timescale = self._audio_sample_rate()
+        return self._cached_timescale
 
     def _audio_fragment_times(self) -> List[Tuple[float, int]]:
         """[(tfdt, track_id)] của các fragment AUDIO (track chiếm đa số), có cache theo byte.
