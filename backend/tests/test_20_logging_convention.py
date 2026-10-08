@@ -29,6 +29,8 @@ KNOWN_TAGS = {
     "TRANSLATE", "TTS", "WS", "MAIN", "METRICS",
     # Chẩn đoán cắt câu theo độ ổn định (bật bằng `sentence.trace_stability`, mặc định TẮT).
     "SEG",
+    # Nhận diện người nói (Nemotron-3-Diarization).
+    "DIAR",
 }
 #: Token trong `[...]` của thông điệp log. `SEG_*` là trace từng nhịp preview do người dùng
 #: bật để tinh chỉnh ngưỡng cắt câu: SEG_TRACE (mỗi nhịp), SEG_CUT (nhịp chốt câu).

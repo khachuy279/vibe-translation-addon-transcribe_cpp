@@ -248,9 +248,10 @@ class PipelineAPromptStrategy(PromptStrategy):
         context: str = "",
         use_context: bool = False,
         terms: str = "",
+        speaker_tags: Optional[List[str]] = None,
     ) -> str:
         return PipelineBPromptStrategy().build_batch_prompt(
-            sentences, source_lang, target_lang, format_type, context, use_context, terms
+            sentences, source_lang, target_lang, format_type, context, use_context, terms, speaker_tags=speaker_tags
         )
 
 
@@ -290,9 +291,16 @@ class PipelineBPromptStrategy(PromptStrategy):
         context: str = "",
         use_context: bool = False,
         terms: str = "",
+        speaker_tags: Optional[List[str]] = None,
     ) -> str:
         tgt = resolve_lang_name(target_lang)
-        data: Dict[str, Any] = {str(i + 1): (s or "").strip() for i, s in enumerate(sentences)}
+        if speaker_tags and len(speaker_tags) == len(sentences):
+            data: Dict[str, Any] = {
+                str(i + 1): {(speaker_tags[i] or f"speaker {i + 1}").strip(): (s or "").strip()}
+                for i, s in enumerate(sentences)
+            }
+        else:
+            data = {str(i + 1): (s or "").strip() for i, s in enumerate(sentences)}
         json_text = json.dumps(data, ensure_ascii=False, indent=2)
 
         pronoun_guide = _PRONOUN_GUIDANCE_VI if tgt == "Vietnamese" else ""

@@ -90,6 +90,8 @@ MODULE_COLORS = {
     "METRICS": LogColors.GREEN,
     # Tầng SEG: trace từng nhịp preview để tinh chỉnh mốc ngắt câu.
     "SEG": LogColors.BOLD + LogColors.MAGENTA,
+    # Tầng DIAR: nhận diện người nói (Nemotron-3-Diarization)
+    "DIAR": LogColors.BOLD + LogColors.YELLOW,
 }
 
 

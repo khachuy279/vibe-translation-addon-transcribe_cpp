@@ -61,6 +61,7 @@ from backend.asr.forced_aligner import (
     resolve_aligner_language,
 )
 from backend.core.vad_silence import VADSilenceScanner
+from backend.diarization import DiarizationService, assign_speakers_to_subtitles
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import SessionConfigPayload
 from backend.utils.logger import get_logger
@@ -1490,8 +1491,31 @@ class LookaheadSessionState:
             recent_ctx_list.reverse()
             batch_context = "\n".join(recent_ctx_list)
 
+            # Bước 2F: Tách người nói (Speaker Diarization) bằng Nemotron-3-Diarization
+            speaker_tags: Optional[List[str]] = None
+            diar_cfg = getattr(config, "diarization", None)
+            if diar_cfg and getattr(diar_cfg, "enabled", True) and len(candidate_subs) >= 2:
+                try:
+                    t_diar0 = time.perf_counter()
+                    turns = await DiarizationService.diarize_chunk(chunk.pcm, sample_rate=16000)
+                    if turns:
+                        sub_spans = [(sub.start_time, sub.end_time) for _, sub, _, _ in candidate_subs]
+                        speaker_tags = assign_speakers_to_subtitles(sub_spans, turns, sample_rate=16000)
+                        diar_ms = (time.perf_counter() - t_diar0) * 1000.0
+                        # Log thông tin speaker nhận diện được
+                        spk_preview = " ⏐ ".join(f'"{s}: {sub.text[:20]}"' for s, (_, sub, _, _) in zip(speaker_tags[:10], candidate_subs[:10]))
+                        logger.info(
+                            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms): {spk_preview}",
+                            extra={"module_tag": "DIAR"},
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Diarization thất bại, tiếp tục dịch bình thường: {exc}", extra={"module_tag": "DIAR"})
+                    speaker_tags = None
+
             t_tr = time.perf_counter()
-            translated_texts = await self._translate_batch(candidate_texts, context=batch_context)
+            translated_texts = await self._translate_batch(
+                candidate_texts, context=batch_context, speaker_tags=speaker_tags
+            )
             tr_ms = (time.perf_counter() - t_tr) * 1000.0
 
             if candidate_subs:
@@ -1797,7 +1821,12 @@ class LookaheadSessionState:
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def _translate_batch(self, texts: List[str], context: str = "") -> List[str]:
+    async def _translate_batch(
+        self,
+        texts: List[str],
+        context: str = "",
+        speaker_tags: Optional[List[str]] = None,
+    ) -> List[str]:
         """Dịch gộp cả khối câu phụ đề qua Batch Context Translation (Pipeline B)."""
         if not texts:
             return []
@@ -1807,9 +1836,14 @@ class LookaheadSessionState:
         try:
             if hasattr(engine, "translate_batch"):
                 try:
-                    return await engine.translate_batch(texts, self.source_lang, self.target_lang, context=context)
+                    return await engine.translate_batch(
+                        texts, self.source_lang, self.target_lang, context=context, speaker_tags=speaker_tags
+                    )
                 except TypeError:
-                    return await engine.translate_batch(texts, self.source_lang, self.target_lang)
+                    try:
+                        return await engine.translate_batch(texts, self.source_lang, self.target_lang, context=context)
+                    except TypeError:
+                        return await engine.translate_batch(texts, self.source_lang, self.target_lang)
             # Fallback nếu engine không có translate_batch
             results = []
             for t in texts:

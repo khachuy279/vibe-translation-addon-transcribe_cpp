@@ -108,6 +108,14 @@ external/build-tmp/
 # VẪN commit `LICENSE` + `THIRD_PARTY_NOTICES.txt` (nghĩa vụ ghi nguồn Apache-2.0).
 backend/bin/crispasr/*.dll
 
+# 12. Binary audio.cpp / Nemotron-3 Diarization — KHÔNG commit, tự tải khi thiếu
+# Toàn bộ thư mục `backend/bin/audiocpp/` (~2.1 GB gồm ggml-cuda.dll > 1GB và cuBLAS)
+# vượt xa hạn mức GitHub (100 MB/file).
+# `backend/diarization/service.py::ensure_audiocpp_binaries()` tự động tải từ GitHub
+# release của 0xShug0/audio.cpp (v0.9.1) khi thiếu, tương tự cơ chế của CrispASR.
+backend/bin/audiocpp/
+!backend/bin/audiocpp/LICENSE
+
 
 # 10. WAV
 wav_test/google_fleurs

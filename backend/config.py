@@ -623,6 +623,15 @@ class ForcedAlignerConfig(BaseModel):
     n_threads: int = 8
 
 
+class DiarizationConfig(BaseModel):
+    """Cấu hình Speaker Diarization (Nemotron-3-Diarization GGUF qua audio.cpp native CUDA)."""
+    enabled: bool = True
+    active_model: str = "nemotron-3-diarization-bf16.gguf"
+    latency_profile: str = "low"
+    backend: str = "cuda"
+    threads: int = 4
+
+
 class AppConfig(BaseModel):
     """Cấu hình gốc toàn hệ thống Backend."""
     ws: WSConfig = Field(default_factory=WSConfig)
@@ -636,6 +645,7 @@ class AppConfig(BaseModel):
     gpu: GpuConfig = Field(default_factory=GpuConfig)
     lookahead: LookaheadConfig = Field(default_factory=LookaheadConfig)
     forced_aligner: ForcedAlignerConfig = Field(default_factory=ForcedAlignerConfig)
+    diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)
 
     def hot_reload(self, updates: Dict[str, Any]) -> None:
         """Cập nhật cấu hình runtime nhanh chóng không cần khởi động lại server."""

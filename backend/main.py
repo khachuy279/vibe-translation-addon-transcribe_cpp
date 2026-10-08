@@ -147,6 +147,26 @@ def _log_runtime_status_at_startup() -> None:
             )
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"Bỏ qua kiểm tra runtime aligner: {exc}", extra={"module_tag": "MAIN"})
+
+    try:
+        from backend.diarization.service import _find_audiocpp_cli, _find_model_path
+        diar_cfg = getattr(config, "diarization", None)
+        if diar_cfg and getattr(diar_cfg, "enabled", True):
+            cli_path = _find_audiocpp_cli()
+            model_name = getattr(diar_cfg, "active_model", "nemotron-3-diarization-bf16.gguf")
+            model_path = _find_model_path(model_name)
+            if cli_path and model_path:
+                logger.info(
+                    f"[STARTUP] Nemotron-3-Diarization sẵn sàng (audio.cpp native CUDA, model={model_name})",
+                    extra={"module_tag": "DIAR"},
+                )
+            else:
+                logger.warning(
+                    f"[STARTUP] Nemotron-3-Diarization chưa đủ file (cli={bool(cli_path)}, model={bool(model_path)})",
+                    extra={"module_tag": "DIAR"},
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"Bỏ qua kiểm tra Diarization startup: {exc}", extra={"module_tag": "MAIN"})
     if "torch" in sys.modules:  # pragma: no cover - chỉ xảy ra nếu ai đó cài torch thủ công
         logger.warning(
             "[STARTUP] torch CÓ MẶT trong tiến trình dù KHÔNG subsystem nào cần nó. "

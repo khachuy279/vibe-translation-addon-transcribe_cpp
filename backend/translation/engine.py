@@ -72,22 +72,17 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-def _build_batch_prompt(strategy, sentences, source_lang, target_lang, *, context, use_context, terms):
-    """Gọi `build_batch_prompt` kèm gợi ý glossary — chịu được strategy cũ chưa có tham số `terms`.
-
-    Prompt strategy tự viết (fake trong test, plugin bên thứ ba) có thể chưa có `terms`.
-    Thiếu nó KHÔNG phải lỗi chí mạng (chỉ mất gợi ý tên riêng) nên fallback về chữ ký cũ
-    thay vì làm chết đường dịch. Dùng `inspect` (không phải try/except TypeError) để tránh
-    gọi hàm HAI lần khi lỗi TypeError phát sinh từ bên trong thân hàm.
-    """
+def _build_batch_prompt(strategy, sentences, source_lang, target_lang, *, context, use_context, terms, speaker_tags=None):
+    """Gọi `build_batch_prompt` kèm gợi ý glossary và speaker tags — chịu được strategy cũ."""
+    kwargs: Dict[str, Any] = {
+        "context": context,
+        "use_context": use_context,
+    }
     if terms and _accepts_kwarg(strategy.build_batch_prompt, "terms"):
-        return strategy.build_batch_prompt(
-            sentences, source_lang, target_lang,
-            context=context, use_context=use_context, terms=terms,
-        )
-    return strategy.build_batch_prompt(
-        sentences, source_lang, target_lang, context=context, use_context=use_context
-    )
+        kwargs["terms"] = terms
+    if speaker_tags and _accepts_kwarg(strategy.build_batch_prompt, "speaker_tags"):
+        kwargs["speaker_tags"] = speaker_tags
+    return strategy.build_batch_prompt(sentences, source_lang, target_lang, **kwargs)
 
 
 def _build_single_prompt(strategy, *, text, source_lang, target_lang, context, use_context, term):
@@ -185,16 +180,31 @@ def _parse_batch_json(raw_text: str, expected_count: int) -> Optional[List[str]]
             if val is None:
                 found_all = False
                 break
-            results.append(collapse_repetitions(str(val).strip()))
+            # Hỗ trợ dạng lồng speaker: {"speaker 1": "..."} hoặc {"speaker": "...", "text": "..."}
+            if isinstance(val, dict):
+                if "text" in val:
+                    val_text = val["text"]
+                elif "translation" in val:
+                    val_text = val["translation"]
+                else:
+                    val_text = next(iter(val.values()), "")
+                results.append(collapse_repetitions(str(val_text).strip()))
+            else:
+                results.append(collapse_repetitions(str(val).strip()))
         if found_all and len(results) == expected_count:
             return results
 
     # 4. Fallback cứu nguy: Dùng Regex trích xuất từng cặp key-value
-    # Hữu hiệu khi JSON bị lỗi cú pháp do chuỗi dịch có chứa dấu ngoặc kép không escape
-    # Ví dụ: "2": "À, trên "Travel Dow" nó được 3.9 sao",
+    # Hỗ trợ cả {"1": {"speaker 1": "nội dung"}} và {"1": "nội dung"}
+    # Ví dụ regex dò: "1":\s*\{\s*"speaker[^"]*":\s*"(.*?)"
     lines = candidate.splitlines()
     kv: Dict[int, str] = {}
     for line in lines:
+        # Mẫu 1: "1": { "speaker 1": "..." } hoặc "1": "..."
+        m_spk = re.search(r'^\s*"?(\d+)"?\s*:\s*\{\s*"[^"]+"\s*:\s*"(.*)"\s*\}', line)
+        if m_spk:
+            kv[int(m_spk.group(1))] = m_spk.group(2).strip()
+            continue
         m = re.search(r'^\s*"?(\d+)"?\s*:\s*"(.*)"\s*,?\s*$', line)
         if m:
             idx = int(m.group(1))
@@ -204,7 +214,15 @@ def _parse_batch_json(raw_text: str, expected_count: int) -> Optional[List[str]]
     if all(i in kv for i in range(1, expected_count + 1)):
         return [collapse_repetitions(kv[i]) for i in range(1, expected_count + 1)]
 
-    # Regex fallback 2: tìm mẫu "?(\d+)"?:\s*"(.*?)" trên toàn bộ khối
+    # Regex fallback 2: tìm mẫu lồng speaker trên toàn bộ khối
+    pattern_spk = r'"?(\d+)"?\s*:\s*\{\s*"[^"]+"\s*:\s*"(.*?)"\s*\}'
+    matches_spk = re.findall(pattern_spk, candidate, re.DOTALL)
+    if matches_spk:
+        kv_spk = {int(k): v.strip() for k, v in matches_spk if k.isdigit()}
+        if all(i in kv_spk for i in range(1, expected_count + 1)):
+            return [collapse_repetitions(kv_spk[i]) for i in range(1, expected_count + 1)]
+
+    # Regex fallback 3: tìm mẫu "?(\d+)"?:\s*"(.*?)" trên toàn bộ khối
     pattern = r'"?(\d+)"?\s*:\s*"(.*?)"(?:\s*[,}]\s*|\s*$)'
     matches = re.findall(pattern, candidate, re.DOTALL)
     if matches:
@@ -667,6 +685,7 @@ class GGUFTranslator(BaseTranslator):
         source_lang: str = "auto",
         target_lang: str = "vi",
         context: str = "",
+        speaker_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """Dịch gộp cả danh sách câu (cho Pipeline B) qua JSON instTrans trong 1 lần gọi GPU duy nhất."""
         if not texts:
@@ -698,7 +717,7 @@ class GGUFTranslator(BaseTranslator):
         terms = get_glossary().build_hint(texts, built_cfg)
         batch_prompt = _build_batch_prompt(
             built_strategy, texts, source_lang, target_lang,
-            context=context, use_context=use_ctx, terms=terms,
+            context=context, use_context=use_ctx, terms=terms, speaker_tags=speaker_tags,
         )
         max_tokens = min(1536, max(256, len(texts) * 80))
         kwargs = {
@@ -717,7 +736,7 @@ class GGUFTranslator(BaseTranslator):
             if shared_key != built_key and hasattr(strategy, "build_batch_prompt"):
                 batch_prompt = _build_batch_prompt(
                     strategy, texts, source_lang, target_lang,
-                    context=context, use_context=use_ctx, terms=terms,
+                    context=context, use_context=use_ctx, terms=terms, speaker_tags=speaker_tags,
                 )
 
             try:
@@ -761,6 +780,7 @@ class GGUFTranslator(BaseTranslator):
         source_lang: str = "auto",
         target_lang: str = "vi",
         context: str = "",
+        speaker_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """Async wrapper cho translate_batch_sync chạy trên thread pool với GPU arbiter."""
         loop = asyncio.get_running_loop()
@@ -772,6 +792,7 @@ class GGUFTranslator(BaseTranslator):
             source_lang,
             target_lang,
             context,
+            speaker_tags,
         )
 
     # ------------------------------------------------------------------ streaming
