@@ -89,7 +89,10 @@ def test_nudge_cursor_out_of_gap_after_seek():
     session._batch_from_pts = 322.07
     session._feed_pts = 322.07
 
-    moved = session._nudge_cursor_out_of_gap(322.07)
+    # Trong thời gian chờ kiên nhẫn ban đầu (grace period), KHÔNG được nhảy vội
+    assert session._nudge_cursor_out_of_gap(322.07) is False, "phải chờ kiên nhẫn trong grace period"
+    # Khi ép buộc (hoặc đã hết thời gian chờ kiên nhẫn), mới nhảy ra khỏi khe hở
+    moved = session._nudge_cursor_out_of_gap(322.07, force=True)
 
     assert moved is True, "phải nhảy con trỏ ra khỏi khe hở"
     assert session._batch_from_pts == pytest.approx(330.0)
@@ -98,7 +101,7 @@ def test_nudge_cursor_out_of_gap_after_seek():
     assert session._feed_pts == pytest.approx(322.07)
 
     # Khi CÓ audio tại con trỏ thì KHÔNG được nhảy (đang chờ nạp thêm là chuyện bình thường).
-    assert session._nudge_cursor_out_of_gap(331.0) is False
+    assert session._nudge_cursor_out_of_gap(331.0, force=True) is False
     assert session._batch_from_pts == pytest.approx(330.0)
 
 
@@ -116,7 +119,10 @@ def test_nudge_cursor_out_of_sliver_then_hole():
     session.timeline.append(340.0, np.zeros(16000 * 3, dtype=np.float32))
     session._batch_from_pts = 330.0
 
-    assert session._nudge_cursor_out_of_gap(330.0) is True, "phải nhảy qua mẩu vụn + khe hở"
+    # Trong grace period, không nhảy vội
+    assert session._nudge_cursor_out_of_gap(330.0) is False, "phải chờ kiên nhẫn trong grace period"
+    # Sau grace period hoặc khi force=True, mới nhảy
+    assert session._nudge_cursor_out_of_gap(330.0, force=True) is True, "phải nhảy qua mẩu vụn + khe hở"
     assert session._batch_from_pts == pytest.approx(340.0)
 
 

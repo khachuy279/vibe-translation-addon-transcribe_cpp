@@ -539,6 +539,8 @@ class ForcedAlignerService:
 
         # Gộp các token số bị chẻ bởi dấu chấm thập phân hoặc dấu phẩy hàng nghìn không có khoảng trắng
         # Ví dụ: "3." và "9" trong "星3.9でさ" -> "3.9" (raw_slice là "3.", không có khoảng trắng sau dấu chấm)
+        # Và gộp các từ ghép có dấu gạch nối (hyphen) không có khoảng trắng:
+        # Ví dụ: "deep-" và "cycle" -> "deep-cycle", "sixty-" và "one" -> "sixty-one"
         merged: List[AlignedWord] = []
         for idx, (item, raw_slice) in enumerate(raw_pieces):
             if not merged:
@@ -554,6 +556,18 @@ class ForcedAlignerService:
                 and prev_t[-1] in (".", ",")
                 and len(cur_t) >= 1
                 and cur_t[0].isdigit()
+                and not any(c.isspace() for c in prev_raw)
+            ):
+                merged[-1] = AlignedWord(
+                    text=prev_t + cur_t,
+                    start_time=prev.start_time,
+                    end_time=item.end_time,
+                )
+            elif (
+                len(prev_t) > 1
+                and prev_t.endswith("-")
+                and not prev_t.endswith("--")
+                and len(cur_t) > 0
                 and not any(c.isspace() for c in prev_raw)
             ):
                 merged[-1] = AlignedWord(
@@ -660,6 +674,11 @@ class ForcedAlignerService:
             ch = _last_char(i)
             if ch not in clause_punct:
                 return False
+            # Không coi là ngắt vế nếu là dấu gạch nối trong từ ghép (ví dụ: "deep-", "sixty-")
+            if ch == "-":
+                t = _text_at(i)
+                if not (t == "-" or t.endswith("--")):
+                    return False
             # Không coi là ngắt vế nếu là dấu phẩy phân cách hàng nghìn / số thập phân (ví dụ: "1,000")
             if ch == ",":
                 t = _text_at(i)

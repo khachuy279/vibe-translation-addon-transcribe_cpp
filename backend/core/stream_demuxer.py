@@ -551,20 +551,8 @@ class StreamDemuxer:
                 return []
 
             chunks = self._decode_new()
-            if (
-                not chunks
-                and media_end is not None
-                and self._browser_axis_bias is not None
-            ):
-                # Có byte mới mà KHÔNG ra PCM nào: neo trục đã học không còn đúng (đổi
-                # base/period của luồng). Bỏ neo và giải mã lại một lần — nếu không, frontier
-                # lọc sạch mọi frame và pipeline đứng vĩnh viễn.
-                self._browser_axis_bias = None
-                self._axis_shift_obs = None
-                self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
-                chunks = self._decode_new()
-            if not chunks and media_end is not None:
-                # ── HỌC LẠI TRỤC TỪ "DẤU VẾT TRÌNH DUYỆT" ─────────────────────────
+            if not chunks and media_end is not None and self._browser_axis_bias is None:
+                # ── HỌC LẠI TRỤC TỪ "DẤU VẾT TRÌNH DUYỆT" (chỉ khi CHƯA có neo trục) ──
                 # SỰ CỐ THẬT 2026-10-05 (xhamster.com): mở PHIÊN MỚI giữa video (hoặc trang tự
                 # nạp lại nguồn) làm PTS trong container quay về 0 trong khi trục trình duyệt
                 # đang ở ~984s. `_browser_axis_bias` CHƯA học được ở phiên mới ⇒ mọi frame bị
@@ -577,8 +565,6 @@ class StreamDemuxer:
                 raw_end = self._probe_last_frame_pts_end()
                 if raw_end is not None:
                     learned = float(media_end) - float(raw_end)
-                    had_bias = self._browser_axis_bias is not None
-                    previous = self._axis_offset()
                     self._browser_axis_bias = learned
                     self._axis_shift_obs = None
                     self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
@@ -587,14 +573,14 @@ class StreamDemuxer:
                         logger.warning(
                             f"HỌC LẠI TRỤC THỜI GIAN từ dấu vết trình duyệt: byte kết thúc ở "
                             f"{float(media_end):.2f}s (trục trình duyệt) nhưng PTS container kết "
-                            f"thúc ở {float(raw_end):.2f}s ⇒ bias {learned:+.2f}s (trước đó "
-                            f"{previous:+.2f}s). Đã giải mã được {len(chunks)} đoạn PCM.",
+                            f"thúc ở {float(raw_end):.2f}s ⇒ bias {learned:+.2f}s. "
+                            f"Đã giải mã được {len(chunks)} đoạn PCM.",
                             extra={"module_tag": "WS"},
                         )
                     else:
                         # Học xong vẫn không ra PCM ⇒ trả lại trạng thái cũ, không để lại một
                         # neo sai làm hỏng cả các mảnh sau.
-                        self._browser_axis_bias = previous if had_bias else None
+                        self._browser_axis_bias = None
             return self._anchor_to_browser_axis(chunks, media_start, media_end)
 
     def _probe_last_frame_pts_end(self) -> Optional[float]:
@@ -672,6 +658,26 @@ class StreamDemuxer:
                 )
             self._axis_shift_obs = None
             return chunks
+
+        # ── KIỂM TRA TÍNH LIÊN TỤC THEO `media_start` ───────────────────────────
+        # Khi trục đã khoá (self._browser_axis_bias is not None) và có `media_start`:
+        # Nếu media_start khớp với điểm bắt đầu của chunk (hoặc khớp với điểm kết thúc
+        # của chunk), tức là luồng audio hoàn toàn LIÊN TỤC với trục hiện tại.
+        # Sai khác `observed = media_end - chunks[-1].pts_end` thực chất chỉ là độ dài
+        # vùng đệm trước (lead time) mà trình duyệt vừa nạp thêm vào SourceBuffer.
+        # TUYỆT ĐỐI KHÔNG được coi đó là lệch trục thời gian (sẽ tạo khe hở mất phụ đề).
+        if self._browser_axis_bias is not None and media_start is not None:
+            try:
+                m_start = float(media_start)
+                is_continuous = (
+                    abs(m_start - float(chunks[0].pts_start)) <= _AXIS_ANCHOR_MIN_SEC
+                    or abs(m_start - float(chunks[-1].pts_end)) <= _AXIS_ANCHOR_MIN_SEC
+                )
+                if is_continuous:
+                    self._axis_shift_obs = None
+                    return chunks
+            except (TypeError, ValueError):
+                pass
 
         previous = self._axis_shift_obs
         confirmed = previous is not None and abs(observed - previous) <= _AXIS_ANCHOR_CONFIRM_SEC

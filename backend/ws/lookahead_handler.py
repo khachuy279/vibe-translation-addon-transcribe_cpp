@@ -296,6 +296,10 @@ class LookaheadSessionState:
         self.chunks_decoded = 0
         self.utterances_sent = 0
         self.started_at = time.time()
+        self._session_reset_at: float = time.perf_counter()
+        self._gap_seen_pts: Optional[float] = None
+        self._gap_seen_since: Optional[float] = None
+        self._last_gap_wait_log_at: float = 0.0
         # ── Chẩn đoán NĂNG LỰC GIẢI MÃ (2026-10-01) ──────────────────────────────
         # Sự cố "trang khác chỉ hiện 1/3-5 câu": cần biết tầng nào là nút cổ chai —
         # `decoder` (byte tới nhiều mà PCM giải mã ra ít) hay tầng xử lý khối (PCM có sẵn mà lâu
@@ -884,6 +888,10 @@ class LookaheadSessionState:
             self._ready_until_pts = float(target_time)
             self._ready_until_seq = self._seek_seq
             self._frontier_stuck_since = None
+            self._session_reset_at = time.perf_counter()
+            self._gap_seen_pts = None
+            self._gap_seen_since = None
+            self._last_gap_wait_log_at = 0.0
 
             self._sent_items.clear()
             if self.tts_queue is not None:
@@ -977,6 +985,9 @@ class LookaheadSessionState:
         self._batch_dedup.clear()
         self._frontier_stuck_since = None
         self._frontier_behind_since = None
+        self._gap_seen_pts = None
+        self._gap_seen_since = None
+        self._last_gap_wait_log_at = 0.0
 
     def _maybe_reanchor_batch_frontier(self, from_pts: float, max_ahead_pts: float) -> bool:
         """RÀNG BUỘC CỨNG: con trỏ khối không được KẸT xa vị trí phát.
@@ -1051,49 +1062,94 @@ class LookaheadSessionState:
         self._frontier_behind_since = None
         return True
 
-    def _nudge_cursor_out_of_gap(self, from_pts: float) -> bool:
-        """Đưa CON TRỎ KHỐI ra khỏi vùng KHÔNG ĐỦ AUDIO ĐỂ CẮT KHỐI.
+    def _is_in_gap_grace_period(self, from_pts: float) -> Tuple[bool, Optional[float], float]:
+        """Kiểm tra con trỏ khối có đang trong THỜI GIAN CHỜ KIÊN NHẪN (Grace Period) hay không.
 
-        Hai dạng đã gặp thật (xvideos.com, HLS tách track):
-
-        1. **Khe hở hoàn toàn** (2026-10-05): `handle_seek` neo con trỏ đúng vào mốc tua
-           (313,44 s) nhưng audio thật của vị trí mới chỉ bắt đầu muộn hơn ⇒
-           `buffered_end_from(con_trỏ)` trả `None` ⇒ `next_chunk()` trả `None` MÃI MÃI.
-        2. **Mẩu vụn rồi khe hở** (đo lại cùng ngày): con trỏ ở 330,03 s — có ĐÚNG 0,0 s audio
-           tại đó (mép cuối một đoạn) rồi khe hở mới tới đoạn kế. `buffered_end_from()` trả về
-           ~330,03 (KHÁC `None`) nên van theo kiểu (1) không kích hoạt; `next_chunk()` vẫn trả
-           `None` vì `buffered_end <= from_pts + 0.05`. Hệ quả: `mốc-đã-xử-lý` đứng im và client
-           pause/resume liên tục dù RAM đã có hàng chục giây audio ngay sau khe.
-
-        Cách xử lý chung: nếu lượng audio ĐỌC ĐƯỢC tại con trỏ nhỏ hơn mức tối thiểu để cắt một
-        khối (`_MIN_USEFUL_AUDIO_SEC`) VÀ tồn tại một đoạn audio nằm sau khe hở thì nhảy con trỏ
-        tới đầu đoạn đó. Không có đoạn nào phía sau (đang ở mép nạp) ⇒ KHÔNG nhảy, chờ nạp thêm
-        là đúng.
+        Tránh nhảy sớm (làm mất vĩnh viễn phụ đề khúc đầu hoặc sau khi tua) khi:
+        1. Vừa khởi tạo phiên hoặc vừa tua: audio đang trên đường truyền từ extension/mạng sang backend.
+        2. Khe hở mới xuất hiện: cần kiên nhẫn đợi tối thiểu `gap_grace_period_sec` (mặc định 3.0s) để
+           đảm bảo audio thực sự không có, trước khi kết luận là khe hở và nhảy sang đoạn kế tiếp.
 
         Returns:
-            True nếu vừa nhảy con trỏ.
+            (in_grace_period, next_audio_pts, available_sec)
         """
         run_end = self.timeline.buffered_end_from(from_pts)
         available = 0.0 if run_end is None else max(0.0, float(run_end) - float(from_pts))
         if available >= _MIN_USEFUL_AUDIO_SEC:
-            return False
-        # Dò từ NGAY SAU phần audio hiện có: chỉ nhảy khi thật sự có đoạn audio ở phía sau khe.
+            self._gap_seen_pts = None
+            self._gap_seen_since = None
+            return False, None, available
+
         probe = float(from_pts) + max(0.05, available) + 0.05
         nxt = self.timeline.first_audio_pts_at_or_after(probe)
         if nxt is None or nxt <= float(from_pts) + 0.2:
+            self._gap_seen_pts = None
+            self._gap_seen_since = None
+            return False, None, available
+
+        now = time.perf_counter()
+        la = config.lookahead
+        grace_period = float(getattr(la, "gap_grace_period_sec", 3.0))
+        time_since_reset = now - getattr(self, "_session_reset_at", 0.0)
+
+        if self._gap_seen_pts is None or abs(self._gap_seen_pts - float(from_pts)) > 0.05:
+            self._gap_seen_pts = float(from_pts)
+            self._gap_seen_since = now
+
+        time_waiting_gap = now - (self._gap_seen_since or now)
+
+        if time_since_reset < grace_period or time_waiting_gap < grace_period:
+            if now - getattr(self, "_last_gap_wait_log_at", 0.0) >= 1.0:
+                self._last_gap_wait_log_at = now
+                logger.info(
+                    f"[SEG_BATCH] Con trỏ khối {from_pts:.2f}s đang kiên nhẫn chờ nạp audio "
+                    f"(đã chờ {time_waiting_gap:.1f}s / {grace_period:.1f}s; "
+                    f"sau reset {time_since_reset:.1f}s; đoạn kế @{nxt:.2f}s)...",
+                    extra={"module_tag": "ASR"},
+                )
+            return True, nxt, available
+
+        return False, nxt, available
+
+    def _nudge_cursor_out_of_gap(self, from_pts: float, force: bool = False) -> bool:
+        """Đưa CON TRỎ KHỐI ra khỏi vùng KHÔNG ĐỦ AUDIO ĐỂ CẮT KHỐI sau khi hết thời gian chờ kiên nhẫn.
+
+        Chỉ nhảy khi:
+        1. `force` là True (dùng trong test hoặc ép buộc), HOẶC
+        2. Đã hết thời gian chờ kiên nhẫn (`_is_in_gap_grace_period` trả về False) VÀ có đoạn audio phía sau.
+        """
+        run_end = self.timeline.buffered_end_from(from_pts)
+        available = 0.0 if run_end is None else max(0.0, float(run_end) - float(from_pts))
+        if available >= _MIN_USEFUL_AUDIO_SEC:
+            self._gap_seen_pts = None
+            self._gap_seen_since = None
             return False
+
+        probe = float(from_pts) + max(0.05, available) + 0.05
+        nxt = self.timeline.first_audio_pts_at_or_after(probe)
+        if nxt is None or nxt <= float(from_pts) + 0.2:
+            self._gap_seen_pts = None
+            self._gap_seen_since = None
+            return False
+
+        if not force:
+            in_grace, _, _ = self._is_in_gap_grace_period(from_pts)
+            if in_grace:
+                return False
+
+        la = config.lookahead
+        grace_period = float(getattr(la, "gap_grace_period_sec", 3.0))
         logger.info(
             f"[SEG_BATCH] Con trỏ khối {from_pts:.2f}s chỉ có {available:.2f}s audio tại chỗ "
-            f"(cần ≥ {_MIN_USEFUL_AUDIO_SEC:.1f}s để cắt khối) — nhảy tới đầu đoạn audio kế tiếp "
-            f"{nxt:.2f}s (lệch {nxt - float(from_pts):.2f}s) để pipeline chạy tiếp thay vì đứng im.",
+            f"(cần ≥ {_MIN_USEFUL_AUDIO_SEC:.1f}s để cắt khối; đã chờ kiên nhẫn ≥ {grace_period:.1f}s) — "
+            f"nhảy tới đầu đoạn audio kế tiếp {nxt:.2f}s (lệch {nxt - float(from_pts):.2f}s) "
+            f"để pipeline chạy tiếp thay vì đứng im.",
             extra={"module_tag": "ASR"},
         )
         metrics_collector.increment_counter("lookahead.batch_cursor_gap_nudged")
         self._batch_from_pts = float(nxt)
-        #: KHÔNG đụng `_feed_pts`: nó nghĩa là "audio ĐÃ QUA ASR". Vùng bị nhảy qua không có audio
-        #: nên không thể xử lý; nếu ta đẩy `_feed_pts` tới đây thì `fed_ahead` bị thổi phồng và
-        #: client tưởng vùng đó đã được quét (resume sớm) — đo thật 2026-10-05: `prebuffer_ready`
-        #: bật với `ready_ahead=0.00s, fed_ahead=29.85s` ngay sau khi nhảy 30s.
+        self._gap_seen_pts = None
+        self._gap_seen_since = None
         return True
 
     def _log_empty_block(self, chunk) -> None:
@@ -1181,9 +1237,15 @@ class LookaheadSessionState:
 
         frontier = self.timeline.buffered_end_from(from_pts)
         if frontier is None:
-            # Chưa có audio ở con trỏ: để bộ cắt khối tự trả `None` như cũ.
+            in_grace, _, _ = self._is_in_gap_grace_period(from_pts)
+            if in_grace:
+                return False, "wait_gap_grace", False
             return True, "no_audio", False
         available = max(0.0, float(frontier) - float(from_pts))
+        if available < _MIN_USEFUL_AUDIO_SEC:
+            in_grace, _, _ = self._is_in_gap_grace_period(from_pts)
+            if in_grace:
+                return False, "wait_gap_grace", False
         want = min(
             float(getattr(la, "batch_ready_sec", 30.0)),
             float(self.chunker.max_audio_sec),
@@ -1939,11 +2001,22 @@ class LookaheadSessionState:
 
         # Sẵn sàng phát lại khi:
         # 1. Đã dịch trước đủ min_ready_ahead_sec (ít nhất 1 câu phủ mốc phát), HOẶC
-        # 2. Đã quét VAD qua ít nhất 3.5s im lặng (vùng này không có tiếng nói để dịch).
+        # 2. Đã quét VAD qua ít nhất 3.5s im lặng THẬT SỰ (sau khi đã nạp & giải mã ít nhất 1 khối
+        #    và đã vượt qua thời gian chờ kiên nhẫn ban đầu `initial_patience_sec`).
         min_ready = float(la.min_ready_ahead_sec)
         if buffered_ahead > 0:
             min_ready = min(min_ready, max(1.0, buffered_ahead - 0.5))
-        speech_ready = bool(ready_ahead >= min_ready) or bool(fed_ahead >= 3.5 and ready_ahead == 0.0)
+
+        now_perf = time.perf_counter()
+        initial_patience = float(getattr(la, "initial_patience_sec", 3.5))
+        time_since_reset = now_perf - getattr(self, "_session_reset_at", 0.0)
+        is_silence_ready = bool(
+            self.chunks_decoded > 0
+            and time_since_reset >= initial_patience
+            and fed_ahead >= 3.5
+            and ready_ahead == 0.0
+        )
+        speech_ready = bool(ready_ahead >= min_ready) or is_silence_ready
         prebuffer_ready = speech_ready and tts_ready
         # Log khi TRẠNG THÁI SẴN SÀNG ĐỔI — đây là mốc quyết định "cho video phát hay chưa",
         # nếu không log thì rất khó chẩn đoán tại sao video cứ chờ hết timeout.

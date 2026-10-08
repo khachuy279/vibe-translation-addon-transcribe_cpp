@@ -517,7 +517,7 @@ class LookaheadConfig(BaseModel):
     #: do `k_max_new = 256` token của Qwen3-ASR trong C++ (tương đương 50-85s nói liên tục).
     batch_max_audio_sec: float = 45.0
 
-    # ── CỔNG KIÊN NHẪN (PATIENT GATE, 2026-10-05) ─────────────────────────────
+    # ── CỔNG KIÊN NHẪN (PATIENT GATE & GRACE PERIOD) ─────────────────────────
     #: Bật cổng chờ: không vội cắt khối ngắn khi audio mới có sẵn ít, mà kiên nhẫn đợi
     #: trình duyệt gom đủ audio dài ~30s trừ khi sắp hết phụ đề phía trước playhead.
     batch_wait_for_full_block: bool = True
@@ -526,6 +526,11 @@ class LookaheadConfig(BaseModel):
     #: Ngưỡng khoảng cách an toàn tối thiểu (giây) giữa phụ đề đã dịch và playhead.
     #: Khi playhead tiến gần mốc này thì kích hoạt chế độ khẩn cấp (urgent) để không gián đoạn video.
     batch_urgent_lead_sec: float = 5.0
+    #: Thời gian chờ kiên nhẫn (giây) trước khi kết luận có khe hở (gap) và nhảy con trỏ qua khe hở.
+    #: Chống nhảy oan khi audio khúc đầu hoặc sau khi seek đang trên đường truyền từ extension/network sang backend.
+    gap_grace_period_sec: float = 3.0
+    #: Thời gian chờ kiên nhẫn ban đầu (giây) sau khi khởi tạo phiên hoặc seek trước khi cho phép báo khoảng lặng.
+    initial_patience_sec: float = 3.5
 
     # ── CẮT KHỐI BẰNG VAD SILENCE (ĐƯỜNG CHÍNH) ──────────────────────────────
     #: Cắt khối tại khoảng lặng do VAD (Silero) xác nhận. Điểm cắt tại GIỮA khoảng lặng.

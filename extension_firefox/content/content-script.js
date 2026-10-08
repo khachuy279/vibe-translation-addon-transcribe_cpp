@@ -1023,7 +1023,7 @@
     const hasEnoughHeadroomToResume = () => {
       const st = laSession.lastStatus || {};
       const fed = Number(st.fed_ahead || 0);
-      if (fed >= 4.0 && Number(st.ready_ahead || 0) <= 0.05) return true;  // khoảng lặng
+      if (st.prebuffer_ready && fed >= 3.5 && Number(st.ready_ahead || 0) <= 0.05) return true;  // khoảng lặng do backend xác nhận
       return currentReadyAhead() >= LA_MIN_RESUME_AHEAD_SEC;
     };
 
@@ -1207,35 +1207,34 @@
       );
       // Chốt an toàn (đồng hồ ĐỒNG HỒ THỰC). Với TUA, mục tiêu là "dịch xong ngay tại vị trí
       // mới rồi mới phát" nên KHÔNG cắt cứng ở 3,5 s: nếu backend còn tiến triển thì gia hạn
-      // thêm, chỉ bỏ cuộc khi hết tiến triển (xem nhánh gia hạn bên dưới).
-      // `underrun` (playhead chạm mốc đã xử lý) cần chờ LÂU hơn vì backend phải ASR xong một khối
-      // 12-30 s audio mới đẩy được mốc lên.
+      // Chốt an toàn (đồng hồ ĐỒNG HỒ THỰC): kiên nhẫn chờ backend gom khối, ASR và TTS.
+      // Với Pipeline B, cần đảm bảo mọi thứ đã sẵn sàng trước khi phát video.
       const timeoutMs = why === "seek"
-        ? (settings.ttsEnabled ? 6000 : 5000)
+        ? (settings.ttsEnabled ? 8000 : 6000)
         : (why === "underrun"
             ? (settings.ttsEnabled ? 12000 : 9000)
-            : (settings.ttsEnabled ? 5000 : 3500));
+            : (settings.ttsEnabled ? 8000 : 6000));
       bufferProgress = { ready: 0, fed: 0, at: Date.now(), extensions: 0 };
       if (resumeTimer) clearTimeout(resumeTimer);
       const scheduleResume = (ms) => {
         resumeTimer = setTimeout(() => {
           if (!lookaheadPausedVideo) return;
           // Còn tiến triển (ready_ahead/fed_ahead tăng) ⇒ gia hạn thay vì phát khi chưa có
-          // phụ đề. Tối đa 3 lần để không treo trình phát.
-          const progressing = Date.now() - bufferProgress.at < 2000;
+          // phụ đề. Tối đa 5 lần để không treo trình phát.
+          const progressing = Date.now() - bufferProgress.at < 2500;
           const grew = (bufferProgress.ready > 0 || bufferProgress.fed > 0) && progressing;
           // Gia hạn THÊM khi đệm đã dịch còn dưới ngưỡng mà backend VẪN đang nhận/giải mã audio:
           // phát lúc này là chạy 1-2s rồi phải dừng lại (nhịp pause/play ngắn — đo thật trên
-          // YouTube 2026-10-05). Chỉ gia hạn khi backend còn sống, tối đa 3 lần (≈6s).
-          const backendAlive = Date.now() - Number(laSession.lastFragmentsAt || 0) < 2000;
+          // YouTube 2026-10-05). Chỉ gia hạn khi backend còn sống, tối đa 5 lần (≈10s).
+          const backendAlive = Date.now() - Number(laSession.lastFragmentsAt || 0) < 3000;
           const belowTarget = !hasEnoughHeadroomToResume();
           if ((why === "seek" || why === "start")
-              && bufferProgress.extensions < 3
+              && bufferProgress.extensions < 5
               && (grew || (belowTarget && backendAlive))) {
             bufferProgress.extensions += 1;
             console.log(
               `[BS] Chờ thêm bản dịch tại vị trí hiện tại (ready ${bufferProgress.ready.toFixed(1)}s, ` +
-              `cần ≥ ${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s; gia hạn ${bufferProgress.extensions}/3).`
+              `cần ≥ ${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s; gia hạn ${bufferProgress.extensions}/5).`
             );
             scheduleResume(2000);
             return;
@@ -1248,8 +1247,9 @@
     };
     lookaheadPauseForBuffering = pauseForBuffering;
 
-    // Nếu video đã có buffer phía trước thì tạm dừng để xử lý dịch trước.
-    if (aheadSec >= 1.0) pauseForBuffering("start");
+    // Với Pipeline B (Lookahead), LUÔN tạm dừng video khi bắt đầu để nạp đệm và dịch trước
+    // (xác định mọi thứ đã sẵn sàng trước khi phát video, tránh mất phụ đề khúc đầu).
+    pauseForBuffering("start");
 
     // 2. Khởi tạo SubtitleTimelineQueue
     timelineQueue = new SubtitleTimelineQueue({
@@ -1409,13 +1409,12 @@
           }
         },
         onPrebufferReady: (st) => {
-          // `prebuffer_ready` của backend = "đủ theo MỤC TIÊU CỦA NÓ" — có lúc chỉ 2,5s (bootstrap),
-          // không đủ để video chạy mà không phải dừng lại ngay. Quyết định chạy lại nằm ở `onStatus`
-          // với ngưỡng đệm THẬT; ở đây chỉ giữ làm lưới an toàn cho backend không gửi `ready_ahead`.
-          const readyKnown = Number(st?.ready_ahead || 0) > 0;
-          if (readyKnown) return;
-          if (settings.ttsEnabled && !firstTtsReceived) return;
-          resumePlayback("prebuffer_ready_no_metrics");
+          // Lưới an toàn khi backend báo prebuffer_ready trực tiếp
+          const isTts = Boolean(settings.ttsEnabled);
+          if (isTts && !firstTtsReceived) return;
+          if (hasEnoughHeadroomToResume()) {
+            resumePlayback("prebuffer_ready");
+          }
         },
         onTts: (header, wavBuffer) => {
           if (!settings.ttsEnabled) return;
@@ -1499,26 +1498,27 @@
               showBufferingStatus(`${prefix} (${ready.toFixed(1)}s / ${target.toFixed(1)}s)${extra}`);
             }
 
-            // Sẵn sàng CHẠY LẠI khi có ĐỦ ĐỆM ĐÃ DỊCH (xem `hasEnoughHeadroomToResume`):
-            //   • TTS tắt: `ready ≥ LA_MIN_RESUME_AHEAD_SEC` (4s), hoặc đoạn trước là khoảng lặng.
-            //   • TTS bật: đã nhận câu TTS đầu VÀ đủ đệm đã dịch như trên.
-            //   • `prebuffer_ready` của backend KHÔNG tự nó là điều kiện đủ: nó chỉ so với mục
-            //     tiêu của backend (có lúc 2,5s) nên resume theo nó là chạy 1-2s rồi dừng lại.
+            // Sẵn sàng CHẠY LẠI khi CẢ HAI điều kiện đều đạt:
+            // 1. Backend đã xác nhận sẵn sàng (st.prebuffer_ready === true): đã dịch đủ lead time
+            //    hoặc đã xác nhận khoảng lặng an toàn. Tuyệt đối không phát khi backend báo false.
+            // 2. Client có đủ đệm đã dịch phía trước (hasEnoughHeadroomToResume()):
+            //    - TTS tắt: ready >= LA_MIN_RESUME_AHEAD_SEC hoặc khoảng lặng (do backend xác nhận).
+            //    - TTS bật: đã nhận câu TTS đầu tiên.
+            const backendReady = Boolean(st.prebuffer_ready);
             let readyToResume = false;
-            if (hasEnoughHeadroomToResume() && (!isTts || firstTtsReceived)) {
+            if (backendReady && hasEnoughHeadroomToResume() && (!isTts || firstTtsReceived)) {
               readyToResume = true;
             }
 
             if (readyToResume) {
-              resumePlayback(st.prebuffer_ready ? "prebuffer_ready" : "status_ready");
+              resumePlayback("prebuffer_ready");
             } else if (lookaheadPausedVideo && now - (laSession.lastResumeBlockedLogAt || 0) > 3000) {
               // Chẩn đoán: nói rõ VÌ SAO còn phải chờ dù backend đã báo `prebuffer_ready`.
               laSession.lastResumeBlockedLogAt = now;
               laDiag.log("session",
-                `⏳ Chưa cho phát: đệm đã dịch ${currentReadyAhead().toFixed(1)}s < `
-                + `${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s (prebuffer_ready=${st.prebuffer_ready}, `
-                + `ready=${ready.toFixed(1)}s, fed=${fed.toFixed(1)}s${isTts && !firstTtsReceived ? ", chờ TTS đầu" : ""}) `
-                + `— chờ thêm để tránh nhịp pause/play ngắn.`);
+                `⏳ Chưa cho phát: chờ backend & đệm sẵn sàng (prebuffer_ready=${st.prebuffer_ready}, `
+                + `ready=${ready.toFixed(1)}s/${LA_MIN_RESUME_AHEAD_SEC.toFixed(1)}s, fed=${fed.toFixed(1)}s`
+                + `${isTts && !firstTtsReceived ? ", chờ TTS đầu" : ""}) — kiên nhẫn chờ để không mất phụ đề.`);
             }
           }
           // ĐANG PHÁT: việc TẠM DỪNG giữa chừng do RÀNG BUỘC CỨNG ở `timelineQueue._tick()`

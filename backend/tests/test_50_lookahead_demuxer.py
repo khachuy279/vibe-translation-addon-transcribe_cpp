@@ -472,3 +472,41 @@ def test_mp4_fragment_chain_report_on_real_fmp4():
     assert "LIỀN MẠCH" in report, report
 
 
+def test_continuous_buffering_does_not_cause_axis_shift_or_audio_gap():
+    """HỒI QUY 2026-10-08: LỆCH TRỤC THỜI GIAN ma khi browser nạp trước segment (+7.37s).
+
+    Kịch bản thực tế:
+    - Segment 1: PCM [2.04s -> 9.99s], media_end=10.0s. Trục khớp (+0.01s), khoá trục bias=0.0s.
+    - Segment 2: media_start=9.99s, media_end=17.36s (trình duyệt buffer trước 7.37s).
+    - Bản cũ: so media_end (17.36s) với PCM cuối (9.99s) thấy lệch +7.37s (> 5.0s) ⇒ vội vàng
+      đổi bias lên +7.37s và kéo _last_pts lên 17.36s ⇒ tạo khe hở 7.37s và mất trọn 1 đoạn phụ đề!
+    - Bản mới: nhận biết media_start=9.99s liên tục với mốc PCM kết thúc 9.99s ⇒ KHÔNG đổi trục.
+    """
+    demux = StreamDemuxer(target_sample_rate=16000)
+
+    def mk(start: float, end: float):
+        return [StreamAudioChunk(
+            pts_start=start, pts_end=end, duration=end - start,
+            pcm=np.zeros(int(round((end - start) * 16000)), dtype=np.float32),
+        )]
+
+    # Segment 1: [2.04 -> 9.99], media_end=10.0s => khoá trục
+    seg1 = demux._anchor_to_browser_axis(mk(2.04, 9.99), media_start=1.54, media_end=10.0)
+    assert seg1[0].pts_start == pytest.approx(2.04)
+    assert demux._browser_axis_bias == 0.0
+
+    # Segment 2 nạp vào: media_start=9.99s, media_end=17.36s
+    # Lúc này nếu có chunk mới bắt đầu từ 9.99s (hoặc chunk cũ kết thúc ở 9.99s)
+    seg2 = demux._anchor_to_browser_axis(mk(9.99, 17.36), media_start=9.99, media_end=17.36)
+    assert seg2[0].pts_start == pytest.approx(9.99)
+    assert seg2[0].pts_end == pytest.approx(17.36)
+    assert demux._browser_axis_bias == 0.0, "Trục phải giữ nguyên bias=0.0s, không được nhảy +7.37s"
+
+    # Trường hợp mảnh byte của segment 2 mới chỉ giải mã được 1 phần nhỏ (vd 9.99s -> 11.0s)
+    # trong khi media_end đã là 17.36s (chênh 6.36s > 5.0s)
+    seg2_partial = demux._anchor_to_browser_axis(mk(9.99, 11.0), media_start=9.99, media_end=17.36)
+    assert seg2_partial[0].pts_start == pytest.approx(9.99)
+    assert seg2_partial[0].pts_end == pytest.approx(11.0)
+    assert demux._browser_axis_bias == 0.0, "Không được lệch trục khi mảnh mới bắt đầu đúng media_start"
+
+

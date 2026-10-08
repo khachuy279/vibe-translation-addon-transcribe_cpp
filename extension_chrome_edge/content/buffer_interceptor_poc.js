@@ -680,6 +680,11 @@
         return media ? (media[0] <= playhead + 1 && media[1] >= playhead) : false;
       });
       if (!covered) {
+        console.warn(
+          `%c[Lookahead] ⏳ Chưa phủ audio tại vị trí phát (${playhead.toFixed(1)}s) ` +
+          `— đang yêu cầu nạp thêm / tải lại, video sẽ kiên nhẫn chờ backend sẵn sàng.`,
+          'color: #f59e0b; font-weight: bold;'
+        );
         if (state.mediaRanges.length > 0) {
           void refetchForPlayhead(playhead, state.bytesPerSecHint);
         } else if (AUTO_NUDGE_ON_STARVATION) {

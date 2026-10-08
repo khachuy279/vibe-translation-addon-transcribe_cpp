@@ -79,3 +79,47 @@ def test_english_period_segmentation_safety_net():
         "It's fine.",
         "See, it was.",
     ]
+
+
+def test_hyphenated_compound_words_are_not_split():
+    """HỒI QUY 2026-10-08: [SEG_BATCH] ngắt nhầm từ ghép nối bằng gạch nối.
+
+    Ví dụ:
+      'Before you go, consider this: not only do I have a deep-cycle marine battery power source...'
+      bị chẻ thành "not only do I have a deep-" ⏐ "cycle marine battery power source"
+      và "I also have all sixty-" ⏐ "one episodes..."
+    """
+    text = (
+        "Before you go, consider this: not only do I have a deep-cycle marine battery power source, "
+        "which is more than capable of running our entertainment system, "
+        "I also have all sixty-one episodes of the BBC series Red Dwarf."
+    )
+    # Giả lập Aligner tokenize 'deep' và 'cycle' thành 2 token riêng biệt
+    raw_tokens = [
+        "Before", "you", "go,", "consider", "this:", "not", "only", "do", "I", "have", "a",
+        "deep", "cycle", "marine", "battery", "power", "source,", "which", "is", "more", "than",
+        "capable", "of", "running", "our", "entertainment", "system,", "I", "also", "have", "all",
+        "sixty", "one", "episodes", "of", "the", "BBC", "series", "Red", "Dwarf."
+    ]
+    step = 20.0 / len(raw_tokens)
+    items = [
+        AlignedWord(text=w, start_time=round(i * step, 3), end_time=round((i + 1) * step, 3))
+        for i, w in enumerate(raw_tokens)
+    ]
+    merged = ForcedAlignerService.merge_source_text(items, text)
+    # Xác nhận merge_source_text đã gộp thành deep-cycle và sixty-one
+    merged_texts = [m.text for m in merged]
+    assert "deep-cycle" in merged_texts
+    assert "sixty-one" in merged_texts
+    assert not any(t == "deep-" for t in merged_texts)
+    assert not any(t == "sixty-" for t in merged_texts)
+
+    subs = ForcedAlignerService.group_words_to_subtitles(merged, language="English")
+    sub_texts = [s.text for s in subs]
+    assert not any(t.endswith("deep-") for t in sub_texts)
+    assert not any(t.startswith("cycle") for t in sub_texts)
+    assert not any(t.endswith("sixty-") for t in sub_texts)
+    assert not any(t.startswith("one") for t in sub_texts)
+    assert any("deep-cycle" in t for t in sub_texts)
+    assert any("sixty-one" in t for t in sub_texts)
+
