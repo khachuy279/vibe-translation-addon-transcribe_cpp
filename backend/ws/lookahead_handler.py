@@ -73,7 +73,13 @@ from backend.asr.forced_aligner import (
 from backend.core.vad_silence import VADSilenceScanner
 from backend.diarization import DiarizationService, assign_speakers_to_subtitles
 from backend.ws.connection import SafeWebSocketConnection
-from backend.ws.session import SessionConfigPayload
+from backend.ws.session import (
+    SessionConfigPayload,
+    clamp_min_words,
+    clamp_sync_offset_ms,
+    off_means_none_ms,
+    pick_vad_threshold,
+)
 from backend.ws.serializers import make_model_status_msg
 from backend.utils.logger import get_logger
 from backend.utils.text_repetition import is_repetition_hallucination
@@ -380,13 +386,12 @@ class LookaheadSessionState:
             or vad_engine or config.vad.vad_engine
         vad_threshold = config.vad.effective_threshold
         if parsed is not None:
-            _th = parsed.vad_threshold if parsed.vad_threshold is not None else parsed.threshold
+            _th = pick_vad_threshold(parsed)
             if _th is not None:
-                vad_threshold = float(_th)
+                vad_threshold = _th
         vad_silence = config.vad.effective_silence_ms
         if parsed is not None and parsed.silence_duration_ms is not None:
-            _raw = int(parsed.silence_duration_ms)
-            vad_silence = _raw if _raw > 0 else None
+            vad_silence = off_means_none_ms(parsed.silence_duration_ms)
         vad_enabled = True
         if parsed is not None and parsed.vad_enabled is not None:
             vad_enabled = bool(parsed.vad_enabled)
@@ -404,6 +409,21 @@ class LookaheadSessionState:
         if self._parsed_config is not None:
             self._apply_config_sync(self._parsed_config)
         self._refresh_start_pad()
+
+    def _set_min_words_to_commit(self, parsed: Any) -> Optional[int]:
+        """Áp `min_words_to_commit` từ popup vào trạng thái phiên.
+
+        Trả giá trị ĐÃ ÁP, hoặc `None` nếu payload không mang trường này (để caller ghi vào
+        `applied` mà không cần kiểm tra lại).
+
+        Gọi ở CẢ `_apply_config_sync` và `apply_init` — trước đây hai chỗ đó viết trùng nhau
+        y hệt (5 dòng × 2, xem `report/audit/26_...md` §5.9).
+        """
+        if parsed is None or parsed.min_words_to_commit is None:
+            return None
+        self._min_words_to_commit = clamp_min_words(parsed.min_words_to_commit)
+        self._batch_sub_opts["min_words"] = max(1, self._min_words_to_commit)
+        return self._min_words_to_commit
 
     def _refresh_start_pad(self) -> None:
         """Đọc phần bù mép-nói-sớm của VAD engine đang dùng (để canh phụ đề/TTS)."""
@@ -479,21 +499,19 @@ class LookaheadSessionState:
         # bản phiên âm + mốc từ của Forced Aligner), nên các tham số phân câu kiểu A
         # (`stability_*`, `max_duration_sec`, `max_chars`, `split_on_stability`…) KHÔNG được áp ở
         # đây. Chỉ `min_words_to_commit` được dùng lại — với nghĩa GỘP mảnh cụt, không phải lọc bỏ.
-        if parsed.min_words_to_commit is not None:
-            self._min_words_to_commit = max(0, int(parsed.min_words_to_commit))
-            self._batch_sub_opts["min_words"] = max(1, self._min_words_to_commit)
-            applied["min_words_to_commit"] = self._min_words_to_commit
+        _applied_min_words = self._set_min_words_to_commit(parsed)
+        if _applied_min_words is not None:
+            applied["min_words_to_commit"] = _applied_min_words
 
         if self.vad_processor is not None:
             vad_kwargs: Dict[str, Any] = {}
             if parsed.vad_engine:
                 vad_kwargs["vad_engine"] = str(parsed.vad_engine)
-            th = parsed.vad_threshold if parsed.vad_threshold is not None else parsed.threshold
+            th = pick_vad_threshold(parsed)
             if th is not None:
-                vad_kwargs["threshold"] = float(th)
+                vad_kwargs["threshold"] = th
             if parsed.silence_duration_ms is not None:
-                raw_ms = int(parsed.silence_duration_ms)
-                vad_kwargs["silence_duration_ms"] = raw_ms if raw_ms > 0 else None
+                vad_kwargs["silence_duration_ms"] = off_means_none_ms(parsed.silence_duration_ms)
             if parsed.vad_enabled is not None:
                 vad_kwargs["enabled"] = bool(parsed.vad_enabled)
             if vad_kwargs:
@@ -588,13 +606,12 @@ class LookaheadSessionState:
         applied = self._apply_config_sync(parsed)
         self._refresh_start_pad()
 
-        sync_raw = raw.get("lookaheadSyncOffsetMs", raw.get("lookahead_sync_offset_ms"))
-        if sync_raw is not None:
-            try:
-                self.sync_offset_ms = max(-1500.0, min(1500.0, float(sync_raw)))
-                applied["sync_offset_ms"] = self.sync_offset_ms
-            except (TypeError, ValueError):
-                pass
+        sync_ms = clamp_sync_offset_ms(
+            raw.get("lookaheadSyncOffsetMs", raw.get("lookahead_sync_offset_ms"))
+        )
+        if sync_ms is not None:
+            self.sync_offset_ms = sync_ms
+            applied["sync_offset_ms"] = self.sync_offset_ms
 
         requested_asr = parsed.asr_model or parsed.asr_engine or parsed.model_id
         if requested_asr:
@@ -1676,8 +1693,23 @@ class LookaheadSessionState:
     def _trim_tts_queue(self) -> None:
         """Giữ hàng đợi TTS trong trần: bỏ câu cũ nhất trong hàng đợi khi vượt trần.
 
-        Vì sao: khi GPU quá tải, một câu có thể mất hàng chục giây để tổng hợp; hàng đợi phình
-        ra thì vừa tốn VRAM vừa khiến mọi câu đều trễ. Bỏ câu cũ là đánh đổi đúng.
+        ⚠️ CHÍNH SÁCH NÀY CỐ Ý KHÁC Pipeline A — ĐỪNG "hợp nhất" hai bên.
+        Pipeline A (`ws/handler.py::_coalesce_enqueue`) khi đầy thì **GỘP** vào câu mới nhất;
+        ở đây khi đầy thì **BỎ CÂU CŨ NHẤT**. Hai bên khác nhau vì hai pipeline hoạt động khác
+        nhau, không phải vì lệch cài đặt:
+
+        * **Pipeline A** phải đợi chốt xong câu dịch mới phát được TTS, nên các câu DỒN LẠI
+          trong hàng đợi. Ở đó không có mốc thời gian video để bám ⇒ không có khái niệm "không
+          kịp". Vứt một câu nghĩa là câu đó **vĩnh viễn không có bản dịch/lồng tiếng** (phụ đề
+          gốc treo ở "...") ⇒ mất mát về đúng đắn, nên phải GỘP.
+        * **Pipeline B** hiển thị bản dịch trong ĐÚNG khoảng thời gian nhân vật nói
+          (`start_pts`→`end_pts`), nên TTS **phải phát kịp trong cửa sổ đó**. Nếu GPU không theo
+          kịp, câu đang chờ đã hết thời gian để phát — giữ nó lại chỉ làm câu SAU càng trễ. Bỏ
+          câu cũ để nhường câu mới là đánh đổi đúng. Gộp hai câu (như Pipeline A) còn tệ hơn:
+          chuỗi gộp DÀI HƠN nên càng không thể phát kịp trong cửa sổ.
+
+        Cũng vì lý do trên mà khi GPU quá tải, một câu có thể mất hàng chục giây để tổng hợp;
+        hàng đợi phình ra thì vừa tốn VRAM vừa khiến mọi câu đều trễ.
         """
         limit = max(1, int(config.lookahead.tts_max_queue))
         if self.tts_queue is None:
@@ -2122,18 +2154,15 @@ class LookaheadSessionState:
             requested = parsed.asr_model or parsed.asr_engine or parsed.model_id
             if requested:
                 self._requested_asr_model = str(requested).strip().lower()
-            if parsed.min_words_to_commit is not None:
-                self._min_words_to_commit = max(0, int(parsed.min_words_to_commit))
-                self._batch_sub_opts["min_words"] = max(1, self._min_words_to_commit)
+            self._set_min_words_to_commit(parsed)
 
         # Offset canh đồng bộ (ms) do người dùng chỉnh trong popup — trường riêng của
         # Lookahead nên không nằm trong `SessionConfigPayload`.
-        sync_raw = data.get("lookaheadSyncOffsetMs", data.get("lookahead_sync_offset_ms"))
-        if sync_raw is not None:
-            try:
-                self.sync_offset_ms = max(-1500.0, min(1500.0, float(sync_raw)))
-            except (TypeError, ValueError):
-                pass
+        sync_ms = clamp_sync_offset_ms(
+            data.get("lookaheadSyncOffsetMs", data.get("lookahead_sync_offset_ms"))
+        )
+        if sync_ms is not None:
+            self.sync_offset_ms = sync_ms
 
         # Vị trí phát hiện tại của video khi bắt đầu phiên
         cur_time_raw = data.get("current_time", data.get("currentTime"))

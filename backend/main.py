@@ -58,6 +58,7 @@ from backend.tts import VoiceManager, OmniVoiceTTS, get_tts_engine
 from backend.core.metrics import metrics_collector
 from backend.ws.handler import handle_ws
 from backend.ws.lookahead_handler import handle_lookahead_ws
+from backend.ws.session import clamp_min_words, off_means_none_ms
 from backend.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -110,43 +111,44 @@ def _log_asr_backend_at_startup() -> None:
 
 
 def _log_runtime_status_at_startup() -> None:
-    """Log runtime native ngay lúc khởi động (onnxruntime cho VAD, CrispASR cho aligner).
+    """Log runtime native ngay lúc khởi động.
 
-    VÌ SAO CẦN: trước đây hàm này kiểm tra torch để phát hiện việc pip âm thầm hạ torch xuống bản
-    CPU-only. Sau Giai đoạn 3, **không subsystem nào cần torch** nên câu hỏi đó không còn ý nghĩa;
-    cái cần nhìn thấy ngay bây giờ là runtime THẬT của VAD và aligner.
+    NGUỒN SỰ THẬT cho onnxruntime + aligner là `env_check.runtime_status()` — TRƯỚC ĐÂY hàm
+    này tự kiểm tra lại hai thứ đó (trùng lặp; xem `report/audit/26_...md` §5.10), nên sửa
+    một bên là bên kia lệch.
+
+    Ở đây chỉ THÊM hai kiểm tra mà `env_check` KHÔNG có: Diarization (audio.cpp + model
+    Nemotron) và cảnh báo `torch` lọt vào tiến trình.
     """
-    try:
-        import onnxruntime as ort
+    from backend.utils import env_check
 
+    status = env_check.runtime_status()
+
+    ort_version = status.get("onnxruntime")
+    if ort_version:
         logger.info(
-            f"[STARTUP] onnxruntime {ort.__version__} — VAD Silero + FireRed chạy ONNX "
-            f"(providers={ort.get_available_providers()})",
+            f"[STARTUP] onnxruntime {ort_version} — VAD Silero + FireRed chạy ONNX "
+            f"(providers={status.get('onnxruntime_providers')})",
             extra={"module_tag": "MAIN"},
         )
-    except Exception as exc:  # noqa: BLE001
+    else:
         logger.warning(
-            f"[STARTUP] KHÔNG nạp được onnxruntime ({type(exc).__name__}: {exc}) — "
-            f"VAD sẽ suy giảm sang bộ dò năng lượng. Chạy `pip install onnxruntime`.",
+            "[STARTUP] KHÔNG nạp được onnxruntime — VAD sẽ suy giảm sang bộ dò năng lượng. "
+            "Chạy `pip install onnxruntime`.",
             extra={"module_tag": "MAIN"},
         )
-    try:
-        from backend.asr.crispasr_aligner import available as _fa_available
 
-        ok, reason = _fa_available()
-        if ok:
-            logger.info(
-                "[STARTUP] ForcedAligner: CrispASR GGUF sẵn sàng",
-                extra={"module_tag": "ASR"},
-            )
-        else:
-            logger.warning(
-                f"[STARTUP] ForcedAligner CHƯA sẵn sàng ({reason}) — Pipeline B sẽ không có mốc "
-                f"từ. Chạy backend một lần để tự tải model/DLL.",
-                extra={"module_tag": "ASR"},
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"Bỏ qua kiểm tra runtime aligner: {exc}", extra={"module_tag": "MAIN"})
+    if status.get("aligner_ready"):
+        logger.info(
+            "[STARTUP] ForcedAligner: CrispASR GGUF sẵn sàng",
+            extra={"module_tag": "ASR"},
+        )
+    else:
+        logger.warning(
+            f"[STARTUP] ForcedAligner CHƯA sẵn sàng ({status.get('aligner_reason') or 'không rõ'}) "
+            f"— Pipeline B sẽ không có mốc từ. Chạy backend một lần để tự tải model/DLL.",
+            extra={"module_tag": "ASR"},
+        )
 
     try:
         from backend.diarization.service import _find_audiocpp_cli, _find_model_path
@@ -1008,10 +1010,9 @@ async def update_backend_config(req: SwitchModelRequest):
         config.vad.threshold = req.vad_threshold
     if req.silence_duration_ms is not None:
         # 0 = "off" ⇒ None = dùng đúng mặc định của engine (xem report/audit/19_…).
-        raw_ms = int(req.silence_duration_ms)
-        config.vad.silence_duration_ms = raw_ms if raw_ms > 0 else None
+        config.vad.silence_duration_ms = off_means_none_ms(req.silence_duration_ms)
     if req.min_words_to_commit is not None:
-        config.sentence.min_words_to_commit = max(0, req.min_words_to_commit)
+        config.sentence.min_words_to_commit = clamp_min_words(req.min_words_to_commit)
     # ---- Cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut) ----
     if req.split_on_stability is not None:
         config.sentence.split_on_stability = bool(req.split_on_stability)

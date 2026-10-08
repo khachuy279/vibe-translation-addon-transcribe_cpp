@@ -196,25 +196,23 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const cfg = {
       asrEngine: selAsrEngine ? selAsrEngine.value : undefined,
       vadEngine: selVadEngine ? selVadEngine.value : undefined,
+      //: Chỉ MỘT tên cho mỗi giá trị (camelCase). Trước đây mỗi giá trị được ghi thêm 1–2 khoá
+      //: snake_case "cho chắc", nhưng MỌI phía đọc đều đã có nhánh fallback
+      //: (`content-script.js::buildWsConfig`, các chỗ đọc `bs_settings` trong file này) nên các
+      //: bản ghi thêm là thừa — và chúng che mất chỗ một payload trộn lẫn hai quy ước.
+      //: Xem `report/audit/26_...md` §5.10.
       vadSilenceDurationMs: vadSilenceMs,
-      silenceDurationMs: vadSilenceMs,
-      silence_duration_ms: vadSilenceMs,
       vadThreshold: vadThresholdVal,
-      vad_threshold: vadThresholdVal,
-      threshold: vadThresholdVal,
       minWordsToCommit: minWords,
-      min_words_to_commit: minWords,
       // Cắt câu theo ĐỘ ỔN ĐỊNH (stable_cut): text đứng im đủ lâu ⇒ chốt câu.
       splitOnStability: chkStableCut ? chkStableCut.checked : true,
       stabilityDurationSec: stableMs / 1000,
+      //: Bản ms của cùng giá trị trên — payload REST cần đơn vị ms nên đọc thẳng khoá này thay vì
+      //: nhân lại `stabilityDurationSec * 1000` (sai số dấu phẩy động: 0.05*1000 = 50.00000000000001).
+      stabilityDurationMs: stableMs,
       stabilityMinDurationSec: rangeStableMinSec ? parseFloat(rangeStableMinSec.value) : 2.5,
       stabilityMinWords: rangeStableMinWords ? parseInt(rangeStableMinWords.value, 10) : 4,
-      stability_duration_ms: stableMs,
-      stability_min_duration_sec: rangeStableMinSec ? parseFloat(rangeStableMinSec.value) : 2.5,
-      stability_min_words: rangeStableMinWords ? parseInt(rangeStableMinWords.value, 10) : 4,
-      split_on_stability: chkStableCut ? chkStableCut.checked : true,
       traceStability: chkStableTrace ? chkStableTrace.checked : false,
-      trace_stability: chkStableTrace ? chkStableTrace.checked : false,
       sourceLanguage: selSourceLang ? selSourceLang.value : "auto",
       targetLang: selTargetLang ? selTargetLang.value : "vi",
       translationModel: selTranslationModel ? selTranslationModel.value : "xiaomi",
@@ -1299,14 +1297,17 @@ const api = typeof browser !== "undefined" ? browser : chrome;
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          //: Khoá GỬI đi là snake_case (backend mong đợi), nhưng NGUỒN đọc luôn là camelCase —
+          //: trước đây 3 dòng cuối đọc thẳng khoá snake_case của `cfg`, trộn hai quy ước trong
+          //: cùng một payload (xem `report/audit/26_...md` §5.10).
           min_words_to_commit: cfg.minWordsToCommit,
-          silence_duration_ms: cfg.silenceDurationMs,
+          silence_duration_ms: cfg.vadSilenceDurationMs,
           vad_threshold: cfg.vadThreshold,
           // stable_cut: đẩy sang REST để áp cho MỌI phiên đang chạy (giống VAD/threshold).
           split_on_stability: cfg.splitOnStability,
-          stability_duration_ms: cfg.stability_duration_ms,
-          stability_min_duration_sec: cfg.stability_min_duration_sec,
-          stability_min_words: cfg.stability_min_words,
+          stability_duration_ms: cfg.stabilityDurationMs,
+          stability_min_duration_sec: cfg.stabilityMinDurationSec,
+          stability_min_words: cfg.stabilityMinWords,
           trace_stability: cfg.traceStability,
         }),
       }).catch(() => { });

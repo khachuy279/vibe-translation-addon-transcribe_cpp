@@ -483,12 +483,9 @@
     if (!bytes || bytes.byteLength < 8) return false;
     const u8 = new Uint8Array(bytes);
     const scanLen = Math.min(u8.length, 1 << 20);
-    const hasMagic = (a, b, c, d) => {
-      for (let i = 0; i + 4 <= scanLen; i++) {
-        if (u8[i] === a && u8[i + 1] === b && u8[i + 2] === c && u8[i + 3] === d) return true;
-      }
-      return false;
-    };
+    // Dùng CHUNG `containsMagic` thay vì tự viết lại vòng quét 4 byte (trước đây có 2 bản
+    // y hệt nhau trong cùng file: xem report/audit/26_...md §5.10).
+    const hasMagic = (a, b, c, d) => containsMagic(u8, scanLen, a, b, c, d);
     // WebM / Matroska: EBML magic, và KHÔNG chứa Cluster (0x1F43B675) ⇒ thuần header.
     if (u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) {
       return !hasMagic(0x1f, 0x43, 0xb6, 0x75);

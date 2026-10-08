@@ -78,6 +78,56 @@ class SessionConfigPayload(BaseModel):
     protocol_version: Optional[int] = Field(default=None, alias="protocolVersion")
 
 
+# ──────────────────────────────────── Chuẩn hoá giá trị config (MỘT chỗ duy nhất)
+#: Các quy ước dưới đây từng bị viết lặp ở 2–3 nơi (`main.py`, `session.py`,
+#: `lookahead_handler.py`) ⇒ sửa một chỗ là lệch hai chỗ còn lại. Xem
+#: `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.9.
+
+#: Trần kẹp offset đồng bộ phụ đề/TTS (ms) — popup cũng dùng đúng con số này.
+SYNC_OFFSET_LIMIT_MS = 1500.0
+
+
+def pick_vad_threshold(parsed: Any) -> Optional[float]:
+    """Ngưỡng VAD từ payload: ưu tiên `vad_threshold`, rơi về alias cũ `threshold`.
+
+    Alias `threshold` là tên cũ còn sót lại; popup hiện gửi `vad_threshold`. Giữ nhánh
+    fallback để client cũ không bị bỏ qua.
+    """
+    if parsed is None:
+        return None
+    raw = parsed.vad_threshold if parsed.vad_threshold is not None else parsed.threshold
+    return None if raw is None else float(raw)
+
+
+def off_means_none_ms(raw_ms: Any) -> Optional[int]:
+    """`0` (hoặc âm) nghĩa là "TẮT" ⇒ trả `None` để engine dùng mặc định của chính nó.
+
+    Quy ước này ghi ở `report/audit/19_...`: kéo slider về 0 phải TẮT ngắt câu theo khoảng
+    lặng, KHÔNG phải "khoảng lặng dài 0 ms".
+    """
+    value = int(raw_ms)
+    return value if value > 0 else None
+
+
+def clamp_min_words(raw: Any) -> int:
+    """`min_words_to_commit` không bao giờ âm."""
+    return max(0, int(raw))
+
+
+def clamp_sync_offset_ms(raw: Any) -> Optional[float]:
+    """Kẹp offset đồng bộ vào ±`SYNC_OFFSET_LIMIT_MS`. Trả `None` nếu không parse được.
+
+    Trả `None` (thay vì ném) vì đây là giá trị người dùng chỉnh trong popup — payload hỏng
+    không được làm sập phiên.
+    """
+    if raw is None:
+        return None
+    try:
+        return max(-SYNC_OFFSET_LIMIT_MS, min(SYNC_OFFSET_LIMIT_MS, float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
 class SessionConfig:
     """Quản lý cấu hình động theo từng phiên làm việc."""
 
@@ -399,13 +449,12 @@ class SessionState:
                 )
             else:
                 updates["vad_engine"] = parsed.vad_engine
-        vad_th = parsed.vad_threshold if parsed.vad_threshold is not None else parsed.threshold
+        vad_th = pick_vad_threshold(parsed)
         if vad_th is not None:
-            updates["vad_threshold"] = float(vad_th)
+            updates["vad_threshold"] = vad_th
         if parsed.silence_duration_ms is not None:
             # 0 (hoặc âm) = "off" ⇒ để VAD dùng mặc định trong docs của nó.
-            raw_ms = int(parsed.silence_duration_ms)
-            updates["silence_duration_ms"] = raw_ms if raw_ms > 0 else None
+            updates["silence_duration_ms"] = off_means_none_ms(parsed.silence_duration_ms)
         if parsed.vad_enabled is not None:
             updates["vad_enabled"] = bool(parsed.vad_enabled)
 

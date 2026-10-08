@@ -214,6 +214,17 @@ def _coalesce_enqueue(
       câu đã bị gộp (tránh phụ đề treo ở "...").
 
     Trả về: "queued" | "merged" | "dropped".
+
+    ⚠️ CHÍNH SÁCH NÀY CỐ Ý KHÁC Pipeline B — ĐỪNG "hợp nhất" hai bên.
+    Pipeline B (`ws/lookahead_handler.py::_trim_tts_queue`) khi đầy thì **BỎ CÂU CŨ NHẤT**;
+    ở đây khi đầy thì **GỘP**. Khác nhau vì hai pipeline hoạt động khác nhau:
+
+    * **Pipeline A** (ở đây) phải đợi chốt xong câu dịch mới phát được TTS ⇒ các câu dồn lại
+      trong hàng đợi. Không có mốc thời gian video để bám ⇒ không có khái niệm "không phát kịp".
+      Vứt một câu nghĩa là câu đó vĩnh viễn không có bản dịch/lồng tiếng ⇒ phải GỘP.
+    * **Pipeline B** hiển thị bản dịch trong ĐÚNG khoảng nhân vật nói (`start_pts`→`end_pts`),
+      nên TTS phải phát kịp trong cửa sổ đó; không kịp thì phải HUỶ để nhường câu sau. Gộp hai
+      câu lại càng sai vì chuỗi gộp DÀI HƠN nên càng không thể phát kịp.
     """
     try:
         queue.put_nowait(item)

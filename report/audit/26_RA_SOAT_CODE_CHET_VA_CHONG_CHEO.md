@@ -109,10 +109,10 @@
 | 5.4 | Định dạng khung audio 4 lần | ✅ xong (P3-ter) |
 | 5.5 | 3 bộ dedup, 3 quy tắc chuẩn hoá | ✅ xong (chuẩn hoá hợp nhất; chiến lược khớp giữ riêng có chủ đích) |
 | 5.6 | `popup.js` trùng lặp | ✅ xong một phần (P3; 2 cặp `handle*Switch` cố ý không gộp) |
-| 5.7 | Pipeline A vs B trùng lặp | ❌ **CHƯA** — gồm chính sách hàng đợi TTS ngược nhau |
+| 5.7 | Pipeline A vs B trùng lặp | ✅ xử lý (phần cơ học còn lại; **chính sách TTS khác nhau là CỐ Ý**) |
 | 5.8 | `model_status` 18 dict literal | ✅ xong (P3-ter) |
-| 5.9 | Parse config lặp | ❌ **CHƯA** — xem chi tiết bên dưới |
-| 5.10 | Khác | ❌ **CHƯA** (một phần đã xử lý ở P3) |
+| 5.9 | Parse config lặp | ✅ xong (4 quy ước gom về `ws/session.py`; 2 mục payload để lại có lý do) |
+| 5.10 | Khác | ✅ xong 3/4 (tách câu giữ nguyên có chủ đích) |
 
 ### 5.1 SHA-256 cài 5 lần ở 4 module
 `utils/crispasr_native.py:112` (`_sha256_file`) · `utils/crispasr_native.py:175` (nội tuyến) ·
@@ -170,39 +170,75 @@ Khác biệt **duy nhất**: `K32GetProcessMemoryInfo` vs `psapi.GetProcessMemor
 `renderAsrEngineOptions` (`:345-372`) vs `renderTranslationModelOptions` (`:374-401`) — **65 % giống** ·
 `monitorAsrDownload` vs `monitorTranslationDownload` · `handleEngineSwitch` (`:609-710`) vs `handleTranslationModelSwitch` (`:875-933`).
 
-### 5.7 Pipeline A vs Pipeline B
-- `_spawn`: `ws/session.py:186` vs `ws/lookahead_handler.py:569` — **giống hệt từng byte**, chỉ khác log.
+### 5.7 Pipeline A vs Pipeline B — ✅ ĐÃ XỬ LÝ (phần cơ học + ghi rõ phần cố ý)
+- `_spawn`: `ws/session.py` vs `ws/lookahead_handler.py` — **giống hệt từng byte**, chỉ khác log.
 - `send_json` **3 lớp** bọc nhau, hai lớp cuối chỉ khác một kiểm tra `_closed`.
-- `_schedule_asr_model_switch`/`_schedule_translation_model_switch` **cài đặt 2 lần** (`session.py:241,309` vs `lookahead_handler.py:501,537`).
-- **Chính sách hàng đợi TTS NGƯỢC NHAU**: `handler.py:192 _coalesce_enqueue` (khoá `ws.tts_queue_maxsize`) **GỘP** khi đầy;
-  `lookahead_handler.py:1658 _enqueue_tts` + `:1675 _trim_tts_queue` (khoá `lookahead.tts_max_queue`) **BỎ CŨ NHẤT**.
-  Cùng khái niệm, 2 config key, 2 hành vi trái ngược.
-- `_is_duplicate` (`lookahead_handler.py:1945`) nhận tham số `pts_end` nhưng **không dùng**.
+- `_schedule_asr_model_switch`/`_schedule_translation_model_switch` **cài đặt 2 lần**.
+- `_is_duplicate` (`lookahead_handler.py`) nhận tham số `pts_end` nhưng **không dùng**.
+
+**Chính sách hàng đợi TTS NGƯỢC NHAU — ✅ CỐ Ý, KHÔNG PHẢI LỖI.** Người dùng đã xác nhận lý do:
+
+| | Pipeline A (`handler.py::_coalesce_enqueue`) | Pipeline B (`lookahead_handler.py::_trim_tts_queue`) |
+|---|---|---|
+| Khi hàng đợi đầy | **GỘP** vào câu mới nhất | **BỎ CÂU CŨ NHẤT** |
+| Vì sao | A phải đợi chốt xong câu dịch mới phát được TTS ⇒ các câu DỒN LẠI. Không có mốc thời gian video để bám ⇒ không có khái niệm "không kịp". Vứt một câu = câu đó **vĩnh viễn** không có bản dịch/lồng tiếng (phụ đề gốc treo ở "…") ⇒ mất mát về ĐÚNG ĐẮN | B hiển thị bản dịch trong ĐÚNG khoảng nhân vật nói (`start_pts`→`end_pts`), nên TTS **phải phát kịp trong cửa sổ đó**. Không kịp thì phải HUỶ để nhường câu sau. Gộp hai câu càng sai: chuỗi gộp DÀI HƠN nên càng không thể phát kịp |
+
+⇒ Đã ghi lý do này vào **docstring của CẢ HAI hàm**, kèm câu "ĐỪNG hợp nhất hai bên", vì đây đúng
+là loại code trông như trùng lặp nhưng khác biệt là có chủ đích.
 
 ### 5.8 Payload `model_status` lặp 18 lần dạng dict literal
 `session.py` 12 chỗ (`:251,272,280,290,297,303,326,348,356,366,373,379`) + `lookahead_handler.py` 6 chỗ (`:516,527,531,554,559,563`),
 trong khi `serializers.make_model_status_msg` (`:173`) đã tồn tại nhưng **chỉ test dùng**.
 
-### 5.9 Parse config lặp — ❌ **CHƯA SỬA** (đã kiểm chứng lại 2026-10-08)
+### 5.9 Parse config lặp — ✅ ĐÃ SỬA
 
-`min_words_to_commit`: **5 chỗ** (`main.py:1013,1147,1202`, `session.py:480`, `lookahead_handler.py:482,2125`) ·
-VAD `"0 = tắt" → None`: **3 chỗ** (`main.py:1012`, `session.py:408`, `lookahead_handler.py:496`) ·
-alias `vad_threshold if not None else threshold`: **3 chỗ** (`session.py:402`, `lookahead_handler.py:383,491`) ·
-clamp `lookaheadSyncOffsetMs`: **2 chỗ** (`lookahead_handler.py:591`, `:2131`) ·
-`main.py:1138-1170` lặp lại bảng alias của `SessionConfigPayload` (`session.py:37-77`) ·
-Pipeline B parse payload **2 lần** (`apply_config` và `apply_init`).
+Trước: `min_words_to_commit` **5+ chỗ** · VAD `"0 = tắt" → None` **3 chỗ** · alias
+`vad_threshold if not None else threshold` **3 chỗ** · clamp `lookaheadSyncOffsetMs` **2 chỗ** ·
+`lookahead_handler.py:482-485` và `:2125-2127` **trùng nhau y hệt TRONG cùng một file**.
 
-⚠️ Đáng chú ý: `lookahead_handler.py:482-485` và `:2125-2127` **trùng nhau y hệt TRONG cùng một file**
-(5 dòng × 2). Đây là chỗ dễ sửa nhất và nên làm trước.
+Nay mọi quy ước nằm ở **`backend/ws/session.py`** (cạnh `SessionConfigPayload`) và mọi nơi uỷ quyền:
 
-### 5.10 Khác
-- `main.py:112-175` `_log_runtime_status_at_startup()` cài lại `env_check.runtime_status()`.
-- `content/content-script.js:107-170` vs `popup/popup.js:166-236`: **2 bản** chuẩn hoá settings→protocol.
-- `buffer_interceptor_poc.js:196-201` `containsMagic` vs `hasMagic` nội tuyến `:486-491`.
-- **Tách câu: 2 cài đặt ngữ nghĩa khác nhau** — `core/hypothesis.py:57 _split_sentences` (đơn giản, ~17 dòng,
-  **không xử lý viết tắt/số thập phân**) vs `asr/forced_aligner.py:188 _split_text_by_sentence` (đầy đủ: `3.14`,
-  `domain.com`, `Dr.`, ngoặc đóng). Phục vụ 2 mục đích khác nhau nên **chấp nhận được**, nhưng cần biết là
-  bộ đếm preview dùng bản đơn giản.
+| Helper | Thay cho |
+|---|---|
+| `pick_vad_threshold(parsed)` | 3 nhánh alias `vad_threshold`/`threshold` |
+| `off_means_none_ms(raw)` | 3 chỗ `raw if raw > 0 else None` |
+| `clamp_min_words(raw)` | 3 chỗ `max(0, int(...))` |
+| `clamp_sync_offset_ms(raw)` | 2 khối `try/except` + `min(1500.0, …)` |
+| `LookaheadSessionState._set_min_words_to_commit(parsed)` | 2 khối trùng trong cùng file |
+
+Kiểm chứng: `min(1500`, `raw_ms if raw_ms > 0 else`, `vad_threshold if … else …threshold` đều còn
+**0 lần** ngoài `session.py`; `_batch_sub_opts["min_words"]` chỉ còn **1 chỗ gán**.
+
+**CHƯA làm (ghi lại để không quên):** `main.py:1138-1170` vẫn dựng `session_payload` thủ công thay vì
+dùng `SessionConfigPayload` + `model_dump()`; Pipeline B vẫn parse payload **2 lần**
+(`apply_config` và `apply_init`). Hai việc này cần đụng vào hợp đồng alias của payload nên tách riêng.
+
+### 5.10 Khác — ✅ ĐÃ SỬA (3/4)
+
+- **`main.py::_log_runtime_status_at_startup()` cài lại `env_check.runtime_status()`** → ✅ hàm log nay
+  đọc thẳng từ `env_check.runtime_status()`; chỉ giữ 2 kiểm tra mà `env_check` KHÔNG có (Diarization và
+  cảnh báo `torch` lọt vào tiến trình). Lưu ý: `main.py::_vad_runtime_info()` vẫn `import onnxruntime`
+  — đó là hàm KHÁC, hợp lệ, không phải trùng lặp.
+- **`getSettings()` ghi mỗi giá trị dưới 2–3 khoá alias, và payload REST trộn hai quy ước** → ✅
+  `getSettings()` nay chỉ ghi **một tên camelCase** cho mỗi giá trị; payload REST gửi snake_case nhưng
+  **đọc từ camelCase** nhất quán. An toàn vì mọi phía đọc đều đã có nhánh fallback
+  (`content-script.js::buildWsConfig`, các chỗ đọc `bs_settings`) — đã kiểm từng chỗ.
+  Thêm `stabilityDurationMs` để payload REST khỏi nhân `stabilityDurationSec * 1000`
+  (sai số dấu phẩy động: `0.05 * 1000 = 50.00000000000001`).
+- **`containsMagic` vs `hasMagic` nội tuyến** (`buffer_interceptor_poc.js`) → ✅ `isInitSegment` nay
+  gọi `containsMagic` thay vì tự viết lại vòng quét 4 byte.
+- **Tách câu: 2 cài đặt ngữ nghĩa khác nhau** → **GIỮ NGUYÊN, có chủ đích**.
+  `core/hypothesis.py::_split_sentences` (đơn giản, đếm nhịp preview) vs
+  `asr/forced_aligner.py::_split_text_by_sentence` (đầy đủ: `3.14`, `domain.com`, `Dr.`, ngoặc đóng —
+  dùng để ngắt phụ đề). Hai mục đích khác nhau, gộp lại sẽ làm bản đơn giản phức tạp lên mà không có lợi.
+
+**Test hồi quy:** `backend/tests/test_73_config_coercion.py` — 24 test: hành vi của 4 helper + chốt
+mã nguồn (quy ước §5.9 chỉ còn ở `session.py`; `min_words` chỉ gán 1 chỗ; hàm log khởi động không tự
+import onnxruntime/gọi aligner; `getSettings()` không ghi alias snake_case; payload REST đọc camelCase).
+Đã kiểm chứng guard **FAIL thật** khi chèn lại alias snake_case vào `getSettings()`, và pass lại sau
+khi khôi phục.
+
+
 
 ## 6. Tài liệu/comment SAI SỰ THẬT — nhóm nguy hiểm nhất
 
