@@ -220,9 +220,29 @@ Nay mọi quy ước nằm ở **`backend/ws/session.py`** (cạnh `SessionConfi
 Kiểm chứng: `min(1500`, `raw_ms if raw_ms > 0 else`, `vad_threshold if … else …threshold` đều còn
 **0 lần** ngoài `session.py`; `_batch_sub_opts["min_words"]` chỉ còn **1 chỗ gán**.
 
-**CHƯA làm (ghi lại để không quên):** `main.py:1138-1170` vẫn dựng `session_payload` thủ công thay vì
+**CHƯA làm (ghi lại để không quên):** `main.py:1138-1180` vẫn dựng `session_payload` thủ công thay vì
 dùng `SessionConfigPayload` + `model_dump()`; Pipeline B vẫn parse payload **2 lần**
 (`apply_config` và `apply_init`). Hai việc này cần đụng vào hợp đồng alias của payload nên tách riêng.
+
+> **⚠️ BUG TÌM THẤY KHI RÀ CHÍNH MỤC NÀY (đã vá).** Vì `SessionConfigPayload` khai
+> `extra="ignore"`, mọi khoá `main.py` gửi mà payload KHÔNG hiểu đều bị **nuốt im lặng** — không
+> lỗi, không log, không tác dụng. Và đã có đúng một khoá như vậy:
+>
+> | Đường | Gửi | `parsed.stability_duration_sec` |
+> |---|---|---|
+> | REST (`main.py:1151`) | `stability_duration_ms: 150.0` | **`None`** ← bị nuốt |
+> | WS (`buildWsConfig`) | `stabilityDurationSec: 0.15` | `0.15` ✅ |
+>
+> Hệ quả: kéo slider "Stable for (ms)" thì `config.sentence` TOÀN CỤC vẫn được cập nhật, nhưng
+> **phiên ĐANG CHẠY không nhận gì** qua đường REST. Không test nào bắt được vì đường WS gửi đúng
+> `stabilityDurationSec` nên tính năng vẫn chạy — đây là loại lỗi chỉ lộ ra khi ĐỌC code.
+>
+> **Đã vá:** `main.py` nay gửi `stability_duration_sec = ms / 1000`.
+> **Test hồi quy:** `backend/tests/test_75_session_payload_contract.py` — 6 test, trong đó có bất biến
+> TỔNG QUÁT *"mọi khoá `main.py` gửi cho phiên phải là field name hoặc alias của
+> `SessionConfigPayload`"*. Guard này bắt được **cả những khoá lệch trong tương lai**, không chỉ
+> khoá này. Đã kiểm chứng nó **FAIL thật** khi quay lại code cũ.
+
 
 ### 5.10 Khác — ✅ ĐÃ SỬA (3/4)
 
@@ -502,11 +522,21 @@ giúp mọi test hiện/ sau này không phải tự nhớ thứ tự nạp củ
 - chốt `setUint32(0,` chỉ có trong `frame-builder.js`;
 - kiểm chứng **hành vi thật** của `frame-builder.js` dưới Node (bố cục 4 byte LE + JSON + PCM khớp).
 
-### CÒN LẠI (chưa làm — cần quyết định, không thuần cơ học)
+### CÒN LẠI (đã kiểm chứng lại 2026-10-08 — chỉ còn 2 mục, đều KHÔNG thuần cơ học)
 
-- **3 bộ dedup với 3 quy tắc chuẩn hoá KHÁC NHAU** — hợp nhất đòi hỏi chọn ngữ nghĩa đúng, có thể đổi hành vi lọc ⇒ cần người quyết.
-- **Chính sách hàng đợi TTS ngược nhau** giữa Pipeline A (gộp) và B (bỏ cũ nhất) — cần chọn một.
-- `handleEngineSwitch` / `handleTranslationModelSwitch` — **cố ý không gộp** (chỉ giống ~33 %, xem §P3).
+- **`main.py:1139-1180` dựng `session_payload` thủ công** thay vì dùng `SessionConfigPayload`.
+  KHÔNG phải refactor cơ học: `SwitchModelRequest` (19 field) và `SessionConfigPayload` (29 field)
+  **không trùng tập** — `lookahead_enabled` không có trong payload, còn `stability_duration_ms`
+  khác ĐƠN VỊ (`_sec` vs `_ms`). Chính sự lệch này đã gây ra bug **`stability_duration_ms` bị nuốt
+  im lặng** (xem §5.9). Làm refactor này phải xử lý 2 field lệch trước.
+- **Pipeline B parse payload 2 lần** (`apply_config` + `apply_init`) với phần xử lý chồng nhau
+  (source/target lang, requested model). `apply_init` chỉ áp MỘT PHẦN vì lúc đó VAD processor
+  chưa tồn tại nên không gọi thẳng `_apply_config_sync` được.
+
+**Đã xử lý xong (trước đây nằm trong danh sách này — mục đã cũ):**
+- ~~3 bộ dedup khác quy tắc chuẩn hoá~~ → ✅ hợp nhất (`eaaef2e`)
+- ~~Chính sách hàng đợi TTS ngược nhau~~ → ✅ xác nhận là **CỐ Ý**, đã ghi lý do vào docstring cả hai hàm
+- `handleEngineSwitch` / `handleTranslationModelSwitch` → vẫn **cố ý không gộp** (chỉ giống ~33 %, xem §P3)
 
 ### P2-quater — Đấu dây 6 id mồ côi trong popup ✅ XONG
 

@@ -1148,7 +1148,13 @@ async def update_backend_config(req: SwitchModelRequest):
     if req.min_words_to_commit is not None:
         session_payload["min_words_to_commit"] = req.min_words_to_commit
     if req.stability_duration_ms is not None:
-        session_payload["stability_duration_ms"] = float(req.stability_duration_ms)
+        # ⚠️ Payload phiên dùng `stability_duration_sec` (GIÂY), cùng đơn vị với
+        # `stabilityDurationSec` mà extension gửi qua WS. Trước đây chỗ này gửi thẳng khoá
+        # `stability_duration_ms` (mili-giây) — nhưng `SessionConfigPayload` khai
+        # `extra="ignore"` và không có field/alias nào tên đó, nên khoá ấy bị **NUỐT IM LẶNG**:
+        # slider "Stable for (ms)" đổi ở popup thì `config.sentence` TOÀN CỤC được cập nhật
+        # (dòng trên), còn phiên ĐANG CHẠY thì không nhận gì qua đường REST.
+        session_payload["stability_duration_sec"] = max(0.0, float(req.stability_duration_ms) / 1000.0)
     if req.stability_min_duration_sec is not None:
         session_payload["stability_min_duration_sec"] = float(req.stability_min_duration_sec)
     if req.stability_min_words is not None:
