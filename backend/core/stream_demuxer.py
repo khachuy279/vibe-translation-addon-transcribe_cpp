@@ -353,6 +353,9 @@ class StreamDemuxer:
         self._epoch: int = 0
         self._min_pts: Optional[float] = None
         self._last_pts: float = float("-inf")
+        #: Sàn QUÉT của đường giải mã từng-fragment — xem `_decode_fragments_individually`.
+        #: Chỉ nghĩa "đã thử và không ra PCM", KHÔNG nghĩa "đã phát".
+        self._indiv_scan_floor: float = float("-inf")
         self._latest_ts_offset: float = 0.0
         #: `timestampOffset` suy ra từ `SourceBuffer.buffered` (extension gửi kèm) — xem
         #: `_anchor_to_browser_axis`. Khi đã có, nó THAY THẾ `_latest_ts_offset` làm trục giải mã
@@ -425,6 +428,7 @@ class StreamDemuxer:
             if min_pts is not None:
                 self._min_pts = float(min_pts)
             self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
+            self._indiv_scan_floor = float("-inf")
             self._latest_ts_offset = 0.0
             if epoch is not None and int(epoch) != self._epoch:
                 # SourceBuffer MỚI ⇒ luồng mới ⇒ mọi neo trục cũ không còn giá trị.
@@ -486,6 +490,7 @@ class StreamDemuxer:
                 self._media.clear()
                 self._epoch = int(epoch)
                 self._last_pts = float(self._min_pts) if self._min_pts is not None else float("-inf")
+                self._indiv_scan_floor = float("-inf")
                 self._browser_axis_bias = None
                 self._axis_shift_obs = None
                 self._axis_shift_logged = False
@@ -1011,7 +1016,12 @@ class StreamDemuxer:
                 self.decoded_seconds += sum(c.duration for c in per_frag)
                 self._emitted_sec += sum(c.duration for c in per_frag)
                 self._last_pts = max(self._last_pts, per_frag[-1].pts_end)
-                return per_frag
+                # ── NỐI THÊM, KHÔNG THAY THẾ ──────────────────────────────────────
+                # `_decode_fragments_individually` lọc frame theo `_last_pts` ĐỌC SAU khi
+                # đường chuẩn đã chạy, nên `per_frag` chỉ chứa audio NẰM SAU phần `chunks`
+                # vừa phát — hai tập RỜI NHAU. Trả `per_frag` không thôi là vứt toàn bộ PCM
+                # mà đường chuẩn vừa giải mã được (đo được: 31,11s → 0,50s).
+                return chunks + per_frag
 
         # ── DỰ PHÒNG fMP4/AAC ─────────────────────────────────────────────────────
         # Nếu đường chuẩn không lấy ra được gì trong khi bộ đệm ĐÃ có byte media, thử bóc
@@ -1117,7 +1127,13 @@ class StreamDemuxer:
         # Nhắm thẳng vào vùng cần: bỏ qua các mảnh ĐÃ phát và chỉ lấy tối đa 200 mảnh kế tiếp.
         # Nếu lấy 200 mảnh ĐẦU bộ đệm thì hàm này giải mã lại mãi phần cũ và không bao giờ tới
         # phần đang cần (lỗi đã gặp: bộ đệm 6 MB / 3000+ mảnh, chỉ 46 mảnh đầu được xét).
-        frontier = self._last_pts if self._last_pts > float("-inf") else float("-inf")
+        #: Mốc CHỌN mảnh để giải mã từng-fragment: `max(_last_pts, _indiv_scan_floor)`.
+        #: PHẢI tách khỏi `_last_pts` (mốc PCM ĐÃ PHÁT). Dùng chung một biến thì việc
+        #: "đã quét qua vùng không ra PCM" bị ghi nhầm thành "đã phát hết vùng đó", và
+        #: audio chưa hề phát sẽ bị frontier lọc VĨNH VIỄN — đúng cơ chế làm Pipeline B
+        #: kẹt ở một mốc duy nhất (xem `test_77_demuxer_no_audio_loss.py`).
+        self_floor = self._indiv_scan_floor
+        frontier = max(self._last_pts, self_floor)
         pending = []
         for pair in pairs:
             if pair[2] < frontier - 0.05:
@@ -1129,10 +1145,9 @@ class StreamDemuxer:
             return []
         pairs = pending
 
-        # `_last_pts` âm vô cực có nghĩa: chưa có mốc đã phát. Trong trường hợp đó, CỨU mốc
-        # tiến độ bằng mốc của mảnh cuối vùng vừa xử lý — nếu để `-inf` thì mọi lượt sau lại
-        # bắt đầu lại từ mảnh đầu tiên và pipeline đứng yên (lỗi đã gặp: bộ đệm 8 MB,
-        # `emitted` không tăng, `last_pts=-infs`).
+        # `_last_pts` âm vô cực có nghĩa: chưa có mốc đã phát. Khi đó mốc tiến độ được giữ ở
+        # `recovered_frontier` (mốc của mảnh CUỐI vùng vừa xét) — nhưng CHỈ ghi vào sàn quét
+        # `_indiv_scan_floor`, không bao giờ ghi vào `_last_pts` (xem cuối hàm).
         recovered_frontier = float("-inf")
         for _s, _e, dt in pairs:
             if dt > recovered_frontier:
@@ -1204,8 +1219,25 @@ class StreamDemuxer:
                     pass
         # Không ra PCM nhưng vùng này đã được xử lý: ghi nhận mốc để lượt sau TIẾN tiếp thay vì
         # giải mã lại đúng 200 mảnh đó mãi (nguyên nhân `emitted` đứng yên ở log thật).
+        #
+        # ⚠️ CHỈ nâng SÀN QUÉT, TUYỆT ĐỐI KHÔNG nâng `_last_pts`. `_last_pts` là mốc PCM ĐÃ
+        # PHÁT; nâng nó ở đây nghĩa là "coi như đã phát" một vùng chưa hề phát ra mẫu nào ⇒
+        # mọi frame của vùng đó vĩnh viễn bị lọc (`pts < _last_pts`) và không đường nào lấy
+        # lại được. Log thật 2026-10-08: bộ đệm giữ 0→40s, `_last_pts`=16s, một lượt dự phòng
+        # rỗng đẩy thẳng frontier tới 36,02s ⇒ pipeline đứng im ở 16,00s suốt phiên.
         if not out and recovered_frontier > float("-inf"):
-            self._last_pts = max(self._last_pts, recovered_frontier + 0.02)
+            advanced = recovered_frontier + 0.02 > self._indiv_scan_floor
+            self._indiv_scan_floor = max(self._indiv_scan_floor, recovered_frontier + 0.02)
+            if advanced:
+                # Nhánh này TỪNG im lặng tuyệt đối, và chính sự im lặng đó làm sự cố
+                # 2026-10-08 khó chẩn đoán: bộ đệm đầy audio nhưng không ra PCM nào.
+                logger.warning(
+                    f"Giải mã từng-fragment không ra PCM cho vùng "
+                    f"{self._last_pts:.2f}s→{recovered_frontier:.2f}s "
+                    f"({len(pairs)} mảnh) — nâng SÀN QUÉT (không đụng mốc đã phát). "
+                    f"Byte vẫn nằm trong bộ đệm nên đường giải mã nối-liền vẫn thử lại được.",
+                    extra={"module_tag": "WS"},
+                )
         return out
 
     def _fragment_byte_ranges(self) -> List[Tuple[int, int, float]]:
