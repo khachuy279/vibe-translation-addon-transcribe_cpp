@@ -80,10 +80,6 @@ def pykakasi_available() -> bool:
     return _get_kakasi() is not None
 
 
-def import_error() -> Optional[str]:
-    """Thông báo lỗi khi không nạp được `pykakasi` (None nếu nạp được hoặc chưa thử)."""
-    return _KAKASI_ERROR
-
 _KANJI_RE = re.compile(r"[\u4e00-\u9fff]")
 _KANA_RE = re.compile(r"[\u3041-\u3096\u30a1-\u30f6\u30fc]")
 _LATIN_OK_RE = re.compile(r"^[A-Za-z][A-Za-z'\- ]*$")
@@ -217,4 +213,4 @@ def _convert(text: str) -> Optional[str]:
     return _kana_to_romaji(text)
 
 
-__all__ = ["romanize", "pykakasi_available", "import_error"]
+__all__ = ["romanize", "pykakasi_available"]

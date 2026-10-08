@@ -90,11 +90,6 @@ class ContinuousAudioTimeline:
         return self._cursor
 
     @property
-    def session_base_pts(self) -> Optional[float]:
-        """PTS tuyệt đối ứng với sample 0 của bộ đệm ASR (mốc neo của phiên)."""
-        return self._session_base_pts
-
-    @property
     def gap_filled_sec(self) -> float:
         return self._gap_filled_sec
 
@@ -102,11 +97,6 @@ class ContinuousAudioTimeline:
         """Tổng thời lượng audio (giây) đang lưu trữ trong RAM."""
         with self._lock:
             return sum(len(c.pcm) for c in self._chunks) / self.sample_rate
-
-    def total_stored_bytes(self) -> int:
-        """Tổng dung lượng RAM (bytes) đang lưu trữ audio PCM."""
-        with self._lock:
-            return sum(c.pcm.nbytes for c in self._chunks)
 
     def pending_seconds(self) -> float:
         """Tổng độ dài audio liên tục đang chờ đọc phía trước con trỏ."""

@@ -9,10 +9,6 @@ class BaseTTSEngine(Protocol):
 
     sample_rate: int
 
-    def is_model_ready(self) -> bool:
-        """Kiểm tra tài nguyên/weights của model có sẵn sàng hay không."""
-        ...
-
     def load_model(self) -> None:
         """Nạp và warm-up mô hình vào bộ nhớ/GPU."""
         ...

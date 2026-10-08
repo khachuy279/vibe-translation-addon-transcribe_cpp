@@ -70,10 +70,6 @@ def _worker_loop(conn: Connection, dll_dir: str) -> None:
                 ok = engine.extract_voice_ref(voice_key, audio_24k)
                 conn.send(("ok", ok))
 
-            elif cmd == "has_voice":
-                voice_key = msg[1]
-                conn.send(("ok", voice_key in engine._cached_voice_refs))
-
             elif cmd == "synthesize":
                 text, voice_key, ref_text, raw_audio, num_steps, seed, lang, instruct = msg[1]
                 audio_np = engine.synthesize(
@@ -268,13 +264,6 @@ class TTSWorkerClient:
         """Trích xuất mã giọng tham chiếu và lưu vào cache của Worker."""
         with self._lock:
             return bool(self._send_cmd("extract_voice", (voice_key, audio_24k), timeout=15.0))
-
-    def has_voice(self, voice_key: str) -> bool:
-        """Kiểm tra xem voice_key đã có trong cache Worker chưa."""
-        with self._lock:
-            if not self.is_loaded:
-                return False
-            return bool(self._send_cmd("has_voice", voice_key, timeout=5.0))
 
     def synthesize(
         self,

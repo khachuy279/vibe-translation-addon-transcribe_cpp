@@ -112,7 +112,12 @@ backend/bin/crispasr/*.dll
 # Toàn bộ thư mục `backend/bin/audiocpp/` (~2.1 GB gồm ggml-cuda.dll > 1GB và cuBLAS)
 # vượt xa hạn mức GitHub (100 MB/file).
 # `backend/diarization/service.py::ensure_audiocpp_binaries()` tự động tải từ GitHub
-# release của 0xShug0/audio.cpp (v0.9.1) khi thiếu, tương tự cơ chế của CrispASR.
+# release của 0xShug0/audio.cpp (v0.9.1) khi thiếu.
+# ⚠️ KHÁC CrispASR ở mục 11: các lượt tải này **KHÔNG xác thực SHA-256** — `service.py` chỉ
+#    kiểm tra kích thước file (> 100 MB), nên bản tải hỏng/khác nguồn vẫn được chấp nhận.
+#    Bất đối xứng này là hậu quả của việc mỗi module tự viết lại bộ tải thay vì dùng chung
+#    `backend/utils/model_download.py`. Xem
+#    `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.2.
 backend/bin/audiocpp/
 !backend/bin/audiocpp/LICENSE
 

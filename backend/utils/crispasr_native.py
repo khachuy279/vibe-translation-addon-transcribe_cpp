@@ -88,8 +88,6 @@ BUNDLE_URL = (
 )
 #: SHA-256 của file zip phát hành (đã tải và kiểm ngày 2026-10-06).
 BUNDLE_SHA256 = "91c11b44834e274fa0db87b114a0427102a35797d8c218ac6ab44203bc7e9a45"
-#: Thư mục con bên trong zip.
-BUNDLE_INNER_DIR = "crispasr-windows-x86_64-cuda13-non-cuda"
 
 #: Các DLL BẮT BUỘC (đủ để chạy aligner trên CUDA 13 + fallback CPU).
 REQUIRED_DLLS: Tuple[str, ...] = (

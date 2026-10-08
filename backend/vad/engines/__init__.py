@@ -118,13 +118,6 @@ class VADEngineFactory:
                 results[key] = f"error: {type(exc).__name__}: {exc}"
         return results
 
-    @classmethod
-    def reset_pool(cls) -> None:
-        """Giải phóng các instance engine đang cache."""
-        with cls._lock:
-            cls._engines.clear()
-
-
 __all__ = [
     "BaseVADEngine",
     "FireRedVADEngine",

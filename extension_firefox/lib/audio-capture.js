@@ -30,11 +30,8 @@ class AudioCapture {
   /**
    * Có thể duck bằng GainNode không (đường MediaElementSource).
    *
-   * VÌ SAO QUAN TRỌNG: nhánh capture cho ASR lấy từ `sourceNode`, mà `sourceNode` **đã bị
-   * nhân bởi `video.volume`**. Nếu duck bằng cách hạ `video.volume` thì ASR cũng nhận audio
-   * nhỏ đi — và ở 0% thì nhận **im lặng kỹ thuật số** ⇒ VAD không thấy tiếng nói ⇒ **mất
-   * phụ đề, mất dịch, mất TTS**. Duck bằng GainNode chỉ tác động lên nhánh NGHE, còn nhánh
-   * capture luôn full-scale ⇒ kéo slider về 0% vẫn giữ nguyên phụ đề.
+   * Được dùng bởi harness `backend/tests/js/audio_capture_ducking_test.js` — ĐỪNG xoá dù
+   * không thấy caller nào trong `extension_src/`.
    */
   supportsGainDucking() {
     return !!this.duckGain;
@@ -43,6 +40,12 @@ class AudioCapture {
   /**
    * Đặt mức âm lượng NGHE của tiếng gốc (0..1). Không đụng `video.volume`.
    * Trả `true` nếu đã xử lý bằng gain; `false` để caller rơi về đường `video.volume`.
+   *
+   * VÌ SAO PHẢI DÙNG GAIN thay vì hạ `video.volume`: nhánh capture cho ASR lấy từ `sourceNode`,
+   * mà `sourceNode` **đã bị nhân bởi `video.volume`**. Nếu duck bằng cách hạ `video.volume` thì
+   * ASR cũng nhận audio nhỏ đi — và ở 0% thì nhận **im lặng kỹ thuật số** ⇒ VAD không thấy tiếng
+   * nói ⇒ **mất phụ đề, mất dịch, mất TTS**. GainNode chỉ tác động lên nhánh NGHE, còn nhánh
+   * capture luôn full-scale ⇒ kéo slider về 0% vẫn giữ nguyên phụ đề.
    */
   setDuckLevel(level) {
     if (!this.duckGain) return false;

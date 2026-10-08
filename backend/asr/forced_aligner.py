@@ -175,16 +175,6 @@ def _ends_with_abbreviation(text: str) -> bool:
     return len(word) == 1 and word.isupper()
 
 
-def _looks_like_sentence_end(text: str) -> bool:
-    """Dấu kết câu cuối cùng của `text` có thật sự KẾT CÂU không (đã trừ từ viết tắt)?"""
-    t = (text or "").rstrip()
-    if not t:
-        return False
-    if t.endswith("."):
-        return not _ends_with_abbreviation(t)
-    return True
-
-
 def _split_text_by_sentence(text: str) -> List[str]:
     """Cắt văn bản thành các CÂU theo dấu kết câu (giữ dấu ở cuối mảnh, gộp ngoặc/nháy đóng)."""
     if not text:

@@ -31,7 +31,6 @@ from backend.tts.voice_manager import VoiceManager
 from backend.tts.worker import TTSWorkerClient
 from backend.tts.downloader import (
     ensure_tts_models,
-    is_model_available,
     get_model_paths,
 )
 from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TTS
@@ -85,10 +84,6 @@ class OmniVoiceTTS(BaseTTSEngine):
         if base_path.is_file():
             return str(base_path)
         return str(base_path)
-
-    def is_model_ready(self) -> bool:
-        """Kiểm tra xem mô hình GGUF có sẵn sàng trong backend/models hay không."""
-        return is_model_available()
 
     def _lock_for_voice(self, cache_key: Tuple[str, str]) -> threading.Lock:
         """Lock riêng cho một cache_key giọng (QWEN-Q15). Số entry bị chặn trên."""

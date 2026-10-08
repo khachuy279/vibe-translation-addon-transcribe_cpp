@@ -371,7 +371,6 @@ class StreamDemuxer:
         self.fragments: int = 0
         self.decoded_seconds: float = 0.0
         self.decode_time_sec: float = 0.0
-        self.init_bytes: int = 0
         self._seek_fallbacks: int = 0
         #: Chẩn đoán mất audio (2026-10-01): `emitted_sec` = tổng audio ĐÃ PHÁT ra PCM;
         #: `frames_skipped` = frame bị lọc vì cũ hơn mốc đã phát; `gaps_in_media` = số khe hở
@@ -456,12 +455,6 @@ class StreamDemuxer:
             else:
                 self._min_pts = None
 
-    def drop_init(self) -> None:
-        """Quên init segment (khi SourceBuffer tạo lại ⇒ header mới)."""
-        with self._lock:
-            self._init = b""
-            self.init_bytes = 0
-
     # ------------------------------------------------------------------ ingress
     def feed(
         self,
@@ -531,7 +524,6 @@ class StreamDemuxer:
                 init_part, media_part = _split_init_media(raw_bytes, container)
                 if init_part:
                     self._init = init_part
-                    self.init_bytes = len(init_part)
                 if media_part:
                     self._media.extend(media_part)
             elif self._init and raw_bytes.startswith(EBML_MAGIC):
@@ -539,7 +531,6 @@ class StreamDemuxer:
                 init_part, media_part = _split_init_media(raw_bytes, container)
                 if init_part:
                     self._init = init_part
-                    self.init_bytes = len(init_part)
                 if media_part:
                     self._media.extend(media_part)
             else:
@@ -1450,20 +1441,6 @@ class StreamDemuxer:
         if self.decoded_seconds <= 0:
             return 0.0
         return self.decode_time_sec / self.decoded_seconds
-
-    def coverage_report(self) -> str:
-        """Chuỗi chẩn đoán: mốc đã phát, số frame bị lọc, số khe hở trong dữ liệu nhận được.
-
-        Dùng để phân biệt "mất audio do logic" (`frames_skipped` lớn) với "nguồn gửi thiếu
-        hoặc mảnh bị cắt" (`gaps_in_media` lớn) — hai nguyên nhân có cách xử lý hoàn toàn khác.
-        """
-        return (
-            f"emitted={self._emitted_sec:.1f}s, last_pts={self._last_pts:.2f}s, "
-            f"skipped_frames={self._frames_skipped}, gaps_in_media={self._gaps_in_media}, "
-            f"seek_fallbacks={self._seek_fallbacks}, aac_thô={self._raw_fallback_used}/"
-            f"{self._raw_fallback_rejected} (dùng/từ chối), "
-            f"giải_mã_từng_mảnh={self._frag_decode_used}"
-        )
 
     def structure_report(self) -> str:
         """Cấu trúc container THẬT của bộ đệm hiện tại (chẩn đoán nút cổ chai giải mã).

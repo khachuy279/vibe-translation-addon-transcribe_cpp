@@ -40,7 +40,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
@@ -361,15 +361,9 @@ def get_glossary() -> TranslationGlossary:
     return TranslationGlossary.get_instance()
 
 
-def build_glossary_hint(texts: Iterable[str], cfg: Any = None) -> str:
-    """Tiện ích cho engine: dựng hint từ danh sách câu."""
-    return get_glossary().build_hint(list(texts), cfg)
-
-
 __all__ = [
     "TranslationGlossary",
     "get_glossary",
-    "build_glossary_hint",
     "MAX_TERMS_IN_HINT",
     "MAX_NAMES_IN_HINT",
 ]

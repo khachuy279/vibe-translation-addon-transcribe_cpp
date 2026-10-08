@@ -122,9 +122,6 @@ class SessionConfig:
     def update(self, new_data: Dict[str, Any]) -> None:
         self._data.update(new_data)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return dict(self._data)
-
 
 class SessionState:
     """Theo dõi trạng thái và các thành phần Pipeline cho 1 kết nối WebSocket."""
@@ -163,25 +160,9 @@ class SessionState:
         """
         return self.protocol_version >= 3 and int(config.ws.protocol_version) >= 3
 
-    @property
-    def ws(self) -> WebSocket:
-        """Truy cập đối tượng WebSocket bên dưới."""
-        return self.connection.raw_ws
-
-    @ws.setter
-    def ws(self, value: Union[WebSocket, SafeWebSocketConnection]) -> None:
-        if isinstance(value, SafeWebSocketConnection):
-            self.connection = value
-        else:
-            self.connection = SafeWebSocketConnection(value)
-
     async def send_json(self, payload: Dict[str, Any]) -> bool:
         """Gửi JSON payload qua WebSocket an toàn."""
         return await self.connection.send_json(payload)
-
-    async def send_text(self, text: str) -> bool:
-        """Gửi raw text qua WebSocket an toàn."""
-        return await self.connection.send_text(text)
 
     def _spawn(self, coro) -> None:
         """Chạy task nền và giữ tham chiếu (tránh bị GC thu hồi giữa đường)."""

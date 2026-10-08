@@ -310,16 +310,6 @@ class StreamVadPostprocessor:
 
 
 # =========================================================================== model files
-def _sha256_of(path: Path) -> str:
-    import hashlib
-
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
 def _download(url: str, target: Path, expected_sha256: str) -> bool:
     """Tải 1 file + xác thực SHA-256. Trả `False` (không ném) nếu hỏng."""
     target.parent.mkdir(parents=True, exist_ok=True)

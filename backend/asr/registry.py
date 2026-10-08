@@ -131,13 +131,6 @@ class ModelRegistry:
             stage="ASR",
         )
 
-    def is_streaming_model(self, model_key: Optional[str] = None) -> bool:
-        """Kiểm tra xem model có phải là kiến trúc streaming (session.stream) không."""
-        info = self.get_model_info(model_key)
-        if not info:
-            return False
-        return info.get("architecture_type") == "streaming"
-
     def resolve_model_path(self, model_key: Optional[str] = None, *, allow_download: bool = False) -> str:
         """Tìm đường dẫn file GGUF cục bộ của model (tuỳ chọn tự tải nếu allow_download=True)."""
         if allow_download:

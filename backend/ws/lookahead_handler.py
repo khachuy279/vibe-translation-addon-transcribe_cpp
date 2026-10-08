@@ -1,34 +1,46 @@
-"""Lookahead WebSocket Handler — Pipeline B (Zero Perceived Latency) v2.
+"""Lookahead WebSocket Handler — Pipeline B **v3** (OFFLINE_BATCH, độ trễ hiển thị 0.0 s).
 
-TRIẾT LÝ THIẾT KẾ (v2 — viết lại sau khi bản v1 mất phụ đề gốc + bản dịch)
-=========================================================================
+Pipeline B phục vụ video VoD/YouTube/phim: extension chặn các phân đoạn MediaSource (MSE),
+đẩy lên đây để xử lý TRƯỚC khi người dùng tới, nhờ vậy phụ đề hiện ngay lúc lời nói vang lên.
 
-Bản v1 cắt audio thành lưới 4 giây cố định rồi gọi ASR cho TỪNG mảnh rời. Cách đó sai ở
-ba điểm chí mạng, đã kiểm chứng bằng log thật + đo lường (xem
-`report/08_lookahead_video_buffering/pipeline_b_redesign_v2.md` §2 và test
-`backend/tests/test_50_lookahead_demuxer.py::test_stream_demuxer_reassembles_fragmented_webm`):
+LỊCH SỬ ĐẶT TÊN (đọc để không nhầm "v2" với kiến trúc hiện hành)
+================================================================
+* **v1** — cắt audio theo lưới 4 giây cố định rồi gọi ASR cho TỪNG mảnh rời. Sai ở ba điểm,
+  đã kiểm chứng bằng log thật + đo lường (xem
+  `report/08_lookahead_video_buffering/pipeline_b_redesign_v2.md` §2 và
+  `backend/tests/test_50_lookahead_demuxer.py::test_stream_demuxer_reassembles_fragmented_webm`):
+  giải mã từng mảnh MSE độc lập là bất khả thi (PyAV chỉ đọc được ~35 % lượng audio), cắt theo
+  lưới 4 giây phá ngữ cảnh câu, và không có VAD nên mốc gửi về client là mốc lưới chứ không
+  phải mốc người nói.
+* **v2** — "streaming giả lập": tái dùng đúng Pipeline A (`VADProcessor.feed_chunk` →
+  `TranscribeEngine.stream_tokens` → ánh xạ "anchor" sample→PTS). **ĐÃ BỊ XOÁ ngày 2026-10-02.**
+  Trong file này KHÔNG còn mã v2 nào; `feed_chunk` và `stream_tokens` chỉ còn được nhắc trong
+  khối lịch sử này.
+* **v3** — OFFLINE_BATCH: tuyến **DUY NHẤT** hiện hành (luồng bên dưới). Tên "Pipeline B v3"
+  được dùng nhất quán ở `core/lookahead_chunker.py`, `core/lookahead_timeline.py`,
+  `test_56_lookahead_chunker.py` và `test_58_lookahead_offline_batch.py`.
 
-1. **Giải mã từng mảnh MSE độc lập là bất khả thi.** Trình duyệt append các mảnh ~32 KB
-   nằm GIỮA cluster WebM; PyAV chỉ đọc được ~35 % lượng audio ⇒ phần lớn câu không bao
-   giờ tới được ASR.
-2. **Cắt theo lưới 4 giây phá ngữ cảnh câu.** Model nhận 4 giây cụt đầu cụt đuôi nên trả
-   về chữ rác/hallucination, và cùng một đoạn bị xử lý LẶP nhiều lần (khi buffer lớn dần,
-   `is_pts_processed` không khớp nên một mốc bị dịch 2-3 lần với nội dung khác nhau).
-3. **Không có VAD ⇒ không có mốc câu thật.** Mốc gửi về client là mốc lưới, không phải
-   mốc người nói, nên `SubtitleTimelineQueue` không bao giờ khớp `video.currentTime`.
+LUỒNG v3 (OFFLINE_BATCH)
+========================
 
-Kiến trúc v2 — DÙNG LẠI ĐÚNG PIPELINE A:
-
-    mảnh MSE ──► StreamDemuxer (ghép nối byte liên tục + giải mã tăng dần)
+    mảnh MSE ──► StreamDemuxer (ghép byte liên tục + giải mã tăng dần)
               ──► ContinuousAudioTimeline (dòng PCM LIÊN TỤC, lấp khe hở bằng silence)
-              ──► VADProcessor.feed_chunk  (giống hệt /ws realtime)
-              ──► TranscribeEngine.stream_tokens (VAD → commit câu, tắt preview)
-              ──► ánh xạ sample → PTS tuyệt đối qua "anchor" ghi lúc nạp
-              ──► Dịch GGUF
-              ──► lookahead_subtitles {start_pts, end_pts} → client hiện đúng lúc phát
+              ──► LookaheadChunker (khối ~8–45 s, cắt vào GIỮA khoảng lặng do
+                  VADSilenceScanner xác nhận ⇒ mép khối không rơi vào giữa từ)
+              ──► ASR TRỌN KHỐI (transcribe.cpp qua `_run_asr_block` — ngữ cảnh đầy đủ)
+              ──► ForcedAlignerService (CrispASR GGUF, mốc TỪNG TỪ) + gắn lại dấu câu
+              ──► group_words_to_subtitles (ngắt câu theo dấu câu của bản phiên âm)
+              ──► DiarizationService (Nemotron-3, gán nhãn speaker)
+              ──► Dịch GGUF (ngữ cảnh 2 chiều)
+              ──► lookahead_subtitles {start_pts, end_pts} ──► hàng đợi TTS OmniVoice
 
-Nhờ vậy chất lượng phụ đề/gốc và bản dịch **giống hệt** Pipeline A, nhưng mốc thời gian
-được neo vào timeline video nên phụ đề xuất hiện đúng 0.0 s khi video chạy tới.
+Điểm cốt lõi khác biệt với Pipeline A nằm ở **đầu vào của ASR**: Pipeline A đưa cửa sổ nhỏ
+theo VAD, còn Pipeline B đưa **trọn một khối dài** ⇒ ngữ cảnh đầy đủ nên WER/CER thấp hơn;
+mốc thời gian do Forced Aligner cấp nên phụ đề khớp `video.currentTime`. Extension tự dừng
+video khi chạm mốc chưa xử lý.
+
+Vì mép khối nằm giữa khoảng lặng thật nên KHÔNG cần trừ chồng lấn và KHÔNG cần ghép mảnh cuối
+chưa kết câu (cả hai đã bị xoá ngày 2026-10-04 — xem docstring `_offline_batch_loop`).
 """
 
 from __future__ import annotations
@@ -38,7 +50,6 @@ import base64
 import hashlib
 import json
 import struct
-import sys
 import time
 import uuid
 from collections import deque
@@ -54,7 +65,6 @@ from backend.core.lookahead_timeline import ContinuousAudioTimeline
 from backend.core.metrics import metrics_collector
 from backend.core.stream_demuxer import StreamDemuxer
 from backend.asr.forced_aligner import (
-    AlignedWord,
     ForcedAlignerService,
     SubtitleSentence,
     detect_aligner_language_from_text,
@@ -71,9 +81,6 @@ logger = get_logger("ws.lookahead")
 
 #: Cửa sổ (giây) coi một mảnh giống hệt là "gửi trùng" (mảnh nạp lại sau khi tua vẫn được nhận).
 _DUP_WINDOW_SEC = 15.0
-#: Lệch quá ngần này giây giữa audio nhận được và vị trí phát ⇒ cảnh báo "đoạn đầu sẽ không
-#: có phụ đề" (dấu hiệu cache mảnh phía Extension không bám vị trí phát).
-_START_OFFSET_WARN_SEC = 20.0
 #: Xê dịch tối đa (giây) giữa mốc neo hiện tại và vị trí báo mới mà vẫn coi là CÙNG một mốc
 #: (không reset pipeline). Chống reset lặp khi `sync_state` gửi `seek_id` mới ở cùng vị trí.
 _REANCHOR_TOLERANCE_SEC = 1.5
@@ -238,7 +245,12 @@ class LookaheadSessionState:
         #: Mốc thời gian lần cuối log "khối ASR trả về rỗng" (xem `_log_empty_block`).
         self._last_empty_block_log_at: float = 0.0
         self._frontier_behind_since: Optional[float] = None
-        #: Bộ lọc trùng của Pipeline A — chỉ còn dùng cho trường hợp aligner lỗi hẳn (fallback).
+        #: Bộ lọc trùng của Pipeline A. ⚠️ Hiện CHỈ ĐƯỢC GHI: `record_commit()` (khi phát phụ đề)
+        #: và `clear()` (khi tua/neo lại). KHÔNG nơi nào gọi `is_duplicate()` hay
+        #: `trim_boundary_overlap()` trên nó ⇒ nó chưa lọc được gì cả.
+        #: Bộ lọc trùng THẬT của Pipeline B là `_is_duplicate()` (dựa trên `_sent_items`).
+        #: Comment cũ ở đây từng nói field dùng cho "aligner lỗi hẳn (fallback)" — KHÔNG đúng,
+        #: không có nhánh fallback nào như vậy. Xem report/audit/26_... §2 mục 29.
         self._batch_dedup = CommitDeduplicator()
         self._aligner_service: ForcedAlignerService = ForcedAlignerService.get_instance()
         self._batch_from_pts: Optional[float] = None
@@ -309,18 +321,12 @@ class LookaheadSessionState:
         self.decode_wall_sec = 0.0         # tổng thời gian wall của các lời gọi demuxer.feed
         self.media_seconds = 0.0           # tổng giây MEDIA giải mã ra (kể cả phần bị bỏ xa)
         self.decode_delta_sec = 0.0        # giây media trong cửa sổ chẩn đoán hiện tại
-        self.decode_windows = 0            # số lượt feed CÓ sinh ra PCM
         self.chunks_dropped_far = 0        # số đoạn PCM bị bỏ vì quá xa vị trí phát
-        self.start_offset_warned = 0       # số lần cảnh báo lệch đầu phiên (chỉ log vài lần)
-        #: Chẩn đoán sau khi tua (xem `handle_audio_fragment`).
-        self._seek_reset_at = 0.0
-        self._seek_diag_left = 0
         self.fragments_deduped = 0         # số mảnh bị bỏ vì trùng nội dung
         self._fragment_digests: Dict[bytes, float] = {}
         self._fragment_digest_order: deque = deque()
         self._max_decode_lead_sec = float(getattr(la, "max_decode_lead_sec", 240.0) or 240.0)
         self._playhead_pts = 0.0
-        self._last_decoded_at = 0.0        # lần cuối có PCM mới
         #: Mốc so sánh cho log chẩn đoán định kỳ (xem `_maybe_log_diagnostics`).
         self._last_diag_at = time.perf_counter()
         self._diag_bytes_in = 0
@@ -813,8 +819,6 @@ class LookaheadSessionState:
             )
 
         if decoded:
-            self._last_decoded_at = time.perf_counter()
-            self.decode_windows += 1
             logger.debug(
                 f"Giải mã: +{media_sec:.2f}s [{decoded[0].pts_start:.2f}s -> {decoded[-1].pts_end:.2f}s] "
                 f"(mảnh {len(chunk_bytes)}B, buffer={self.demuxer.buffered_bytes}B)",
@@ -2072,7 +2076,6 @@ class LookaheadSessionState:
 
         d_bytes = self.bytes_in - self._diag_bytes_in
         d_decode = self.decode_seconds - self._diag_decode_seconds
-        d_media = self.media_seconds - self._diag_media_seconds
         d_decode_wall = self.decode_wall_sec - self._diag_decode_wall
         self._diag_bytes_in = self.bytes_in
         self._diag_decode_seconds = self.decode_seconds

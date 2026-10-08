@@ -24,6 +24,7 @@ import numpy as np
 
 from backend.config import BACKEND_DIR, config
 from backend.utils.logger import logger
+from backend.utils.model_download import sha256_file, verify_sha256
 
 _TAG = "DIAR"
 _DIAR_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nemotron_diar")
@@ -32,6 +33,42 @@ AUDIOCPP_RELEASE_TAG = "v0.9.1"
 AUDIOCPP_BIN_URL = f"https://github.com/0xShug0/audio.cpp/releases/download/{AUDIOCPP_RELEASE_TAG}/audio-{AUDIOCPP_RELEASE_TAG}-bin-windows-x64-cuda12.4.zip"
 AUDIOCPP_CUDART_URL = f"https://github.com/0xShug0/audio.cpp/releases/download/{AUDIOCPP_RELEASE_TAG}/audio-{AUDIOCPP_RELEASE_TAG}-cudart-windows-x64-cuda12.4.zip"
 NEMOTRON_MODEL_URL = "https://huggingface.co/audio-cpp/Nemotron-3-Diarization-GGUF/resolve/main/nemotron-3-diarization-bf16.gguf"
+
+#: SHA-256 của từng artifact, lấy từ NGUỒN CHÍNH THỨC (không tự băm file cục bộ — băm file
+#: trên máy chỉ chứng minh "file khớp với chính nó", không chứng minh nguồn gốc):
+#:   • 2 file zip  — trường `digest` do GitHub API công bố cho release v0.9.1
+#:                   (`GET /repos/0xShug0/audio.cpp/releases/tags/v0.9.1`).
+#:   • model GGUF  — LFS `oid` của repo HuggingFace `audio-cpp/Nemotron-3-Diarization-GGUF`;
+#:                   với Git LFS, `oid` CHÍNH LÀ SHA-256 của nội dung file.
+#: Đã đối chiếu chéo: hash cục bộ của `nemotron-3-diarization-bf16.gguf` khớp đúng LFS oid.
+AUDIOCPP_BIN_SHA256 = "f32a40f8fb14ac4772c9c25525f97715db228979178e51654da73aa65005c0ef"
+AUDIOCPP_CUDART_SHA256 = "8bfdce7cb00b5a51560b5ab0d444344d86a2f0d7e2727bb7f18c15ef4734451b"
+NEMOTRON_MODEL_SHA256 = "84f6f0f12b9ecf2615548427e884534a72fedbca32d00872d95c0f72a078c953"
+
+
+def _fetch_verified(url: str, target: Path, expected_sha256: str, label: str) -> bool:
+    """Tải `url` về `target` rồi TỪ CHỐI file nếu SHA-256 không khớp.
+
+    VÌ SAO CẦN: trước đây `ensure_audiocpp_binaries()` và `ensure_diarization_model()` chỉ kiểm
+    tra **kích thước** file (> 100 MB). Một bản tải hỏng, bị cắt cụt, hoặc bị tráo từ nguồn khác
+    vẫn qua được vòng kiểm tra đó rồi được giải nén và nạp vào tiến trình.
+
+    CHỈ xác thực ở LƯỢT TẢI (ranh giới supply-chain), KHÔNG băm lại file đã có sẵn lúc khởi
+    động: `ggml-cuda.dll` nặng 1,09 GB, băm mỗi lần khởi động sẽ cộng thêm vài giây vô ích.
+    """
+    urllib.request.urlretrieve(url, target)
+    if verify_sha256(target, expected_sha256):
+        logger.info(f"[STARTUP] {label}: tải xong, SHA-256 khớp.", extra={"module_tag": _TAG})
+        return True
+
+    got = sha256_file(target) if target.is_file() else "<không có file>"
+    logger.error(
+        f"[STARTUP] {label}: SHA-256 KHÔNG khớp — TỪ CHỐI dùng file vừa tải.\n"
+        f"  mong đợi : {expected_sha256}\n"
+        f"  nhận được: {got}",
+        extra={"module_tag": _TAG},
+    )
+    return False
 
 
 def ensure_audiocpp_binaries() -> bool:
@@ -55,12 +92,18 @@ def ensure_audiocpp_binaries() -> bool:
             tmp_cudart_zip = Path(tmp_dir) / "cudart.zip"
 
             if not cli_path.is_file():
-                urllib.request.urlretrieve(AUDIOCPP_BIN_URL, tmp_bin_zip)
+                if not _fetch_verified(
+                    AUDIOCPP_BIN_URL, tmp_bin_zip, AUDIOCPP_BIN_SHA256, "runtime audio.cpp"
+                ):
+                    return False
                 with zipfile.ZipFile(tmp_bin_zip, "r") as zf:
                     zf.extractall(dest_dir)
 
             if not cuda_dll.is_file():
-                urllib.request.urlretrieve(AUDIOCPP_CUDART_URL, tmp_cudart_zip)
+                if not _fetch_verified(
+                    AUDIOCPP_CUDART_URL, tmp_cudart_zip, AUDIOCPP_CUDART_SHA256, "cudart audio.cpp"
+                ):
+                    return False
                 with zipfile.ZipFile(tmp_cudart_zip, "r") as zf:
                     zf.extractall(dest_dir)
 
@@ -84,7 +127,12 @@ def ensure_diarization_model(model_filename: str = "nemotron-3-diarization-bf16.
     )
     try:
         tmp_model = model_path.with_suffix(".download.tmp")
-        urllib.request.urlretrieve(NEMOTRON_MODEL_URL, tmp_model)
+        if not _fetch_verified(
+            NEMOTRON_MODEL_URL, tmp_model, NEMOTRON_MODEL_SHA256, f"model {model_filename}"
+        ):
+            # Không để lại file rác đã bị từ chối trong `backend/models/`.
+            tmp_model.unlink(missing_ok=True)
+            return False
         if tmp_model.is_file() and tmp_model.stat().st_size > 100_000_000:
             tmp_model.replace(model_path)
             logger.info(f"[STARTUP] Tải model {model_filename} hoàn tất!", extra={"module_tag": _TAG})

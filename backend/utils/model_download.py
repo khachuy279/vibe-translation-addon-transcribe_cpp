@@ -16,6 +16,7 @@ backend báo lỗi cứng, người dùng phải tự copy GGUF vào thư mục 
 Tiến độ được giữ trong `_STATE` để `/api/config` và popup hiển thị được (state/bytes/percent).
 """
 
+import hashlib
 import os
 from pathlib import Path
 import threading
@@ -54,6 +55,47 @@ class ModelDownloadError(RuntimeError):
 
 class ModelFileMissing(FileNotFoundError):
     """File GGUF chưa có cục bộ và việc tải tự động đang bị tắt."""
+
+
+# ─────────────────────────────────────────────────────────────────────── SHA-256
+#: Helper băm DÙNG CHUNG cho mọi đường tải trong repo.
+#:
+#: VÌ SAO ĐẶT Ở ĐÂY: trước đây mỗi module tự viết lại một bản (`crispasr_native._sha256_file`,
+#: `silero_onnx._sha256`, `firered_onnx._sha256_of`/`_sha256_of_bytes`) — 5 bản ở 4 module.
+#: Hệ quả thật: `diarization/service.py` tải 2,1 GB binary mà **không xác thực gì cả**, trong
+#: khi 3 module kia đều xác thực ⇒ lỗ hổng toàn vẹn dữ liệu. Xem
+#: `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.2.
+#:
+#: Mọi lượt tải MỚI phải dùng các hàm này thay vì tự băm lại.
+_SHA256_BLOCK_BYTES = 1024 * 1024
+
+
+def sha256_file(path: Path) -> str:
+    """SHA-256 (hex thường) của một file, đọc theo khối 1 MiB để không nạp cả GB vào RAM."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(_SHA256_BLOCK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    """SHA-256 (hex thường) của một buffer trong RAM."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def verify_sha256(path: Path, expected_hex: str) -> bool:
+    """`True` nếu SHA-256 của `path` khớp `expected_hex` (không phân biệt hoa/thường).
+
+    `expected_hex` rỗng ⇒ trả `False` (coi như thiếu hash để đối chiếu, KHÔNG phải "bỏ qua").
+    """
+    expected = (expected_hex or "").strip().lower()
+    if not expected:
+        return False
+    try:
+        return sha256_file(path) == expected
+    except OSError:
+        return False
 
 
 def _mb(num_bytes: Optional[float]) -> Optional[float]:

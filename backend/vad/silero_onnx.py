@@ -24,7 +24,6 @@ State (`state`, `context`) do **caller sở hữu** thay vì giấu trong model 
 
 * Một `InferenceSession` **dùng chung** cho mọi phiên (bản JIT phải nạp model riêng cho từng
   phiên vì `reset_states()` ghi vào chính model, tốn ~93 ms/phiên).
-* `snapshot()`/`restore()` cho phép tái lập chính xác (dùng ở `core/vad_silence.py`).
 * Không cần `torch.no_grad()`, không cần chuyển tensor, không có GIL contention của torch.
 """
 
@@ -261,15 +260,6 @@ class SileroVadOnnx:
         """Xoá state về 0 — tương đương `model.reset_states()` của bản JIT."""
         self._state = np.zeros(STATE_SHAPE, dtype=np.float32)
         self._context = np.zeros((1, CONTEXT_SAMPLES), dtype=np.float32)
-
-    def snapshot(self) -> Dict[str, np.ndarray]:
-        """Ảnh chụp state (bản sao) — dùng để tái lập / tránh quét nguội."""
-        return {"state": self._state.copy(), "context": self._context.copy()}
-
-    def restore(self, snap: Dict[str, np.ndarray]) -> None:
-        """Khôi phục state từ `snapshot()`."""
-        self._state = np.array(snap["state"], dtype=np.float32, copy=True)
-        self._context = np.array(snap["context"], dtype=np.float32, copy=True)
 
     # ------------------------------------------------------------------ inference
     def probability(self, window: np.ndarray) -> float:

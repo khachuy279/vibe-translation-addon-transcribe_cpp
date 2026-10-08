@@ -55,7 +55,7 @@ from backend.asr.base import BaseASREngine
 from backend.asr.registry import ModelRegistry
 from backend.asr.adapters import build_family_options, normalize_language_for_family
 from backend.asr.text_cleaner import clean_transcript_text
-from backend.asr.native import resolve_backend, native_bundle_dir
+from backend.asr.native import resolve_backend
 from backend.core.gpu_scheduler import gpu_arbiter
 from backend.utils.logger import logger
 
@@ -1181,12 +1181,6 @@ class TranscribeEngine(BaseASREngine):
             self._end_infer()
             if is_commit:
                 gpu_arbiter.commit_end()
-
-    async def transcribe_pcm(self, pcm_data: np.ndarray) -> str:
-        """API ASR nhận trực tiếp mảng float32 PCM 16kHz (dùng cho Lookahead Batch Ingress)."""
-        if pcm_data is None or len(pcm_data) == 0:
-            return ""
-        return await self._infer_with_watchdog(pcm_data, is_commit=True)
 
     def _publish_recompute_ratio(self) -> None:
         """FIX-10: công bố gauge lãng phí compute của preview (giá trị SỐNG, cập nhật mỗi vòng).

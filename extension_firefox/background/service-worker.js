@@ -2,6 +2,22 @@
 // Provides a WebSocket Bridge so content scripts inside cross-origin iframes
 // can reliably connect to the backend (wss://localhost:8765/ws) without being
 // blocked by iframe CSP, sandbox, or Private Network Access restrictions.
+//
+// File này DÙNG CHUNG cho cả Firefox và Chromium (nguồn: `extension_src/`).
+
+// ── Nạp thư viện phụ thuộc, tương thích CẢ HAI trình duyệt ──────────────────────
+// Chromium MV3 chỉ cho phép MỘT file `background.service_worker`, nên các lib dùng chung
+// buộc phải nạp bằng `importScripts()`. Firefox MV3 khai báo chúng trong
+// `background.scripts` của manifest ⇒ chúng ĐÃ có sẵn trước file này.
+// Điều kiện "còn thiếu" khiến việc nạp chỉ xảy ra khi thật sự cần ⇒ không bao giờ nạp
+// trùng ở Firefox, bất kể context của Firefox có `importScripts` hay không.
+// (Cả hai lib đều là UMD/IIFE nên kể cả nạp trùng cũng chỉ gán lại global, không ném lỗi.)
+if (
+  typeof importScripts === "function" &&
+  (typeof BackpressureGate === "undefined" || typeof buildBinaryAudioPacket === "undefined")
+) {
+  importScripts("../lib/backpressure-gate.js", "../lib/frame-builder.js");
+}
 
 const api = typeof browser !== "undefined" ? browser : chrome;
 const textEncoder = new TextEncoder();
@@ -246,19 +262,9 @@ api.runtime.onConnect.addListener((port) => {
         }
       }
     } else if (msg.action === "SEND_BINARY") {
-      const buffer = (typeof buildBinaryAudioPacket === "function")
-        ? buildBinaryAudioPacket(msg.header, msg.pcmBuffer, textEncoder)
-        : (() => {
-            const headerBytes = textEncoder.encode(JSON.stringify(msg.header));
-            const pcmBytes = new Uint8Array(msg.pcmBuffer);
-            const totalSize = 4 + headerBytes.length + pcmBytes.byteLength;
-            const buf = new ArrayBuffer(totalSize);
-            const view = new DataView(buf);
-            view.setUint32(0, headerBytes.length, true);
-            new Uint8Array(buf, 4, headerBytes.length).set(headerBytes);
-            new Uint8Array(buf, 4 + headerBytes.length).set(pcmBytes);
-            return buf;
-          })();
+      // `buildBinaryAudioPacket` được nạp ở ĐẦU file này (`importScripts` trên Chromium,
+      // `background.scripts` trên Firefox) ⇒ luôn có sẵn.
+      const buffer = buildBinaryAudioPacket(msg.header, msg.pcmBuffer, textEncoder);
 
       sendOrQueue(buffer);
     } else if (msg.action === "SEND_RAW_BINARY" || msg.action === "SEND_BUFFER") {

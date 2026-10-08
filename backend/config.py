@@ -603,24 +603,30 @@ class LookaheadConfig(BaseModel):
 class ForcedAlignerConfig(BaseModel):
     """Cấu hình engine căn chỉnh mốc thời gian từ (Pipeline B / Lookahead).
 
-    Có HAI đường chạy cùng một model `Qwen3-ForcedAligner-0.6B`:
+    CHỈ CÒN MỘT ĐƯỜNG: CrispASR GGUF (không PyTorch).
 
-    * `"crispasr"` (**mặc định từ 2026-10-06**) — bản **GGUF Q4_K** chạy trên CrispASR (C++/ggml)
-      trong MỘT TIẾN TRÌNH CON. KHÔNG cần PyTorch. Đo thật: khối 28,26 s mất 195–307 ms
-      (RTF 0,0069–0,0109) — ngang đường torch trên GPU; nạp model 127–839 ms (torch: 1,6 s nạp
-      + 0,5 s prewarm). A/B ở tầng phụ đề cho **cùng số câu và cùng nội dung** trên tiếng Nhật,
-      Trung, Anh (`backend/tests/test_64_crispasr_aligner.py`).
-    * `"torch"` — `transformers` + PyTorch, đọc snapshot safetensors trong
-      `backend/models/Qwen3-ForcedAligner-0.6B/`. Kéo theo `torch`, `transformers`, `nagisa`,
-      `soynlp` và cây vendored `backend/asr/qwen_asr/`. Vẫn giữ làm **ĐƯỜNG DỰ PHÒNG**: nếu thiếu
-      DLL/model GGUF thì `ForcedAlignerService` tự rơi về đây kèm cảnh báo, Pipeline B không hỏng.
+    Model `Qwen3-ForcedAligner-0.6B` bản **GGUF Q4_K** chạy trên **CrispASR (C++/ggml) trong
+    MỘT TIẾN TRÌNH CON**. Đo thật: khối 28,26 s mất 195–307 ms (RTF 0,0069–0,0109); nạp model
+    127–839 ms. A/B ở tầng phụ đề cho **cùng số câu và cùng nội dung** trên tiếng Nhật, Trung,
+    Anh (`backend/tests/test_64_crispasr_aligner.py`).
 
-    Vì sao `"crispasr"` phải là TIẾN TRÌNH CON: xem `backend/utils/crispasr_native.py` (Windows
-    phân giải DLL theo TÊN MODULE ⇒ bộ `ggml*.dll` thứ ba trong cùng tiến trình gây `0xc0000139`).
+    Vì sao phải là TIẾN TRÌNH CON: xem `backend/utils/crispasr_native.py` (Windows phân giải DLL
+    theo TÊN MODULE ⇒ bộ `ggml*.dll` thứ ba trong cùng tiến trình gây `0xc0000139`).
 
-    Muốn quay lại đường cũ: đặt `forced_aligner.backend = "torch"` (không cần sửa mã).
+    ⚠️ ĐƯỜNG `"torch"` ĐÃ BỊ XOÁ (Giai đoạn 3, 2026-10-06). `backend/asr/forced_aligner.py`
+    không còn `torch`/`transformers`/`nagisa`/`soynlp`, và `test_64_crispasr_aligner.py` khoá
+    bất biến đó. Hệ quả cần biết:
+
+    * Trường `backend` bên dưới **KHÔNG còn tác dụng chuyển đổi cài đặt** — không nhánh mã nào
+      rẽ theo nó. Nó chỉ được ĐỌC ĐỂ BÁO CÁO ở `/health` (`backend/main.py:211`) và
+      `backend/utils/env_check.py:67`.
+    * Đặt `"torch"` sẽ **không có tác dụng gì**, và **KHÔNG có đường dự phòng nào tồn tại**:
+      thiếu DLL/GGUF thì aligner báo lỗi chứ không tự rơi về đâu.
+
+    (Đối chiếu: `config.asr.backend` thì hoạt động thật — có `resolve_backend()` và fallback
+    trong `backend/asr/native.py`. Đừng suy ra hành vi của aligner từ đó.)
     """
-    #: `"crispasr"` (mặc định, không cần PyTorch) hoặc `"torch"` (dự phòng).
+    #: Luôn là `"crispasr"`. Giữ lại để báo cáo/tương thích; KHÔNG rẽ nhánh theo giá trị này.
     backend: str = "crispasr"
     #: Tự động tải file GGUF (~500 MB) khi thiếu.
     auto_download: bool = True
@@ -651,17 +657,6 @@ class AppConfig(BaseModel):
     lookahead: LookaheadConfig = Field(default_factory=LookaheadConfig)
     forced_aligner: ForcedAlignerConfig = Field(default_factory=ForcedAlignerConfig)
     diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)
-
-    def hot_reload(self, updates: Dict[str, Any]) -> None:
-        """Cập nhật cấu hình runtime nhanh chóng không cần khởi động lại server."""
-        for key, value in updates.items():
-            if hasattr(self, key) and isinstance(value, dict):
-                sub_cfg = getattr(self, key)
-                for sub_k, sub_v in value.items():
-                    if hasattr(sub_cfg, sub_k):
-                        setattr(sub_cfg, sub_k, sub_v)
-            elif hasattr(self, key):
-                setattr(self, key, value)
 
 
 RUNTIME_STATE_FILE = BACKEND_DIR / "runtime_state.json"

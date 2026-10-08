@@ -6,7 +6,23 @@ class WSClient {
     this.url = url;
     this.port = null;
     this.ws = null;
-    this.useBridge = typeof chrome !== "undefined" && !!chrome.runtime?.connect;
+    // Bridge qua background (`chrome.runtime.connect`) để vượt CSP/CORS của trang ngoài.
+    //
+    // ĐÂY LÀ KHÁC BIỆT DUY NHẤT giữa Firefox và Chromium, và nó nằm ở MỘT chỗ:
+    // `lib/browser-config.js` (sinh bởi `tools/build_extensions.py`).
+    //   • FIREFOX  : background script KHÔNG bị kill sau ~30s idle ⇒ bridge là đường CHÍNH ⇒ true.
+    //   • CHROME/EDGE: MV3 service worker bị kill sau ~30s idle ⇒ bridge chết giữa phiên ⇒ dùng
+    //     WebSocket mở thẳng từ content script (`_connectDirect()`) ⇒ false.
+    // Trước đây hai giá trị này bị hard-code ở hai bản extension copy tay, nên bản Chrome lệch
+    // khỏi bản Firefox mà không ai phát hiện. Xem `tools/build_extensions.py`.
+    //
+    // Thiếu `browser-config.js` (vd harness Node trong `backend/tests/js/`) ⇒ giữ nguyên cách
+    // dò cũ, KHÔNG mặc định về `false`: harness stub `chrome.runtime.connect` để kiểm tra
+    // đường bridge, nên đổi mặc định sẽ làm hỏng bài kiểm thử đó.
+    const bsCfg = globalThis.BS_BROWSER_CONFIG;
+    this.useBridge = bsCfg
+      ? bsCfg.useBridge === true
+      : (typeof chrome !== "undefined" && !!chrome.runtime?.connect);
     this.isConnected = false;
     this.reconnectAttempts = 0;
     this.maxReconnectDelay = 30000;
@@ -25,9 +41,6 @@ class WSClient {
     this.backpressurePauseCount = 0;
     this.backpressureResumeCount = 0;
     this.backpressurePausedMs = 0;
-    // P3.1: backend có gửi audio TTS dạng binary frame không (do backend quyết định
-    // theo protocol version mà client khai báo).
-    this.supportsBinaryTts = false;
   }
 
   // ── Connection ──────────────────────────────────────────
@@ -66,12 +79,6 @@ class WSClient {
           } else if (msg.type === "ws_json") {
             const data = msg.data;
             const payload = data.payload !== undefined ? data.payload : data;
-            if (data.type === "connected" || data.type === "hello") {
-              // Backend xác nhận phiên bản giao thức -> biết có được dùng binary TTS không.
-              if (typeof data.binary_tts === "boolean") {
-                this.supportsBinaryTts = data.binary_tts;
-              }
-            }
             this._emit(data.type, payload);
             this._emit("message", data);
           } else if (msg.type === "ws_binary") {
@@ -301,9 +308,9 @@ class WSClient {
         this._textEncoder = new TextEncoder();
       }
 
-      const buffer = (typeof buildBinaryAudioPacket === "function")
-        ? buildBinaryAudioPacket(header, rawBuffer, this._textEncoder)
-        : this._buildPacketFallback(header, rawBuffer);
+      // `buildBinaryAudioPacket` do `lib/frame-builder.js` cung cấp; manifest nạp file đó
+      // TRƯỚC `ws-client.js` trong cùng `content_scripts.js[]` ⇒ luôn có sẵn.
+      const buffer = buildBinaryAudioPacket(header, rawBuffer, this._textEncoder);
 
       try {
         this.ws.send(buffer);
@@ -311,19 +318,6 @@ class WSClient {
         console.error("[WSClient] Send error:", e);
       }
     }
-  }
-
-  _buildPacketFallback(header, rawBuffer) {
-    const enc = this._textEncoder || new TextEncoder();
-    const headerBytes = enc.encode(JSON.stringify(header));
-    const pcmBytes = new Uint8Array(rawBuffer);
-    const totalSize = 4 + headerBytes.length + pcmBytes.byteLength;
-    const buffer = new ArrayBuffer(totalSize);
-    const view = new DataView(buffer);
-    view.setUint32(0, headerBytes.length, true);
-    new Uint8Array(buffer, 4, headerBytes.length).set(headerBytes);
-    new Uint8Array(buffer, 4 + headerBytes.length).set(pcmBytes);
-    return buffer;
   }
 
   /**
@@ -380,11 +374,6 @@ class WSClient {
       this.listeners.set(event, new Set());
     }
     this.listeners.get(event).add(callback);
-  }
-
-  off(event, callback) {
-    const cbs = this.listeners.get(event);
-    if (cbs) cbs.delete(callback);
   }
 
   _emit(event, data) {

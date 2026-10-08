@@ -358,14 +358,10 @@
     constructor(tag) {
       this.tag = tag || "LA";
       this.enabled = true;
-      this.verbose = false;
-      this.counters = Object.create(null);
-      this._onceKeys = new Set();
       this._throttleAt = Object.create(null);
     }
 
     setEnabled(on) { this.enabled = !!on; return this; }
-    setVerbose(on) { this.verbose = !!on; return this; }
 
     _prefix(channel) {
       return `%c[${this.tag}][Diag][${channel}]`;
@@ -403,16 +399,6 @@
       else console.error(`${this._prefix(channel)} ${message}`, data);
     }
 
-    /** In một lần cho mỗi `key` (đổi `key` = được in lại). */
-    once(key, level, channel, message, data) {
-      if (this._onceKeys.has(key)) return false;
-      this._onceKeys.add(key);
-      this[level === "warn" ? "warn" : (level === "error" ? "error" : "log")](channel, message, data);
-      return true;
-    }
-
-    resetOnce(key) { this._onceKeys.delete(key); }
-
     /** In tối đa 1 lần / `ms` cho mỗi `key`. Trả về true nếu lần này THỰC SỰ in. */
     throttled(key, ms, level, channel, message, data) {
       const now = Date.now();
@@ -423,12 +409,6 @@
       else if (level === "error") this.error(channel, message, data);
       else this.log(channel, message, data);
       return true;
-    }
-
-    /** Tăng bộ đếm và trả về giá trị mới. */
-    count(key, delta = 1) {
-      this.counters[key] = (this.counters[key] || 0) + delta;
-      return this.counters[key];
     }
 
     /**
@@ -492,7 +472,6 @@
 
   const api = {
     LA_REASON,
-    SRC_KIND_TEXT,
     explainLookaheadReason,
     describeSrcKind,
     classifyLookaheadAvailability,

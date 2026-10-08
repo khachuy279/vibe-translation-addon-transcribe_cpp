@@ -11,13 +11,7 @@ Mọi hàm ở đây nhận thêm `compact: bool = False`; `compact=True` là ch
 """
 
 import time
-from typing import Any, Dict, Iterable
-
-
-def strip_dup_fields(msg: Dict[str, Any], keep: Iterable[str]) -> Dict[str, Any]:
-    """Giữ đúng các khoá trong `keep` (dùng để kiểm chứng payload gọn)."""
-    keep_set = set(keep)
-    return {k: v for k, v in msg.items() if k in keep_set}
+from typing import Any, Dict
 
 
 def make_pong_msg(timestamp: Any, compact: bool = False) -> Dict[str, Any]:

@@ -27,6 +27,16 @@ from backend.ws.lookahead_handler import LookaheadSessionState
 ROOT = Path(__file__).resolve().parents[2]
 EXT_DIRS = ("extension_firefox", "extension_chrome_edge")
 
+#: Hai file ĐƯỢC PHÉP khác nhau giữa Firefox và Chrome/Edge. Nguồn sự thật:
+#: `tools/build_extensions.py`.
+#:   • `manifest.json`         — Chromium MV3 bắt buộc `background.service_worker` (một file);
+#:                               Firefox MV3 dùng `background.scripts` + gecko id +
+#:                               `match_origin_as_fallback`. Không thể gộp.
+#:   • `lib/browser-config.js` — cờ `useBridge`: Chromium kill service worker sau ~30s idle nên
+#:                               phải mở WebSocket thẳng; Firefox giữ background sống nên dùng
+#:                               bridge để vượt CSP/CORS.
+ALLOWED_MIRROR_DIFFS = frozenset({"manifest.json", "lib/browser-config.js"})
+
 #: Các khoá cấu hình chỉ phục vụ Pipeline B v2 (đã xoá).
 REMOVED_LOOKAHEAD_KEYS = (
     "processing_mode",
@@ -155,11 +165,32 @@ def test_popup_has_no_prebuffer_ahead_slider(ext: str):
 
 
 def test_extension_mirrors_stay_in_sync():
-    """Hai bản extension phải giống nhau ở các file không có khác biệt cố ý (popup + timeline)."""
-    for rel in ("popup/popup.js", "lib/lookahead-timeline.js"):
-        a = (ROOT / EXT_DIRS[0] / rel).read_text(encoding="utf-8")
-        b = (ROOT / EXT_DIRS[1] / rel).read_text(encoding="utf-8")
-        assert a == b, f"{rel} lệch nhau giữa {EXT_DIRS[0]} và {EXT_DIRS[1]}"
+    """Hai bản extension phải giống NHAU TỪNG BYTE, trừ 2 file khác-biệt-cố-ý.
+
+    LỊCH SỬ: test này trước đây chỉ so 2 file (`popup/popup.js`, `lib/lookahead-timeline.js`).
+    Vì allowlist quá hẹp nên `lib/ws-client.js` và `lib/lookahead-client.js` đã LỆCH NHAU âm
+    thầm ở đúng dòng quyết định cách kết nối backend, mà không test nào phát hiện. Nay so
+    TOÀN BỘ cây file, chỉ chừa ra 2 file thật sự phải khác.
+    """
+    a_root, b_root = (ROOT / d for d in EXT_DIRS)
+    a_files = {p.relative_to(a_root).as_posix() for p in a_root.rglob("*") if p.is_file()}
+    b_files = {p.relative_to(b_root).as_posix() for p in b_root.rglob("*") if p.is_file()}
+    assert a_files == b_files, (
+        f"tập file lệch nhau — chỉ có ở {EXT_DIRS[0]}: {sorted(a_files - b_files)}; "
+        f"chỉ có ở {EXT_DIRS[1]}: {sorted(b_files - a_files)}"
+    )
+
+    drift = sorted(
+        rel
+        for rel in a_files - ALLOWED_MIRROR_DIFFS
+        if (a_root / rel).read_bytes() != (b_root / rel).read_bytes()
+    )
+    assert not drift, (
+        f"các file sau lệch giữa {EXT_DIRS[0]} và {EXT_DIRS[1]} nhưng KHÔNG nằm trong danh "
+        f"sách khác-biệt-cố-ý {sorted(ALLOWED_MIRROR_DIFFS)}: {drift}.\n"
+        "Hai bản extension là OUTPUT SINH RA từ `extension_src/`. Sửa ở đó rồi chạy:\n"
+        "    python tools/build_extensions.py"
+    )
 
 
 #: Sự cố thật 2026-10-05 (ảnh người dùng): video phát HẾT nhưng phiên vẫn sống — overlay

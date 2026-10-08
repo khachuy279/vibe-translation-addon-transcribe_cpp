@@ -109,21 +109,6 @@ def collapse_ratio(original: str, collapsed: str) -> float:
     return max(0.0, 1.0 - (len(collapsed) / len(original)))
 
 
-_WS = re.compile(r"\s+")
-
-
-def collapse_repetitions_preserve_spacing(text: str, **kwargs) -> str:
-    """Như `collapse_repetitions` nhưng giữ nguyên khoảng trắng gốc nếu KHÔNG gộp gì.
-
-    Dùng cho đường phụ đề: tránh việc hàm làm sạch vô tình chuẩn hoá khoảng trắng của câu
-    bình thường (gây diff khó hiểu ở test đang chốt văn bản).
-    """
-    collapsed = collapse_repetitions(text, **kwargs)
-    if collapsed == " ".join(text.split()):
-        return text
-    return collapsed
-
-
 def is_repetition_hallucination(text: str, min_reps: int = 3) -> bool:
     """Kiểm tra xem văn bản có phải ảo giác kẹt vòng (từ/ký tự lặp liên tiếp >= min_reps lần).
 

@@ -36,7 +36,6 @@ import os
 import sys
 import threading
 import time
-from typing import Optional
 
 # Cấu hình UTF-8 cho stdout/stderr trên Windows để tránh crash emoji
 if sys.platform == "win32":
@@ -52,8 +51,7 @@ class LogColors:
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
-    
-    BLACK = "\033[30m"
+
     RED = "\033[31m"
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
@@ -61,21 +59,9 @@ class LogColors:
     MAGENTA = "\033[35m"
     CYAN = "\033[36m"
     WHITE = "\033[37m"
-    
+
     BG_RED = "\033[41m"
-    BG_GREEN = "\033[42m"
-    BG_YELLOW = "\033[43m"
-    BG_BLUE = "\033[44m"
 
-
-# Emoji cho từng cấp độ và module
-LEVEL_ICONS = {
-    logging.DEBUG: "🔍",
-    logging.INFO: "ℹ️",
-    logging.WARNING: "⚠️",
-    logging.ERROR: "❌",
-    logging.CRITICAL: "🚨",
-}
 
 MODULE_COLORS = {
     "CORE": LogColors.CYAN,
@@ -106,8 +92,7 @@ class ColoredFormatter(logging.Formatter):
         created = record.created
         msec = int((created - int(created)) * 1000)
         time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created)) + f".{msec:03d}"
-        
-        icon = LEVEL_ICONS.get(record.levelno, "•")
+
         levelname = record.levelname
         
         module_tag = getattr(record, "module_tag", record.name.replace("backend.", "").upper())

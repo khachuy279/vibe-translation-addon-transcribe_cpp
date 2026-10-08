@@ -57,15 +57,14 @@
     ? new LA_DIAG.LookaheadDiag("BS")
     : {
         log() {}, ok() {}, warn() {}, error() {}, group() {},
-        once() { return false; }, throttled() { return false; }, count() { return 0; },
-        setEnabled() { return this; }, setVerbose() { return this; },
+        throttled() { return false; },
+        setEnabled() { return this; },
       };
   if (!LA_DIAG) {
     console.warn("[BS][Diag] Không nạp được lib/lookahead-diagnostics.js — log chẩn đoán sẽ ở mức tối thiểu.");
   }
   //: Bật/tắt log chẩn đoán từ Console: `window.__bsLookaheadDiag(false)`.
   window.__bsLookaheadDiag = (on) => { laDiag.setEnabled(on !== false); return "ok"; };
-  window.__bsLookaheadVerbose = (on) => { laDiag.setVerbose(on !== false); return "ok"; };
 
   /** Thông tin thẻ <video> mà content script đang dùng (để đối chiếu với interceptor). */
   function laVideoInfo(video) {

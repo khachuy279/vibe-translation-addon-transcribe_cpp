@@ -480,26 +480,6 @@ class SubtitleTimelineQueue {
     return before - this.items.length;
   }
 
-  /**
-   * Chẩn đoán: số câu đang giữ và khoảng phủ phía trước.
-   */
-  stats() {
-    if (!this.videoElement || !this.items.length) {
-      return {
-        count: this.items.length, ahead: 0,
-        ignoredSeeks: this.ignoredSeeks, acceptedSeeks: this.acceptedSeeks,
-        horizonSuspended: this.isHorizonSuspended(),
-      };
-    }
-    const cur = this.videoElement.currentTime;
-    const ahead = this.items.filter((it) => it.end_pts > cur).reduce((m, it) => Math.max(m, it.end_pts - cur), 0);
-    return {
-      count: this.items.length, ahead,
-      ignoredSeeks: this.ignoredSeeks, acceptedSeeks: this.acceptedSeeks,
-      horizonSuspended: this.isHorizonSuspended(),
-    };
-  }
-
   clear() {
     this.items = [];
     this.activeSubtitle = null;

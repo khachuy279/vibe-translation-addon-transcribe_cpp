@@ -75,16 +75,6 @@ def _backend_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def native_bundle_dir() -> Optional[Path]:
-    """Thư mục bundle native đang dùng, hoặc None nếu dùng provider đã cài."""
-    return _bundle_dir
-
-
-def native_bundle_source() -> str:
-    """Nguồn bundle: 'config' | 'default' | 'env' | 'installed'."""
-    return _bundle_source
-
-
 def _resolve_bundle_dir() -> Tuple[Optional[Path], str]:
     """Tìm thư mục bundle native theo thứ tự ưu tiên."""
     from backend.config import config
@@ -109,7 +99,8 @@ def _resolve_bundle_dir() -> Tuple[Optional[Path], str]:
     candidates.append((_backend_dir() / "bin", "default"))
     # Vị trí CŨ trước khi bundle được gom vào `backend/bin`. Giữ làm fallback để bản cài đã có
     # sẵn `<root>/bin` không mất CUDA sau khi nâng cấp. Vẫn báo nguồn là "default" — tập giá
-    # trị của `native_bundle_source()` giữ nguyên: config | default | env | installed.
+    # trị của khoá `native_bundle_source` trong `runtime_bundle_info()` giữ nguyên:
+    # config | default | env | installed.
     candidates.append((_project_root() / "bin", "default"))
 
     for cand, source in candidates:
@@ -316,12 +307,6 @@ def resolve_backend(requested: Optional[str], *, force_log: bool = False) -> str
 
     _resolved[key] = chosen
     return chosen
-
-
-def reset_backend_cache() -> None:
-    """Xoá cache phân giải backend (dùng khi đổi cấu hình lúc chạy / trong test)."""
-    with _resolve_lock:
-        _resolved.clear()
 
 
 def runtime_info() -> dict:

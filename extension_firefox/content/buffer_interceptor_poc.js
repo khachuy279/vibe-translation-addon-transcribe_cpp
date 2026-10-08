@@ -1251,51 +1251,11 @@
     }
   }
 
-  /**
-   * Tải lại khoảng byte đã ghi cho những phân đoạn CHƯA có trong cache (vùng đã buffer sẵn),
-   * rồi gửi sang content script như một mảnh bình thường.
-   */
-  async function refetchAudioRange(fromByte, toByte, maxBytes) {
-    if (!state.mediaRanges.length) return 0;
-    const selected = state.mediaRanges.filter(
-      (r) => r.end > fromByte && r.start < toByte && !state.refetchedRanges.has(`${r.start}-${r.end}`)
-    );
-    if (!selected.length) return 0;
-    // Gộp thành MỘT request cho cả khoảng (YouTube chấp nhận range lớn).
-    const start = Math.min(...selected.map((r) => r.start));
-    const end = Math.min(toByte, Math.max(...selected.map((r) => r.end)));
-    const url = selected[0].url;
-    if (end - start > maxBytes) return 0;
-    try {
-      const resp = await window.__vibe_orig_fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
-      if (!resp || !resp.ok) return 0;
-      const buf = await resp.arrayBuffer();
-      for (const r of selected) state.refetchedRanges.add(`${r.start}-${r.end}`);
-      window.postMessage({
-        source: 'VIBE_LOOKAHEAD_POC',
-        type: 'AUDIO_CHUNK_INTERCEPTED',
-        payload: {
-          timestampOffset: 0,
-          mime: state.lastMimeType,
-          isInit: false,
-          epoch: state.bufferEpoch,
-          refetched: true
-        },
-        rawBytes: buf
-      }, '*');
-      console.log(`%c[Lookahead] ⬇️ Tải lại ${buf.byteLength}B (bytes=${start}-${end}) cho vùng đã buffer sẵn.`, 'color: #fbbf24;');
-      return buf.byteLength;
-    } catch (e) {
-      console.warn('[Lookahead] Tải lại phân đoạn thất bại:', e);
-      return 0;
-    }
-  }
-
   if (window.fetch && !window.__vibe_orig_fetch) {
     window.__vibe_orig_fetch = window.fetch;
     window.fetch = async function (...args) {
       const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-      // Ghi lại Range của request để có thể tải lại sau (xem `refetchAudioRange`).
+      // Ghi lại Range của request để có thể tải lại sau (xem `refetchForPlayhead`).
       try {
         const init = args[1] || {};
         const hdrs = init.headers || (args[0] && args[0].headers) || {};

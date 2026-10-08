@@ -41,13 +41,18 @@ class LookaheadClient {
     this.ws = null;
     this.port = null;
     // Cho phép dùng Background Bridge để vượt qua CSP / CORS của các trang web ngoài.
-    // FIREFOX: bridge qua `chrome.runtime.connect` là đường CHÍNH (background script của Firefox
-    // KHÔNG bị kill sau ~30s idle như service worker của Chromium). Bản chrome_edge đặt mặc định
-    // `false` (WebSocket mở thẳng) vì lý do riêng của Chromium — ĐỪNG copy giá trị đó sang đây.
-    // Nếu môi trường không có chrome.runtime.connect (vd Node test), tự fallback sang WebSocket trực tiếp.
+    // Mặc định per-browser nằm ở MỘT chỗ: `lib/browser-config.js` (sinh bởi
+    // `tools/build_extensions.py`), KHÔNG hard-code ở đây nữa:
+    //   • FIREFOX      — bridge là đường CHÍNH (background script không bị kill sau ~30s idle).
+    //   • CHROME/EDGE  — service worker bị kill sau ~30s idle ⇒ WebSocket mở thẳng.
+    // `options.useBridge` vẫn được ưu tiên cao nhất (test truyền tường minh).
+    // Thiếu config (vd Node test) ⇒ giữ nguyên cách dò cũ `chrome.runtime.connect`.
+    const bsCfg = globalThis.BS_BROWSER_CONFIG;
     this.useBridge = (typeof options.useBridge === "boolean")
       ? options.useBridge
-      : (typeof chrome !== "undefined" && !!chrome.runtime?.connect);
+      : (bsCfg
+        ? bsCfg.useBridge === true
+        : (typeof chrome !== "undefined" && !!chrome.runtime?.connect));
 
     this.isConnected = false;
     this.isServerReady = false;
