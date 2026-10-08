@@ -319,14 +319,35 @@ trong service worker (không thể chạy), `SubtitleTimelineQueue.stats()` (19 
 và `window.__bsLookaheadVerbose` (API nói dối: cờ `verbose` không được đọc ở đâu).
 
 **CÒN LẠI của P2 (chưa làm, cần quyết định riêng):**
-- Chuỗi giao thức chết nhiều file: `partial_transcript`, `sentence_complete`, `set_overlay_mode`
-  (chạm `content-script.js` → `overlay-manager.js` → `subtitle-renderer.js`), `ws_json_raw`, `SEND_BUFFER`.
-- `popup/popup.js:70` `lblActiveModel` + 7 nhánh `if` — HTML đã comment out. Cần chọn: mở lại HTML **hoặc** xoá JS.
-- HTML/CSS chết: 6 id trong `popup.html`, 5 class trong `popup.css`.
-- Hợp nhất chồng chéo (§5): SHA-256 còn 3 bản ở VAD/crispasr, 3 bộ tải `urllib`, đọc RSS 2 bản,
-  định dạng khung audio, 3 bộ dedup khác quy tắc, `popup.js` ~200 dòng lặp.
+- HTML/CSS chết: 6 id trong `popup.html` (`lookaheadStatusDot`, `lookaheadSyncGroup`, `stableToggleRow`,
+  `stableTraceToggleRow`, `duckingSliderRow`, `translationOnceToggleRow`). ⚠️ **KHÔNG xoá vội**: các hàng
+  này vẫn HIỆN trong UI nhưng thiếu handler JS ⇒ đây là **lỗ hổng UX**, không phải markup chết. Cần quyết
+  định: thêm handler hay bỏ hàng.
+- Hợp nhất chồng chéo còn lại (§5): 3 bộ tải `urllib`, định dạng khung audio (còn ở `lookahead-client.js`),
+  **3 bộ dedup với 3 quy tắc chuẩn hoá khác nhau** (đây là quyết định ngữ nghĩa, không phải cơ học),
+  chính sách hàng đợi TTS ngược nhau, `make_model_status_msg` vs 18 dict literal,
+  `popup.js` ~200 dòng lặp (`waitFor*`/`render*`/`monitor*`).
 
-### Ba bài học đo được (đã trả giá để biết)
+### P2-bis — Hợp nhất chồng chéo ✅ XONG (phần cơ học)
+
+| Việc | Kết quả |
+|---|---|
+| **SHA-256** | Từ **5 bản ở 4 module** → **1 bản duy nhất** ở `model_download.py`. `crispasr_native._sha256_file`, `silero_onnx._sha256`, `firered_onnx._sha256_of_bytes` nay uỷ quyền; `crispasr_native` bỏ luôn `hashlib` nội tuyến. Kiểm chứng: `hashlib.sha256` chỉ còn xuất hiện trong `model_download.py` |
+| **Đọc RSS** | `ASREngine._process_rss_mb` từ bản sao ~35 dòng → uỷ quyền `mem_guard.rss_mb`. **Giữ method** vì `test_17_executor_backpressure.py` monkeypatch chính attribute này làm seam kiểm thử |
+
+### P2-ter — Dọn giao thức chết ở extension ✅ XONG
+
+Xoá: `partial_transcript`, `sentence_complete`, `set_overlay_mode` (chuỗi 3 file:
+`content-script.js` → `overlay-manager.js` → `subtitle-renderer.js`, gồm cả `SubtitleRenderer.setMode`
+và thuộc tính `this.mode` chỉ-ghi), `ws_json_raw` (thay bằng `console.warn` để lỗi parse vẫn thấy được),
+alias `SEND_BUFFER`, emit `reconnecting` (**đã khôi phục — xem bài học 4**), và theo quyết định của người
+dùng: khối HTML comment `#lblActiveModel` + `popup.js:70` + 3 nhánh `if` + 5 class CSS mồ côi
+(`.model-info-*`, `.toggle-icon`).
+
+**GIỮ LẠI có chủ đích:** `stream_reset` (backend gửi, extension không nhận) — `test_21_seek_reset.py:143`
+khẳng định đây là hành vi CÓ CHỦ ĐÍCH. Client bỏ qua một thông báo thông tin không biến nó thành code chết.
+
+### Bốn bài học đo được (đã trả giá để biết)
 
 1. **Đếm bằng regex là SAI.** Bản đầu của bộ dò tính cả comment/docstring là "tham chiếu". Hậu quả:
    `native_bundle_source`, `build_glossary_hint`, `import_error`, `has_voice`, `restore` bị ẩn khỏi báo cáo.
@@ -338,4 +359,10 @@ và `window.__bsLookaheadVerbose` (API nói dối: cờ `verbose` không đượ
    cả `backend/tests/`.
 3. **Không thể tin một nguồn duy nhất.** Chính báo cáo này có 2/4 mục §6.4 sai; chính bộ dò của tôi có
    3 lỗi logic. Mọi kết luận "chết" đều phải đọc code xác nhận, không chỉ dựa vào công cụ.
+4. **"Không có listener/consumer" KHÔNG đồng nghĩa với chết — với API event-emitter thì càng sai.**
+   Tôi xoá `WSClient._emit("reconnecting", …)` với lý do "không ai nghe trong `extension_src`".
+   `backend/tests/js/ws_reconnect_on_port_death_test.js` khẳng định sự kiện này là **hợp đồng** và đã
+   đỏ ngay. Đã khôi phục kèm comment cảnh báo. Cùng lớp lỗi với `supportsGainDucking` (bài học 2):
+   **API công khai tồn tại để bên ngoài dùng, kể cả khi bên ngoài đó là test.**
+   → Quy tắc rút ra: trước khi xoá bất kỳ symbol nào của extension, bắt buộc grep **cả `backend/tests/`**.
 

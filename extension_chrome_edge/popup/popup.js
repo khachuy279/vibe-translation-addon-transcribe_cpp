@@ -67,7 +67,6 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   // Chẩn đoán: log mỗi nhịp preview ([SEG_TRACE]) — mặc định TẮT.
   const chkStableTrace = document.getElementById("chkStableTrace");
   const valMinWords = document.getElementById("valMinWords");
-  const lblActiveModel = document.getElementById("lblActiveModel");
   const selSourceLang = document.getElementById("selSourceLang");
   const selTargetLang = document.getElementById("selTargetLang");
   const selTranslationModel = document.getElementById("selTranslationModel");
@@ -488,11 +487,6 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     lastActiveAsr = activeAsr;
     lastActiveVad = activeVad;
 
-    if (lblActiveModel) {
-      lblActiveModel.textContent = data.loaded_model || data.model_size || activeAsr;
-      lblActiveModel.title = `Mô hình ASR đang nạp: ${data.loaded_model || data.model_size || activeAsr}`;
-    }
-
     // Dynamically populate available ASR engines from backend catalog
     if (data.available_models || data.available_asr_engines) {
       renderAsrEngineOptions(data.available_models || data.available_asr_engines, activeAsr);
@@ -628,10 +622,6 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     const labelDesc = newAsr === "whisper" ? `Whisper (${newLang})` : newAsr.toUpperCase();
     statusBadge.textContent = `Nạp ${labelDesc}...`;
     statusBadge.className = "badge badge-reconnecting";
-    if (lblActiveModel) {
-      lblActiveModel.textContent = `Đang nạp ${labelDesc}...`;
-      lblActiveModel.title = `Đang nạp mô hình ${labelDesc}...`;
-    }
     showMsg(`⏳ Đang kiểm tra, tải & giải phóng VRAM để nạp model ASR ${labelDesc}... Vui lòng đợi.`, "info");
 
     try {
@@ -676,11 +666,6 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       lastActiveAsr = result.engine || newAsr;
       lastActiveVad = result.vad_engine || newVad;
       lastActiveLang = result.source_lang || newLang;
-
-      if (lblActiveModel) {
-        lblActiveModel.textContent = result.loaded_model || result.model_size || lastActiveAsr;
-        lblActiveModel.title = `Mô hình ASR đang nạp: ${result.loaded_model || result.model_size || lastActiveAsr}`;
-      }
 
       // Update supported languages dropdown
       if (result.supported_languages) {

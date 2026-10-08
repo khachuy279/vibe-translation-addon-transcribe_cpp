@@ -222,7 +222,9 @@ api.runtime.onConnect.addListener((port) => {
               const parsed = JSON.parse(event.data);
               port.postMessage({ type: "ws_json", data: parsed });
             } catch (e) {
-              port.postMessage({ type: "ws_json_raw", data: event.data });
+              // Không có phía nhận `ws_json_raw` nào (đã kiểm tra toàn bộ extension_src),
+              // nên ghi log thay vì gửi một message không ai đọc.
+              console.warn("[BS Background] JSON không hợp lệ từ backend:", e);
             }
           } else {
             // P3.1: audio TTS hoặc audio binary frame có thể tới dưới dạng binary frame (không base64).
@@ -267,7 +269,7 @@ api.runtime.onConnect.addListener((port) => {
       const buffer = buildBinaryAudioPacket(msg.header, msg.pcmBuffer, textEncoder);
 
       sendOrQueue(buffer);
-    } else if (msg.action === "SEND_RAW_BINARY" || msg.action === "SEND_BUFFER") {
+    } else if (msg.action === "SEND_RAW_BINARY") {
       const buf = msg.buffer || msg.data;
       if (ws && ws.readyState === WebSocket.OPEN && buf) {
         try {

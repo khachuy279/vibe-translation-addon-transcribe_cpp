@@ -317,18 +317,11 @@
       return;
     }
 
-    // Khi Lookahead đang hiển thị phụ đề đã nạp sẵn, chặn partial transcript đè nhấp nháy
-    if (eventType === "partial_transcript" && timelineQueue && timelineQueue.activeSubtitle) {
-      return;
-    }
-
     const video = getVideo();
     // 1. If this frame HAS the video element, render overlay directly inside this frame
     if (video) {
       const om = ensureOverlay(video);
-      if (eventType === "partial_transcript") om.onPartialTranscript(payload);
-      else if (eventType === "utterance_update") om.onUtteranceUpdate(payload);
-      else if (eventType === "sentence_complete") om.onSentenceComplete(payload);
+      if (eventType === "utterance_update") om.onUtteranceUpdate(payload);
       else if (eventType === "translation") om.onTranslation(payload);
       return;
     }
@@ -336,9 +329,7 @@
     // 2. If this frame is actively capturing audio (even if video ref is temporary null)
     if (isCapturing) {
       const om = ensureOverlay(null);
-      if (eventType === "partial_transcript") om.onPartialTranscript(payload);
-      else if (eventType === "utterance_update") om.onUtteranceUpdate(payload);
-      else if (eventType === "sentence_complete") om.onSentenceComplete(payload);
+      if (eventType === "utterance_update") om.onUtteranceUpdate(payload);
       else if (eventType === "translation") om.onTranslation(payload);
       return;
     }
@@ -562,10 +553,6 @@
           });
           return true;
         }
-      case "set_overlay_mode":
-        if (msg.payload?.mode) settings.overlayStyle = msg.payload.mode;
-        if (overlayManager) overlayManager.setMode(settings.overlayStyle);
-        break;
       case "update_settings":
         if (msg.settings) {
           Object.assign(settings, msg.settings);
@@ -822,7 +809,6 @@
       wsClient.sendJSON(buildWsConfig(settings));
     });
 
-    wsClient.on("partial_transcript", p => emitSubtitleEvent("partial_transcript", p));
     wsClient.on("utterance_update", p => emitSubtitleEvent("utterance_update", p));
     wsClient.on("translation", p => emitSubtitleEvent("translation", p));
     wsClient.on("tts_audio", p => emitSubtitleEvent("tts_audio", p));

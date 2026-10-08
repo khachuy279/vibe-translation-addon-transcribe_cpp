@@ -231,6 +231,9 @@ class WSClient {
       this.maxReconnectDelay
     );
     this.reconnectAttempts++;
+    //: Sự kiện này là HỢP ĐỒNG ĐƯỢC TEST: `backend/tests/js/ws_reconnect_on_port_death_test.js`
+    //: khẳng định `WSClient` PHẢI phát 'reconnecting'. Không có listener trong `extension_src`
+    //: KHÔNG có nghĩa là chết — đừng xoá.
     this._emit("reconnecting", { attempt: this.reconnectAttempts, delayMs: delay });
 
     this._cancelReconnect();

@@ -362,8 +362,6 @@ body::-webkit-scrollbar-thumb:hover {
   align-items: center;
   gap: 7px;
 }
-.toggle-icon { font-size: 14px; }
-
 .switch { position: relative; display: inline-block; width: 42px; height: 25px; flex-shrink: 0; }
 .switch input { opacity: 0; width: 0; height: 0; }
 
@@ -390,13 +388,3 @@ body::-webkit-scrollbar-thumb:hover {
 input:checked + .slider { background: var(--accent); box-shadow: 0 0 0 0 transparent; }
 input:checked + .slider:before { transform: translateX(17px); }
 
-/* Model info banner */
-.model-info-banner {
-  display: flex; align-items: center; gap: 6px;
-  background: var(--bg-card); border: 1px solid var(--border-soft);
-  padding: 6px 10px; border-radius: var(--radius-md);
-  margin-bottom: 10px; font-size: 11px; box-shadow: var(--shadow-card);
-}
-.model-info-icon { font-size: 13px; }
-.model-info-label { color: var(--text-muted); font-weight: 700; font-size: 10px; letter-spacing: 0.4px; }
-.model-info-value { color: #1a7a35; font-weight: 600; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }

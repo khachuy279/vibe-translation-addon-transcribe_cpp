@@ -6,7 +6,6 @@
 class SubtitleRenderer {
   constructor(container) {
     this.container = container;
-    this.mode = "bottom_bar"; // "bottom_bar" | "floating"
 
     // Completed translated sentences pool (CHỈ CHỨA CÁC CÂU ĐÃ CÓ BẢN DỊCH HOÀN CHỈNH)
     this.completedSentences = [];
@@ -193,11 +192,6 @@ class SubtitleRenderer {
     this.container.appendChild(this.historyLayer);
     this.container.appendChild(this.focusLayer);
     this.container.appendChild(this.liveLayer);
-  }
-
-  setMode(mode) {
-    this.mode = mode;
-    this.container.className = "bs-content-area";
   }
 
   setMaxLines(maxLines) {
@@ -723,29 +717,6 @@ class SubtitleRenderer {
     }
 
     return sentenceDiv;
-  }
-
-  // ── Legacy Handlers ───────────────────────────────────────
-
-  onPartialTranscript(tokens) {
-    if (!tokens || tokens.length === 0) return;
-    const text = tokens.map((t) => t.text).join("");
-    if (text) {
-      this.onUtteranceUpdate({
-        utterance_id: "legacy-draft",
-        ui_text: text,
-        is_final: false,
-      });
-    }
-  }
-
-  onSentenceComplete(sentence) {
-    if (!sentence) return;
-    this.onUtteranceUpdate({
-      utterance_id: sentence.sentence_id || sentence.id,
-      ui_text: sentence.ui_text || sentence.text || "",
-      is_final: true,
-    });
   }
 
   clear() {

@@ -44,6 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from backend.utils.logger import logger
+from backend.utils.model_download import sha256_bytes as _shared_sha256_bytes
 
 #: Hình học frame của upstream (`fireredvad/core/constants.py`) — KHÔNG đổi được.
 FRAME_LENGTH_SAMPLE = 400   # cửa sổ 25 ms
@@ -348,9 +349,8 @@ def _download(url: str, target: Path, expected_sha256: str) -> bool:
 
 
 def _sha256_of_bytes(data: bytes) -> str:
-    import hashlib
-
-    return hashlib.sha256(data).hexdigest()
+    """SHA-256 của buffer. Uỷ quyền cho helper DÙNG CHUNG ở `backend.utils.model_download`."""
+    return _shared_sha256_bytes(data)
 
 
 def ensure_firered_onnx_files(model_dir: Path, *, allow_download: bool = True) -> None:

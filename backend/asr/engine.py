@@ -145,39 +145,18 @@ class TranscribeEngine(BaseASREngine):
 
     @staticmethod
     def _process_rss_mb() -> float:
-        """RSS của tiến trình (MB). Trả 0 nếu không đọc được (khi đó mọi guard tự tắt)."""
-        try:
-            import psutil  # type: ignore
+        """RSS của tiến trình (MB) — uỷ quyền cho `backend.utils.mem_guard.rss_mb`.
 
-            return float(psutil.Process().memory_info().rss) / (1024.0 * 1024.0)
-        except Exception:  # noqa: BLE001
-            pass
-        try:  # pragma: no cover - phụ thuộc nền tảng
-            import ctypes
-            import ctypes.wintypes as wt
+        Trước đây hàm này là bản sao ~35 dòng của `mem_guard.rss_mb` (khác đúng một lời gọi
+        Win32: `psapi.GetProcessMemoryInfo` vs `K32GetProcessMemoryInfo` — cùng một hàm).
+        Xem `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.3.
 
-            class _PMC(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wt.DWORD),
-                    ("PageFaultCount", wt.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
+        GIỮ LẠI dưới dạng method vì `test_17_executor_backpressure.py` monkeypatch chính
+        attribute này làm seam kiểm thử — đừng xoá hay đổi tên.
+        """
+        from backend.utils.mem_guard import rss_mb
 
-            pmc = _PMC()
-            pmc.cb = ctypes.sizeof(_PMC)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
-                return float(pmc.WorkingSetSize) / (1024.0 * 1024.0)
-        except Exception:  # noqa: BLE001
-            pass
-        return 0.0
+        return rss_mb()
 
     async def maybe_recycle_native(self) -> bool:
         """F-39 (phần native): đóng phiên native đã phình để lần sau nạp lại sạch.

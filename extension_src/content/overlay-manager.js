@@ -427,10 +427,6 @@ class OverlayManager {
     console.log("[OverlayManager] Destroyed");
   }
 
-  setMode(mode) {
-    // Kept for backward compatibility
-  }
-
   applySettings(settings) {
     if (!settings) return;
 
@@ -487,17 +483,6 @@ class OverlayManager {
   onUtteranceUpdate(payload) {
     if (!this.renderer) return;
     this.renderer.onUtteranceUpdate(payload);
-  }
-
-  onPartialTranscript(payload) {
-    if (!this.renderer) return;
-    const tokens = payload.tokens || [];
-    this.renderer.onPartialTranscript(tokens);
-  }
-
-  onSentenceComplete(payload) {
-    if (!this.renderer) return;
-    this.renderer.onSentenceComplete(payload);
   }
 
   onTranslation(payload) {

@@ -38,6 +38,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from backend.utils.logger import logger
+from backend.utils.model_download import sha256_bytes as _shared_sha256_bytes
 
 #: Cửa sổ bắt buộc của Silero @16 kHz (32 ms) — KHÔNG đổi được.
 WINDOW_SAMPLES = 512
@@ -111,9 +112,8 @@ def find_bundled_onnx() -> Optional[Path]:
 
 
 def _sha256(data: bytes) -> str:
-    import hashlib
-
-    return hashlib.sha256(data).hexdigest()
+    """SHA-256 của buffer. Uỷ quyền cho helper DÙNG CHUNG ở `backend.utils.model_download`."""
+    return _shared_sha256_bytes(data)
 
 
 def _download_onnx(target: Path) -> bool:

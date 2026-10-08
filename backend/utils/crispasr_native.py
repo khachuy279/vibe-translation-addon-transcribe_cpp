@@ -43,6 +43,10 @@ import numpy as np
 
 from backend.config import BACKEND_DIR, MODELS_DIR
 from backend.utils.logger import logger
+from backend.utils.model_download import (
+    sha256_bytes as _shared_sha256_bytes,
+    sha256_file as _shared_sha256_file,
+)
 
 _TAG = "ASR"
 
@@ -108,13 +112,12 @@ DLL_SHA256: Dict[str, str] = {
 
 
 def _sha256_file(path: Path) -> str:
-    import hashlib
+    """SHA-256 của file. Uỷ quyền cho helper DÙNG CHUNG ở `backend.utils.model_download`.
 
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
+    Trước đây mỗi module tự cài lại SHA-256 (5 bản ở 4 module) — xem
+    `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.1.
+    """
+    return _shared_sha256_file(path)
 
 
 def _dlls_present(lib_dir: Path, *, verify: bool = False) -> bool:
@@ -144,7 +147,6 @@ def ensure_lib_files(
 
     Trả về thư mục DLL. Ném `FileNotFoundError` nếu thiếu và không được phép/khoong tải được.
     """
-    import hashlib
     import urllib.error
     import urllib.request
     import zipfile
@@ -170,7 +172,7 @@ def ensure_lib_files(
         )
         with urllib.request.urlopen(BUNDLE_URL, timeout=300) as resp:  # noqa: S310 - URL hằng số
             data = resp.read()
-        digest = hashlib.sha256(data).hexdigest()
+        digest = _shared_sha256_bytes(data)
         if digest != BUNDLE_SHA256:
             raise RuntimeError(
                 f"Gói DLL tải về có SHA-256 {digest} khác giá trị mong đợi {BUNDLE_SHA256} — TỪ CHỐI."
