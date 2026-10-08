@@ -79,6 +79,7 @@ from backend.ws.session import (
     clamp_sync_offset_ms,
     off_means_none_ms,
     pick_vad_threshold,
+    spawn_background_task,
 )
 from backend.ws.serializers import make_model_status_msg
 from backend.utils.logger import get_logger
@@ -345,6 +346,13 @@ class LookaheadSessionState:
 
     # ────────────────────────────────────────────────────────────── gửi tin
     async def send_json(self, payload: Dict[str, Any]) -> bool:
+        """Gửi JSON; thoát SỚM nếu phiên Lookahead đã đóng.
+
+        Lớp cuối của chuỗi 3 lớp (`SafeWebSocketConnection` → `SessionState` → đây). CỐ Ý giữ
+        riêng: phiên Lookahead có thể đóng (`_closed`) TRƯỚC khi socket đóng, và ghi thêm frame
+        vào một phiên đã kết thúc là nguồn của phụ đề "ma". Xem
+        `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.7.
+        """
         if self._closed:
             return False
         return await self.connection.send_json(payload)
@@ -524,7 +532,18 @@ class LookaheadSessionState:
         return applied
 
     def _schedule_asr_model_switch(self, model_key: str) -> None:
-        """Đổi model ASR cho phiên Lookahead (tác vụ nền, không chặn vòng nhận tin)."""
+        """Đổi model ASR cho phiên Lookahead (tác vụ nền, không chặn vòng nhận tin).
+
+        ⚠️ CỐ Ý KHÁC bản của Pipeline A (`session.py::_schedule_asr_model_switch`):
+          * Ở đây nhánh từ chối chỉ LOG rồi `return` (không gửi `model_status` error), luôn gửi
+            `loading`, và ném lỗi TRONG task khi auto_download tắt;
+          * Bản Pipeline A gửi `model_status` error ở mọi nhánh từ chối và phân biệt
+            `downloading`/`loading`.
+        Thêm nữa, chỉ bản này đồng bộ `asr_engine.model_key/model_info` của phiên (nếu không,
+        lần suy luận kế tiếp sẽ nạp LẠI model cũ). Gộp hai bên sẽ đổi thông báo người dùng thấy
+        ở một trong hai pipeline ⇒ KHÔNG gộp.
+        Xem `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.7.
+        """
         from backend.asr import lifecycle as asr_lifecycle
         from backend.asr.registry import ModelRegistry
 
@@ -557,7 +576,13 @@ class LookaheadSessionState:
         self._spawn(_run())
 
     def _schedule_translation_model_switch(self, model_request: str) -> None:
-        """Đổi model dịch cho phiên Lookahead (tác vụ nền)."""
+        """Đổi model dịch cho phiên Lookahead (tác vụ nền).
+
+        ⚠️ CỐ Ý KHÁC bản của Pipeline A (`session.py::_schedule_translation_model_switch`):
+        bản này thoát sớm khi model đích TRÙNG model đang dùng (`config.translation.base`), và
+        không gửi `model_status` error ở nhánh từ chối. Xem §5.7 của
+        `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md`.
+        """
         from backend.translation import lifecycle as trans_lifecycle
         from backend.translation.registry import TranslationModelRegistry
 
@@ -588,13 +613,12 @@ class LookaheadSessionState:
         self._spawn(_run())
 
     def _spawn(self, coro) -> None:
-        """Chạy tác vụ nền và giữ tham chiếu (tránh bị GC thu hồi giữa đường)."""
-        try:
-            task = asyncio.get_running_loop().create_task(coro)
-        except RuntimeError:
-            return
-        self._bg_tasks.add(task)
-        task.add_done_callback(lambda t: self._bg_tasks.discard(t))
+        """Chạy tác vụ nền và giữ tham chiếu (tránh bị GC thu hồi giữa đường).
+
+        Uỷ quyền cho `spawn_background_task` — dùng chung với `SessionState` (hai bản trước
+        đây giống hệt nhau từng byte).
+        """
+        spawn_background_task(coro, self._bg_tasks)
 
     async def apply_config(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """Áp cấu hình popup cho phiên Lookahead (cả khi đang chạy)."""
@@ -1616,7 +1640,7 @@ class LookaheadSessionState:
                 if not translated:
                     translated = sub.text
 
-                if self._is_duplicate(pts_start, pts_end, sub.text):
+                if self._is_duplicate(pts_start, sub.text):
                     continue
 
                 self._sent_items.append((pts_start, pts_end, sub.text))
@@ -1975,11 +1999,17 @@ class LookaheadSessionState:
             return (result.get("translated_text") or result.get("text") or text).strip()
         return text
 
-    def _is_duplicate(self, pts_start: float, pts_end: float, text: str) -> bool:
+    def _is_duplicate(self, pts_start: float, text: str) -> bool:
+        """Câu này vừa được phát gần đây (cùng nội dung, mốc bắt đầu lệch < 1 s)?
+
+        So khớp trên văn bản ĐÃ CHUẨN HOÁ (`normalize_for_dedup`) nên khác dấu câu vẫn bị coi
+        là trùng. Tham số `pts_end` từng được khai báo nhưng KHÔNG dùng — đã bỏ để chữ ký
+        không nói dối (xem `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.7).
+        """
         norm = normalize_for_dedup(text)
         if not norm:
             return True
-        for s0, s1, prev in self._sent_items[-64:]:
+        for s0, _s1, prev in self._sent_items[-64:]:
             if normalize_for_dedup(prev) == norm and abs(s0 - pts_start) < 1.0:
                 return True
         return False

@@ -128,6 +128,24 @@ def clamp_sync_offset_ms(raw: Any) -> Optional[float]:
         return None
 
 
+def spawn_background_task(coro: Any, sink: set) -> None:
+    """Chạy `coro` thành task nền và giữ tham chiếu trong `sink` để GC không thu hồi giữa đường.
+
+    DÙNG CHUNG cho `SessionState` và `LookaheadSessionState`: hai lớp trước đây có bản `_spawn`
+    **giống hệt nhau từng byte** (khác đúng một dòng log). Xem
+    `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.7.
+
+    Không có event loop (test đồng bộ) ⇒ bỏ qua an toàn thay vì ném.
+    """
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        logger.debug("Không có event loop đang chạy — bỏ qua task nền.", extra={"module_tag": "WS"})
+        return
+    sink.add(task)
+    task.add_done_callback(sink.discard)
+
+
 class SessionConfig:
     """Quản lý cấu hình động theo từng phiên làm việc."""
 
@@ -212,19 +230,26 @@ class SessionState:
         return self.protocol_version >= 3 and int(config.ws.protocol_version) >= 3
 
     async def send_json(self, payload: Dict[str, Any]) -> bool:
-        """Gửi JSON payload qua WebSocket an toàn."""
+        """Gửi JSON payload qua WebSocket an toàn.
+
+        ⚠️ Đây là lớp MỎNG trong chuỗi 3 lớp (`SafeWebSocketConnection.send_json` →
+        `SessionState.send_json` → `LookaheadSessionState.send_json`). CỐ Ý giữ cả ba, KHÔNG gộp:
+        mỗi lớp làm một việc khác nhau —
+          * `connection`: tuần tự hoá, đo metric `ws.send_*`, chặn khi socket đã đóng;
+          * `SessionState` (đây): API của lớp phiên, để handler không phải chạm `session.connection`;
+          * `LookaheadSessionState`: thoát SỚM khi `_closed` (phiên Lookahead đóng trước khi
+            socket đóng), tránh ghi thêm frame vào một phiên đã kết thúc.
+        Gộp lại sẽ phải sửa mọi call-site và làm mất ý nghĩa "phiên đã đóng" của Pipeline B.
+        Xem `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.7.
+        """
         return await self.connection.send_json(payload)
 
     def _spawn(self, coro) -> None:
-        """Chạy task nền và giữ tham chiếu (tránh bị GC thu hồi giữa đường)."""
-        try:
-            task = asyncio.get_running_loop().create_task(coro)
-        except RuntimeError:
-            # Không có event loop (test đồng bộ): bỏ qua an toàn.
-            logger.debug("Không có event loop đang chạy — bỏ qua task nền.", extra={"module_tag": "WS"})
-            return
-        self._bg_tasks.add(task)
-        task.add_done_callback(lambda t: self._bg_tasks.discard(t))
+        """Chạy task nền và giữ tham chiếu (tránh bị GC thu hồi giữa đường).
+
+        Uỷ quyền cho `spawn_background_task` — dùng chung với `LookaheadSessionState`.
+        """
+        spawn_background_task(coro, self._bg_tasks)
 
     def init_components(self, asr_engine=None, vad_engine=None) -> None:
         """Khởi tạo toàn bộ các thành phần ASR, VAD và hàng đợi bất đồng bộ.
@@ -271,7 +296,15 @@ class SessionState:
 
     # ------------------------------------------------------------ model switching
     def _schedule_asr_model_switch(self, model_key: str) -> None:
-        """P1.8: nạp trước model ASR rồi swap, có thông báo trạng thái qua WS (tự tải nếu thiếu file)."""
+        """P1.8: nạp trước model ASR rồi swap, có thông báo trạng thái qua WS (tự tải nếu thiếu file).
+
+        ⚠️ CỐ Ý KHÁC bản của Pipeline B (`lookahead_handler.py::_schedule_asr_model_switch`):
+          * Ở đây MỌI nhánh từ chối đều GỬI `model_status(state="error")` cho client, và phân biệt
+            `downloading` vs `loading` theo `needs_download`;
+          * Bản Lookahead chỉ LOG rồi `return`, luôn gửi `loading`, và ném lỗi TRONG task.
+        Gộp hai bên sẽ đổi thông báo mà người dùng thấy ở một trong hai pipeline ⇒ KHÔNG gộp.
+        Xem `report/audit/26_RA_SOAT_CODE_CHET_VA_CHONG_CHEO.md` §5.7.
+        """
         from backend.asr import lifecycle as asr_lifecycle
         from backend.asr.registry import ModelRegistry
 
