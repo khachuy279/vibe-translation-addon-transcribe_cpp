@@ -318,11 +318,48 @@ trong service worker (không thể chạy), `SubtitleTimelineQueue.stats()` (19 
 `WSClient.off()`, `supportsBinaryTts` + nhánh `binary_tts`, export `SRC_KIND_TEXT`,
 và `window.__bsLookaheadVerbose` (API nói dối: cờ `verbose` không được đọc ở đâu).
 
-**CÒN LẠI của P2 (chưa làm, cần quyết định riêng):**
-- Hợp nhất chồng chéo còn lại (§5): 3 bộ tải `urllib`, định dạng khung audio (còn ở `lookahead-client.js`),
-  **3 bộ dedup với 3 quy tắc chuẩn hoá khác nhau** (đây là quyết định ngữ nghĩa, không phải cơ học),
-  chính sách hàng đợi TTS ngược nhau, `make_model_status_msg` vs 18 dict literal,
-  `popup.js` ~200 dòng lặp (`waitFor*`/`render*`/`monitor*`).
+### P3 — Giảm trùng lặp trong `popup.js` ✅ XONG (một phần, có chủ đích)
+
+Ba cặp hàm gần trùng đã được hợp nhất, mỗi cặp nay còn **1 cài đặt dùng chung + 2 wrapper mỏng giữ
+tên cũ** (tên cũ được `test_22` chốt bằng chuỗi, và vẫn đọc rõ nghĩa ở call-site):
+
+| Cặp | Trước | Sau |
+|---|---|---|
+| `renderAsrEngineOptions` / `renderTranslationModelOptions` | 2 bản giống ~65 % | `renderModelOptions(selectEl, …)` dùng chung |
+| `waitForAsrActivation` / `waitForTranslationActivation` | 2 bản giống ~83 % (vòng poll 46 dòng) | `waitForActivation(modelId, shortDesc, spec)` — khác biệt gói trong `spec.readState` |
+| `monitorAsrDownload` / `monitorTranslationDownload` | 2 bản ~24 dòng gần y hệt | `monitorModelDownload(kind, …)` + bảng `ACTIVATION_TARGETS` (gom bất đối xứng ASR/dịch về một chỗ) |
+
+**Số đo trung thực (không phải "~200 dòng" như ước lượng ban đầu):**
+
+| Chỉ số | Trước | Sau | Chênh |
+|---|---|---|---|
+| Tổng dòng file | 1563 | 1541 | **−22** |
+| Dòng CODE thuần (bỏ comment/dòng trắng) | 1334 | 1291 | **−43** |
+| `note !== lastNote` (lõi vòng poll) | 2 bản | **1 bản** | −1 |
+| `dl.model && dl.model !== modelId` | 2 bản | **1 bản** | −1 |
+| `item.is_downloaded === false` | 2 bản | **1 bản** | −1 |
+| `console.error("[Popup] Translation activation` | 1 bản | 0 (đã thành template) | — |
+
+Con số "~200 dòng trùng lặp" trong §5.6 đếm **số dòng giống nhau giữa hai bản**, không phải số dòng
+**xoá được**: gộp hai hàm 46 dòng giống 83 % chỉ tiết kiệm được phần *khác biệt*, và tôi còn **thêm**
+docstring giải thích ⇒ tổng file gần như không đổi. Giá trị thật nằm ở chỗ khác: **hết nguy cơ sửa
+một bên mà quên bên kia**.
+
+**CỐ Ý KHÔNG GỘP `handleEngineSwitch` / `handleTranslationModelSwitch`.** Hai hàm chỉ giống ~33 %
+(đo LCS 29/87 dòng): bản ASR dựng payload VAD/SEG đầy đủ, gửi `asr_engine`+`vad_engine`, rồi
+**fetch lại** `/api/config` để lấy `result`, cập nhật `lastActiveAsr/Vad/Lang` và render lại dropdown
+ngôn ngữ; bản dịch chỉ gửi `translation_model` và không fetch lại. Gộp chúng sẽ cần một "spec" 6–7
+trường — tức là **abstraction giả**, khó đọc hơn hai hàm tường minh. Đây là cùng loại lỗi với
+"chồng chéo chức năng", chỉ ngược chiều.
+
+### CÒN LẠI (chưa làm — cần quyết định, không thuần cơ học)
+
+- **3 bộ tải `urllib`** (`crispasr_native`, `silero_onnx`, `firered_onnx`) → hợp nhất về `utils/model_download`.
+- **Định dạng khung audio** còn 1 bản nữa ở `lookahead-client.js:629` (không dùng `frame-builder.js`).
+- **3 bộ dedup với 3 quy tắc chuẩn hoá KHÁC NHAU** — hợp nhất đòi hỏi chọn ngữ nghĩa đúng, có thể đổi hành vi lọc ⇒ cần người quyết.
+- **Chính sách hàng đợi TTS ngược nhau** giữa Pipeline A (gộp) và B (bỏ cũ nhất) — cần chọn một.
+- `make_model_status_msg` vs 18 dict literal rải ở `session.py`/`lookahead_handler.py`.
+- `handleEngineSwitch` / `handleTranslationModelSwitch` — **cố ý không gộp** (xem §P3).
 
 ### P2-quater — Đấu dây 6 id mồ côi trong popup ✅ XONG
 

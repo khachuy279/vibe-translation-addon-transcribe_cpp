@@ -387,62 +387,48 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     return activeTab;
   }
 
-  function renderAsrEngineOptions(availableModels, currentActiveId) {
-    if (!selAsrEngine || !availableModels || availableModels.length === 0) return;
-    const previousSelection = currentActiveId || selAsrEngine.value;
-    selAsrEngine.textContent = "";
+  /**
+   * Dựng `<option>` cho một `<select>` model từ catalog của backend.
+   *
+   * DÙNG CHUNG cho cả ASR và model dịch: hai bản trước đây giống nhau ~65% (chỉ khác `<select>`
+   * đích và khoá mô tả `description` vs `desc || description`) ⇒ sửa một bên rất dễ quên bên kia.
+   */
+  function renderModelOptions(selectEl, availableModels, currentActiveId) {
+    if (!selectEl || !Array.isArray(availableModels) || availableModels.length === 0) return;
+    const previousSelection = currentActiveId || selectEl.value;
+    selectEl.textContent = "";
 
     availableModels.forEach((item) => {
       const opt = document.createElement("option");
-      const id = typeof item === "string" ? item : item.id;
-      let name = typeof item === "string" ? item : (item.name || item.id);
-      if (typeof item === "object" && item.is_downloaded === false) {
+      const isObj = typeof item === "object" && item !== null;
+      const id = isObj ? item.id : item;
+      let name = isObj ? (item.name || item.id) : item;
+      if (isObj && item.is_downloaded === false) {
         name += " ⤓ chưa tải";
-      } else if (typeof item === "object" && item.is_downloaded) {
+      } else if (isObj && item.is_downloaded) {
         name += " ⚡";
       }
       opt.value = id;
       opt.textContent = name;
-      if (typeof item === "object" && item.description) {
-        opt.title = item.description;
-      }
-      selAsrEngine.appendChild(opt);
+      const desc = isObj ? (item.desc || item.description) : "";
+      if (desc) opt.title = desc;
+      selectEl.appendChild(opt);
     });
 
-    if (availableModels.some((item) => (typeof item === "string" ? item : item.id) === previousSelection)) {
-      selAsrEngine.value = previousSelection;
-    } else {
-      selAsrEngine.value = typeof availableModels[0] === "string" ? availableModels[0] : availableModels[0].id;
-    }
+    const stillThere = availableModels.some(
+      (item) => (typeof item === "string" ? item : item.id) === previousSelection
+    );
+    selectEl.value = stillThere
+      ? previousSelection
+      : (typeof availableModels[0] === "string" ? availableModels[0] : availableModels[0].id);
+  }
+
+  function renderAsrEngineOptions(availableModels, currentActiveId) {
+    return renderModelOptions(selAsrEngine, availableModels, currentActiveId);
   }
 
   function renderTranslationModelOptions(availableModels, currentActiveId) {
-    if (!selTranslationModel || !availableModels || !Array.isArray(availableModels) || availableModels.length === 0) return;
-    const previousSelection = currentActiveId || selTranslationModel.value;
-    selTranslationModel.textContent = "";
-
-    availableModels.forEach((item) => {
-      const opt = document.createElement("option");
-      const id = typeof item === "string" ? item : item.id;
-      let name = typeof item === "string" ? item : (item.name || item.id);
-      if (typeof item === "object" && item.is_downloaded === false) {
-        name += " ⤓ chưa tải";
-      } else if (typeof item === "object" && item.is_downloaded) {
-        name += " ⚡";
-      }
-      opt.value = id;
-      opt.textContent = name;
-      if (typeof item === "object" && (item.desc || item.description)) {
-        opt.title = item.desc || item.description;
-      }
-      selTranslationModel.appendChild(opt);
-    });
-
-    if (availableModels.some((item) => (typeof item === "string" ? item : item.id) === previousSelection)) {
-      selTranslationModel.value = previousSelection;
-    } else {
-      selTranslationModel.value = typeof availableModels[0] === "string" ? availableModels[0] : availableModels[0].id;
-    }
+    return renderModelOptions(selTranslationModel, availableModels, currentActiveId);
   }
 
   function renderLanguageOptions(supportedLanguages, currentLangCode) {
@@ -751,156 +737,148 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     return "đang tải";
   }
 
-  // Chờ backend tải (nếu thiếu file) + nạp model ASR. Backend trả HTTP 202 và làm việc
-  // trong nền, nên popup hỏi tiến độ qua /api/config cho tới khi ready/error.
+  // Chờ backend tải (nếu thiếu file) + nạp model. Backend trả HTTP 202 và làm việc trong nền,
+  // nên popup hỏi tiến độ qua /api/config cho tới khi ready/error.
+  //
+  // DÙNG CHUNG cho ASR và model dịch: hai bản trước đây giống nhau ~83%, chỉ khác khoá đọc
+  // trạng thái (`data.asr`/`data.asr_download` vs `data.translation`/`tr.download`) và vài
+  // chuỗi thông báo ⇒ sửa một bên rất dễ quên bên kia.
+  //
+  // `spec.readState(data)` trả `{ dl, isReady }`:
+  //   dl      — nhánh tiến độ tải của backend
+  //   isReady — điều kiện "model đã là model đang hoạt động"
+  async function waitForActivation(modelId, shortDesc, spec) {
+    const deadline = Date.now() + MODEL_DOWNLOAD_TIMEOUT_MS;
+    let lastNote = "";
+
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, MODEL_DOWNLOAD_POLL_MS));
+
+      let data = null;
+      try {
+        const res = await fetchBackend("/api/config", { timeout: 15000 });
+        if (!res || !res.ok) continue;
+        data = await res.json();
+      } catch (e) {
+        continue;
+      }
+
+      const { dl, isReady } = spec.readState(data);
+      if (dl.model && dl.model !== modelId) continue; // lượt tải của model khác
+
+      if (dl.state === "downloading") {
+        const note = describeDownloadProgress(dl);
+        if (note !== lastNote) {
+          lastNote = note;
+          if (statusBadge) statusBadge.textContent = `Tải ${shortDesc} ${note}`;
+          showMsg(`⏳ Đang tải ${spec.label} ${shortDesc} về máy: ${note}. Nút Bắt đầu đang được khoá.`, "info");
+        }
+        continue;
+      }
+      if (dl.state === "loading") {
+        if (statusBadge) statusBadge.textContent = `Nạp ${shortDesc}...`;
+        if (lastNote !== "loading") {
+          lastNote = "loading";
+          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU... Nút Bắt đầu đang được khoá.`, "info");
+        }
+        continue;
+      }
+      if (dl.state === "error") {
+        throw new Error(dl.error || `Tải/nạp ${spec.label} ${shortDesc} thất bại`);
+      }
+      if (dl.state === "ready" || isReady) {
+        return true;
+      }
+    }
+    throw new Error(`Hết thời gian chờ tải ${spec.label} (30 phút). Kiểm tra mạng rồi thử lại.`);
+  }
+
+  //: Giữ hai tên riêng để call-site đọc rõ nghĩa (và `test_22` chốt chuỗi
+  //: `waitForTranslationActivation` — đừng đổi tên).
   async function waitForAsrActivation(modelId, shortDesc) {
-    const deadline = Date.now() + MODEL_DOWNLOAD_TIMEOUT_MS;
-    let lastNote = "";
-
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, MODEL_DOWNLOAD_POLL_MS));
-
-      let data = null;
-      try {
-        const res = await fetchBackend("/api/config", { timeout: 15000 });
-        if (!res || !res.ok) continue;
-        data = await res.json();
-      } catch (e) {
-        continue;
-      }
-
-      const asr = data.asr || {};
-      const dl = data.asr_download || asr.download || {};
-      if (dl.model && dl.model !== modelId) continue; // lượt tải của model khác
-
-      if (dl.state === "downloading") {
-        const note = describeDownloadProgress(dl);
-        if (note !== lastNote) {
-          lastNote = note;
-          if (statusBadge) statusBadge.textContent = `Tải ${shortDesc} ${note}`;
-          showMsg(`⏳ Đang tải model ASR ${shortDesc} về máy: ${note}. Nút Bắt đầu đang được khoá.`, "info");
-        }
-        continue;
-      }
-      if (dl.state === "loading") {
-        if (statusBadge) statusBadge.textContent = `Nạp ${shortDesc}...`;
-        if (lastNote !== "loading") {
-          lastNote = "loading";
-          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU... Nút Bắt đầu đang được khoá.`, "info");
-        }
-        continue;
-      }
-      if (dl.state === "error") {
-        throw new Error(dl.error || `Tải/nạp model ASR ${shortDesc} thất bại`);
-      }
-      if (dl.state === "ready" || data.engine === modelId || asr.active_model === modelId) {
-        return true;
-      }
-    }
-    throw new Error("Hết thời gian chờ tải model ASR (30 phút). Kiểm tra mạng rồi thử lại.");
+    return waitForActivation(modelId, shortDesc, {
+      label: "model ASR",
+      readState: (data) => {
+        const asr = data.asr || {};
+        return {
+          dl: data.asr_download || asr.download || {},
+          isReady: data.engine === modelId || asr.active_model === modelId,
+        };
+      },
+    });
   }
 
-  // Chờ backend tải (nếu thiếu file) + nạp model dịch. Backend trả HTTP 202 và làm việc
-  // trong nền, nên popup hỏi tiến độ qua /api/config cho tới khi ready/error.
   async function waitForTranslationActivation(modelId, shortDesc) {
-    const deadline = Date.now() + MODEL_DOWNLOAD_TIMEOUT_MS;
-    let lastNote = "";
-
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, MODEL_DOWNLOAD_POLL_MS));
-
-      let data = null;
-      try {
-        const res = await fetchBackend("/api/config", { timeout: 15000 });
-        if (!res || !res.ok) continue;
-        data = await res.json();
-      } catch (e) {
-        continue;
-      }
-
-      const tr = data.translation || {};
-      const dl = tr.download || {};
-      if (dl.model && dl.model !== modelId) continue; // lượt tải của model khác
-
-      if (dl.state === "downloading") {
-        const note = describeDownloadProgress(dl);
-        if (note !== lastNote) {
-          lastNote = note;
-          if (statusBadge) statusBadge.textContent = `Tải ${shortDesc} ${note}`;
-          showMsg(`⏳ Đang tải model dịch ${shortDesc} về máy: ${note}. Nút Bắt đầu đang được khoá.`, "info");
-        }
-        continue;
-      }
-      if (dl.state === "loading") {
-        if (statusBadge) statusBadge.textContent = `Nạp ${shortDesc}...`;
-        if (lastNote !== "loading") {
-          lastNote = "loading";
-          showMsg(`⏳ Đã tải xong ${shortDesc}, đang nạp vào GPU... Nút Bắt đầu đang được khoá.`, "info");
-        }
-        continue;
-      }
-      if (dl.state === "error") {
-        throw new Error(dl.error || `Tải/nạp model dịch ${shortDesc} thất bại`);
-      }
-      if (dl.state === "ready" || tr.base === modelId) {
-        return true;
-      }
-    }
-    throw new Error("Hết thời gian chờ tải model dịch (30 phút). Kiểm tra mạng rồi thử lại.");
+    return waitForActivation(modelId, shortDesc, {
+      label: "model dịch",
+      readState: (data) => {
+        const tr = data.translation || {};
+        return { dl: tr.download || {}, isReady: tr.base === modelId };
+      },
+    });
   }
 
-  async function monitorTranslationDownload(modelId, shortDesc) {
-    if (isMonitoringTranslation || isSwitchingTranslationModel) return;
-    isMonitoringTranslation = true;
-    isSwitchingTranslationModel = true;
-    if (selTranslationModel) selTranslationModel.disabled = true;
+  /**
+   * Bảng khác biệt DUY NHẤT giữa hai đích nạp model — gom về một chỗ để thấy rõ bất đối xứng:
+   * ASR khoá thêm `selVadEngine`, còn model dịch chỉ khoá `selTranslationModel`.
+   */
+  const ACTIVATION_TARGETS = {
+    asr: {
+      label: "model ASR",
+      errorBadge: "LỖI ASR",
+      logTag: "ASR activation",
+      wait: waitForAsrActivation,
+      busy: () => isMonitoringAsr || isSwitchingEngine,
+      setBusy: (v) => { isMonitoringAsr = v; isSwitchingEngine = v; },
+      selects: () => [selAsrEngine, selVadEngine],
+    },
+    translation: {
+      label: "model dịch",
+      errorBadge: "LỖI DỊCH",
+      logTag: "Translation activation",
+      wait: waitForTranslationActivation,
+      busy: () => isMonitoringTranslation || isSwitchingTranslationModel,
+      setBusy: (v) => { isMonitoringTranslation = v; isSwitchingTranslationModel = v; },
+      selects: () => [selTranslationModel],
+    },
+  };
+
+  /**
+   * Bọc việc chờ nạp model bằng khoá UI: khoá các `<select>` liên quan, hiện trạng thái, mở khoá
+   * trong `finally`. Trước đây ASR và model dịch có hai bản gần như trùng nhau (~24 dòng mỗi bản).
+   */
+  async function monitorModelDownload(kind, modelId, shortDesc) {
+    const t = ACTIVATION_TARGETS[kind];
+    if (t.busy()) return;
+    t.setBusy(true);
+    t.selects().forEach((el) => { if (el) el.disabled = true; });
     updateStartButtonState();
     try {
-      await waitForTranslationActivation(modelId, shortDesc);
+      await t.wait(modelId, shortDesc);
       currentModelError = null;
       statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
       statusBadge.className = "badge badge-ready";
-      showMsg(`✅ Đã nạp thành công model dịch: ${shortDesc}`, "success");
+      showMsg(`✅ Đã nạp thành công ${t.label}: ${shortDesc}`, "success");
     } catch (err) {
-      console.error("[Popup] Translation activation error:", err);
-      currentModelError = err.message || "Không thể nạp model dịch";
-      statusBadge.textContent = "LỖI DỊCH";
+      console.error(`[Popup] ${t.logTag} error:`, err);
+      currentModelError = err.message || `Không thể nạp ${t.label}`;
+      statusBadge.textContent = t.errorBadge;
       statusBadge.className = "badge badge-disconnected";
-      showMsg(`❌ Lỗi nạp model dịch: ${currentModelError}. Vui lòng chọn model khác!`, "error");
+      showMsg(`❌ Lỗi nạp ${t.label}: ${currentModelError}. Vui lòng chọn model khác!`, "error");
     } finally {
-      isMonitoringTranslation = false;
-      isSwitchingTranslationModel = false;
-      if (selTranslationModel) selTranslationModel.disabled = isCapturingNow;
+      t.setBusy(false);
+      t.selects().forEach((el) => { if (el) el.disabled = isCapturingNow; });
       updateStartButtonState();
     }
   }
 
-  async function monitorAsrDownload(modelId, shortDesc) {
-    if (isMonitoringAsr || isSwitchingEngine) return;
-    isMonitoringAsr = true;
-    isSwitchingEngine = true;
-    if (selAsrEngine) selAsrEngine.disabled = true;
-    if (selVadEngine) selVadEngine.disabled = true;
-    updateStartButtonState();
-    try {
-      await waitForAsrActivation(modelId, shortDesc);
-      currentModelError = null;
-      statusBadge.textContent = `${lastActiveAsr.toUpperCase()}`;
-      statusBadge.className = "badge badge-ready";
-      showMsg(`✅ Đã nạp thành công model ASR: ${shortDesc}`, "success");
-    } catch (err) {
-      console.error("[Popup] ASR activation error:", err);
-      currentModelError = err.message || "Không thể nạp model ASR";
-      statusBadge.textContent = "LỖI ASR";
-      statusBadge.className = "badge badge-disconnected";
-      showMsg(`❌ Lỗi nạp model ASR: ${currentModelError}. Vui lòng chọn model khác!`, "error");
-    } finally {
-      isMonitoringAsr = false;
-      isSwitchingEngine = false;
-      if (selAsrEngine) selAsrEngine.disabled = isCapturingNow;
-      if (selVadEngine) selVadEngine.disabled = isCapturingNow;
-      updateStartButtonState();
-    }
+  //: Giữ hai tên riêng ở call-site cho rõ nghĩa.
+  function monitorTranslationDownload(modelId, shortDesc) {
+    return monitorModelDownload("translation", modelId, shortDesc);
+  }
+
+  function monitorAsrDownload(modelId, shortDesc) {
+    return monitorModelDownload("asr", modelId, shortDesc);
   }
 
   async function handleTranslationModelSwitch() {
