@@ -1,19 +1,21 @@
-"""test_65 — P4.1 (ép ràng buộc đại từ) & P4.2 (glossary tên riêng/thuật ngữ).
+"""test_65 — P4.2 (glossary tên riêng/thuật ngữ) & hợp đồng prompt của Pipeline A/B.
 
 Bối cảnh (log thật 2026-10-07, xem `report/12_qwen35_translation_ab`):
+``美咲さん`` bị dịch sai tên (``Meisaka`` / ``Misa`` / ``Miaki-san`` tuỳ model).
+⇒ Cần bảng "cách viết cố định" — đúng cơ chế ``TEMPLATE_TERMINOLOGY`` của upstream nhưng
+chưa từng được nối vào Pipeline B.
 
-1. Prompt đã ghi rõ ``never use the word mình anywhere`` nhưng Index-Translate-9B vẫn trả
-   ``"tôi còn nói là **mình** chắc chắn không thể quay lại…"``.
-   ⇒ Ràng buộc ở prompt là *hy vọng*; cần hậu kiểm ở tầng văn bản.
-2. ``美咲さん`` bị dịch sai tên (``Meisaka`` / ``Misa`` / ``Miaki-san`` tuỳ model).
-   ⇒ Cần bảng "cách viết cố định" — đúng cơ chế ``TEMPLATE_TERMINOLOGY`` của upstream nhưng
-   chưa từng được nối vào Pipeline B.
+LỊCH SỬ P4.1 — ĐÃ GỠ (quyết định 2026-10-10): bản cũ ép đại từ ("tôi"/"bạn") ở HAI lớp —
+nhét ``_PRONOUN_GUIDANCE_VI`` vào cả 3 template Index, và hậu kiểm bằng ``pronoun_guard.py``
+ở tầng engine. Cả hai lớp đều bị xoá: ràng buộc chỉ nằm ở prompt thì model **vẫn bỏ qua**
+(log thật trong ``report/13_pronoun_and_glossary``), còn hậu kiểm văn bản thì **phá câu hợp
+lệ** (``một mình``, ``chính mình``, ``nhà mình``…). Việc chọn đại từ do model quyết định
+theo ngữ cảnh. Test dưới đây chốt việc **KHÔNG** ép đại từ ở bất kỳ pipeline nào.
 
-Bộ test này chốt 4 thứ:
-  * `pronoun_guard` KHÔNG phá các cụm hợp lệ chứa "mình" (một mình, chính mình, mình ơi…);
+Bộ test này chốt 3 thứ:
   * `glossary` nạp file + ghi đè runtime + phát hiện tên riêng;
-  * prompt Pipeline B có khối ràng buộc cứng và dòng glossary;
-  * engine THẬT sửa đầu ra và vẫn chạy được với prompt strategy cũ (không có tham số `terms`).
+  * prompt Pipeline B có khối ràng buộc cứng + dòng glossary, Pipeline A KHÔNG thêm khối nào;
+  * engine giữ NGUYÊN đầu ra của model và vẫn chạy được với prompt strategy cũ (không có `terms`).
 """
 
 from __future__ import annotations
@@ -23,56 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.translation.glossary import TranslationGlossary
-from backend.translation.prompts import get_prompt_strategy
-from backend.translation.pronoun_guard import (
-    contains_replaceable_minh,
-    count_occurrences,
-    enforce_no_minh,
-)
-
-# ─────────────────────────────────────────────────────────── P4.1: pronoun guard
-
-#: (đầu vào, kỳ vọng) — nửa đầu là ca PHẢI sửa, nửa sau là ca PHẢI GIỮ NGUYÊN.
-PRONOUN_CASES = [
-    # ── phải sửa ──
-    ("tôi còn nói là mình chắc chắn không thể quay lại", "tôi còn nói là tôi chắc chắn không thể quay lại"),
-    ("Mình nghĩ là nên đi.", "Tôi nghĩ là nên đi."),
-    ("chúng mình đi thôi", "chúng ta đi thôi"),
-    ("bọn mình đã bàn rồi", "chúng ta đã bàn rồi"),
-    ("tụi mình về nhé", "chúng ta về nhé"),
-    ("để mình làm cho", "để tôi làm cho"),
-    ("nếu mình không đi thì sao?", "nếu tôi không đi thì sao?"),
-    # ── phải giữ nguyên (thay bừa sẽ thành câu sai ngữ pháp) ──
-    ("anh ấy tự mình làm", "anh ấy tự mình làm"),
-    ("chính mình cũng không biết", "chính mình cũng không biết"),
-    ("nhà mình hôm nay có khách", "nhà mình hôm nay có khách"),
-    ("mình ơi, về nhà thôi", "mình ơi, về nhà thôi"),
-    ("bản thân mình phải cố gắng", "bản thân mình phải cố gắng"),
-    ("để mình một mình", "để tôi một mình"),  # cái đầu sửa, cái sau giữ
-    ("mỗi mình nó biết", "mỗi mình nó biết"),
-    ("không có gì đâu", "không có gì đâu"),
-    ("", ""),
-]
-
-
-@pytest.mark.parametrize("src,want", PRONOUN_CASES)
-def test_enforce_no_minh(src, want):
-    assert enforce_no_minh(src) == want
-
-
-def test_enforce_no_minh_tra_nguyen_van_khi_khong_co_gi():
-    """Không có gì để sửa ⇒ trả ĐÚNG object cũ (tầng gọi so sánh `is`/`!=` rẻ)."""
-    text = "Câu này không có đại từ cấm."
-    assert enforce_no_minh(text) is text
-
-
-def test_contains_replaceable_minh_va_count():
-    assert contains_replaceable_minh("tôi nói là mình sẽ đi") is True
-    assert contains_replaceable_minh("một mình thôi") is False
-    assert contains_replaceable_minh("") is False
-    # `count_occurrences` đếm MỌI dạng (kể cả dạng bị chặn) — dùng cho log/metrics.
-    assert count_occurrences("mình và mình") == 2
-    assert count_occurrences("một mình") == 1
+from backend.translation.prompts import get_prompt_strategy, resolve_lang_name
 
 
 # ───────────────────────────────────────────────────────────── P4.2: glossary
@@ -188,9 +141,6 @@ def test_batch_prompt_co_khoi_rang_buoc_cung():
     # Ràng buộc cứng nằm SAU payload (recency) và trước lượt assistant.
     assert "Hard constraints" in prompt
     assert prompt.index('"2": "World"') < prompt.index("Hard constraints")
-    assert "NEVER write the Vietnamese word" in prompt
-    # Ràng buộc đại từ đã được siết: nêu đích danh các dạng ghép.
-    assert "chúng mình" in prompt and "bọn mình" in prompt
     assert "<|im_start|>assistant" in prompt
 
 
@@ -211,11 +161,48 @@ def test_batch_prompt_khong_terms_van_chay():
 
 
 def test_single_prompt_khong_bi_doi_hinh_dang_them():
-    """Pipeline A chỉ siết câu chữ đại từ — KHÔNG thêm khối ràng buộc (ưu tiên độ trễ)."""
+    """Pipeline A: câu chữ ĐÚNG template upstream, KHÔNG thêm khối ràng buộc nào."""
     prompt = get_prompt_strategy("pipeline_a").build_prompt("Hello world", "en", "vi")
     assert "Translate the following text into Vietnamese" in prompt
     assert "Hard constraints" not in prompt
-    assert "chúng mình" in prompt  # ràng buộc đại từ đã siết vẫn có mặt
+    assert "Style constraints" not in prompt
+
+
+# ──────────────────────────── KHÔNG ép đại từ tôi/bạn (quyết định 2026-10-10)
+
+def test_khong_ep_dai_tu_o_ca_hai_ho_model():
+    """Ràng buộc đại từ đã bị gỡ khỏi MỌI pipeline và không được tái xuất hiện.
+
+    Hồi quy: bản cũ nhét ``Use ONLY "tôi" for the first person`` (Pipeline A) và
+    ``NEVER write the Vietnamese word "mình"`` + ``chúng mình``/``bọn mình``/``tụi mình``
+    (Pipeline B) vào template Index.
+    """
+    prompts = [
+        get_prompt_strategy("pipeline_a").build_prompt("Hello", "en", "vi"),
+        get_prompt_strategy("pipeline_b").build_batch_prompt(["Hello", "World"], "en", "vi"),
+        get_prompt_strategy("gemma-sub").build_prompt("Hello", "en", "vi"),
+        get_prompt_strategy("gemma-sub").build_batch_prompt(["Hello", "World"], "en", "vi"),
+    ]
+    for prompt in prompts:
+        assert "Style constraints" not in prompt
+        assert "Use ONLY" not in prompt
+        assert '"tôi"' not in prompt
+        assert '"bạn"' not in prompt
+        assert "chúng mình" not in prompt
+        assert "NEVER write the Vietnamese word" not in prompt
+
+
+# ─────────────────────────────────────── resolve_lang_name (mã vùng / tên đầy đủ)
+
+def test_resolve_lang_name_chuan_hoa_ma_vung_va_ten_day_du():
+    """``vi-VN`` / ``VI`` / ``Vietnamese`` phải CÙNG ra "Vietnamese" (trước đây ra "English")."""
+    for code in ("vi", "VI", "vi-VN", "vi_VN", "Vietnamese", "vietnamese"):
+        assert resolve_lang_name(code) == "Vietnamese"
+    assert resolve_lang_name("zh-CN") == "Chinese"
+    assert resolve_lang_name("ja") == "Japanese"
+    assert resolve_lang_name("en") == "English"
+    # Mã lạ vẫn rơi về mặc định cũ — hành vi không đổi.
+    assert resolve_lang_name("auto") == "English"
 
 
 # ─────────────────────────────────────────────────────── Tích hợp vào engine
@@ -236,7 +223,7 @@ def _batch_translator(monkeypatch, llm, cfg):
 def _cfg(tmp_path, **over):
     base = dict(
         max_tokens=128, temperature=None, top_p=None, top_k=None, repetition_penalty=None,
-        use_context=False, enforce_pronoun_policy=True, glossary_file="", glossary={},
+        use_context=False, glossary_file="", glossary={},
         glossary_derive_names=True,
     )
     base.update(over)
@@ -267,23 +254,13 @@ BATCH_WITH_MINH = (
 )
 
 
-def test_batch_engine_ep_rang_buoc_dai_tu(allow_real_translation_methods, monkeypatch, tmp_path):
-    """Đầu ra batch còn `mình` ⇒ engine PHẢI sửa trước khi trả về."""
+def test_batch_engine_giu_nguyen_dau_ra(allow_real_translation_methods, monkeypatch, tmp_path):
+    """Không còn ép ràng buộc đại từ: đầu ra của model được giữ nguyên."""
     llm = _CapturingLlama(BATCH_WITH_MINH)
     t = _batch_translator(monkeypatch, llm, _cfg(tmp_path))
 
     out = t.translate_batch_sync(["美咲さんとはうまくいってるみたいですね。", "もう絶対会社員にも戻れないって言ってるよ。"], "ja", "vi")
     assert len(out) == 2
-    assert "mình" not in out[1], out[1]
-    assert "tôi chắc chắn" in out[1]
-
-
-def test_batch_engine_tat_duoc_rang_buoc(allow_real_translation_methods, monkeypatch, tmp_path):
-    """`enforce_pronoun_policy=False` ⇒ giữ nguyên đầu ra của model (để A/B)."""
-    llm = _CapturingLlama(BATCH_WITH_MINH)
-    t = _batch_translator(monkeypatch, llm, _cfg(tmp_path, enforce_pronoun_policy=False))
-
-    out = t.translate_batch_sync(["あ", "い"], "ja", "vi")
     assert "mình" in out[1]
 
 
@@ -332,10 +309,10 @@ def test_engine_chiu_duoc_strategy_cu_khong_co_terms(allow_real_translation_meth
 
     out = t.translate_batch_sync(["美咲さん、おはよう", "もう絶対会社員にも戻れないって言ってるよ。"], "ja", "vi")
     assert llm.prompts == ["legacy-batch"]
-    assert "mình" not in out[1]
+    assert len(out) == 2
 
 
-def test_single_engine_ep_rang_buoc_dai_tu(allow_real_translation_methods, monkeypatch, tmp_path):
+def test_single_engine_giu_nguyen_dau_ra(allow_real_translation_methods, monkeypatch, tmp_path):
     from backend.translation.engine import GGUFTranslator
 
     llm = _CapturingLlama("tôi còn nói là mình chắc chắn không thể quay lại")
@@ -348,7 +325,7 @@ def test_single_engine_ep_rang_buoc_dai_tu(allow_real_translation_methods, monke
     t.prompt_strategy = get_prompt_strategy("pipeline_a")
 
     res = t._translate_sync("もう絶対会社員にも戻れないって言ってるよ。", "ja", "vi")
-    assert res["translated_text"] == "tôi còn nói là tôi chắc chắn không thể quay lại"
+    assert res["translated_text"] == "tôi còn nói là mình chắc chắn không thể quay lại"
 
 
 def test_single_engine_truyen_glossary_qua_tem(allow_real_translation_methods, monkeypatch, tmp_path):

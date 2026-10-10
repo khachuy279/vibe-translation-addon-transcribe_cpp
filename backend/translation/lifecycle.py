@@ -164,9 +164,6 @@ async def run_reserved(canonical_key: str, *, allow_download: Optional[bool] = N
             target_lang=config.translation.target_lang,
             source_lang=config.translation.source_lang,
             auto_download=allow_download,
-            # P4.1/P4.2: đổi model KHÔNG được âm thầm tắt ràng buộc đại từ hay bỏ glossary —
-            # `TranslationConfig` mới sẽ quay về giá trị mặc định nếu không chép tay ở đây.
-            enforce_pronoun_policy=config.translation.enforce_pronoun_policy,
             glossary_file=config.translation.glossary_file,
             glossary=dict(config.translation.glossary or {}),
             glossary_derive_names=config.translation.glossary_derive_names,

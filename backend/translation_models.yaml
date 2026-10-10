@@ -26,3 +26,16 @@ models:
     aliases:
       - index-9b
     description: Chất lượng cao 9B (en/ja/zh/vi..., ~5.5GB Q4_K_M)
+
+  translate-gemma-4-sub:
+    name: Translate-Gemma-4-Sub (E4B)
+    model: 17slever17/translate-gemma-4-sub-e4b-GGUF
+    gguf_file: translate_gemma4_sub-E4B-Q4_K_XL.gguf # hoặc bản Quant khác
+    temperature: 0.0
+    top_p: 1.0
+    top_k: 1
+    repetition_penalty: 1.0
+    prompt_style: gemma-sub
+    aliases:
+      - gemma-sub
+    description: Model chuyên dịch phụ đề ngữ cảnh đời thực (SubWave)

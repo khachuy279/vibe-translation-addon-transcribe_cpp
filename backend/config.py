@@ -345,12 +345,15 @@ class SentenceConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "index-translate-9b"  # index-translate-2b, index-translate-9b
+    base: str = "translate-gemma-4-sub"  # index-translate-2b, index-translate-9b, translate-gemma-4-sub
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None
     target_lang: str = "vi"
     source_lang: str = "auto"
+    #: Thông số sinh (sampling). ``None`` = KHÔNG đặt ⇒ engine lấy đúng giá trị của model
+    #: trong ``translation_models.yaml`` (nguồn chính, xem `backend/translation_models.yaml`).
+    #: Chỉ điền vào đây khi muốn đè tường minh cho cả Pipeline A lẫn Pipeline B.
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -385,15 +388,6 @@ class TranslationConfig(BaseModel):
     # bao giờ chạy trên hot path dịch từng câu; tắt bằng cách đặt false.
     auto_download: bool = True
 
-    # ── Ràng buộc đại từ (P4.1) ───────────────────────────────────────────────
-    #: Ép "không dùng đại từ *mình*" ở TẦNG VĂN BẢN, không chỉ ở prompt.
-    #:
-    #: Vì sao cần: prompt đã ghi rõ `never use the word mình anywhere` nhưng
-    #: Index-Translate-9B vẫn trả "tôi còn nói là **mình** chắc chắn…" (log thật 2026-10-07).
-    #: Ràng buộc ở prompt là hy vọng; hậu kiểm là bảo đảm. Xem
-    #: `backend/translation/pronoun_guard.py` — chỉ thay khi "mình" là ĐẠI TỪ NGÔI THỨ NHẤT,
-    #: giữ nguyên "một mình", "chính mình", "tự mình", "nhà mình", "mình ơi"…
-    enforce_pronoun_policy: bool = True
 
     # ── Glossary tên riêng / thuật ngữ (P4.2) ─────────────────────────────────
     #: File YAML chứa bảng "nguồn -> cách dịch cố định" (xem `backend/glossary.yaml`).

@@ -38,7 +38,7 @@ def _fresh_glossary():
 def _cfg(**over):
     base = dict(
         max_tokens=128, temperature=None, top_p=None, top_k=None, repetition_penalty=None,
-        use_context=False, enforce_pronoun_policy=True,
+        use_context=False,
         glossary_file="", glossary={}, glossary_derive_names=True,
     )
     base.update(over)

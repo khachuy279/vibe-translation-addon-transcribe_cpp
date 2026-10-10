@@ -6,7 +6,6 @@ from backend.translation.prompts import PromptStrategy, get_prompt_strategy
 from backend.translation.context import ContextManager
 from backend.translation.dedup import TranslationDedupState
 from backend.translation.glossary import TranslationGlossary, get_glossary
-from backend.translation.pronoun_guard import enforce_no_minh
 from backend.translation.romaji import romanize as romanize_name
 from backend.translation.engine import (
     GGUFTranslator,
@@ -37,7 +36,6 @@ __all__ = [
     "TranslationDeduplicator",
     "TranslationGlossary",
     "get_glossary",
-    "enforce_no_minh",
     "romanize_name",
     "GGUFTranslator",
     "GGUFTranslationEngine",

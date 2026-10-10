@@ -56,7 +56,6 @@ from backend.utils.model_download import ensure_model_file
 from backend.core.gpu_scheduler import gpu_arbiter, PRIORITY_TRANSLATION
 from backend.utils.text_repetition import collapse_repetitions
 from backend.translation.glossary import get_glossary
-from backend.translation.pronoun_guard import contains_replaceable_minh, enforce_no_minh
 
 _TRANS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="translation_worker")
 
@@ -98,19 +97,97 @@ def _build_single_prompt(strategy, *, text, source_lang, target_lang, context, u
     )
 
 
-def _enforce_pronouns(text: str, cfg: Any, *, log: bool = True) -> str:
-    """Hậu kiểm ràng buộc đại từ (P4.1). Tắt được bằng `cfg.enforce_pronoun_policy`."""
-    if not text or not getattr(cfg, "enforce_pronoun_policy", True):
-        return text
-    if not contains_replaceable_minh(text):
-        return text
-    fixed = enforce_no_minh(text)
-    if fixed != text and log:
-        logger.info(
-            f"Ép ràng buộc đại từ: đã thay 'mình' -> 'tôi' ({text.count('mình')} chỗ).",
+#: Bốn thông số sinh lấy từ `translation_models.yaml` (tên field trong YAML ⇔ tên trong config).
+_SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "repetition_penalty")
+
+#: Giá trị dự phòng CUỐI CÙNG — **CHỈ** dùng khi `translation_models.yaml` của model thiếu field.
+#: Đây KHÔNG phải "thông số của model nào": mọi model trong catalog phải tự khai đủ 4 field
+#: (xem `backend/translation_models.yaml`). Khối này tồn tại chỉ để một catalog khuyết thiếu
+#: không làm nổ câu lệnh gọi llama.cpp.
+_FALLBACK_GENERATION: Dict[str, Any] = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "repetition_penalty": 1.05,
+}
+
+
+def resolve_generation_params(cfg: Any, info: Optional[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Thông số sinh cho một lượt gọi LLM. NGUỒN CHÍNH là `translation_models.yaml` của model.
+
+    Thứ tự ưu tiên (cao → thấp):
+
+    1. ``cfg``       — người dùng đặt TƯỜNG MINH qua ``TranslationConfig`` (mặc định ``None``
+       nghĩa là "không đặt", KHÔNG phải "đặt bằng 0").
+    2. ``overrides`` — hook ``batch_generation_params()`` của prompt strategy: nhu cầu riêng
+       của một pipeline (ví dụ bắt buộc greedy để JSON luôn hợp lệ).
+    3. ``info``      — entry của model ĐANG NẠP trong ``translation_models.yaml``.
+    4. ``_FALLBACK_GENERATION`` — chỉ khi cả ba nguồn trên đều không khai.
+
+    Nhờ vậy KHÔNG còn thông số greedy hardcode cho mọi model ở đường batch: mỗi model chạy
+    đúng temperature/top_p/top_k/repetition_penalty mà catalog của nó khai.
+
+    Key lạ trong ``overrides`` (ví dụ ``max_tokens``) được truyền thẳng vào kwargs.
+    """
+    info = info or {}
+    overrides = overrides or {}
+    out: Dict[str, Any] = {}
+
+    for field in _SAMPLING_FIELDS:
+        value = getattr(cfg, field, None) if cfg is not None else None
+        if value is None:
+            value = overrides.get(field)
+        if value is None:
+            value = info.get(field)
+        if value is None:
+            value = _FALLBACK_GENERATION[field]
+        # llama.cpp nhận `repeat_penalty`, catalog khai `repetition_penalty`.
+        out["repeat_penalty" if field == "repetition_penalty" else field] = value
+
+    for key, value in overrides.items():
+        if key not in _SAMPLING_FIELDS and value is not None:
+            out[key] = value
+
+    return out
+
+
+def _strategy_batch_params(strategy: Any) -> Dict[str, Any]:
+    """Gọi hook `batch_generation_params()` của strategy — chịu được strategy không có hook.
+
+    Hook hỏng/trả sai kiểu KHÔNG được làm chết đường dịch: chỉ cảnh báo rồi rơi về thông số
+    trong `translation_models.yaml`.
+    """
+    hook = getattr(strategy, "batch_generation_params", None)
+    if not callable(hook):
+        return {}
+    try:
+        params = hook()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"Hook batch_generation_params lỗi (bỏ qua, dùng thông số YAML): {exc}",
             extra={"module_tag": "TRANSLATE"},
         )
-    return fixed
+        return {}
+    if not isinstance(params, dict):
+        return {}
+    return dict(params)
+
+
+def clean_translation_tags(text: str) -> str:
+    """Loại bỏ các artifact tag của mô hình (ví dụ <output>, </output>, <think>, </think>, <|turn>model, <turn|>)."""
+    if not text:
+        return ""
+    # Bỏ khối <think>...</think> nếu có
+    out = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Bỏ các tag đơn lẻ
+    out = re.sub(r"</?(?:output|think|channel)[^>]*>", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"<\|turn>[^\n]*\n?", "", out)
+    out = re.sub(r"<\|turn[^>]*>", "", out)
+    out = re.sub(r"<turn\|>", "", out)
+    out = re.sub(r"<\|im_end\|>", "", out)
+    out = re.sub(r"<\|endoftext\|>", "", out)
+    out = re.sub(r"\[CURRENT_SOURCE\]", "", out, flags=re.IGNORECASE)
+    return out.strip()
 
 
 def _parse_batch_json(raw_text: str, expected_count: int) -> Optional[List[str]]:
@@ -416,13 +493,9 @@ class GGUFTranslator(BaseTranslator):
         info = self.registry.get_model(key) or {}
         kwargs = {
             "max_tokens": cfg.max_tokens,
-            "temperature": cfg.temperature if cfg.temperature is not None else info.get("temperature", 0.7),
-            "top_p": cfg.top_p if cfg.top_p is not None else info.get("top_p", 0.6),
-            "top_k": cfg.top_k if cfg.top_k is not None else info.get("top_k", 20),
-            "repeat_penalty": (
-                cfg.repetition_penalty if cfg.repetition_penalty is not None
-                else info.get("repetition_penalty", 1.05)
-            ),
+            # Thông số sinh lấy từ `translation_models.yaml` của model đang nạp (xem
+            # `resolve_generation_params`) — không hardcode trong code.
+            **resolve_generation_params(cfg, info),
             "stop": strategy.get_stop_tokens(),
         }
         # P4.2: Pipeline A chỉ nhận mục glossary khớp CHÍNH câu này (đổ vào template
@@ -634,11 +707,8 @@ class GGUFTranslator(BaseTranslator):
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
             raw_text = output["choices"][0]["text"].strip()
-            # Dọn dẹp khoảng trắng + gộp cụm lặp: model dịch cũng "kẹt vòng" khi đầu vào là
-            # chuỗi lặp (ca thật: ASR trả 'ha ha ha…' ⇒ dịch trả về ~150 lần 'ha' trong 2395 ms).
-            clean_out = collapse_repetitions(raw_text.replace("<|im_end|>", "").strip())
-            # P4.1: hậu kiểm đại từ — ràng buộc ở prompt không đủ (xem pronoun_guard).
-            clean_out = _enforce_pronouns(clean_out, cfg)
+            # Dọn dẹp khoảng trắng, tag mô hình + gộp cụm lặp:
+            clean_out = collapse_repetitions(clean_translation_tags(raw_text))
 
             return {
                 "translated_text": clean_out,
@@ -704,13 +774,17 @@ class GGUFTranslator(BaseTranslator):
             return list(texts)
 
         built_key, built_cfg, built_strategy = self._shared_config_snapshot()
+        supports_json_batch = getattr(built_strategy, "supports_json_batch", True)
         prompt_fn = getattr(built_strategy, "build_batch_prompt", None)
-        if prompt_fn is None:
-            # Fallback nếu strategy không hỗ trợ batch
-            return [
-                self._translate_sync(t, source_lang=source_lang, target_lang=target_lang, context=context).get("translated_text") or t
-                for t in texts
-            ]
+
+        if not supports_json_batch or prompt_fn is None:
+            # Strategy bên thứ ba không hỗ trợ JSON batch: dịch tuần tự nối tiếp ngữ cảnh.
+            return self._translate_batch_sequential(
+                texts,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                initial_context=context,
+            )
 
         use_ctx = bool(context and context.strip())
         # P4.2: gợi ý glossary tính MỘT lần cho cả khối (tên riêng + thuật ngữ khớp).
@@ -719,15 +793,7 @@ class GGUFTranslator(BaseTranslator):
             built_strategy, texts, source_lang, target_lang,
             context=context, use_context=use_ctx, terms=terms, speaker_tags=speaker_tags,
         )
-        max_tokens = min(1536, max(256, len(texts) * 80))
-        kwargs = {
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": 1,
-            "repeat_penalty": 1.05,
-            "stop": built_strategy.get_stop_tokens(),
-        }
+        kwargs = self._batch_infer_kwargs(built_key, built_cfg, built_strategy, len(texts))
 
         with self.__class__._infer_lock:
             llm, shared_key, cfg, strategy = self._snapshot_infer_state()
@@ -738,6 +804,7 @@ class GGUFTranslator(BaseTranslator):
                     strategy, texts, source_lang, target_lang,
                     context=context, use_context=use_ctx, terms=terms, speaker_tags=speaker_tags,
                 )
+                kwargs = self._batch_infer_kwargs(shared_key, cfg, strategy, len(texts))
 
             try:
                 output = llm(batch_prompt, **kwargs)
@@ -753,26 +820,64 @@ class GGUFTranslator(BaseTranslator):
 
         parsed = _parse_batch_json(raw_text, len(texts))
         if parsed is not None and len(parsed) == len(texts):
-            # P4.1: hậu kiểm đại từ trên cả khối (một log cho cả khối, không spam từng câu).
-            if not getattr(cfg, "enforce_pronoun_policy", True):
-                return parsed
-            fixed = [_enforce_pronouns(s, cfg, log=False) for s in parsed]
-            fixed_count = sum(1 for a, b in zip(parsed, fixed) if a != b)
-            if fixed_count:
-                logger.info(
-                    f"Ép ràng buộc đại từ (batch {len(texts)} câu): đã sửa {fixed_count} câu.",
-                    extra={"module_tag": "TRANSLATE"},
-                )
-            return fixed
+            return [clean_translation_tags(s) for s in parsed]
 
         logger.warning(
             f"Parse JSON batch thất bại ({len(raw_text)} chars), fallback dịch tuần tự từng câu. Raw: {raw_text[:200]!r}",
             extra={"module_tag": "TRANSLATE"},
         )
-        return [
-            self._translate_sync(t, source_lang=source_lang, target_lang=target_lang, context=context).get("translated_text") or t
-            for t in texts
-        ]
+        return self._translate_batch_sequential(
+            texts,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            initial_context=context,
+        )
+
+    def _batch_infer_kwargs(
+        self, key: Optional[str], cfg: TranslationConfig, strategy: Any, n_texts: int
+    ) -> Dict[str, Any]:
+        """Kwargs cho MỘT lượt gọi LLM ở Pipeline B: ngân sách token + thông số sinh.
+
+        Thông số sinh lấy từ `translation_models.yaml` của đúng model `key` (nguồn chính),
+        `cfg` đặt tường minh thì đè lên, hook `batch_generation_params()` của strategy đè
+        lên YAML nhưng thua `cfg` — xem `resolve_generation_params`.
+        """
+        info = self.registry.get_model(key) or {}
+        return {
+            # Ngân sách token cho cả khối JSON: 80 token/câu, sàn 256, trần 1536.
+            "max_tokens": min(1536, max(256, n_texts * 80)),
+            **resolve_generation_params(cfg, info, _strategy_batch_params(strategy)),
+            "stop": strategy.get_stop_tokens(),
+        }
+
+    def _translate_batch_sequential(
+        self,
+        texts: List[str],
+        source_lang: str = "auto",
+        target_lang: str = "vi",
+        initial_context: str = "",
+    ) -> List[str]:
+        """Dịch tuần tự theo chuỗi ngữ cảnh liền kề (chaining context): câu trước
+
+        vừa dịch xong sẽ tự động trở thành ngữ cảnh [PREVIOUS] cho câu tiếp theo.
+        Chỉ còn là ĐƯỜNG DỰ PHÒNG: dùng cho strategy bên thứ ba không có
+        `build_batch_prompt`/`supports_json_batch`, hoặc khi JSON batch parse thất bại.
+        """
+        results: List[str] = []
+        current_ctx = initial_context or ""
+        for text in texts:
+            res = self._translate_sync(
+                text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                context=current_ctx,
+            )
+            trans = res.get("translated_text") or text
+            cleaned = clean_translation_tags(trans)
+            results.append(cleaned)
+            if text and cleaned:
+                current_ctx = f"{text.strip()} -> {cleaned.strip()}"
+        return results
 
     async def translate_batch(
         self,
@@ -839,9 +944,7 @@ class GGUFTranslator(BaseTranslator):
                 acc += piece
                 # Gộp cụm lặp NGAY trên bản streaming: nếu model kẹt vòng thì phụ đề không
                 # phình thành một bức tường chữ (và độ dài hiển thị bị chặn trên).
-                # P4.1: ép ràng buộc đại từ ngay trên partial — client thay thế cả chuỗi mỗi
-                # lần nhận nên bản sửa luôn thắng bản cũ (không cần chờ tới câu cuối).
-                yield _enforce_pronouns(collapse_repetitions(acc), cfg, log=False)
+                yield collapse_repetitions(acc)
             if not acc:
                 return
 

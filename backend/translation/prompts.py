@@ -26,16 +26,24 @@ Các lỗi đã sửa so với bản cũ:
   (đúng câu chữ upstream, và ``{source_text}`` nằm chung lượt ``user``).
 * ``"Translate the following subtitle JSON data ... preserve the exact numeric keys, structure, and JSON format"``
   ⇒ template ``structured`` chuẩn: ``{format_type}`` + ``"never alter the structure, keys, or placeholders"``.
+* Template ``structured`` từng bị thay cụm giữa thành "translate user-facing text fields into natural,
+  spoken {target_lang} suitable for video subtitles (conversational tone, contextual nuance)".
+  Đã **khôi phục nguyên văn upstream** (``translate only user-facing text fields``): module này
+  cam kết giữ đúng câu chữ lúc fine-tune, và không có báo cáo nào trong ``report/`` đo lường
+  việc đổi cụm đó. Phần "giọng hội thoại" vốn đã nằm trong ``format_type`` (``JSON``) + ngữ cảnh.
 * Bổ sung loại ``terminology`` (ràng buộc thuật ngữ) trước đây **hoàn toàn thiếu**.
 
-Phần mở rộng của repo này (KHÔNG thuộc upstream) — bổ sung P4.1/P4.2 ngày 2026-10-07:
+Phần mở rộng của repo này (KHÔNG thuộc upstream):
 
-* ``_PRONOUN_GUIDANCE_VI`` được siết: nêu đích danh ``chúng mình``/``bọn mình``/``tụi mình``
-  và ánh xạ đại từ nguồn tiếng Nhật, vì bản cũ bị Index-Translate-9B bỏ qua trong log thật.
 * Pipeline B có thêm khối **ràng buộc cứng** đặt SAU payload JSON (``_build_batch_constraints``)
-  kèm gợi ý glossary tên riêng/thuật ngữ từ ``backend/translation/glossary.py``.
-  Đây là sai lệch CHỦ Ý so với upstream, đánh đổi lấy việc tuân thủ ràng buộc; đã đo lại
-  bằng A/B trước khi bật (xem ``report/13_pronoun_and_glossary``).
+  kèm gợi ý glossary tên riêng/thuật ngữ từ ``backend/translation/glossary.py``
+  (xem ``report/13_pronoun_and_glossary`` cho phần glossary).
+
+KHÔNG ép đại từ ở tầng prompt (quyết định 2026-10-10): không có khối ``"Style constraints"``
+và không có câu lệnh kiểu ``Use ONLY "tôi" for the first person``. Bản cũ nhét ràng buộc đại
+từ vào cả 3 template — vừa làm lệch câu chữ upstream, vừa **vẫn bị model bỏ qua** — rồi hậu
+kiểm bằng ``pronoun_guard.py`` ở tầng engine. Cả hai lớp đó đã bị xoá: việc chọn đại từ do
+model quyết định theo ngữ cảnh, không gán cứng "tôi"/"bạn".
 
 Ghi chú thiết kế: ``source_lang`` vẫn được nhận trong signature để giữ tương thích
 ngược cho ``engine.py``, nhưng **không** được nhúng vào prompt — cả 3 template chính
@@ -44,34 +52,15 @@ thức đều không có placeholder ngôn ngữ nguồn (model tự nhận di�
 
 import json
 from typing import Any, Dict, List, Optional
-
+from backend.utils.logger import logger
 
 # --------------------------------------------------------------------------- #
 # Template CHÍNH THỨC (bản EN) — NGUYÊN VĂN từ docs/prompts.md
 # --------------------------------------------------------------------------- #
 
-# Hướng dẫn đại từ nhân xưng khi dịch sang tiếng Việt (khi không rõ giới tính/tuổi tác)
-#
-# P4.1 (2026-10-07): siết ràng buộc. Bản cũ chỉ nói "never use the word mình anywhere" và
-# Index-Translate-9B **vẫn vi phạm** (`"tôi còn nói là mình chắc chắn…"` — log thật). Bản mới
-# (a) gọi tên đích danh các dạng ghép ("chúng mình", "bọn mình", "tụi mình") vì model rất hay
-# coi đó là ngoại lệ, (b) nêu ví dụ đại từ NGUỒN tiếng Nhật để model ánh xạ đúng, thay vì chỉ
-# mô tả trừu tượng bằng tiếng Anh.
-#
-# Ràng buộc ở prompt vẫn chỉ là HY VỌNG — bảo đảm nằm ở `pronoun_guard.enforce_no_minh()`,
-# được engine gọi trên mọi đầu ra.
-_PRONOUN_GUIDANCE_VI = (
-    "Requirements: NEVER output the Vietnamese word \"mình\" in any form — not as a standalone "
-    "pronoun, and not inside \"chúng mình\", \"bọn mình\" or \"tụi mình\"; "
-    "translate first-person pronouns (私, 僕, 俺, 自分) strictly as \"tôi\", "
-    "second-person pronouns (あなた, 君, お前) strictly as \"bạn\", and \"we\" as \"chúng ta\". "
-    "If the source sentence lacks an explicit subject, do NOT invent or assume one (keep it impersonal without arbitrarily adding pronouns). "
-)
-
 # Loại 1: Dịch mặc định (Index-Translate)
 TEMPLATE_DEFAULT = (
     "Translate the following text into {target_lang}. "
-    "{pronoun_guidance}"
     "Output the translation directly, without any explanation:\n\n"
     "{source_text}"
 )
@@ -80,16 +69,14 @@ TEMPLATE_DEFAULT = (
 TEMPLATE_TERMINOLOGY = (
     "Translate the following subtitles into {target_lang}. "
     "Requirements: keep terminology consistent across sentences "
-    "(fixed rendering for {term}), {pronoun_guidance}preserve structure and placeholders:\n\n"
+    "(fixed rendering for {term}), preserve structure and placeholders:\n\n"
     "{source_text}"
 )
 
-# Loại 3: Dữ liệu có cấu trúc (Index-Translate - tối ưu phụ đề hội thoại video)
+# Loại 3: Dữ liệu có cấu trúc (Index-Translate)
 TEMPLATE_STRUCTURED = (
     "Translate the following {format_type} data into {target_lang}: "
-    "translate user-facing text fields into natural, spoken {target_lang} suitable for video subtitles (conversational tone, contextual nuance); "
-    "{pronoun_guidance}"
-    "never alter the structure, keys, or placeholders:\n\n"
+    "translate only user-facing text fields; never alter the structure, keys, or placeholders:\n\n"
     "{source_text}"
 )
 
@@ -99,16 +86,17 @@ _CONTEXT_HEADER = "Reference translations for context:"
 #: Khối ràng buộc CỨNG cho Pipeline B, chèn **SAU** payload JSON.
 #:
 #: Vì sao đặt SAU payload chứ không nhét thêm vào câu lệnh phía trên: model sinh token theo
-#: thứ tự, phần nằm gần lượt `assistant` nhất có trọng số cao nhất (recency). Ràng buộc đại từ
-#: ở bản cũ nằm lọt giữa câu lệnh tiếng Anh và đã bị model bỏ qua trong log thật.
+#: thứ tự, phần nằm gần lượt `assistant` nhất có trọng số cao nhất (recency).
+#: Chỉ áp cho Pipeline B. Pipeline A dịch từng câu ưu tiên độ trễ.
 #:
-#: Chỉ áp cho Pipeline B. Pipeline A (dịch từng câu, ưu tiên độ trễ) đã được siết ngay trong
-#: `_PRONOUN_GUIDANCE_VI` và được `pronoun_guard` hậu kiểm ở tầng engine.
+#: ⚠️ Dòng "DO NOT add or invent a subject" đang MÂU THUẪN với kết quả đo:
+#: `report/15_subject_constraint_ab` kết luận **"KHÔNG thêm ràng buộc 'không tự gán chủ thể'
+#: vào prompt batch"** vì nó áp dụng quá rộng và phá câu đối chứng (`自分` bị đổi thành
+#: "Anh ấy"). Dòng này được giữ nguyên ở đây vì việc bỏ nó là quyết định chất lượng, chưa
+#: được chốt — xem mục 6 của báo cáo đó cho thiết kế thay thế ("phát hiện + gọi lại 1 câu").
 _BATCH_CONSTRAINTS_HEADER = (
     "\n\nHard constraints — the answer is REJECTED if any of these is violated:\n"
     "- Reply with the JSON object ONLY: no markdown fence, no commentary, no extra keys.\n"
-    "- NEVER write the Vietnamese word \"mình\" — not standalone, nor in \"chúng mình\", "
-    "\"bọn mình\", \"tụi mình\". First person = \"tôi\", second person = \"bạn\", we = \"chúng tôi\".\n"
     "- If the source sentence does not specify a subject, DO NOT add or invent a subject in the translation (keep it impersonal).\n"
     "- Keep the SAME speaker and the SAME pronouns as the reference context above."
 )
@@ -141,9 +129,24 @@ _LANG_NAME_MAP = {
 
 
 def resolve_lang_name(code: str) -> str:
-    """Chuyển mã ngôn ngữ 2 ký tự sang tên tiếng Anh."""
-    clean = (code or "auto").strip().lower()
-    return _LANG_NAME_MAP.get(clean, "Vietnamese" if clean == "vi" else "English")
+    """Chuyển mã/tên ngôn ngữ về tên tiếng Anh dùng trong prompt.
+
+    Chấp nhận: mã 2 ký tự (``vi``), mã có vùng (``vi-VN``), dấu gạch dưới (``zh_CN``),
+    chữ HOA (``VI``) và tên đầy đủ (``Vietnamese``). Mọi dạng đều quy về cùng một tên.
+    """
+    clean = (code or "auto").strip().lower().replace("_", "-")
+
+    if clean in _LANG_NAME_MAP:
+        return _LANG_NAME_MAP[clean]
+
+    # Tên đầy đủ ("vietnamese" -> "Vietnamese")
+    for name in _LANG_NAME_MAP.values():
+        if name.lower() == clean:
+            return name
+
+    # Mã có vùng ("vi-vn" -> "vi")
+    base = clean.split("-", 1)[0]
+    return _LANG_NAME_MAP.get(base, "Vietnamese" if base == "vi" else "English")
 
 
 def _wrap_chat(user_content: str, no_think_prefix: str = "") -> str:
@@ -189,6 +192,19 @@ class PromptStrategy:
     def get_stop_tokens(self) -> List[str]:
         return ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "</s>"]
 
+    def batch_generation_params(self) -> Optional[Dict[str, Any]]:
+        """Hook: tham số sinh RIÊNG cho lượt dịch GỘP (Pipeline B).
+
+        Trả về ``None`` (mặc định) nghĩa là **"dùng đúng thông số của model trong
+        ``translation_models.yaml``"** — hành vi mong muốn cho mọi model. Chỉ override khi
+        bản thân pipeline bắt buộc khác đi (ví dụ ép ``temperature=0.0`` để JSON luôn hợp lệ).
+
+        Thứ tự ưu tiên đầy đủ do `engine.resolve_generation_params` quyết định:
+        ``cfg`` (người dùng đặt tường minh) → hook này → YAML của model → giá trị dự phòng.
+        Key lạ (ví dụ ``max_tokens``) được truyền thẳng vào kwargs của llama.cpp.
+        """
+        return None
+
 
 class PipelineAPromptStrategy(PromptStrategy):
     """Prompt cho Pipeline A (Realtime Single Sentence Streaming).
@@ -218,18 +234,15 @@ class PipelineAPromptStrategy(PromptStrategy):
         tgt = resolve_lang_name(target_lang)
         source_text = (text or "").strip()
 
-        pronoun_guide = _PRONOUN_GUIDANCE_VI if tgt == "Vietnamese" else ""
         if term and str(term).strip():
             instruction = TEMPLATE_TERMINOLOGY.format(
                 target_lang=tgt,
                 term=str(term).strip(),
-                pronoun_guidance=pronoun_guide,
                 source_text=source_text,
             )
         else:
             instruction = TEMPLATE_DEFAULT.format(
                 target_lang=tgt,
-                pronoun_guidance=pronoun_guide,
                 source_text=source_text,
             )
 
@@ -264,9 +277,9 @@ class PipelineBPromptStrategy(PromptStrategy):
     tối đa hóa tính liền mạch ngữ cảnh hội thoại và tiết kiệm 60-70% thời gian GPU.
     Hỗ trợ kế thừa khối ngữ cảnh hội thoại gần nhất (cross-block context injection).
 
-    P4.1/P4.2 (2026-10-07): sau payload JSON có thêm khối **ràng buộc cứng** (`terms` là gợi ý
+    P4.2 (2026-10-07): sau payload JSON có thêm khối **ràng buộc cứng** (`terms` là gợi ý
     glossary tên riêng/thuật ngữ). Đặt SAU payload vì lý do recency — xem
-    `_BATCH_CONSTRAINTS_HEADER`.
+    `_BATCH_CONSTRAINTS_HEADER`. (P4.1 — ép đại từ — đã bị gỡ, xem docstring module.)
     """
 
     def build_prompt(
@@ -303,11 +316,9 @@ class PipelineBPromptStrategy(PromptStrategy):
             data = {str(i + 1): (s or "").strip() for i, s in enumerate(sentences)}
         json_text = json.dumps(data, ensure_ascii=False, indent=2)
 
-        pronoun_guide = _PRONOUN_GUIDANCE_VI if tgt == "Vietnamese" else ""
         instruction = TEMPLATE_STRUCTURED.format(
             format_type=format_type,
             target_lang=tgt,
-            pronoun_guidance=pronoun_guide,
             source_text=json_text,
         )
 
@@ -318,7 +329,10 @@ class PipelineBPromptStrategy(PromptStrategy):
         user_content = instruction
         if context and use_context:
             user_content = f"{_CONTEXT_HEADER}\n{context.strip()}\n\n{instruction}"
-
+        # logger.info(
+        #     f"batch prompt: {user_content}",
+        #     extra={"module_tag": "TRANSLATE"},
+        # )
         return _wrap_chat(user_content, self._NO_THINK_PREFIX)
 
 
@@ -327,10 +341,14 @@ IndexTranslatePromptStrategy = PipelineBPromptStrategy
 
 
 def get_prompt_strategy(style: Optional[str] = None) -> PromptStrategy:
-    """Lấy Prompt Strategy phù hợp (Index-Translate cho Pipeline A & Pipeline B)."""
+    """Lấy Prompt Strategy phù hợp (Index-Translate cho Pipeline A & Pipeline B, hoặc Gemma-Sub)."""
     st = (style or "index").lower().strip()
+    if st in ("gemma", "gemma-sub", "gemma_sub"):
+        from backend.translation.prompts_gemma import GemmaSubPromptStrategy
+        return GemmaSubPromptStrategy()
     if st in ("pipeline_a", "single"):
         return PipelineAPromptStrategy()
     if st in ("pipeline_b", "batch"):
         return PipelineBPromptStrategy()
     return IndexTranslatePromptStrategy()
+

@@ -31,12 +31,17 @@ def test_translation_registry_and_prompts():
     """Kiểm tra Registry và các chiến lược Prompt."""
     registry = TranslationModelRegistry.get_instance()
     models = registry.list_models()
-    assert len(models) == 2
+    # KHÔNG chốt số lượng cứng (catalog hay được bổ sung model mới) — chỉ chốt các key bắt buộc.
+    assert {"index-translate-2b", "index-translate-9b", "translate-gemma-4-sub"} <= {
+        m["id"] for m in models
+    }
 
     # Kiểm tra resolve alias
     assert registry.resolve_key("index-2b") == "index-translate-2b"
-    assert registry.resolve_key("index-translate") == "index-translate-2b"
     assert registry.resolve_key("index-mt-9b") == "index-translate-9b"
+    # Alias không có thật ⇒ rơi về `default_model` của catalog (hiện là index-translate-9b).
+    assert registry.resolve_key("index-translate") == registry.default_model_key
+    assert registry.resolve_key("gemma-sub") == "translate-gemma-4-sub"
 
     # Kiểm tra prompt builder Pipeline A (đơn câu)
     strategy_a = get_prompt_strategy("pipeline_a")
