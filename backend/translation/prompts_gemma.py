@@ -81,10 +81,10 @@ SYSTEM_TEMPLATE_GENERAL = (
 
 def _wrap_gemma4_chat(system_content: str, user_content: str) -> str:
     """Bọc System và User prompt vào Chat Template của Gemma 4 (<|turn>)."""
-    # logger.info(
-    #     f"system\n{system_content.strip()}\nuser\n{user_content.strip()}",
-    #     extra={"module_tag": "TRANSLATE"},
-    # )
+    logger.info(
+        f"system\n{system_content.strip()}\nuser\n{user_content.strip()}",
+        extra={"module_tag": "TRANSLATE"},
+    )
     return (
         f"<|turn>system\n{system_content.strip()}\n<turn|>\n"
         f"<|turn>user\n{user_content.strip()}\n<turn|>\n"
@@ -254,6 +254,7 @@ class GemmaSubPromptStrategy(PromptStrategy):
             "translate every segment, never merge, split or drop segments",
             "keep the conversational tone and the speaker's pronouns consistent across segments",
             "if a segment omits the subject, do not invent one",
+            # "when the gender is unknown, use only 'bạn' for the second person"
         ]
         # Gợi ý glossary (tên riêng/thuật ngữ) — mỗi dòng thành một ràng buộc riêng.
         if terms and terms.strip():

@@ -32,7 +32,7 @@ def test_translation_registry_and_prompts():
     registry = TranslationModelRegistry.get_instance()
     models = registry.list_models()
     # KHÔNG chốt số lượng cứng (catalog hay được bổ sung model mới) — chỉ chốt các key bắt buộc.
-    assert {"index-translate-2b", "index-translate-9b", "translate-gemma-4-sub"} <= {
+    assert {"index-translate-2b", "index-translate-9b", "translate-gemma-4-sub", "gemma-4-12b-qat"} <= {
         m["id"] for m in models
     }
 
@@ -42,6 +42,7 @@ def test_translation_registry_and_prompts():
     # Alias không có thật ⇒ rơi về `default_model` của catalog (hiện là index-translate-9b).
     assert registry.resolve_key("index-translate") == registry.default_model_key
     assert registry.resolve_key("gemma-sub") == "translate-gemma-4-sub"
+    assert registry.resolve_key("gemma-12b") == "gemma-4-12b-qat"
 
     # Kiểm tra prompt builder Pipeline A (đơn câu)
     strategy_a = get_prompt_strategy("pipeline_a")
@@ -56,6 +57,28 @@ def test_translation_registry_and_prompts():
     assert "Translate the following JSON data into Vietnamese" in prompt_b
     assert '"1": "Hello"' in prompt_b
     assert '"2": "World"' in prompt_b
+
+
+def test_gemma_12b_qat_dung_chung_prompt_gemma_sub():
+    """Gemma 4 12B QAT phải dùng CHUNG chiến lược prompt với Gemma-Sub (khác trọng số, chung format).
+
+    Hồi quy: nếu ai đó đổi `prompt_style` của entry này sang `index`, model sẽ nhận prompt
+    Qwen (`<|im_start|>`) trong khi nó là Gemma 4 (`<|turn>`) ⇒ đầu ra rác.
+    """
+    from backend.translation.prompts_gemma import GemmaSubPromptStrategy
+
+    registry = TranslationModelRegistry.get_instance()
+    info = registry.get_model("gemma-4-12b-qat")
+    assert info is not None
+    assert info["model"] == "unsloth/gemma-4-12B-it-qat-GGUF"
+    assert info["gguf_file"] == "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
+    assert info["prompt_style"] == "gemma-sub"
+    assert isinstance(get_prompt_strategy(info["prompt_style"]), GemmaSubPromptStrategy)
+
+    # Cùng template với Gemma-Sub: prompt dựng ra phải y hệt khi thay model.
+    a = get_prompt_strategy(registry.get_model("translate-gemma-4-sub")["prompt_style"])
+    b = get_prompt_strategy(info["prompt_style"])
+    assert a.build_prompt("Hello", "en", "vi") == b.build_prompt("Hello", "en", "vi")
 
 
 def test_context_manager_and_dedup():

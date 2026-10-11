@@ -271,6 +271,26 @@ def is_aligner_kept_char(ch: str) -> bool:
     return cat.startswith("L") or cat.startswith("N")
 
 
+#: Ngôn ngữ KHÔNG có dấu cách giữa từ ⇒ mỗi ký tự là một token, và KHÔNG được nối bằng `" "`.
+_CJK_LANGUAGES = ("japanese", "chinese", "korean", "cantonese")
+
+
+def _is_cjk_language(language: str) -> bool:
+    """True nếu ngôn ngữ không dùng dấu cách phân tách từ (Nhật/Trung/Hàn/Quảng)."""
+    return str(language or "").strip().lower() in _CJK_LANGUAGES
+
+
+def _count_language_tokens(text: str, is_cjk: bool) -> int:
+    """Đếm token của một mẩu văn bản: CJK ⇒ đếm ký tự; Latinh ⇒ đếm từ.
+
+    Dùng chung cho các bộ tách câu để mọi lớp ngắt câu có cùng định nghĩa "token".
+    """
+    clean = re.sub(r"[,、;；\.?!。？！\s]", "", text or "")
+    if not is_cjk and " " in (text or ""):
+        return len(text.split())
+    return len(re.findall(r"[a-zA-Z0-9]+|[^\s\W\d_]", clean))
+
+
 @dataclass
 class AlignedWord:
     text: str
@@ -865,14 +885,11 @@ class ForcedAlignerService:
         if not subtitles or min_words <= 0:
             return subtitles
 
-        is_cjk = str(language or "").strip().lower() in ("japanese", "chinese", "korean", "cantonese")
+        is_cjk = _is_cjk_language(language)
         clause_delims = {",", "、", ";", "；"}
 
         def count_tokens(s: str) -> int:
-            clean = re.sub(r"[,、;；\.?!。？！\s]", "", s)
-            if not is_cjk and " " in s:
-                return len(s.split())
-            return len(re.findall(r"[a-zA-Z0-9]+|[^\s\W\d_]", clean))
+            return _count_language_tokens(s, is_cjk)
 
         out: List[SubtitleSentence] = []
         for sub in subtitles:
@@ -974,6 +991,140 @@ class ForcedAlignerService:
             for piece, st, en in _allocate_spans(res_texts, sub.start_time, sub.end_time):
                 out.append(SubtitleSentence(text=piece, start_time=st, end_time=en))
 
+        return out
+
+    @staticmethod
+    def split_subtitles_by_pause(
+        subtitles: List[SubtitleSentence],
+        silences: Optional[List[Tuple[float, float]]] = None,
+        *,
+        min_pause_ms: float = 350.0,
+        min_tokens: int = 3,
+        language: str = "Japanese",
+        tolerance_sec: float = 0.12,
+        stats: Optional[Dict[str, int]] = None,
+        dry_run: bool = False,
+    ) -> List[SubtitleSentence]:
+        """Lớp ngắt câu bằng KHOẢNG LẶNG: tách câu dài KHÔNG có dấu câu tại chỗ người nói ngắt hơi.
+
+        VÌ SAO CẦN (log thật 2026-10-11 14:51, trang tiếng Nhật): ASR trả về một câu dài **không
+        có dấu câu** gộp lời của 2–3 người::
+
+            "じゃステージランドよよし次こそ勝つぞあらあら楽しそうねこれいただき物だけどよかったらどうぞうまそう。"
+
+        Các lớp hiện có đều bó tay: `group_words_to_subtitles` chỉ ngắt theo dấu câu, bộ tách theo
+        dấu phẩy cần `、`/`,`. `split_oversized_sentences` chỉ cắt CỨNG theo trần ký tự/từ nên mảnh
+        cắt ra không trùng ranh giới người nói. Hệ quả: một phụ đề dài trộn 2–3 lượt lời, dịch ra
+        cũng trộn, và gán speaker (Nemotron) chỉ còn một nhãn cho cả câu.
+
+        CÁCH LÀM: dựa trên mốc từ của Forced Aligner, tách tại KHE giữa hai từ liên tiếp
+        (`gap = words[i].start_time - words[i-1].end_time`). Khi có `silences` (danh sách khoảng
+        lặng VAD xác nhận, cùng hệ thời gian với `words`) thì khe còn phải NẰM TRONG một khoảng
+        lặng — VAD là bên xác nhận, Aligner chỉ đề xuất. Không có `silences` (VAD tắt/lỗi) thì dùng
+        khe từ đơn thuần; hành vi vẫn tốt hơn cắt cứng theo ký tự.
+
+        Ràng buộc chất lượng: mỗi mảnh — kể cả mảnh ĐẦU và mảnh CUỐI — phải đạt `min_tokens`, nếu
+        không thì BỎ QUA điểm tách đó (thà giữ một câu hơi dài còn hơn tạo mảnh cụt 1–2 ký tự).
+
+        Chỉ áp dụng cho câu CÒN `words` (chưa qua `split_oversized_sentences` — hàm đó bỏ mốc từ).
+
+        `stats` (tuỳ chọn) được điền để CHẨN ĐOÁN: `sentences_in`, `sentences_out`, `candidates`
+        (số khe ≥ ngưỡng), `vad_confirmed` (số khe nằm trong khoảng lặng VAD), `accepted` (số điểm
+        tách thực sự dùng). Caller log từ đây — nếu không có số này thì "không tách" hoàn toàn im
+        lặng, đúng cái bẫy đã gặp ngày 2026-10-11 (không biết lớp mới có chạy hay không).
+
+        `dry_run=True` chỉ ĐẾM (`candidates`) rồi trả nguyên `subtitles`. Dùng để QUYẾT ĐỊNH có cần
+        quét VAD hay không: quét FireRed tốn ~2.6 s cho khối 32 s (đo thật 2026-10-11), nên bỏ qua
+        khi câu không có khe nào đủ dài.
+        """
+        if stats is not None:
+            stats.update(
+                sentences_in=len(subtitles or []),
+                sentences_out=len(subtitles or []),
+                candidates=0,
+                vad_confirmed=0,
+                accepted=0,
+            )
+        if not subtitles or min_pause_ms <= 0:
+            return subtitles
+        if dry_run:
+            # Chỉ đếm khe đủ dài (không xét VAD, không tách).
+            pause_sec = float(min_pause_ms) / 1000.0
+            for sub in subtitles:
+                ws = list(sub.words or [])
+                for i in range(1, len(ws)):
+                    if float(ws[i].start_time) - float(ws[i - 1].end_time) >= pause_sec:
+                        if stats is not None:
+                            stats["candidates"] += 1
+            return subtitles
+
+        is_cjk = _is_cjk_language(language)
+        pause_sec = float(min_pause_ms) / 1000.0
+        min_tokens = max(1, int(min_tokens))
+
+        def tokens_of(ws: List[AlignedWord]) -> int:
+            # Đếm TỪNG từ rồi cộng — KHÔNG nối chuỗi rồi mới đếm: với CJK, nối không dấu cách sẽ
+            # gộp các từ Latinh cạnh nhau thành một run `[a-zA-Z0-9]+` (ví dụ "w1 w2 w3" → 1 token),
+            # làm bộ đếm token hụt và bỏ qua oan mọi điểm tách. Cách đếm này khớp với
+            # `split_subtitles_by_clause_comma`.
+            return sum(_count_language_tokens(w.text, is_cjk) for w in ws)
+
+        def in_silence(t_mid: float) -> bool:
+            if silences is None:
+                return True  # không có VAD ⇒ tin khe từ của aligner
+            return any(
+                (float(s0) - tolerance_sec) <= t_mid <= (float(s1) + tolerance_sec)
+                for s0, s1 in silences
+            )
+
+        out: List[SubtitleSentence] = []
+        for sub in subtitles:
+            words = list(sub.words or [])
+            if len(words) < 2:
+                out.append(sub)
+                continue
+
+            pieces: List[List[AlignedWord]] = []
+            buf: List[AlignedWord] = [words[0]]
+            for i in range(1, len(words)):
+                prev_w, cur_w = words[i - 1], words[i]
+                gap = float(cur_w.start_time) - float(prev_w.end_time)
+                if gap >= pause_sec:
+                    if stats is not None:
+                        stats["candidates"] += 1
+                    t_mid = (float(prev_w.end_time) + float(cur_w.start_time)) / 2.0
+                    rest = words[i:]
+                    if not in_silence(t_mid):
+                        continue
+                    if stats is not None:
+                        stats["vad_confirmed"] += 1
+                    if tokens_of(buf) >= min_tokens and tokens_of(rest) >= min_tokens:
+                        if stats is not None:
+                            stats["accepted"] += 1
+                        pieces.append(buf)
+                        buf = []
+                buf.append(cur_w)
+            pieces.append(buf)
+
+            if len(pieces) <= 1:
+                out.append(sub)
+                continue
+
+            joiner = "" if is_cjk else " "
+            for piece in pieces:
+                text = joiner.join(w.text for w in piece).strip()
+                if not text:
+                    continue
+                out.append(
+                    SubtitleSentence(
+                        text=text,
+                        start_time=float(piece[0].start_time),
+                        end_time=float(piece[-1].end_time),
+                        words=list(piece),
+                    )
+                )
+        if stats is not None:
+            stats["sentences_out"] = len(out)
         return out
 
     def unload_model(self) -> None:

@@ -947,3 +947,92 @@ async def test_pure_repetition_block_emits_nothing():
         )
     finally:
         await session.close()
+
+
+# --- LỚP NGẮT CÂU BẰNG KHOẢNG LẶNG (VAD) trong vòng batch thật (2026-10-11) ----------------
+
+class OneLongSentenceAligner:
+    """Aligner giả: câu dài KHÔNG dấu câu, có MỘT khe ngắt hơi 0.6 s trước từ thứ 5.
+
+    Mô phỏng đúng ca log 2026-10-11: ASR trả một câu dài gộp lời 2 người, và
+    `group_words_to_subtitles` gom tất cả thành MỘT phụ đề (không có dấu câu để ngắt).
+    Từ là kana Nhật (không dấu cách) nên mảnh nối liền nhau — đúng như tiếng Nhật thật.
+    """
+
+    WORDS = ["じゃ", "ステージ", "ランド", "よ", "よし", "次こそ", "勝つぞ", "あらあら"]
+    GAP_BEFORE = 4          # chèn khe ngay trước từ thứ 5 (index 4)
+    GAP_SEC = 0.6
+    WORD_SEC = 0.25
+
+    def prewarm(self):
+        pass
+
+    def align(self, audio: np.ndarray, text: str, language: str = "English"):
+        words = []
+        t = 0.0
+        for i, w in enumerate(self.WORDS):
+            start = t + (self.GAP_SEC if i == self.GAP_BEFORE else 0.0)
+            words.append(AlignedWord(text=w, start_time=start, end_time=start + self.WORD_SEC))
+            t = start + self.WORD_SEC
+        return words
+
+    def group_words_to_subtitles(self, words, language: str = "English", **kwargs):
+        return [
+            SubtitleSentence(
+                text="".join(w.text for w in words),
+                start_time=words[0].start_time,
+                end_time=words[-1].end_time,
+                words=list(words),
+            )
+        ]
+
+
+def _make_batch_session_with_aligner(aligner) -> LookaheadSessionState:
+    conn = MockSafeConnection()
+    asr = FakeInferenceEngine(text_fn=lambda n: "".join(OneLongSentenceAligner.WORDS))
+    translator = ContextAwareFakeTranslator()
+    session = LookaheadSessionState(ws=conn, asr_engine=asr, translation_engine=translator)
+    session.apply_init({"source_lang": "ja", "target_lang": "vi", "lead_time": 15})
+    session.init_components(vad_engine_override=FakeVADEngine())
+    session._aligner_service = aligner
+    return session
+
+
+@pytest.mark.asyncio
+async def test_ngat_cau_theo_khoang_lang_trong_vong_batch(monkeypatch):
+    """Câu dài không dấu câu ⇒ lớp khoảng lặng phải tách thành 2 phụ đề ngay trong vòng batch.
+
+    Đây là test NỐI DÂY (không chỉ hàm thuần): khoá việc handler gọi bộ tách khi `words` còn
+    nguyên vẹn — nếu gọi SAU `split_oversized_sentences` (lớp đó bỏ `words`) thì test này đỏ.
+    """
+    # Bỏ yêu cầu VAD xác nhận: PCM giả là tông liên tục nên VAD không thấy khoảng lặng nào;
+    # nhánh này cũng chính là đường dự phòng khi VAD tắt/lỗi.
+    monkeypatch.setattr(config.lookahead, "batch_sub_pause_require_vad", False)
+    monkeypatch.setattr(config.lookahead, "batch_sub_pause_split", True)
+
+    session = _make_batch_session_with_aligner(OneLongSentenceAligner())
+    try:
+        conn = await _run_one_batch_iteration(session)
+        items = _all_subtitle_items(conn)
+        texts = [it["original_text"] for it in items]
+        assert texts == ["じゃステージランドよ", "よし次こそ勝つぞあらあら"], texts
+        # Bất biến: ghép lại phải bằng câu gốc.
+        assert "".join(texts) == "".join(OneLongSentenceAligner.WORDS)
+        # Mốc thời gian của mảnh sau phải bắt đầu SAU khe ngắt hơi.
+        assert float(items[1]["start_pts"]) > float(items[0]["end_pts"])
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_tat_lop_pause_thi_giu_mot_cau(monkeypatch):
+    """`batch_sub_pause_split=False` ⇒ trở lại ĐÚNG hành vi cũ: một phụ đề dài."""
+    monkeypatch.setattr(config.lookahead, "batch_sub_pause_split", False)
+
+    session = _make_batch_session_with_aligner(OneLongSentenceAligner())
+    try:
+        conn = await _run_one_batch_iteration(session)
+        texts = [it["original_text"] for it in _all_subtitle_items(conn)]
+        assert texts == ["".join(OneLongSentenceAligner.WORDS)], texts
+    finally:
+        await session.close()

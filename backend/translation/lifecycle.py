@@ -166,6 +166,7 @@ async def run_reserved(canonical_key: str, *, allow_download: Optional[bool] = N
             auto_download=allow_download,
             glossary_file=config.translation.glossary_file,
             glossary=dict(config.translation.glossary or {}),
+            glossary_detect_names=config.translation.glossary_detect_names,
             glossary_derive_names=config.translation.glossary_derive_names,
         )
         translator = get_translation_engine(new_cfg)

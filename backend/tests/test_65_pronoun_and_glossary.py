@@ -10,7 +10,7 @@ nhét ``_PRONOUN_GUIDANCE_VI`` vào cả 3 template Index, và hậu kiểm bằ
 ở tầng engine. Cả hai lớp đều bị xoá: ràng buộc chỉ nằm ở prompt thì model **vẫn bỏ qua**
 (log thật trong ``report/13_pronoun_and_glossary``), còn hậu kiểm văn bản thì **phá câu hợp
 lệ** (``một mình``, ``chính mình``, ``nhà mình``…). Việc chọn đại từ do model quyết định
-theo ngữ cảnh. Test dưới đây chốt việc **KHÔNG** ép đại từ ở bất kỳ pipeline nào.
+theo ngữ cảnh. Test dưới đây chốt việc các DẠNG CŨ đó không quay lại.
 
 Bộ test này chốt 3 thứ:
   * `glossary` nạp file + ghi đè runtime + phát hiện tên riêng;
@@ -168,14 +168,18 @@ def test_single_prompt_khong_bi_doi_hinh_dang_them():
     assert "Style constraints" not in prompt
 
 
-# ──────────────────────────── KHÔNG ép đại từ tôi/bạn (quyết định 2026-10-10)
+# ──────────────── Không tái xuất ràng buộc đại từ KIỂU CŨ (quyết định 2026-10-10)
 
-def test_khong_ep_dai_tu_o_ca_hai_ho_model():
-    """Ràng buộc đại từ đã bị gỡ khỏi MỌI pipeline và không được tái xuất hiện.
+def test_khong_tai_xuat_rang_buoc_dai_tu_cu():
+    """Các ràng buộc đại từ kiểu CŨ đã bị gỡ và không được quay lại.
 
-    Hồi quy: bản cũ nhét ``Use ONLY "tôi" for the first person`` (Pipeline A) và
-    ``NEVER write the Vietnamese word "mình"`` + ``chúng mình``/``bọn mình``/``tụi mình``
-    (Pipeline B) vào template Index.
+    Hồi quy: bản cũ nhét ``Use ONLY "tôi" for the first person`` + ``ONLY "bạn" for the second
+    person`` (khối ``Style constraints``, Pipeline A) và ``NEVER write the Vietnamese word
+    "mình"`` + ``chúng mình``/``bọn mình``/``tụi mình`` (Pipeline B) vào template Index.
+
+    GHI CHÚ: assertion dùng ĐÚNG câu chữ cũ thay vì so khớp ``"bạn"``/``"tôi"`` trần — cách so
+    khớp rộng đó dễ dương tính giả (ví dụ rule ngôi 2 dùng dấu nháy đơn ``'bạn'`` sẽ không khớp
+    ``"bạn"``, khiến test "xanh" mà không thực sự kiểm tra được gì).
     """
     prompts = [
         get_prompt_strategy("pipeline_a").build_prompt("Hello", "en", "vi"),
@@ -185,9 +189,8 @@ def test_khong_ep_dai_tu_o_ca_hai_ho_model():
     ]
     for prompt in prompts:
         assert "Style constraints" not in prompt
-        assert "Use ONLY" not in prompt
-        assert '"tôi"' not in prompt
-        assert '"bạn"' not in prompt
+        assert 'Use ONLY "tôi" for the first person' not in prompt
+        assert 'ONLY "bạn" for the second person' not in prompt
         assert "chúng mình" not in prompt
         assert "NEVER write the Vietnamese word" not in prompt
 

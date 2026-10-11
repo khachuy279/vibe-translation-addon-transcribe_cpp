@@ -85,6 +85,31 @@ _KATAKANA_BEFORE_RE = re.compile(r"([" + _KATAKANA_CLASS + r"]{1,10})$")
 _KANJI_BEFORE_RE = re.compile(r"([" + _KANJI_CLASS + r"]{1,4})$")
 
 
+def names_enabled(cfg: Any = None) -> bool:
+    """CÔNG TẮC TỔNG của "nhận diện tên + suy romaji" — `config.translation.glossary_detect_names`.
+
+    Một chỗ duy nhất quyết định, để không lệch nhau giữa dòng ``Proper nouns in the source``
+    (nhận diện tên) và phần suy romaji.
+
+    Thứ tự đọc:
+      1. `cfg` có trường ⇒ dùng nó (đường thật: engine truyền config của model đang chạy).
+      2. `cfg` là None ⇒ đọc **config toàn cục** — cùng cách `_load_terms_from_file` đang xử lý
+         `cfg.glossary_file`, để gọi `build_hint(texts)` không cfg vẫn tôn trọng công tắc.
+      3. `cfg` là object KHÔNG có trường (caller cũ, `SimpleNamespace` trong test) ⇒ coi như BẬT,
+         giữ nguyên hành vi cũ.
+
+    KHÔNG liên quan tới bảng khai tay trong `glossary`/`glossary_file` — bảng đó luôn hoạt động.
+    """
+    if cfg is not None:
+        return bool(getattr(cfg, "glossary_detect_names", True))
+    try:
+        from backend.config import config as _app_config  # noqa: PLC0415
+
+        return bool(getattr(_app_config.translation, "glossary_detect_names", True))
+    except Exception:  # noqa: BLE001 - thiếu config ⇒ giữ hành vi cũ (BẬT)
+        return True
+
+
 class TranslationGlossary:
     """Singleton đọc bảng thuật ngữ + phát hiện tên riêng cho prompt dịch."""
 
@@ -292,9 +317,10 @@ class TranslationGlossary:
         **chuỗi nguồn** (``romaji.romanize``) nên không phụ thuộc model, không cần lưu trạng
         thái, và cùng một tên luôn cho cùng kết quả ở mọi khối. Xem ``backend/translation/romaji.py``.
 
-        Trả về ``{}`` khi bị tắt bằng ``cfg.glossary_derive_names = False``.
+        Trả về ``{}`` khi bị tắt — bằng công tắc TỔNG ``cfg.glossary_detect_names = False``
+        (tắt cả nhận diện tên lẫn suy romaji) hoặc knob riêng ``cfg.glossary_derive_names = False``.
         """
-        if cfg is not None and not getattr(cfg, "glossary_derive_names", True):
+        if not names_enabled(cfg) or not getattr(cfg, "glossary_derive_names", True):
             return {}
         manual = self.matched_terms(texts, cfg)
         out: Dict[str, str] = {}
@@ -327,9 +353,10 @@ class TranslationGlossary:
             )
 
         # Ràng buộc "nhất quán" chỉ có nghĩa khi khối có ≥ 2 câu (một câu thì không có gì
-        # để mâu thuẫn) và khi tên đó chưa được ấn định (khai tay HOẶC suy romaji).
+        # để mâu thuẫn), khi tên đó chưa được ấn định (khai tay HOẶC suy romaji), và khi công tắc
+        # tổng `glossary_detect_names` đang BẬT.
         # So khớp hai chiều để `美咲` (phát hiện được) không lặp lại khi glossary khai `美咲さん`.
-        if len([t for t in texts if t and t.strip()]) >= 2:
+        if names_enabled(cfg) and len([t for t in texts if t and t.strip()]) >= 2:
             names = [
                 n for n in self.detect_names(texts)
                 if not any(n in src or src in n for src in fixed)
@@ -364,6 +391,7 @@ def get_glossary() -> TranslationGlossary:
 __all__ = [
     "TranslationGlossary",
     "get_glossary",
+    "names_enabled",
     "MAX_TERMS_IN_HINT",
     "MAX_NAMES_IN_HINT",
 ]

@@ -174,13 +174,25 @@ def _strategy_batch_params(strategy: Any) -> Dict[str, Any]:
 
 
 def clean_translation_tags(text: str) -> str:
-    """Loại bỏ các artifact tag của mô hình (ví dụ <output>, </output>, <think>, </think>, <|turn>model, <turn|>)."""
+    """Loại bỏ các artifact tag của mô hình (ví dụ <output>, </output>, <think>, </think>, <|turn>model, <turn|>).
+
+    Bao gồm cả "thinking channel" của Gemma 4 (``<|channel>thought … <channel|>``). Lưu ý
+    ``<|channel>`` có dấu ``|`` ngay sau ``<`` nên KHÔNG khớp regex tag thường ``<channel>``
+    — đây là lỗi thật gặp với `gemma-4-12b-qat` (log 2026-10-11): đầu ra là
+    ``"<|channel>thought\\nỪ."`` và marker bị lọt ra phụ đề.
+    """
     if not text:
         return ""
     # Bỏ khối <think>...</think> nếu có
     out = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Gemma 4: khối kênh suy luận ĐÓNG: <|channel>thought\n…\n<channel|>
+    out = re.sub(r"<\|channel>.*?<channel\|>", "", out, flags=re.DOTALL | re.IGNORECASE)
+    # Gemma 4: marker MỞ chưa đóng (model bắt đầu kênh rồi trả luôn bản dịch trong đó).
+    # Chỉ bỏ marker + phần tên kênh trên cùng dòng, GIỮ nội dung phía sau.
+    out = re.sub(r"<\|channel>[^\n]*\n?", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"<channel\|>", "", out)
     # Bỏ các tag đơn lẻ
-    out = re.sub(r"</?(?:output|think|channel)[^>]*>", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"</?(?:output|think|thought|channel)[^>]*>", "", out, flags=re.IGNORECASE)
     out = re.sub(r"<\|turn>[^\n]*\n?", "", out)
     out = re.sub(r"<\|turn[^>]*>", "", out)
     out = re.sub(r"<turn\|>", "", out)
@@ -818,7 +830,9 @@ class GGUFTranslator(BaseTranslator):
                     for t in texts
                 ]
 
-        parsed = _parse_batch_json(raw_text, len(texts))
+        # Dọn artifact tag TRƯỚC khi parse: khối/kênh suy luận của Gemma 4
+        # (`<|channel>thought …`) có thể chứa dấu `{`/`}` làm `_parse_batch_json` bắt sai khối.
+        parsed = _parse_batch_json(clean_translation_tags(raw_text), len(texts))
         if parsed is not None and len(parsed) == len(texts):
             return [clean_translation_tags(s) for s in parsed]
 

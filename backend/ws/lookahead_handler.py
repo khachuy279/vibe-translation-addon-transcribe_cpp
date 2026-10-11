@@ -70,7 +70,8 @@ from backend.asr.forced_aligner import (
     detect_aligner_language_from_text,
     resolve_aligner_language,
 )
-from backend.core.vad_silence import VADSilenceScanner
+from backend.core.vad_silence import VADSilenceScanner, find_silence_gaps_streaming
+from backend.vad.engines import VADEngineFactory
 from backend.diarization import DiarizationService, assign_speakers_to_subtitles
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import (
@@ -1531,6 +1532,112 @@ class LookaheadSessionState:
                 language=align_lang,
                 min_words=min_comma_words,
             )
+
+            # Bước 2E-ter: LỚP NGẮT CÂU BẰNG KHOẢNG LẶNG (VAD) — cho câu dài KHÔNG có dấu câu gộp
+            # lời 2–3 người (log thật 2026-10-11 14:51, trang tiếng Nhật):
+            #     "じゃステージランドよよし次こそ勝つぞあらあら楽しそうねこれいただき物だけどよかったらどうぞうまそう。"
+            # Các lớp trên đều bó tay ở ca này: `group_words_to_subtitles` chỉ ngắt theo dấu câu, bộ
+            # tách dấu phẩy cần `、`/`,`, còn `split_oversized_sentences` chỉ cắt CỨNG theo trần
+            # ký tự/từ nên mảnh cắt ra không trùng ranh giới người nói.
+            #
+            # PHẢI chạy TRƯỚC `split_oversized_sentences`: lớp đó bỏ `words` (chỉ phân bổ thời gian
+            # theo tỉ lệ độ dài văn bản) nên sau nó không còn mốc từ để tìm khe ngắt hơi.
+            if bool(getattr(config.lookahead, "batch_sub_pause_split", True)):
+                pause_ms = float(getattr(config.lookahead, "batch_sub_pause_ms", 350.0) or 0.0)
+                # Ngưỡng QUÉT VAD thấp hơn ngưỡng khe từ và ĐỘC LẬP với nó: khe từ 0.4 s chỉ chứa
+                # ~0.15–0.25 s im lặng, nên quét ở đúng 350 ms sẽ bỏ sót phần lớn khoảng lặng thật.
+                # ĐO THẬT 2026-10-11 (ja_concat_1min.wav, 8 khe thật, 0 artifact):
+                #   FireRed 150 ms → 8/8, 200 ms → 6/8, 350 ms → 3/8   (không nhận nhầm khe nào)
+                #   Silero  150 ms → 6/8, 200 ms → 5/8, 350 ms → 2/8
+                # ⇒ dùng FIRERED (engine mặc định của dự án) ở 150 ms.
+                vad_ms = float(getattr(config.lookahead, "batch_sub_pause_vad_ms", 150.0) or 0.0)
+                min_tokens = int(getattr(config.lookahead, "batch_sub_pause_min_tokens", 3) or 3)
+                silences: Optional[List[Tuple[float, float]]] = None
+                #: off | skipped | firered | silero | empty | error | khe-từ
+                vad_state = "off"
+
+                # (1) ĐẾM khe đủ dài TRƯỚC: quét FireRed tốn ~2.6 s cho khối 32 s (đo thật), nên
+                # chỉ quét khi thật sự có khe cần xác nhận. Phần lớn khối không có khe nào.
+                pre_stats: Dict[str, int] = {}
+                ForcedAlignerService.split_subtitles_by_pause(
+                    subtitles, min_pause_ms=pause_ms, language=align_lang,
+                    stats=pre_stats, dry_run=True,
+                )
+                has_candidates = pre_stats.get("candidates", 0) > 0
+
+                if pause_ms <= 0 or not has_candidates:
+                    vad_state = "skipped"
+                elif bool(getattr(config.lookahead, "batch_sub_pause_require_vad", True)):
+                    # (2) Ưu tiên FIRERED (engine mặc định của dự án), chỉ lấy engine ĐÃ NẠP SẴN
+                    # (`peek_engine`) để không tải/nạp model trên đường nóng.
+                    engine = VADEngineFactory.peek_engine("firered-vad")
+                    scanner = None
+                    if engine is not None:
+                        vad_state = "firered"
+                    elif self.silence_scanner is not None:
+                        scanner = self.silence_scanner
+                        vad_state = "silero"
+                    else:
+                        vad_state = "khe-từ"
+                    if engine is not None or scanner is not None:
+                        try:
+                            if engine is not None:
+                                gaps = await asyncio.to_thread(
+                                    find_silence_gaps_streaming,
+                                    engine,
+                                    chunk.pcm,
+                                    float(chunk.pts_start),
+                                    vad_ms,
+                                    int(getattr(config.vad, "sample_rate", 16000) or 16000),
+                                )
+                            else:
+                                gaps = await asyncio.to_thread(
+                                    scanner.find_silence_gaps,
+                                    chunk.pcm,
+                                    float(chunk.pts_start),
+                                    vad_ms,
+                                )
+                            if gaps:
+                                # `words` của aligner tính từ ĐẦU KHỐI ⇒ đổi về cùng hệ thời gian.
+                                silences = [
+                                    (
+                                        float(g.start_pts) - float(chunk.pts_start),
+                                        float(g.end_pts) - float(chunk.pts_start),
+                                    )
+                                    for g in gaps
+                                ]
+                            else:
+                                # KHÔNG veto: "VAD không thấy khoảng lặng nào trong 23 s hội thoại"
+                                # gần như luôn là VAD không kết luận được, chứ không phải bằng
+                                # chứng câu liền một mạch. Rơi về khe từ của Forced Aligner.
+                                vad_state = "empty"
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug(
+                                f"Quét khoảng lặng để ngắt câu lỗi (dùng khe từ của aligner): {exc}",
+                                extra={"module_tag": "ASR"},
+                            )
+                            vad_state = "error"
+
+                pause_stats: Dict[str, int] = {}
+                subtitles = ForcedAlignerService.split_subtitles_by_pause(
+                    subtitles,
+                    silences=silences,
+                    min_pause_ms=pause_ms,
+                    min_tokens=min_tokens,
+                    language=align_lang,
+                    stats=pause_stats,
+                )
+                # LUÔN log quyết định của lớp này: không có dòng này thì "không tách" hoàn toàn im
+                # lặng và không thể biết lớp mới có chạy hay không (sự cố 2026-10-11).
+                logger.info(
+                    f"[SEG_BATCH] Khoảng lặng (nguồn={vad_state}, khe≥{pause_ms:.0f}ms, "
+                    f"VAD≥{vad_ms:.0f}ms): "
+                    f"{pause_stats.get('sentences_in', 0)} → {pause_stats.get('sentences_out', 0)} phụ đề "
+                    f"| khe đủ dài={pause_stats.get('candidates', 0)}, "
+                    f"VAD xác nhận={pause_stats.get('vad_confirmed', 0)}, "
+                    f"điểm tách dùng={pause_stats.get('accepted', 0)}",
+                    extra={"module_tag": "ASR"},
+                )
 
             # LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
             # câu hiện thành MỘT phụ đề dài khi aligner trả một item duy nhất).

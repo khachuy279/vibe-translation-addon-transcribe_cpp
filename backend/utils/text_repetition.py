@@ -23,6 +23,13 @@ khi giữ lại thì giữ nguyên token gốc của lần xuất hiện đầu.
 
 Văn bản không tách được thành ≥ `single_min_run` token (ví dụ tiếng Trung/Nhật không dấu
 cách) được trả về NGUYÊN VẸN — hàm này không bao giờ cắt bừa.
+
+**Hai hàm, hai mục đích khác nhau — đừng lẫn:**
+  * `collapse_repetitions()` — LÀM SẠCH văn bản, vẫn GIỮ vài lần lặp (vì lặp ngắn là nội dung
+    thật). Dùng trên đầu ra ASR/dịch.
+  * `is_repetition_hallucination()` — QUYẾT ĐỊNH **BỎ CẢ CÂU**, nên phải chặt hơn hẳn: đoạn
+    lặp còn phải chiếm ≥ `REPEAT_MIN_DOMINANCE` độ dài câu. Bản cũ chỉ cần "có lặp ở đâu đó"
+    nên đã bỏ nhầm câu tiếng Nhật bình thường (log 2026-10-11).
 """
 
 import re
@@ -36,6 +43,19 @@ PHRASE_MIN_REPS = 3     # cụm phải lặp ≥ 3 lần
 PHRASE_MAX_KEEP = 1     # cụm lặp verbatim thường là lỗi decoder ⇒ giữ 1 lần
 
 _STRIP = string.punctuation + "…“”‘’«»–—"
+
+#: Đoạn lặp phải chiếm ÍT NHẤT tỉ lệ này của câu mới bị coi là ảo giác kẹt vòng.
+#:
+#: **Vì sao cần (log thật 2026-10-11):** `min_reps=3` một mình bắt nhầm câu tiếng Nhật bình
+#: thường. Câu ``かわきたならちゃんと独身でまともないいい男が選べる立場なんだから。`` có đoạn
+#: ``いいい`` (3 ký tự ``い`` liền nhau = 3/33 ký tự) do ``まともな`` + ``いい男`` ghép lại,
+#: hoàn toàn KHÔNG kẹt vòng — nhưng bộ lọc theo câu ở ``lookahead_handler`` đã **bỏ cả câu**,
+#: làm mất một phụ đề thật. Tiếng Nhật/Trung không có dấu cách nên "có ký tự lặp" không đồng
+#: nghĩa với "decoder kẹt vòng" như ở chữ Latinh.
+#:
+#: Ngưỡng 0.5 tách đúng hai nhóm: ``ああああ…`` (100 %) vẫn bị bỏ, còn lặp ngắn nằm trong câu
+#: dài (``いいい``, ``No, no, no, I don't think so.``) được GIỮ.
+REPEAT_MIN_DOMINANCE = 0.5
 
 
 def _norm(token: str) -> str:
@@ -109,7 +129,12 @@ def collapse_ratio(original: str, collapsed: str) -> float:
     return max(0.0, 1.0 - (len(collapsed) / len(original)))
 
 
-def is_repetition_hallucination(text: str, min_reps: int = 3) -> bool:
+def is_repetition_hallucination(
+    text: str,
+    min_reps: int = 3,
+    *,
+    min_dominance: float = REPEAT_MIN_DOMINANCE,
+) -> bool:
     """Kiểm tra xem văn bản có phải ảo giác kẹt vòng (từ/ký tự lặp liên tiếp >= min_reps lần).
 
     Quy tắc:
@@ -117,6 +142,9 @@ def is_repetition_hallucination(text: str, min_reps: int = 3) -> bool:
     2. Cụm 2-4 ký tự lặp liên tiếp (ví dụ 'そうそうそう' -> True).
     3. Từ phân cách bằng khoảng trắng hoặc dấu ngắt lặp liên tiếp (ví dụ 'ha ha ha', 'no, no, no', 'はい、はい、はい' -> True).
     4. Không bắt nhầm dấu câu thông thường ('...') hay chữ số ('1000').
+
+    **Điều kiện đủ (thêm 2026-10-11):** đoạn lặp phải chiếm >= `min_dominance` độ dài câu.
+    Chỉ "có một đoạn lặp ở đâu đó" là CHƯA đủ — xem `REPEAT_MIN_DOMINANCE`.
     """
     if not text or not text.strip():
         return False
@@ -124,19 +152,35 @@ def is_repetition_hallucination(text: str, min_reps: int = 3) -> bool:
     if len(s) < min_reps:
         return False
 
+    span = _longest_repeat_span(s, min_reps)
+    if span <= 0:
+        return False
+    return span / len(s) >= min_dominance
+
+
+def _longest_repeat_span(s: str, min_reps: int) -> int:
+    """Độ dài (số ký tự) của đoạn lặp liên tiếp DÀI NHẤT tìm được; 0 nếu không có.
+
+    Gộp cả 3 quy tắc của `is_repetition_hallucination` vào một phép đo duy nhất, để hàm
+    quyết định chỉ còn một ngưỡng "chiếm bao nhiêu phần câu".
+    """
+    best = 0
+
     # 1. Ký tự đơn lặp liên tiếp >= min_reps lần (bỏ qua số và dấu câu)
-    if re.search(r"([^\s\W\d_])\1{" + str(min_reps - 1) + r",}", s):
-        return True
+    for m in re.finditer(r"([^\s\W\d_])\1{" + str(min_reps - 1) + r",}", s):
+        best = max(best, m.end() - m.start())
 
     # 2. Cụm 2-4 ký tự lặp liên tiếp >= min_reps lần (tiếng Nhật/Trung không dấu cách: ví dụ そうそうそう)
     for k in range(2, 5):
-        if len(s) >= k * min_reps and re.search(r"([^\s\W\d_]{" + str(k) + r"})\1{" + str(min_reps - 1) + r",}", s):
-            return True
+        if len(s) < k * min_reps:
+            continue
+        for m in re.finditer(r"([^\s\W\d_]{" + str(k) + r"})\1{" + str(min_reps - 1) + r",}", s):
+            best = max(best, m.end() - m.start())
 
     # 3. Từ phân cách bằng khoảng trắng hoặc dấu ngắt lặp liên tiếp >= min_reps lần
     pattern_word = r"(?:\b|^)(\w+)(?:\s*[,、，\.!\?]?\s*\1){" + str(min_reps - 1) + r",}(?:\b|$)"
-    if re.search(pattern_word, s, flags=re.IGNORECASE):
-        return True
+    for m in re.finditer(pattern_word, s, flags=re.IGNORECASE):
+        best = max(best, m.end() - m.start())
 
-    return False
+    return best
 

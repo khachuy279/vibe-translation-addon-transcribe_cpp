@@ -345,7 +345,7 @@ class SentenceConfig(BaseModel):
 
 class TranslationConfig(BaseModel):
     """Cấu hình dịch thuật cục bộ GGUF qua Llama.cpp."""
-    base: str = "translate-gemma-4-sub"  # index-translate-2b, index-translate-9b, translate-gemma-4-sub
+    base: str = "gemma-4-12b-qat"  # index-translate-2b, index-translate-9b, translate-gemma-4-sub, gemma-4-12b-qat
     enabled: bool = True
     model: Optional[str] = None
     gguf_file: Optional[str] = None
@@ -396,13 +396,26 @@ class TranslationConfig(BaseModel):
     #: Bảng glossary bổ sung ở tầng runtime (dict). Ưu tiên CAO HƠN file — dùng khi cần
     #: ghi đè theo phiên mà không muốn sửa file trên đĩa.
     glossary: Dict[str, str] = Field(default_factory=dict)
+    #: CÔNG TẮC TỔNG cho "NHẬN DIỆN TÊN + SUY ROMAJI" (mặc định BẬT).
+    #:
+    #: Tắt (`False`) ⇒ prompt dịch KHÔNG còn dòng `Proper nouns in the source (...)` và KHÔNG
+    #: suy romaji cho tên chưa khai. Đây là công tắc duy nhất điều khiển CẢ HAI thứ đó.
+    #:
+    #: KHÔNG ảnh hưởng bảng khai tay trong `glossary`/`glossary_file`: mục khai tay vẫn khớp và
+    #: vẫn được ấn định như thường (xem `TranslationGlossary.build_hint`).
+    #:
+    #: Dùng khi muốn giảm token prompt / tránh mọi phỏng đoán về tên riêng (ví dụ model dịch đã
+    #: đủ tốt, hoặc gặp nội dung mà suy romaji cho kết quả khó chịu).
+    glossary_detect_names: bool = False
     #: Suy **romaji** cho tên riêng CHƯA khai trong glossary, ngay từ chuỗi nguồn
     #: (`backend/translation/romaji.py`): `美咲 -> Misaki`, `ミサキ -> Misaki`.
     #:
     #: Đây là hàm XÁC ĐỊNH của văn bản nguồn nên cùng một tên luôn ra cùng cách viết ở mọi
     #: khối — nhất quán mà KHÔNG cần lưu trạng thái, KHÔNG cần "học" từ bản dịch.
     #: Mục khai tay trong `glossary`/`glossary_file` luôn ĐÈ lên kết quả suy tự động.
-    #: Tắt để quay lại hành vi chỉ-ràng-buộc-nhất-quán (A/B: report/13 §nghiệm thu).
+    #: Tắt để quay lại hành vi CHỈ-ràng-buộc-nhất-quán (A/B: report/13 §nghiệm thu) — khi đó
+    #: dòng `Proper nouns in the source (...)` VẪN còn; muốn tắt luôn cả dòng đó thì dùng
+    #: `glossary_detect_names = False` ở trên.
     glossary_derive_names: bool = True
 
 
@@ -556,6 +569,27 @@ class LookaheadConfig(BaseModel):
     batch_sub_sentence_max_chars: int = 160
     #: Tách câu phụ đề tại dấu ngắt vế (、 hoặc ,) khi số từ/token phía trước >= ngần này
     batch_sub_comma_min_words: int = 4
+    #: LỚP NGẮT CÂU BẰNG KHOẢNG LẶNG (VAD) — cho câu dài KHÔNG có dấu câu gộp lời 2–3 người.
+    #: Bật/tắt cả lớp; tắt ⇒ giữ nguyên hành vi cũ (chỉ dấu câu + trần ký tự/từ).
+    batch_sub_pause_split: bool = True
+    #: Khe giữa hai từ (giây×1000) đủ dài để coi là chỗ ngắt hơi. 350 ms ≈ ngập ngừng giữa lượt
+    #: lời; thấp hơn nữa sẽ cắt vào giữa câu nói bình thường.
+    #: ĐO THẬT 2026-10-11 (ja_concat_1min.wav, 152 từ): khe ở ranh giới cụm từ = 0.40–0.56 s,
+    #: còn khe GIỮA MỘT TỪ (aligner chẻ `発展` thành `発`+`展`) chỉ 0.08 s ⇒ 350 ms tách đúng.
+    batch_sub_pause_ms: float = 350.0
+    #: Ngưỡng QUÉT VAD — CỐ Ý thấp hơn `batch_sub_pause_ms` và KHÁC đơn vị đo: một khe TỪ 0.4 s
+    #: chỉ chứa ~0.15–0.25 s im lặng xác nhận được (VAD cần vài frame để lật trạng thái).
+    #: ĐO THẬT 2026-10-11 (`ja_concat_1min.wav`, 8 khe thật 0.32–0.56 s, 0 khe-giữa-từ):
+    #:   FireRed (mặc định) 150 ms → 8/8 | 200 ms → 6/8 | 350 ms → 3/8   — nhận nhầm 0
+    #:   Silero             150 ms → 6/8 | 200 ms → 5/8 | 350 ms → 2/8   — nhận nhầm 0
+    #: Lớp ngắt câu dùng **FireRed** (engine mặc định của dự án) vì bắt đủ hơn hẳn; xem
+    #: `find_silence_gaps_streaming`. FireRed chạy đúng cấu hình mặc định ở `VADConfig.firered`.
+    batch_sub_pause_vad_ms: float = 150.0
+    #: Số token TỐI THIỂU của MỖI mảnh (kể cả mảnh đầu/cuối) — chặn mảnh cụt 1–2 ký tự.
+    batch_sub_pause_min_tokens: int = 3
+    #: Khi VAD khả dụng, khe từ còn phải nằm trong khoảng lặng VAD xác nhận (VAD là bên xác nhận,
+    #: Forced Aligner chỉ đề xuất điểm). Tắt ⇒ chỉ dùng khe từ.
+    batch_sub_pause_require_vad: bool = True
 
     # ── BỘ ĐỆM & DỊCH TRƯỚC (LOOKAHEAD BUFFER & TIMELINE) ─────────────────────
     #: Thời gian dịch trước (giây) — khoảng đệm mục tiêu trước vị trí phát.

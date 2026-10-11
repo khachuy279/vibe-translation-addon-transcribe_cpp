@@ -442,4 +442,77 @@ class VADSilenceScanner:
         return inside[-1]
 
 
-__all__ = ["SilenceGap", "VADSilenceScanner"]
+# --------------------------------------------------------------------------- #
+# Quét khoảng lặng bằng MỘT ENGINE VAD BẤT KỲ (không riêng Silero)
+# --------------------------------------------------------------------------- #
+
+def find_silence_gaps_streaming(
+    engine,
+    pcm: np.ndarray,
+    base_pts: float = 0.0,
+    min_silence_ms: float = 150.0,
+    sample_rate: int = 16000,
+) -> List[SilenceGap]:
+    """Chạy một VAD engine STREAMING (FireRed/Silero) qua TOÀN BỘ `pcm` ⇒ danh sách khoảng lặng.
+
+    VÌ SAO CẦN (2026-10-11): `VADSilenceScanner` ở trên gắn cứng model **Silero** và đo thật cho
+    thấy nó bỏ sót phần lớn khoảng lặng giữa các từ (quét ở 350 ms chỉ xác nhận 2/6 khe thật của
+    file `ja_concat_1min.wav`). Dự án mặc định dùng **FireRed VAD** (`config.vad.vad_engine`) nên
+    lớp ngắt câu theo khoảng lặng phải quét được bằng chính engine đó.
+
+    Khác `VADSilenceScanner`:
+      * dùng engine + cấu hình NGUYÊN BẢN của engine (`create_initial_state()` không truyền
+        threshold/silence ⇒ đúng mặc định FireRed: ngưỡng 0.4, pad 5, min_speech 8, min_silence 20);
+      * không có cache/mồi riêng — chạy một lượt qua vùng audio được đưa vào;
+      * gom khoảng lặng từ QUYẾT ĐỊNH TỪNG FRAME (`result.is_speech`), chứ không dùng máy trạng
+        thái START/END (vốn có trễ 200 ms và trả về *đoạn nói*, không trả về *khe*).
+
+    `pcm` là float32 trong [-1, 1] (đúng định dạng timeline); engine nhận **int16** nên ở đây đổi
+    bằng ĐÚNG công thức của `VADProcessor` (`(clip(x,-1,1) * 32767).astype(int16)`).
+    """
+    if engine is None or pcm is None or len(pcm) == 0:
+        return []
+    hop = int(getattr(engine, "frame_samples", 512) or 512)
+    if hop <= 0 or len(pcm) < hop:
+        return []
+
+    samples = np.asarray(pcm, dtype=np.float32)
+    if samples.dtype != np.int16:
+        samples = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+    state = engine.create_initial_state()
+    hop_sec = hop / float(sample_rate)
+    need_frames = max(1, int(round(float(min_silence_ms) / 1000.0 / hop_sec)))
+
+    gaps: List[SilenceGap] = []
+    start_idx: Optional[int] = None
+    n_frames = len(samples) // hop
+    for i in range(n_frames):
+        frame = samples[i * hop : (i + 1) * hop]
+        result = engine.is_speech(frame, state)
+        if not bool(result.is_speech):
+            if start_idx is None:
+                start_idx = i
+            continue
+        if start_idx is not None:
+            if (i - start_idx) >= need_frames:
+                gaps.append(
+                    SilenceGap(
+                        start_pts=float(base_pts) + start_idx * hop_sec,
+                        end_pts=float(base_pts) + i * hop_sec,
+                        vad_confirmed=True,
+                    )
+                )
+            start_idx = None
+    if start_idx is not None and (n_frames - start_idx) >= need_frames:
+        gaps.append(
+            SilenceGap(
+                start_pts=float(base_pts) + start_idx * hop_sec,
+                end_pts=float(base_pts) + n_frames * hop_sec,
+                vad_confirmed=True,
+            )
+        )
+    return gaps
+
+
+__all__ = ["SilenceGap", "VADSilenceScanner", "find_silence_gaps_streaming"]

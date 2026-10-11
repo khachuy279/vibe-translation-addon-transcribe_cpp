@@ -40,6 +40,8 @@ def _cfg(**over):
         max_tokens=128, temperature=None, top_p=None, top_k=None, repetition_penalty=None,
         use_context=False,
         glossary_file="", glossary={}, glossary_derive_names=True,
+        #: Công tắc TỔNG (nhận diện tên + suy romaji) — `config.translation.glossary_detect_names`.
+        glossary_detect_names=True,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -258,6 +260,76 @@ def test_tat_suy_tu_dong_thi_quay_ve_rang_buoc_nhat_quan():
     hint = g.build_hint(texts, _cfg(glossary_derive_names=False))
     assert "Fixed renderings" not in hint
     assert "Proper nouns in the source (美咲)" in hint
+
+
+# ───────────────────── công tắc TỔNG `glossary_detect_names` (nhận diện tên + suy romaji)
+
+def test_cong_tac_tong_tat_ca_hai():
+    """`glossary_detect_names=False` ⇒ TẮT CẢ dòng `Proper nouns` LẪN suy romaji.
+
+    Lưu ý cách đọc: dòng `Proper nouns` CHỈ xuất hiện khi tên chưa được ấn định — nên muốn thấy
+    nó thì phải tắt suy romaji (`glossary_derive_names=False`), đúng như
+    `test_tat_suy_tu_dong_thi_quay_ve_rang_buoc_nhat_quan`.
+    """
+    g = TranslationGlossary.get_instance()
+    texts = ["美咲さんとはうまくいってるみたいですね。", "佐藤部長に報告しておきます。"]
+
+    # (a) nhận diện tên BẬT: hiện ở dòng "Proper nouns" khi không suy romaji
+    on = g.build_hint(texts, _cfg(glossary_derive_names=False))
+    assert "Proper nouns in the source (美咲" in on
+
+    # (b) suy romaji BẬT
+    assert g.derived_renderings(texts, _cfg()) == {"美咲": "Misaki", "佐藤": "Sato"}
+
+    # (c) TẮT công tắc tổng ⇒ cả hai biến mất
+    off = g.build_hint(texts, _cfg(glossary_derive_names=False, glossary_detect_names=False))
+    assert off == "", f"công tắc tắt mà vẫn còn hint: {off!r}"
+    assert g.derived_renderings(texts, _cfg(glossary_detect_names=False)) == {}
+    assert g.terms_for_single(texts[0], _cfg(glossary_detect_names=False)) == ""
+
+
+def test_cong_tac_tong_khong_dung_toi_glossary_khai_tay():
+    """Tắt nhận diện tên KHÔNG được làm mất bảng khai tay trong `glossary`/file."""
+    g = TranslationGlossary.get_instance()
+    texts = ["美咲さんとはうまくいってるみたいですね。", "佐藤部長に報告しておきます。"]
+    hint = g.build_hint(texts, _cfg(glossary_detect_names=False, glossary={"美咲": "Mỹ Sako"}))
+    assert "美咲 -> Mỹ Sako" in hint
+    assert "佐藤 -> Sato" not in hint, "suy romaji phải tắt theo công tắc tổng"
+    assert "Proper nouns in the source" not in hint
+
+
+def test_cong_tac_tong_mac_dinh_bat_khi_thieu_truong():
+    """Caller cũ / tests dùng `SimpleNamespace` thiếu trường ⇒ coi như BẬT (không hồi quy)."""
+    from backend.translation.glossary import names_enabled
+
+    assert names_enabled(SimpleNamespace()) is True
+    assert names_enabled(SimpleNamespace(glossary_detect_names=True)) is True
+    assert names_enabled(SimpleNamespace(glossary_detect_names=False)) is False
+
+
+def test_cong_tac_tong_cfg_none_doc_config_toan_cuc():
+    """Gọi `build_hint(texts)` KHÔNG truyền cfg vẫn phải tôn trọng công tắc trong config.py."""
+    from backend.config import config
+    from backend.translation.glossary import names_enabled
+
+    g = TranslationGlossary.get_instance()
+    texts = ["美咲さんとはうまくいってるみたいですね。", "佐藤部長に報告しておきます。"]
+    before = config.translation.glossary_detect_names
+    try:
+        config.translation.glossary_detect_names = False
+        assert names_enabled(None) is False
+        assert g.build_hint(texts) == ""
+        assert g.terms_for_single(texts[0]) == ""
+    finally:
+        config.translation.glossary_detect_names = before
+    assert names_enabled(None) is True
+
+
+def test_cong_tac_tong_co_trong_config_that():
+    """Trường phải tồn tại thật trong `TranslationConfig` (không chỉ ở test)."""
+    from backend.config import TranslationConfig
+
+    assert TranslationConfig().glossary_detect_names is True
 
 
 def test_suy_tu_dong_khong_lap_lai_dong_nhat_quan():

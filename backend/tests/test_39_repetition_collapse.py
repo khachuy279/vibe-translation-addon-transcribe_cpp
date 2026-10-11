@@ -16,7 +16,11 @@ Nguyên tắc quan trọng: **lặp ngắn là nội dung THẬT** — `ha ha ha
 import pytest
 
 from backend.asr.text_cleaner import clean_transcript_text
-from backend.utils.text_repetition import collapse_ratio, collapse_repetitions
+from backend.utils.text_repetition import (
+    collapse_ratio,
+    collapse_repetitions,
+    is_repetition_hallucination,
+)
 
 
 # ─────────────────────────────────────────────── ca thật
@@ -66,6 +70,73 @@ def test_cjk_khong_dau_cach_tra_ve_nguyen_ven():
 def test_khong_lam_mat_tu_khi_lap_ngan_nam_trong_cau_dai():
     text = "Well, no no no, that is not what I meant at all."
     assert collapse_repetitions(text) == text
+
+
+# ───────────────────── phát hiện ảo giác kẹt vòng (dùng để BỎ CÂU, không phải gộp)
+
+def test_khong_bo_cau_tieng_nhat_binh_thuong_co_ba_kana_giong_nhau():
+    """Hồi quy log 2026-10-11: `まともないい男` chứa `いいい` nhưng KHÔNG hề kẹt vòng.
+
+    Bản cũ trả `True` chỉ vì có 3 ký tự `い` liền nhau ⇒ `lookahead_handler` bỏ CẢ CÂU,
+    mất một phụ đề thật.
+
+    (`まともな` + `いい男` ghép lại thành đúng chuỗi này — đây là ca ASR thật trong log,
+    không phải chuỗi bịa.)
+    """
+    text = "かわきたならちゃんと独身でまともないいい男が選べる立場なんだから。"
+    assert is_repetition_hallucination(text, min_reps=3) is False
+
+
+@pytest.mark.parametrize("text", [
+    "この犬は本当にかわいいですね。",   # かわいい — 2 kana, dưới ngưỡng
+    "彼はいい人だ。",                   # いい
+    "駅はとおいですか。",               # とおい
+    "それはゆいいつの方法だ。",         # ゆいいつ
+    "めいいっぱい頑張った。",           # めいいっぱい
+    "人がおおい。",                     # おおい
+    "今日天气很好我们一起去公园散步吧",  # tiếng Trung bình thường
+])
+def test_khong_bo_cau_binh_thuong(text):
+    assert is_repetition_hallucination(text, min_reps=3) is False
+
+
+@pytest.mark.parametrize("text", [
+    "あ" * 30,                          # khối rác thuần (test_58 dùng đúng chuỗi này)
+    "ああああああ",
+    "そうそうそう",
+    " ".join(["ha"] * 250),             # ca thật trong log ASR
+])
+def test_van_bo_cau_ket_vong_thuan(text):
+    """Câu CHỈ toàn đoạn lặp (chiếm gần 100 %) vẫn phải bị bỏ."""
+    assert is_repetition_hallucination(text, min_reps=3) is True
+
+
+def test_cum_nhieu_tu_lap_khong_phai_viec_cua_bo_cau():
+    """Cụm lặp có DẤU CÁCH ('I don't know' ×6) không thuộc phạm vi hàm này.
+
+    `is_repetition_hallucination` chỉ soi ký tự/CJK không dấu cách và 1 TỪ lặp lại; cụm nhiều
+    từ là việc của `collapse_repetitions` (gộp lại, KHÔNG bỏ câu) — xem
+    `test_cum_lap_verbatim_gop_con_1`. Ghi lại đây để không ai tưởng hàm bỏ câu bắt được nó.
+    """
+    text = "I don't know " * 6
+    assert is_repetition_hallucination(text, min_reps=3) is False
+    assert collapse_repetitions(text.strip()) == "I don't know"
+
+
+@pytest.mark.parametrize("text", [
+    "No, no, no, I don't think so.",              # lặp ngắn trong câu dài = nội dung thật
+    "Well, no no no, that is not what I meant.",  # như trên
+    "ちょっとちょっと、待ってください。",           # lặp 2 lần, dưới ngưỡng
+])
+def test_khong_bo_cau_dai_co_lap_ngan(text):
+    assert is_repetition_hallucination(text, min_reps=3) is False
+
+
+def test_nguong_dominance_co_the_chinh():
+    """`min_dominance` là ngưỡng duy nhất quyết định — hạ xuống thì bắt lại được ca cũ."""
+    text = "かわきたならちゃんと独身でまともないいい男が選べる立場なんだから。"
+    assert is_repetition_hallucination(text, min_reps=3, min_dominance=0.0) is True
+    assert is_repetition_hallucination(text, min_reps=3, min_dominance=0.5) is False
 
 
 # ─────────────────────────────────────────────── tích hợp vào ASR

@@ -2,6 +2,138 @@ import pytest
 from backend.asr.forced_aligner import AlignedWord, ForcedAlignerService, SubtitleSentence
 
 
+# ─────────────── LỚP NGẮT CÂU BẰNG KHOẢNG LẶNG (VAD) — log thật 2026-10-11 14:51 ──────────
+
+#: Câu THẬT trong log: ASR trả một câu dài KHÔNG dấu câu, gộp lời 2–3 người.
+_PAUSE_CASE_TEXT = (
+    "じゃステージランドよよし次こそ勝つぞあらあら楽しそうね"
+    "これいただき物だけどよかったらどうぞうまそう"
+)
+
+#: Cách aligner tokenize câu trên (mốc từ giây, khe ngắt hơi chèn trước 'あらあら' và 'うまそう').
+_PAUSE_CASE_WORDS = [
+    "じゃ", "ステージ", "ランド", "よ", "よし", "次こそ", "勝つぞ",
+    "あらあら", "楽しそう", "ね", "これ", "いただき物", "だけど", "よかったら", "どうぞ",
+    "うまそう",
+]
+#: Chỉ số từ BẮT ĐẦU một lượt lời mới ⇒ chèn khe 0.6 s ngay trước nó.
+_PAUSE_AFTER_INDEXES = (7, 15)
+_PAUSE_GAP_SEC = 0.6
+_WORD_SEC = 0.25
+
+
+def _pause_case_sentence() -> SubtitleSentence:
+    words = []
+    t = 0.0
+    for i, w in enumerate(_PAUSE_CASE_WORDS):
+        start = t + (_PAUSE_GAP_SEC if i in _PAUSE_AFTER_INDEXES else 0.0)
+        words.append(AlignedWord(text=w, start_time=start, end_time=start + _WORD_SEC))
+        t = start + _WORD_SEC
+    return SubtitleSentence(
+        text=_PAUSE_CASE_TEXT, start_time=0.0, end_time=words[-1].end_time, words=words
+    )
+
+
+def test_ngat_cau_bang_khoang_lang_vad_tach_cau_dai_tieng_nhat():
+    """Ca thật: một câu dài không dấu câu ⇒ VAD xác nhận 2 khe ⇒ tách thành 3 phụ đề."""
+    sub = _pause_case_sentence()
+    # Hai khoảng lặng VAD xác nhận, ĐÚNG hệ thời gian của `words` (tính từ đầu khối).
+    silences = [(1.6, 2.4), (4.6, 5.4)]
+
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=silences, min_pause_ms=350, min_tokens=3, language="Japanese"
+    )
+
+    assert [s.text for s in out] == [
+        "じゃステージランドよよし次こそ勝つぞ",
+        "あらあら楽しそうねこれいただき物だけどよかったらどうぞ",
+        "うまそう",
+    ]
+    # BẤT BIẾN: không được mất hay thêm ký tự nào so với câu gốc.
+    assert "".join(s.text for s in out) == _PAUSE_CASE_TEXT
+    # Mốc thời gian lấy CHÍNH XÁC từ mốc từ (không chia theo tỉ lệ độ dài văn bản).
+    assert out[0].start_time == pytest.approx(0.0)
+    assert out[0].end_time == pytest.approx(1.75)
+    assert out[1].end_time == pytest.approx(4.35)
+    assert out[2].end_time == pytest.approx(5.2)
+    # Mỗi mảnh vẫn giữ `words` của mình (để lớp sau / diarization còn dùng).
+    assert all(s.words for s in out)
+
+
+def test_vad_khong_xac_nhan_thi_khong_ngat():
+    """VAD chạy nhưng KHÔNG thấy khoảng lặng nào ⇒ giữ nguyên câu (VAD là bên xác nhận)."""
+    sub = _pause_case_sentence()
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=[], min_pause_ms=350, min_tokens=3, language="Japanese"
+    )
+    assert len(out) == 1
+    assert out[0].text == _PAUSE_CASE_TEXT
+
+
+def test_vad_tat_thi_van_ngat_theo_khe_tu():
+    """`silences=None` (VAD tắt/lỗi) ⇒ dùng khe từ của Forced Aligner; vẫn tốt hơn cắt cứng."""
+    sub = _pause_case_sentence()
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=None, min_pause_ms=350, min_tokens=3, language="Japanese"
+    )
+    assert len(out) == 3
+    assert "".join(s.text for s in out) == _PAUSE_CASE_TEXT
+
+
+def test_khong_tao_manh_cut_duoi_nguong_token():
+    """Khe nằm quá sớm/quá muộn (mảnh < `min_tokens`) ⇒ BỎ QUA điểm tách, không tạo mảnh cụt.
+
+    Lưu ý: với tiếng Nhật, 1 "token" = 1 ký tự (xem `_count_language_tokens`), nên 'じゃ' = 2
+    token còn 'うまそう' = 4 token.
+    """
+    sub = _pause_case_sentence()
+    # Khe ngay sau từ ĐẦU TIÊN: mảnh đầu 'じゃ' = 2 token < 3 ⇒ phải bỏ qua.
+    early = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=[(0.2, 0.9)], min_pause_ms=350, min_tokens=3, language="Japanese"
+    )
+    assert len(early) == 1
+
+    # Khe ngay trước từ CUỐI: mảnh cuối 'うまそう' = 4 token ⇒ với min_tokens=5 cũng phải bỏ qua.
+    late = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=[(4.3, 4.9)], min_pause_ms=350, min_tokens=5, language="Japanese"
+    )
+    assert len(late) == 1
+
+
+def test_khong_ngat_khi_khe_ngan_hon_nguong():
+    """Khe 0.6 s > 350 ms mới đủ; hạ `min_pause_ms` lên cao hơn khe ⇒ không tách."""
+    sub = _pause_case_sentence()
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=None, min_pause_ms=900, min_tokens=3, language="Japanese"
+    )
+    assert len(out) == 1
+
+
+def test_cau_khong_co_moc_tu_giu_nguyen():
+    """Câu đã qua `split_oversized_sentences` (mất `words`) ⇒ lớp này không đụng vào."""
+    sub = SubtitleSentence(text=_PAUSE_CASE_TEXT, start_time=0.0, end_time=10.0)
+    assert len(ForcedAlignerService.split_subtitles_by_pause([sub], silences=None)) == 1
+
+
+def test_tieng_anh_noi_manh_bang_dau_cach():
+    """Tiếng Anh: mảnh nối bằng dấu cách (khác CJK nối liền)."""
+    words = [
+        AlignedWord("I", 0.0, 0.2), AlignedWord("won", 0.2, 0.5), AlignedWord("again", 0.5, 0.9),
+        AlignedWord("you", 1.6, 1.8), AlignedWord("lost", 1.8, 2.1), AlignedWord("fair", 2.1, 2.5),
+        AlignedWord("and", 2.5, 2.7), AlignedWord("square", 2.7, 3.2),
+    ]
+    sub = SubtitleSentence(
+        text="I won again you lost fair and square", start_time=0.0, end_time=3.2, words=words
+    )
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=None, min_pause_ms=350, min_tokens=2, language="English"
+    )
+    assert [s.text for s in out] == ["I won again", "you lost fair and square"]
+
+
+# ─────────────────────────────────────────────── các ca hồi quy cũ
+
+
 def test_abbreviations_do_not_split_sentences():
     """HỒI QUY 2026-10-05: `Dr.` bị coi là KẾT CÂU ⇒ phụ đề vụn và bản dịch sai.
 

@@ -114,6 +114,31 @@ def test_clean_gemma_output():
     assert clean_translation_tags(raw3) == "Xin chào bạn"
 
 
+def test_clean_gemma_channel_thought():
+    """Hồi quy log 2026-10-11 (`gemma-4-12b-qat`): marker ``<|channel>thought`` lọt ra phụ đề.
+
+    ``<|channel>`` có dấu ``|`` nên KHÔNG khớp regex tag thường ``<channel>`` — phải xử lý riêng.
+    """
+    from backend.translation.engine import clean_translation_tags
+
+    # Ca THẬT trong log: marker chưa đóng, bản dịch nằm ngay sau marker.
+    assert clean_translation_tags("<|channel>thought\nỪ.") == "Ừ."
+
+    # Kênh suy luận ĐÓNG: bỏ cả khối, giữ bản dịch phía sau.
+    assert clean_translation_tags(
+        "<|channel>thought\nNgười nói đang đồng ý.\n<channel|>\nỪ, được thôi."
+    ) == "Ừ, được thôi."
+
+    # Kênh rỗng.
+    assert clean_translation_tags("<|channel>thought\n<channel|>\nXin chào") == "Xin chào"
+
+    # Tag trần còn sót.
+    assert clean_translation_tags("Xin chào <channel|>") == "Xin chào"
+
+    # Không được ăn mất nội dung hợp lệ khi không có marker.
+    assert clean_translation_tags("Ừ, được thôi.") == "Ừ, được thôi."
+
+
 def test_gemma_strategy_supports_json_batch():
     """Pipeline B của Gemma-Sub dùng JSON giống Index-Translate (không tuần tự dây chuyền)."""
     strategy = GemmaSubPromptStrategy()
@@ -161,6 +186,16 @@ def test_gemma_batch_prompt_voi_context_va_speaker_tags():
     assert "Misaki -> Mỹ Kỳ" in prompt
 
 
+#: 4 quy tắc LÕI của prompt batch, theo ĐÚNG thứ tự. Rule phụ (glossary, ngôi 2…) được phép
+#: thêm/bớt mà không làm đỏ test này — xem `test_gemma_quy_tac_nhat_quan_dai_tu_va_chu_ngu`.
+RULES_CORE_BATCH = (
+    "keep the original segment count and order",
+    "translate every segment, never merge, split or drop segments",
+    "keep the conversational tone and the speaker's pronouns consistent across segments",
+    "if a segment omits the subject, do not invent one",
+)
+
+
 def test_gemma_quy_tac_nhat_quan_dai_tu_va_chu_ngu():
     """Quy tắc SubWave chuẩn: giữ ngữ điệu hội thoại, ngôi xưng nhất quán, không tự bịa chủ ngữ."""
     strategy = GemmaSubPromptStrategy()
@@ -172,12 +207,18 @@ def test_gemma_quy_tac_nhat_quan_dai_tu_va_chu_ngu():
     assert "STYLE: neutral." in single
 
     batch = strategy.build_batch_prompt(["Hello", "World"], "ja", "vi")
-    assert (
-        "RULES: keep the original segment count and order; "
-        "translate every segment, never merge, split or drop segments; "
-        "keep the conversational tone and the speaker's pronouns consistent across segments; "
-        "if a segment omits the subject, do not invent one."
-    ) in batch
+
+    # Không chốt cứng TOÀN BỘ chuỗi RULES: rule phụ (glossary động, ngôi 2…) hay được thêm/bớt
+    # và mỗi lần như vậy không nên làm đỏ test. Chốt phần LÕI + ĐÚNG THỨ TỰ.
+    rules = batch.split("RULES: ", 1)[1].split("\nSTYLE:", 1)[0]
+    positions = []
+    for rule in RULES_CORE_BATCH:
+        assert rule in rules, f"thiếu rule lõi: {rule!r}\nRULES thực tế: {rules!r}"
+        positions.append(rules.index(rule))
+    assert positions == sorted(positions), f"rule lõi phải giữ đúng thứ tự: {rules!r}"
+    assert rules.endswith("."), f"RULES phải kết thúc bằng dấu chấm: {rules!r}"
+    assert "; " in rules, f"các rule phải nối bằng '; ': {rules!r}"
+
     assert "STYLE: neutral." in batch
     assert "Translate only CURRENT_SOURCE. PREVIOUS_SOURCE and PREVIOUS_TRANSLATION are context only." in batch
     assert "INPUT FORMAT:" in batch
@@ -290,4 +331,23 @@ def test_engine_goi_gemma_batch_dung_mot_lan(allow_real_translation_methods, mon
     assert out == ["Xin chào", "Tạm biệt"]
     assert len(llm.prompts) == 1, "phải gọi LLM đúng MỘT lần (JSON batch), không dịch tuần tự"
     assert '"1": "Hello"' in llm.prompts[0]
+
+
+def test_engine_bo_khoi_channel_truoc_khi_parse_batch(allow_real_translation_methods, monkeypatch):
+    """Gemma 4 bọc JSON trong kênh suy luận ⇒ vẫn phải parse được, KHÔNG rơi fallback tuần tự.
+
+    Hồi quy: `_parse_batch_json` chạy trên raw sẽ bắt dấu `{` ĐẦU TIÊN — nếu phần suy luận có
+    ngoặc nhọn thì khối JSON thật bị cắt sai. Đây là lý do phải dọn tag TRƯỚC khi parse.
+    """
+    payload = (
+        "<|channel>thought\nNgười nói ngập ngừng, chỗ này có ngoặc {không phải JSON}.\n<channel|>\n"
+        '{"1": "Xin chào", "2": "Tạm biệt"}'
+    )
+    llm = _CapturingLlama(payload)
+    t = _wire_engine(monkeypatch, llm, "gemma-test", GemmaSubPromptStrategy())
+
+    out = t.translate_batch_sync(["Hello", "Bye"], "en", "vi")
+
+    assert out == ["Xin chào", "Tạm biệt"]
+    assert len(llm.prompts) == 1, "không được rơi về đường dịch tuần tự"
 
