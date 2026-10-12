@@ -71,8 +71,11 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-def _build_batch_prompt(strategy, sentences, source_lang, target_lang, *, context, use_context, terms, speaker_tags=None):
-    """Gọi `build_batch_prompt` kèm gợi ý glossary và speaker tags — chịu được strategy cũ."""
+def _build_batch_prompt(
+    strategy, sentences, source_lang, target_lang, *,
+    context, use_context, terms, speaker_tags=None, overlap_flags=None,
+):
+    """Gọi `build_batch_prompt` kèm gợi ý glossary, speaker tags và cờ chồng tiếng — chịu được strategy cũ."""
     kwargs: Dict[str, Any] = {
         "context": context,
         "use_context": use_context,
@@ -81,6 +84,8 @@ def _build_batch_prompt(strategy, sentences, source_lang, target_lang, *, contex
         kwargs["terms"] = terms
     if speaker_tags and _accepts_kwarg(strategy.build_batch_prompt, "speaker_tags"):
         kwargs["speaker_tags"] = speaker_tags
+    if overlap_flags and _accepts_kwarg(strategy.build_batch_prompt, "overlap_flags"):
+        kwargs["overlap_flags"] = overlap_flags
     return strategy.build_batch_prompt(sentences, source_lang, target_lang, **kwargs)
 
 
@@ -768,6 +773,7 @@ class GGUFTranslator(BaseTranslator):
         target_lang: str = "vi",
         context: str = "",
         speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> List[str]:
         """Dịch gộp cả danh sách câu (cho Pipeline B) qua JSON instTrans trong 1 lần gọi GPU duy nhất."""
         if not texts:
@@ -803,7 +809,8 @@ class GGUFTranslator(BaseTranslator):
         terms = get_glossary().build_hint(texts, built_cfg)
         batch_prompt = _build_batch_prompt(
             built_strategy, texts, source_lang, target_lang,
-            context=context, use_context=use_ctx, terms=terms, speaker_tags=speaker_tags,
+            context=context, use_context=use_ctx, terms=terms,
+            speaker_tags=speaker_tags, overlap_flags=overlap_flags,
         )
         kwargs = self._batch_infer_kwargs(built_key, built_cfg, built_strategy, len(texts))
 
@@ -814,7 +821,8 @@ class GGUFTranslator(BaseTranslator):
             if shared_key != built_key and hasattr(strategy, "build_batch_prompt"):
                 batch_prompt = _build_batch_prompt(
                     strategy, texts, source_lang, target_lang,
-                    context=context, use_context=use_ctx, terms=terms, speaker_tags=speaker_tags,
+                    context=context, use_context=use_ctx, terms=terms,
+                    speaker_tags=speaker_tags, overlap_flags=overlap_flags,
                 )
                 kwargs = self._batch_infer_kwargs(shared_key, cfg, strategy, len(texts))
 
@@ -900,6 +908,7 @@ class GGUFTranslator(BaseTranslator):
         target_lang: str = "vi",
         context: str = "",
         speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> List[str]:
         """Async wrapper cho translate_batch_sync chạy trên thread pool với GPU arbiter."""
         loop = asyncio.get_running_loop()
@@ -912,6 +921,7 @@ class GGUFTranslator(BaseTranslator):
             target_lang,
             context,
             speaker_tags,
+            overlap_flags,
         )
 
     # ------------------------------------------------------------------ streaming

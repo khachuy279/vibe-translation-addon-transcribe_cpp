@@ -21,7 +21,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.translation.prompts import PromptStrategy, resolve_lang_name
+from backend.translation.prompts import PromptStrategy, overlap_indices, resolve_lang_name
 from backend.utils.logger import logger
 
 # --------------------------------------------------------------------------- #
@@ -241,10 +241,12 @@ class GemmaSubPromptStrategy(PromptStrategy):
         use_context: bool = False,
         terms: str = "",
         speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> str:
         """Dựng prompt dịch GỘP (Pipeline B) dưới dạng JSON — GIỐNG Index-Translate.
 
         `format_type` chỉ giữ cho tương thích chữ ký (payload luôn là JSON object).
+        `overlap_flags` (P0.3): mục có ≥2 người nói chồng tiếng ⇒ thêm luật hẹp cho đúng các mục đó.
         """
         src_name = resolve_lang_name(source_lang)
         tgt_name = resolve_lang_name(target_lang)
@@ -259,6 +261,17 @@ class GemmaSubPromptStrategy(PromptStrategy):
         # Gợi ý glossary (tên riêng/thuật ngữ) — mỗi dòng thành một ràng buộc riêng.
         if terms and terms.strip():
             rules_list.extend(line.strip() for line in terms.splitlines() if line.strip())
+        # P0.3 — HẸP: chỉ áp cho các mục bị đánh cờ chồng tiếng, không cấm chủ thể toàn khối
+        # (xem `report/15_subject_constraint_ab`: ràng buộc toàn khối phá câu đối chứng).
+        overlap_idx = overlap_indices(overlap_flags or [])
+        if overlap_idx:
+            rules_list.append(
+                "segments "
+                + ", ".join(str(i) for i in overlap_idx[:20])
+                + " contain two or more people speaking at the same time, so their transcript mixes "
+                "voices and the speaker label shows only the dominant voice: for those segments only, "
+                "do not attribute the sentence to one subject and do not invent a subject"
+            )
 
         rules_str = "; ".join(rules_list)
         if rules_str and not rules_str.endswith("."):

@@ -674,12 +674,32 @@ class ForcedAlignerConfig(BaseModel):
 
 
 class DiarizationConfig(BaseModel):
-    """Cấu hình Speaker Diarization (Nemotron-3-Diarization GGUF qua audio.cpp native CUDA)."""
+    """Cấu hình Speaker Diarization (Nemotron-3-Diarization GGUF qua audio.cpp native CUDA).
+
+    P0.2/P0.3 (2026-10-24): ngoài việc gán nhãn cho prompt dịch, diarization còn được dùng để
+    **tách câu tại ranh giới lượt nói** và **đánh cờ chồng tiếng** — xem
+    `backend/diarization/attribution.py`.
+    """
     enabled: bool = True
     active_model: str = "nemotron-3-diarization-bf16.gguf"
     latency_profile: str = "low"
     backend: str = "cuda"
     threads: int = 4
+
+    # ── P0.2 — tách câu tại ranh giới lượt nói ────────────────────────────────────────────
+    #: Bật/tắt việc CHẺ câu theo người nói (tắt ⇒ vẫn gán nhãn + cờ chồng tiếng như P0.3).
+    split_by_speaker: bool = True
+    #: Mảnh tối thiểu (giây) và tối thiểu token để được đứng riêng. Dưới ngưỡng thì gộp vào mảnh
+    #: lân cận — model diarization có lúc "nhấp nháy" nhãn 50–500 ms giữa một mạch nói của CÙNG
+    #: một người (đo thật 2026-10-24), cắt tại đó chỉ tạo mảnh vụn.
+    split_min_sec: float = 0.7
+    split_min_words: int = 2
+
+    # ── P0.3 — cờ chồng tiếng ────────────────────────────────────────────────────────────
+    #: Đánh dấu câu có ≥2 người nói CÙNG LÚC (turns chồng nhau về thời gian).
+    overlap_flag: bool = True
+    #: Vùng chồng lấn tối thiểu (giây) để coi là chồng tiếng thật, không phải nhiễu ở mép lượt.
+    overlap_min_sec: float = 0.30
 
 
 class AppConfig(BaseModel):

@@ -52,6 +52,7 @@ thức đều không có placeholder ngôn ngữ nguồn (model tự nhận di�
 
 import json
 from typing import Any, Dict, List, Optional
+from backend.diarization.attribution import overlap_indices
 from backend.utils.logger import logger
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +111,34 @@ def _build_batch_constraints(terms: str = "") -> str:
         if stripped:
             block += f"\n- {stripped}"
     return block
+
+
+#: Ghi chú cho các mục có ≥2 NGƯỜI NÓI CHỒNG TIẾNG (P0.3 — `backend/diarization/attribution.py`).
+#:
+#: ⚠️ CHỈ áp cho ĐÚNG các mục được liệt kê, KHÔNG phải ràng buộc toàn khối. Lý do có bằng chứng:
+#: `report/15_subject_constraint_ab` kết luận ràng buộc "không tự gán chủ thể" áp TOÀN KHỐI là
+#: phản tác dụng (phá câu đối chứng `自分` → "Anh ấy"), nên nó chỉ dùng được khi CÓ BỘ PHÁT HIỆN
+#: giới hạn phạm vi. Cờ chồng tiếng chính là bộ phát hiện đó: nhãn speaker của mục bị đánh cờ chỉ
+#: là người nói NHIỀU HƠN, còn chữ trong câu là của nhiều người trộn lại.
+_OVERLAP_NOTE_HEADER = (
+    "\n\nOverlapping speech — this applies ONLY to items {items}:\n"
+    "- In those items TWO OR MORE people talk at the same time, so the transcript mixes their words "
+    "and the speaker label shows only the dominant voice.\n"
+    "- For those items only: do NOT attribute the sentence to one subject and do NOT invent a subject; "
+    "if the agent of the sentence is ambiguous, keep the translation impersonal.\n"
+    "- Every other item keeps the rules above unchanged."
+)
+
+
+def _build_overlap_note(indices: List[int]) -> str:
+    """Ghi chú hẹp cho các mục chồng tiếng; danh sách rỗng ⇒ chuỗi rỗng (không đổi prompt)."""
+    clean = [int(i) for i in (indices or []) if int(i) > 0]
+    if not clean:
+        return ""
+    items = ", ".join(str(i) for i in clean[:20])
+    if len(clean) > 20:
+        items += f", … (+{len(clean) - 20})"
+    return _OVERLAP_NOTE_HEADER.format(items=items)
 
 
 _LANG_NAME_MAP = {
@@ -186,6 +215,8 @@ class PromptStrategy:
         context: str = "",
         use_context: bool = False,
         terms: str = "",
+        speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> str:
         raise NotImplementedError
 
@@ -262,9 +293,11 @@ class PipelineAPromptStrategy(PromptStrategy):
         use_context: bool = False,
         terms: str = "",
         speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> str:
         return PipelineBPromptStrategy().build_batch_prompt(
-            sentences, source_lang, target_lang, format_type, context, use_context, terms, speaker_tags=speaker_tags
+            sentences, source_lang, target_lang, format_type, context, use_context, terms,
+            speaker_tags=speaker_tags, overlap_flags=overlap_flags,
         )
 
 
@@ -305,6 +338,7 @@ class PipelineBPromptStrategy(PromptStrategy):
         use_context: bool = False,
         terms: str = "",
         speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> str:
         tgt = resolve_lang_name(target_lang)
         if speaker_tags and len(speaker_tags) == len(sentences):
@@ -325,6 +359,10 @@ class PipelineBPromptStrategy(PromptStrategy):
         # Khối ràng buộc đứng SAU payload (recency). `terms` rỗng ⇒ khối vẫn có, chỉ thiếu
         # dòng glossary — ràng buộc đại từ và "chỉ trả JSON" luôn được áp.
         instruction += _build_batch_constraints(terms)
+
+        # P0.3: ghi chú HẸP cho đúng các mục có người nói chồng tiếng (rỗng ⇒ không đổi prompt).
+        if overlap_flags:
+            instruction += _build_overlap_note(overlap_indices(overlap_flags))
 
         user_content = instruction
         if context and use_context:

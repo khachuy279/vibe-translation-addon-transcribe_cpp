@@ -54,7 +54,7 @@ PIPELINE B — Lookahead + OFFLINE_BATCH (video VoD / YouTube / phim)      độ
 | **Thu âm** | Web Audio Capture từ tab | Chặn phân đoạn MediaSource (MSE) vào RAM |
 | **Đầu vào ASR** | Cửa sổ nhỏ theo VAD | **Trọn khối 12–30 s** ⇒ ngữ cảnh đầy đủ, WER/CER thấp hơn |
 | **Tách câu** | VAD Silence › Max Duration › Stable Prefix › Timeout Force | Dấu câu của ASR + mốc từng từ của Forced Aligner |
-| **Phân vai nói** | Không | **Nemotron-3-Diarization** gán nhãn từng câu nói |
+| **Phân vai nói** | Không | **Nemotron-3-Diarization** gán nhãn từng câu nói, **tách câu theo người nói** và đánh dấu câu chồng tiếng |
 | **Độ trễ** | ~0.8–1.5 s (chờ âm thanh thật) | **0.0 s** — phụ đề hiện ngay lúc nói |
 | **Tua (seek)** | Xoá buffer, mất ngữ cảnh | Lấy ngay audio tại mốc tua từ RAM; đổi thế hệ seek nguyên tử |
 | **Bật/tắt** | Tắt *Lookahead Video Buffering*, hoặc fallback tự động | Bật *Lookahead Video Buffering* (**mặc định**) |
@@ -64,7 +64,7 @@ PIPELINE B — Lookahead + OFFLINE_BATCH (video VoD / YouTube / phim)      độ
 ## Tính năng Nổi bật
 
 - **Phụ đề song ngữ 0.0s** — bản dịch hiện song song theo câu trọn vẹn, căn đúng mốc thời gian video.
-- **Nhận diện người nói (Speaker Diarization)** — tích hợp SOTA **Nemotron-3-Diarization** (NVIDIA), tự động phân tách tới 8 người nói (`speaker 1`, `speaker 2`...) giúp LLM dịch xưng hô chuẩn xác và giải quyết triệt để lỗi mất chủ ngữ trong hội thoại.
+- **Nhận diện người nói (Speaker Diarization)** — tích hợp SOTA **Nemotron-3-Diarization** (NVIDIA), tự động phân tách tới 8 người nói (`speaker 1`, `speaker 2`...) giúp LLM dịch xưng hô chuẩn xác và giải quyết triệt để lỗi mất chủ ngữ trong hội thoại. Câu vắt qua ranh giới **đổi người nói được TÁCH thành từng phụ đề riêng** theo mốc từng từ của Forced Aligner, và câu có **người nói chồng tiếng** được đánh dấu để bản dịch không tự gán chủ ngữ (chỉ thị hẹp cho đúng các câu đó).
 - **Tua an toàn tuyệt đối** — audio nằm trong RAM, tua tới/lui đều có ngay; tự dừng video khi chạm mốc chưa xử lý.
 - **Dịch theo ngữ cảnh 2 chiều** — kế thừa câu trước và câu sau, dịch dạng JSON cấu trúc cao cấp.
 - **Lồng tiếng (TTS)** — OmniVoice GGUF native, voice-cloning, nén WSOLA, auto-ducking.

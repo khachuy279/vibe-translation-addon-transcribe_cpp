@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import struct
 import time
@@ -73,7 +74,7 @@ from backend.asr.forced_aligner import (
 )
 from backend.core.vad_silence import VADSilenceScanner, find_silence_gaps_streaming
 from backend.vad.engines import VADEngineFactory
-from backend.diarization import DiarizationService, assign_speakers_to_subtitles
+from backend.diarization import DiarizationService, attribute_sentences, realign_attribution
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import (
     SessionConfigPayload,
@@ -105,6 +106,23 @@ _FRONTIER_BEHIND_RESYNC_SEC = 20.0
 #: ích (bộ cắt khối cần ≥ 2,5 s cho cả chế độ bootstrap lẫn nhánh khẩn cấp) ⇒ nhảy tới đoạn kế
 #: nếu có (xem `_nudge_cursor_out_of_gap`).
 _MIN_USEFUL_AUDIO_SEC = 2.5
+
+
+def _call_with_supported_kwargs(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Gọi `fn` với các keyword NÓ THẬT SỰ nhận (bỏ phần còn lại).
+
+    VÌ SAO CẦN: `_translate_batch` phải chạy được với cả engine mới (nhận `overlap_flags`) lẫn
+    engine cũ / bản giả trong test (chỉ nhận `context`). Cách cũ là `try/except TypeError` lồng
+    nhau — cách đó nuốt luôn TypeError phát sinh BÊN TRONG lượt dịch rồi chạy lại, vừa tốn GPU
+    vừa che mất lỗi thật. Ở đây lọc theo chữ ký trước khi gọi.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # callable dựng bằng C / không introspection được
+        return fn(*args, **kwargs)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fn(*args, **kwargs)
+    return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
 
 
 def _pack_binary_frame(header: Dict[str, Any], payload: bytes) -> bytes:
@@ -1670,6 +1688,14 @@ class LookaheadSessionState:
                     extra={"module_tag": "ASR"},
                 )
 
+            # ── Bước 2F: GÁN NGƯỜI NÓI + TÁCH CÂU TẠI RANH GIỚI LƯỢT NÓI (P0.2) + CỜ CHỒNG TIẾNG (P0.3)
+            #
+            # PHẢI chạy TRƯỚC `split_oversized_sentences`: lớp đó BỎ `words` (chỉ chia thời gian
+            # theo tỉ lệ độ dài văn bản — xem chú thích ở Bước 2E-ter), mà P0.2 cần mốc TỪNG TỪ để
+            # cắt đúng chỗ đổi người nói. Đây cũng là lý do bước này nằm ở đây chứ không nằm cạnh
+            # khối dịch như bản cũ (bản cũ chạy SAU khi đã lọc `candidate_subs`).
+            subtitles, speaker_pieces = await self._attribute_speakers(subtitles, chunk)
+
             # LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
             # câu hiện thành MỘT phụ đề dài khi aligner trả một item duy nhất).
             subtitles = ForcedAlignerService.split_oversized_sentences(
@@ -1678,6 +1704,9 @@ class LookaheadSessionState:
                 max_chars=int(self._batch_sub_opts.get("sentence_max_chars", 160) or 160),
                 max_words=int(self._batch_sub_opts.get("sentence_max_words", 24) or 24),
             )
+
+            # Lớp trên có thể chẻ thêm câu ⇒ gán lại nhãn/cờ THEO THỜI GIAN (không theo chỉ số).
+            speaker_tags_all, overlap_flags_all = realign_attribution(subtitles, speaker_pieces)
 
             # CHẨN ĐOÁN: đây là text THẬT SỰ được gửi đi (khác `clean_text` của ASR). Không có log
             # này thì không thể biết vì sao phụ đề hiển thị khác bản phiên âm offline — đúng sự cố
@@ -1735,30 +1764,20 @@ class LookaheadSessionState:
                 recent_ctx_list.reverse()
             batch_context = "\n".join(recent_ctx_list)
 
-            # Bước 2F: Tách người nói (Speaker Diarization) bằng Nemotron-3-Diarization
-            speaker_tags: Optional[List[str]] = None
-            diar_cfg = getattr(config, "diarization", None)
-            if diar_cfg and getattr(diar_cfg, "enabled", True) and len(candidate_subs) >= 2:
-                try:
-                    t_diar0 = time.perf_counter()
-                    turns = await DiarizationService.diarize_chunk(chunk.pcm, sample_rate=16000)
-                    if turns:
-                        sub_spans = [(sub.start_time, sub.end_time) for _, sub, _, _ in candidate_subs]
-                        speaker_tags = assign_speakers_to_subtitles(sub_spans, turns, sample_rate=16000)
-                        diar_ms = (time.perf_counter() - t_diar0) * 1000.0
-                        # Log thông tin speaker nhận diện được
-                        spk_preview = " ⏐ ".join(f'"{s}: {sub.text[:20]}"' for s, (_, sub, _, _) in zip(speaker_tags[:10], candidate_subs[:10]))
-                        logger.info(
-                            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms): {spk_preview}",
-                            extra={"module_tag": "DIAR"},
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Diarization thất bại, tiếp tục dịch bình thường: {exc}", extra={"module_tag": "DIAR"})
-                    speaker_tags = None
+            # Nhãn người nói + cờ chồng tiếng cho ĐÚNG các câu sắp dịch (đã lọc theo playhead).
+            # Chỉ truyền `speaker_tags` khi thật sự có nhãn: nếu không, giữ nguyên payload JSON cũ
+            # (không lồng speaker) để không đổi hành vi khi diarization tắt/lỗi.
+            cand_tags = [speaker_tags_all[idx] for idx, _, _, _ in candidate_subs]
+            cand_overlaps = [overlap_flags_all[idx] for idx, _, _, _ in candidate_subs]
+            speaker_tags: Optional[List[str]] = cand_tags if any(cand_tags) else None
+            overlap_flags: Optional[List[bool]] = cand_overlaps if any(cand_overlaps) else None
 
             t_tr = time.perf_counter()
             translated_texts = await self._translate_batch(
-                candidate_texts, context=batch_context, speaker_tags=speaker_tags
+                candidate_texts,
+                context=batch_context,
+                speaker_tags=speaker_tags,
+                overlap_flags=overlap_flags,
             )
             tr_ms = (time.perf_counter() - t_tr) * 1000.0
 
@@ -2080,13 +2099,102 @@ class LookaheadSessionState:
                 except Exception:  # noqa: BLE001
                     pass
 
+    async def _attribute_speakers(
+        self,
+        subtitles: List[SubtitleSentence],
+        chunk: Any,
+    ) -> Tuple[List[SubtitleSentence], List[Any]]:
+        """Chạy Nemotron-3-Diarization cho khối rồi TÁCH CÂU theo lượt nói (P0.2) + cờ chồng tiếng (P0.3).
+
+        Trả về `(subtitles_mới, pieces)`:
+          * `subtitles_mới` — danh sách câu ĐÃ CHẺ theo ranh giới người nói (giữ nguyên `words`).
+          * `pieces` — kết quả gán nhãn (`SpeakerPiece`) để `realign_attribution()` gán lại nhãn nếu
+            các lớp ngắt câu phía sau chẻ tiếp.
+
+        Không có diarization (tắt/lỗi/không có turns) ⇒ trả `(subtitles, [])` — hành vi y hệt trước
+        khi có P0.2/P0.3. Mọi lỗi đều được nuốt: dịch phụ đề KHÔNG bao giờ được chết vì diarization.
+        """
+        empty_pieces: List[Any] = []
+        diar_cfg = getattr(config, "diarization", None)
+        if not subtitles or not diar_cfg or not getattr(diar_cfg, "enabled", True):
+            return subtitles, empty_pieces
+
+        # Cổng chi phí: mỗi lượt gọi diarization tốn ~0,6–1,2 s GPU (đo thật 2026-10-24) và chạy
+        # chung VRAM với ASR/LLM/TTS. Khối không có từ nào (aligner lỗi) thì không thể chẻ câu.
+        total_words = sum(len(getattr(s, "words", None) or []) for s in subtitles)
+        if total_words < 2:
+            return subtitles, empty_pieces
+
+        try:
+            t_diar0 = time.perf_counter()
+            turns = await DiarizationService.diarize_chunk(chunk.pcm, sample_rate=16000)
+            diar_ms = (time.perf_counter() - t_diar0) * 1000.0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Diarization thất bại, tiếp tục dịch bình thường: {exc}",
+                extra={"module_tag": "DIAR"},
+            )
+            return subtitles, empty_pieces
+
+        if not turns:
+            return subtitles, empty_pieces
+
+        try:
+            pieces = attribute_sentences(
+                subtitles,
+                turns,
+                sample_rate=16000,
+                split=bool(getattr(diar_cfg, "split_by_speaker", True)),
+                split_min_sec=float(getattr(diar_cfg, "split_min_sec", 0.7) or 0.0),
+                split_min_words=int(getattr(diar_cfg, "split_min_words", 2) or 0),
+                # `overlap_flag=False` ⇒ ép ngưỡng lên vô cực để không mục nào bị đánh cờ.
+                overlap_min_sec=(
+                    float(getattr(diar_cfg, "overlap_min_sec", 0.30) or 0.0)
+                    if bool(getattr(diar_cfg, "overlap_flag", True))
+                    else float("inf")
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Tách câu theo người nói lỗi, giữ nguyên câu ASR: {exc}",
+                extra={"module_tag": "DIAR"},
+            )
+            return subtitles, empty_pieces
+
+        new_subtitles = [
+            SubtitleSentence(
+                text=p.text,
+                start_time=p.start_time,
+                end_time=p.end_time,
+                words=list(p.words),
+            )
+            for p in pieces
+        ]
+        n_split = max(0, len(new_subtitles) - len(subtitles))
+        n_overlap = sum(1 for p in pieces if p.overlap)
+        #: Danh sách "speaker N: đoạn text" để đọc log — giới hạn 10 mục như bản cũ.
+        spk_preview = " ⏐ ".join(
+            f'{p.speaker or "?"}: {p.text[:20]}' for p in pieces[:10]
+        )
+        logger.info(
+            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms): "
+            f"tách câu +{n_split} phụ đề, chồng tiếng {n_overlap}/{len(pieces)} mục: {spk_preview}",
+            extra={"module_tag": "DIAR"},
+        )
+        return new_subtitles, pieces
+
     async def _translate_batch(
         self,
         texts: List[str],
         context: str = "",
         speaker_tags: Optional[List[str]] = None,
+        overlap_flags: Optional[List[bool]] = None,
     ) -> List[str]:
-        """Dịch gộp cả khối câu phụ đề qua Batch Context Translation (Pipeline B)."""
+        """Dịch gộp cả khối câu phụ đề qua Batch Context Translation (Pipeline B).
+
+        `overlap_flags` (P0.3): đánh dấu mục có ≥2 người nói chồng tiếng ⇒ prompt chỉ thị riêng cho
+        ĐÚNG các mục đó (không cấm chủ thể trên toàn khối — xem `report/15_subject_constraint_ab`).
+        """
         if not texts:
             return []
         engine = self.translation_engine
@@ -2094,15 +2202,18 @@ class LookaheadSessionState:
             return list(texts)
         try:
             if hasattr(engine, "translate_batch"):
-                try:
-                    return await engine.translate_batch(
-                        texts, self.source_lang, self.target_lang, context=context, speaker_tags=speaker_tags
-                    )
-                except TypeError:
-                    try:
-                        return await engine.translate_batch(texts, self.source_lang, self.target_lang, context=context)
-                    except TypeError:
-                        return await engine.translate_batch(texts, self.source_lang, self.target_lang)
+                # Lọc keyword theo CHỮ KÝ THẬT của engine (engine cũ / bản giả trong test có thể
+                # không nhận `overlap_flags`/`speaker_tags`). Lọc bằng `inspect` thay vì
+                # try/except TypeError để KHÔNG nuốt TypeError phát sinh BÊN TRONG lượt dịch.
+                return await _call_with_supported_kwargs(
+                    engine.translate_batch,
+                    texts,
+                    self.source_lang,
+                    self.target_lang,
+                    context=context,
+                    speaker_tags=speaker_tags,
+                    overlap_flags=overlap_flags,
+                )
             # Fallback nếu engine không có translate_batch
             results = []
             for t in texts:

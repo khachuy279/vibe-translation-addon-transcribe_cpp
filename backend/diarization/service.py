@@ -262,6 +262,11 @@ def assign_speakers_to_subtitles(
 ) -> List[str]:
     """Gán nhãn speaker ('speaker 1', 'speaker 2', ...) cho từng câu phụ đề [start_sec, end_sec].
 
+    ⚠️ GIỮ LẠI CHO TƯƠNG THÍCH (2026-10-24): handler Pipeline B KHÔNG còn dùng hàm này — nó dùng
+    `attribution.attribute_sentences()`, bản CHẺ câu tại ranh giới lượt nói (P0.2) và đánh cờ
+    chồng tiếng (P0.3). Hàm này chỉ gán MỘT nhãn cho MỘT câu (theo overlap lớn nhất) nên gán sai
+    vai cho nửa sau của câu vắt qua hai người nói.
+
     Thuật toán:
     1. Đo thời gian overlap giữa câu phụ đề và các turn nói của từng speaker.
     2. Speaker có thời lượng overlap lớn nhất trong câu sẽ được chọn.
