@@ -14,7 +14,7 @@ trong `__init__` này thì MỌI `from backend.core.<bất kỳ> import ...` —
 buộc phải có `av` cài đặt. Tên lười chỉ được nạp khi thật sự truy cập
 (`from backend.core import StreamDemuxer`).
 
-Các module chỉ dùng qua đường dẫn đầy đủ (không export ở đây): `gpu_scheduler`, `hypothesis`,
+Các module chỉ dùng qua đường dẫn đầy đủ (không export ở đây): `gpu_scheduler`,
 `heartbeat`. Dùng `from backend.core.gpu_scheduler import gpu_arbiter` như trước.
 """
 

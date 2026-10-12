@@ -255,3 +255,89 @@ def test_hyphenated_compound_words_are_not_split():
     assert any("deep-cycle" in t for t in sub_texts)
     assert any("sixty-one" in t for t in sub_texts)
 
+
+# ── Hồi quy 2026-10-12: Lớp 3 không chẻ vụn câu có dấu câu ở giữa hoặc câu ngắn ──────────
+
+
+def test_pause_split_khong_che_vun_cau_co_dau_cau_o_giua_hoac_ngan():
+    """HỒI QUY 2026-10-12: ASR trả về câu bình thường có dấu câu ở giữa hoặc câu ngắn
+    ⇒ Lớp 3 (split_subtitles_by_pause) KHÔNG ĐƯỢC chẻ vụn.
+
+    Ca thật trong log người dùng:
+      'あ、本当申し訳ない。ま、私は妻があれば別に大丈夫ですよ。'
+      trước Lớp 3: 2 câu đẹp
+      Lớp 3 cũ: chẻ thành 5 mảnh vụn:
+        "あ、本当" ⏐ "申し訳ない。" ⏐ "ま、私は" ⏐ "妻があれば" ⏐ "別に大丈夫ですよ。"
+    """
+    # Câu 1: "あ、本当申し訳ない。" (10 ký tự, có dấu '、' ở giữa)
+    w1 = [
+        AlignedWord("あ、", 0.0, 0.3),
+        AlignedWord("本当", 0.3, 0.8),
+        # Khe 0.5 s giữa '本当' và '申し訳ない。'
+        AlignedWord("申し訳ない。", 1.3, 2.0),
+    ]
+    sub1 = SubtitleSentence(text="あ、本当申し訳ない。", start_time=0.0, end_time=2.0, words=w1)
+
+    # Câu 2: "ま、私は妻があれば別に大丈夫ですよ。" (18 ký tự, có dấu '、' ở giữa)
+    w2 = [
+        AlignedWord("ま、", 2.1, 2.4),
+        AlignedWord("私は", 2.4, 2.8),
+        # Khe 0.45 s
+        AlignedWord("妻があれば", 3.25, 3.8),
+        # Khe 0.5 s
+        AlignedWord("別に大丈夫ですよ。", 4.3, 5.2),
+    ]
+    sub2 = SubtitleSentence(
+        text="ま、私は妻があれば別に大丈夫ですよ。", start_time=2.1, end_time=5.2, words=w2
+    )
+
+    stats: dict = {}
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub1, sub2],
+        silences=None,
+        min_pause_ms=350.0,
+        language="Japanese",
+        stats=stats,
+    )
+
+    # Giữ NGUYÊN 2 câu, KHÔNG chẻ thành 5 mảnh!
+    assert len(out) == 2, f"Bị chẻ thành {len(out)} phụ đề: {[s.text for s in out]}"
+    assert [s.text for s in out] == [
+        "あ、本当申し訳ない。",
+        "ま、私は妻があれば別に大丈夫ですよ。",
+    ]
+    assert stats["accepted"] == 0
+
+
+def test_pause_split_khong_che_cau_ngan_khong_dau_cau():
+    """Câu ngắn (< min_chars = 20) dù KHÔNG có dấu câu cũng KHÔNG được chẻ vụn."""
+    words = [
+        AlignedWord("妻があれば", 0.0, 0.5),
+        # Khe 0.6 s
+        AlignedWord("大丈夫ですよ", 1.1, 1.8),
+    ]
+    sub = SubtitleSentence(text="妻があれば大丈夫ですよ", start_time=0.0, end_time=1.8, words=words)
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=None, min_pause_ms=350.0, min_chars=20, language="Japanese"
+    )
+    assert len(out) == 1
+    assert out[0].text == "妻があれば大丈夫ですよ"
+
+
+def test_pause_split_khong_che_cau_tieng_anh_co_dau_phay_o_giua():
+    """Tiếng Anh: câu có dấu phẩy ở giữa (Well, this is fine) ⇒ KHÔNG chẻ bằng pause."""
+    words = [
+        AlignedWord("Well,", 0.0, 0.4),
+        # Khe 0.6 s
+        AlignedWord("this", 1.0, 1.3),
+        AlignedWord("is", 1.3, 1.5),
+        AlignedWord("fine.", 1.5, 1.9),
+    ]
+    sub = SubtitleSentence(text="Well, this is fine.", start_time=0.0, end_time=1.9, words=words)
+    out = ForcedAlignerService.split_subtitles_by_pause(
+        [sub], silences=None, min_pause_ms=350.0, min_words=6, language="English"
+    )
+    assert len(out) == 1
+    assert out[0].text == "Well, this is fine."
+
+

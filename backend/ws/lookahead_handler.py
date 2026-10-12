@@ -60,6 +60,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from backend.config import config
 from backend.core.dedup import CommitDeduplicator, normalize_for_dedup
+from backend.core.normalizer import SpeechNormalizer
 from backend.core.lookahead_chunker import LookaheadChunker
 from backend.core.lookahead_timeline import ContinuousAudioTimeline
 from backend.core.metrics import metrics_collector
@@ -223,6 +224,7 @@ class LookaheadSessionState:
             vad_silence_ms=float(getattr(la, "batch_vad_silence_ms", 1500.0)),
             max_audio_sec=float(getattr(la, "batch_max_audio_sec", 45.0)),
         )
+        self.normalizer = SpeechNormalizer.from_config(config.asr)
         #: Trần gom câu phụ đề của tuyến batch (popup có thể thu hẹp qua `min_words_to_commit`).
         self._batch_sub_opts: Dict[str, Any] = {
             "max_words": int(getattr(la, "batch_sub_max_words", 10)),
@@ -969,11 +971,18 @@ class LookaheadSessionState:
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"Prewarm Aligner lỗi (bỏ qua): {exc}", extra={"module_tag": "ASR"})
 
-    def _run_asr_block(self, pcm: np.ndarray, lang: str) -> str:
+    def _run_asr_block(self, pcm: np.ndarray, lang: str, normalize: bool = False) -> str:
         if self.asr_engine is None:
             return ""
         if hasattr(self.asr_engine, "transcribe_block"):
-            return self.asr_engine.transcribe_block(pcm, language=lang if lang != "auto" else None)
+            try:
+                return self.asr_engine.transcribe_block(
+                    pcm, language=lang if lang != "auto" else None, normalize=normalize
+                )
+            except TypeError:
+                return self.asr_engine.transcribe_block(
+                    pcm, language=lang if lang != "auto" else None
+                )
         return ""
 
     def _commit_batch_progress(
@@ -1389,10 +1398,23 @@ class LookaheadSessionState:
                     self._nudge_cursor_out_of_gap(from_pts)
                 continue
 
-            # Bước 2A: ASR Offline Block Decoding
+            # Bước 2A: Chuẩn hóa âm lượng & ASR Offline Block Decoding
+            if bool(getattr(config.asr, "normalize_speech", True)):
+                norm_res = self.normalizer.normalize(chunk.pcm)
+                if norm_res.is_modified:
+                    chunk.pcm = norm_res.audio
+                    if bool(getattr(config.asr, "normalize_log_stats", True)):
+                        logger.info(
+                            f"[NORM] Chuẩn hóa âm lượng (Pipeline B): gain={norm_res.applied_gain:.2f}x "
+                            f"(RMS {norm_res.original_rms:.3f}) khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s]",
+                            extra={"module_tag": "ASR"},
+                        )
+
             t_asr = time.perf_counter()
             try:
-                raw_text = await asyncio.to_thread(self._run_asr_block, chunk.pcm, self.source_lang)
+                raw_text = await asyncio.to_thread(
+                    self._run_asr_block, chunk.pcm, self.source_lang, False
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Lỗi ASR offline block: {exc}", extra={"module_tag": "ASR"})
                 raw_text = ""
@@ -1552,6 +1574,8 @@ class LookaheadSessionState:
                 # ⇒ dùng FIRERED (engine mặc định của dự án) ở 150 ms.
                 vad_ms = float(getattr(config.lookahead, "batch_sub_pause_vad_ms", 150.0) or 0.0)
                 min_tokens = int(getattr(config.lookahead, "batch_sub_pause_min_tokens", 3) or 3)
+                pause_min_chars = int(getattr(config.lookahead, "batch_sub_pause_min_chars", 20) or 20)
+                pause_min_words = int(getattr(config.lookahead, "batch_sub_pause_min_words", 6) or 6)
                 silences: Optional[List[Tuple[float, float]]] = None
                 #: off | skipped | firered | silero | empty | error | khe-từ
                 vad_state = "off"
@@ -1560,8 +1584,13 @@ class LookaheadSessionState:
                 # chỉ quét khi thật sự có khe cần xác nhận. Phần lớn khối không có khe nào.
                 pre_stats: Dict[str, int] = {}
                 ForcedAlignerService.split_subtitles_by_pause(
-                    subtitles, min_pause_ms=pause_ms, language=align_lang,
-                    stats=pre_stats, dry_run=True,
+                    subtitles,
+                    min_pause_ms=pause_ms,
+                    language=align_lang,
+                    min_chars=pause_min_chars,
+                    min_words=pause_min_words,
+                    stats=pre_stats,
+                    dry_run=True,
                 )
                 has_candidates = pre_stats.get("candidates", 0) > 0
 
@@ -1625,6 +1654,8 @@ class LookaheadSessionState:
                     min_pause_ms=pause_ms,
                     min_tokens=min_tokens,
                     language=align_lang,
+                    min_chars=pause_min_chars,
+                    min_words=pause_min_words,
                     stats=pause_stats,
                 )
                 # LUÔN log quyết định của lớp này: không có dòng này thì "không tách" hoàn toàn im
@@ -1689,17 +1720,19 @@ class LookaheadSessionState:
             # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu (kèm ngữ cảnh các câu gần nhất sạch ảo giác)
             candidate_texts = [sub.text for _, sub, _, _ in candidate_subs]
             recent_ctx_list = []
-            for u in reversed(self._recent_utterances[-8:]):
-                orig = (u.get("text") or "").strip()
-                trans = (u.get("translated") or "").strip()
-                if not orig or is_repetition_hallucination(orig, min_reps=3):
-                    continue
-                if trans and is_repetition_hallucination(trans, min_reps=3):
-                    continue
-                recent_ctx_list.append(f"{orig} -> {trans}" if trans else orig)
-                if len(recent_ctx_list) >= 2:
-                    break
-            recent_ctx_list.reverse()
+            if bool(getattr(config.translation, "use_context", True)):
+                ctx_limit = max(1, int(getattr(config.translation, "context_window", 3) or 3))
+                for u in reversed(self._recent_utterances[-8:]):
+                    orig = (u.get("text") or "").strip()
+                    trans = (u.get("translated") or "").strip()
+                    if not orig or is_repetition_hallucination(orig, min_reps=3):
+                        continue
+                    if trans and is_repetition_hallucination(trans, min_reps=3):
+                        continue
+                    recent_ctx_list.append(f"{orig} -> {trans}" if trans else orig)
+                    if len(recent_ctx_list) >= ctx_limit:
+                        break
+                recent_ctx_list.reverse()
             batch_context = "\n".join(recent_ctx_list)
 
             # Bước 2F: Tách người nói (Speaker Diarization) bằng Nemotron-3-Diarization

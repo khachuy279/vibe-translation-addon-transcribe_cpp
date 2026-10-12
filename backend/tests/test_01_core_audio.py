@@ -322,3 +322,59 @@ def test_performance_benchmark_and_generate_report(wav_test_dir, report_dir):
     logger.info(f"📊 [REPORT GENERATED] Đã lưu báo cáo Phase 1 vào: {report_file}")
     
     assert report_file.exists()
+
+
+def test_speech_normalization_logging_pipeline_a_and_b(caplog):
+    """Kiểm tra log Speech Normalization được kích hoạt trên cả Pipeline A và Pipeline B."""
+    import logging
+    from unittest.mock import MagicMock
+    from backend.asr.engine import TranscribeEngine
+    from backend.core.lookahead_chunker import ChunkSlice
+
+    # 1. Pipeline A test: _run_inference_sync với audio cần boost âm lượng
+    engine = TranscribeEngine(model_key="test_mock")
+    engine._ensure_model_loaded = MagicMock()
+    quiet_audio = (np.sin(np.linspace(0, 100, 16000, dtype=np.float32)) * 0.04).astype(np.float32)
+
+    fake_session = MagicMock()
+    fake_res = MagicMock()
+    fake_res.text = "Xin chào"
+    fake_session.run.return_value = fake_res
+    orig_session = TranscribeEngine._shared_session
+    TranscribeEngine._shared_session = fake_session
+    try:
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            engine.transcribe_block(quiet_audio, normalize=True)
+            norm_logs_a = [rec.message for rec in caplog.records if "[NORM]" in rec.message and "Pipeline A" in rec.message]
+            assert len(norm_logs_a) >= 1
+            assert "gain=" in norm_logs_a[0]
+            assert "[utt=" in norm_logs_a[0]
+    finally:
+        TranscribeEngine._shared_session = orig_session
+
+    # 2. Pipeline B test: chuẩn hóa khối batch chunk.pcm
+    normalizer = SpeechNormalizer.from_config(config.asr)
+    chunk = ChunkSlice(
+        pts_start=10.0,
+        pts_end=20.0,
+        pcm=quiet_audio.copy(),
+        is_silence_boundary=True,
+        fallback_mode="vad_silence",
+        next_read_pts=20.0,
+    )
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        res = normalizer.normalize(chunk.pcm)
+        if res.is_modified:
+            chunk.pcm = res.audio
+            logger.info(
+                f"[NORM] Chuẩn hóa âm lượng (Pipeline B): gain={res.applied_gain:.2f}x "
+                f"(RMS {res.original_rms:.3f}) khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s]",
+                extra={"module_tag": "ASR"},
+            )
+        norm_logs_b = [rec.message for rec in caplog.records if "[NORM]" in rec.message and "Pipeline B" in rec.message]
+        assert len(norm_logs_b) == 1
+        assert "gain=" in norm_logs_b[0]
+        assert "khối [10.00s -> 20.00s]" in norm_logs_b[0]
+

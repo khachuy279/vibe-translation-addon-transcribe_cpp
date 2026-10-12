@@ -102,7 +102,7 @@ def detect_aligner_language_from_text(text: str) -> Optional[str]:
     """
     if not text:
         return None
-    kana = hangul = han = 0
+    kana = hangul = han = cyrillic = 0
     for ch in text:
         cp = ord(ch)
         if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF:
@@ -111,12 +111,16 @@ def detect_aligner_language_from_text(text: str) -> Optional[str]:
             hangul += 1
         elif 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF or 0xF900 <= cp <= 0xFAFF:
             han += 1
-    if hangul:
-        return "Korean"
+        elif 0x0400 <= cp <= 0x04FF:
+            cyrillic += 1
     if kana:
         return "Japanese"
+    if hangul:
+        return "Korean"
     if han:
         return "Chinese"
+    if cyrillic:
+        return "Russian"
     return None
 
 
@@ -318,6 +322,32 @@ class SubtitleSentence:
 
 
 MODELS_DIR = REPO_ROOT / "backend" / "models"
+
+
+def _has_internal_punctuation(text: str) -> bool:
+    """Kiểm tra câu có chứa dấu ngắt câu / dấu câu ở giữa hay không.
+
+    Bỏ qua:
+      - Dấu mở ngoặc/nháy ở đầu câu (`「『（([{〈《"'“‘`).
+      - Dấu kết câu và ngoặc/nháy đóng ở đuôi câu (`。！？!?…；;.,:：!?-—」』）)]}〉》"'”’\n `).
+      - Dấu chấm/phẩy/hai chấm giữa các chữ số (ví dụ: `3.9`, `1,000`, `10:30`).
+      - Dấu chấm đi liền sau từ viết tắt (ví dụ: `Dr.`, `Mr.`).
+    """
+    if not text:
+        return False
+    _closing_punct = "。！？!?…；;.,:：!?-—」』）)]}〉》\"'”’\n "
+    _opening_punct = "「『（([{〈《\"'“‘\n "
+    inner = text.strip().rstrip(_closing_punct).lstrip(_opening_punct).strip()
+    if not inner:
+        return False
+    pattern = r"[、，;；:：—–。！？!?…\n]|(?<!\d),(?!\d)|(?<!\d)\.(?!\d)|(?<!\d):(?!\d)"
+    for match in re.finditer(pattern, inner):
+        if match.group() == ".":
+            prefix = inner[: match.start() + 1]
+            if _ends_with_abbreviation(prefix):
+                continue
+        return True
+    return False
 
 
 class ForcedAlignerService:
@@ -630,7 +660,7 @@ class ForcedAlignerService:
             return []
 
         n = len(aligned_items)
-        is_cjk = language.lower() in ("chinese", "japanese", "korean")
+        is_cjk = _is_cjk_language(language)
         sentence_end_punct = {".", "?", "!", "。", "？", "！", "\n"}
         clause_punct = {",", "、", ";", "；", "—", "-"}
 
@@ -1000,8 +1030,10 @@ class ForcedAlignerService:
         *,
         min_pause_ms: float = 350.0,
         min_tokens: int = 3,
-        language: str = "Japanese",
+        language: str = "English",
         tolerance_sec: float = 0.12,
+        min_chars: int = 20,
+        min_words: int = 6,
         stats: Optional[Dict[str, int]] = None,
         dry_run: bool = False,
     ) -> List[SubtitleSentence]:
@@ -1012,10 +1044,13 @@ class ForcedAlignerService:
 
             "じゃステージランドよよし次こそ勝つぞあらあら楽しそうねこれいただき物だけどよかったらどうぞうまそう。"
 
-        Các lớp hiện có đều bó tay: `group_words_to_subtitles` chỉ ngắt theo dấu câu, bộ tách theo
-        dấu phẩy cần `、`/`,`. `split_oversized_sentences` chỉ cắt CỨNG theo trần ký tự/từ nên mảnh
-        cắt ra không trùng ranh giới người nói. Hệ quả: một phụ đề dài trộn 2–3 lượt lời, dịch ra
-        cũng trộn, và gán speaker (Nemotron) chỉ còn một nhãn cho cả câu.
+        RÀNG BUỘC KÍCH HOẠT (chống chẻ vụn câu, cập nhật 2026-10-12):
+        Lớp này CHỈ kích hoạt cho câu khi thỏa mãn đồng thời:
+          1. ASR trả về CÂU RẤT DÀI: CJK >= min_chars (mặc định 20 ký tự), Latinh >= min_words (mặc định 6 từ).
+             Các câu ngắn/vừa phải được giữ nguyên vẹn.
+          2. KHÔNG CÓ DẤU CÂU Ở GIỮA (`not _has_internal_punctuation`): nếu câu đã có dấu ngắt câu/vế
+             ở giữa (như `、`, `,`), hoặc đã kết câu ở cuối, thì giữ nguyên câu cho các lớp dấu câu
+             xử lý, không chẻ vụn tại các khe ngập ngừng nói.
 
         CÁCH LÀM: dựa trên mốc từ của Forced Aligner, tách tại KHE giữa hai từ liên tiếp
         (`gap = words[i].start_time - words[i-1].end_time`). Khi có `silences` (danh sách khoảng
@@ -1027,15 +1062,6 @@ class ForcedAlignerService:
         không thì BỎ QUA điểm tách đó (thà giữ một câu hơi dài còn hơn tạo mảnh cụt 1–2 ký tự).
 
         Chỉ áp dụng cho câu CÒN `words` (chưa qua `split_oversized_sentences` — hàm đó bỏ mốc từ).
-
-        `stats` (tuỳ chọn) được điền để CHẨN ĐOÁN: `sentences_in`, `sentences_out`, `candidates`
-        (số khe ≥ ngưỡng), `vad_confirmed` (số khe nằm trong khoảng lặng VAD), `accepted` (số điểm
-        tách thực sự dùng). Caller log từ đây — nếu không có số này thì "không tách" hoàn toàn im
-        lặng, đúng cái bẫy đã gặp ngày 2026-10-11 (không biết lớp mới có chạy hay không).
-
-        `dry_run=True` chỉ ĐẾM (`candidates`) rồi trả nguyên `subtitles`. Dùng để QUYẾT ĐỊNH có cần
-        quét VAD hay không: quét FireRed tốn ~2.6 s cho khối 32 s (đo thật 2026-10-11), nên bỏ qua
-        khi câu không có khe nào đủ dài.
         """
         if stats is not None:
             stats.update(
@@ -1047,10 +1073,28 @@ class ForcedAlignerService:
             )
         if not subtitles or min_pause_ms <= 0:
             return subtitles
+
+        is_cjk = _is_cjk_language(language)
+
+        def _is_eligible(s: SubtitleSentence) -> bool:
+            """Chỉ xét tách câu khi câu RẤT DÀI và KHÔNG CÓ DẤU CÂU Ở GIỮA."""
+            t = (s.text or "").strip()
+            if not t:
+                return False
+            if _has_internal_punctuation(t):
+                return False
+            tokens = _count_language_tokens(t, is_cjk)
+            threshold = min_chars if is_cjk else min_words
+            if threshold > 0 and tokens < threshold:
+                return False
+            return True
+
         if dry_run:
-            # Chỉ đếm khe đủ dài (không xét VAD, không tách).
+            # Chỉ đếm khe đủ dài của các câu đủ điều kiện (không xét VAD, không tách).
             pause_sec = float(min_pause_ms) / 1000.0
             for sub in subtitles:
+                if not _is_eligible(sub):
+                    continue
                 ws = list(sub.words or [])
                 for i in range(1, len(ws)):
                     if float(ws[i].start_time) - float(ws[i - 1].end_time) >= pause_sec:
@@ -1080,7 +1124,7 @@ class ForcedAlignerService:
         out: List[SubtitleSentence] = []
         for sub in subtitles:
             words = list(sub.words or [])
-            if len(words) < 2:
+            if len(words) < 2 or not _is_eligible(sub):
                 out.append(sub)
                 continue
 

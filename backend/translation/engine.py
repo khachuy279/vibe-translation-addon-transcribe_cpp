@@ -185,12 +185,12 @@ def clean_translation_tags(text: str) -> str:
         return ""
     # Bỏ khối <think>...</think> nếu có
     out = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    # Gemma 4: khối kênh suy luận ĐÓNG: <|channel>thought\n…\n<channel|>
-    out = re.sub(r"<\|channel>.*?<channel\|>", "", out, flags=re.DOTALL | re.IGNORECASE)
+    # Gemma 4: khối kênh suy luận ĐÓNG: <|channel>thought\n…\n<channel|> (hoặc <|channel|>)
+    out = re.sub(r"<\|channel>.*?<\|?channel\|>", "", out, flags=re.DOTALL | re.IGNORECASE)
     # Gemma 4: marker MỞ chưa đóng (model bắt đầu kênh rồi trả luôn bản dịch trong đó).
     # Chỉ bỏ marker + phần tên kênh trên cùng dòng, GIỮ nội dung phía sau.
-    out = re.sub(r"<\|channel>[^\n]*\n?", "", out, flags=re.IGNORECASE)
-    out = re.sub(r"<channel\|>", "", out)
+    out = re.sub(r"<\|channel\|?>[^\n]*\n?", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"<\|?channel\|>", "", out)
     # Bỏ các tag đơn lẻ
     out = re.sub(r"</?(?:output|think|thought|channel)[^>]*>", "", out, flags=re.IGNORECASE)
     out = re.sub(r"<\|turn>[^\n]*\n?", "", out)
@@ -956,9 +956,10 @@ class GGUFTranslator(BaseTranslator):
                 if not piece:
                     continue
                 acc += piece
-                # Gộp cụm lặp NGAY trên bản streaming: nếu model kẹt vòng thì phụ đề không
-                # phình thành một bức tường chữ (và độ dài hiển thị bị chặn trên).
-                yield collapse_repetitions(acc)
+                # Dọn dẹp artifact tag mô hình (kênh thought của Gemma 4, v.v.) và gộp cụm lặp:
+                cleaned = collapse_repetitions(clean_translation_tags(acc))
+                if cleaned:
+                    yield cleaned
             if not acc:
                 return
 

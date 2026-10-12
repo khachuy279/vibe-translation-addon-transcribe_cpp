@@ -44,10 +44,10 @@ models:
     name: Gemma 4 12B IT QAT (UD-Q4_K_XL)
     model: unsloth/gemma-4-12B-it-qat-GGUF
     gguf_file: gemma-4-12B-it-qat-UD-Q4_K_XL.gguf
-    temperature: 0.0
-    top_p: 1.0
-    top_k: 1
-    repetition_penalty: 1.0
+    temperature: 0.1
+    top_p: 0.95
+    top_k: 40
+    repetition_penalty: 1.1
     prompt_style: gemma-sub
     aliases:
       - gemma-12b

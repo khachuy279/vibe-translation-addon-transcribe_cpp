@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from backend.config import config
 from backend.translation.context import TranslationContextTracker
 from backend.translation.dedup import TranslationDeduplicator
-from backend.translation.engine import GGUFTranslationEngine
+from backend.translation.engine import GGUFTranslationEngine, clean_translation_tags, collapse_repetitions
 from backend.tts import get_tts_engine, TTSDedupState
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.protocol import parse_audio_frame
@@ -809,7 +809,10 @@ async def _process_translation_item(
             async for partial in trans_engine.translate_stream(
                 text=text, source_lang=src_lang, target_lang=tgt_lang, context=context_str
             ):
-                translated = partial
+                cleaned_partial = collapse_repetitions(clean_translation_tags(partial))
+                if not cleaned_partial:
+                    continue
+                translated = cleaned_partial
                 if first_token_ms is None:
                     first_token_ms = (time.monotonic() - start_t) * 1000.0
                     metrics_collector.record_metric("translation", "first_token_ms", first_token_ms)
@@ -817,16 +820,16 @@ async def _process_translation_item(
                 # Throttle kép: đủ ký tự MỚI và đủ thời gian. Không gửi tiền tố rác
                 # (ví dụ một khoảng trắng) và không ngập WebSocket.
                 if (
-                    partial != last_sent_text
-                    and len(partial) >= min_chars
+                    cleaned_partial != last_sent_text
+                    and len(cleaned_partial) >= min_chars
                     and (now - last_sent_t) >= min_interval
                 ):
                     last_sent_t = now
-                    last_sent_text = partial
+                    last_sent_text = cleaned_partial
                     await session.send_json(
                         make_translation_msg(
                             utt_id=utt_id,
-                            translated=partial,
+                            translated=cleaned_partial,
                             elapsed_ms=int((now - start_t) * 1000),
                             target_lang=tgt_lang,
                             partial=True,
@@ -845,6 +848,11 @@ async def _process_translation_item(
             context=context_str,
         )
         translated = res.get("translated_text", text)
+
+    # Dọn dẹp artifact tag mô hình (kênh thought của Gemma 4, v.v.) và gộp cụm lặp trước khi giao
+    translated = collapse_repetitions(clean_translation_tags(translated))
+    if not translated:
+        translated = text
 
     elapsed_ms = int((time.monotonic() - start_t) * 1000)
     metrics_collector.record_metric("translation", "infer_ms", float(elapsed_ms))

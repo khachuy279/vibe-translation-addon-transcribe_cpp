@@ -34,8 +34,8 @@ KNOWN_TAGS = {
 }
 #: Token trong `[...]` của thông điệp log. `SEG_*` là trace từng nhịp preview do người dùng
 #: bật để tinh chỉnh ngưỡng cắt câu: SEG_TRACE (mỗi nhịp), SEG_CUT (nhịp chốt câu).
-#: `DRIFT` là cảnh báo ASR viết lại cả câu.
-ALLOWED_BRACKETS = ("utt=", "STARTUP", "SHUTDOWN", "SEG_", "DRIFT")
+#: `NORM` là thông báo chuẩn hóa âm lượng (Speech Normalization).
+ALLOWED_BRACKETS = ("utt=", "STARTUP", "SHUTDOWN", "SEG_", "NORM")
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]")
 BRACKET_RE = re.compile(r"\[([^\[\]]{1,40})\]")
 LEVELS = {"debug", "info", "warning", "error", "critical"}

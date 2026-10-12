@@ -38,7 +38,7 @@ class FakeInferenceEngine(TranscribeEngine):
         self.infer_times: List[float] = []
         self.text_fn = text_fn or (lambda n: "alpha beta gamma delta epsilon")
 
-    def _run_inference_sync(self, pcm_audio: np.ndarray) -> str:  # type: ignore[override]
+    def _run_inference_sync(self, pcm_audio: np.ndarray, *args: Any, **kwargs: Any) -> str:  # type: ignore[override]
         n = 0 if pcm_audio is None else len(pcm_audio)
         self.infer_calls.append(n)
         self.infer_times.append(time.perf_counter())
@@ -75,7 +75,7 @@ class StableTextEngine(FakeInferenceEngine):
         super().__init__(**kwargs)
         self.milestones = sorted(milestones, key=lambda m: m[0])
 
-    def _run_inference_sync(self, pcm_audio: np.ndarray) -> str:  # type: ignore[override]
+    def _run_inference_sync(self, pcm_audio: np.ndarray, *args: Any, **kwargs: Any) -> str:  # type: ignore[override]
         n = 0 if pcm_audio is None else len(pcm_audio)
         self.infer_calls.append(n)
         self.infer_times.append(time.perf_counter())

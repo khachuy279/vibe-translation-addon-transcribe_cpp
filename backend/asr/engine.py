@@ -47,7 +47,6 @@ except ImportError:
 from backend.config import config, SentenceConfig
 from backend.core.audio_buffer import CircularAudioBuffer
 from backend.core.commit_manager import CommitManager, count_content_tokens
-from backend.core.hypothesis import HypothesisConsensus
 from backend.core.metrics import metrics_collector
 from backend.core.normalizer import SpeechNormalizer
 from backend.core.pipeline_events import CommitReason
@@ -223,6 +222,7 @@ class TranscribeEngine(BaseASREngine):
             capacity_sec=float(getattr(config.audio_buffer, "capacity_sec", 60.0) or 60.0),
         )
         self.normalizer = SpeechNormalizer.from_config(config.asr)
+        self._last_logged_norm_utt: Optional[str] = None
         self.commit_manager = CommitManager(sentence_cfg=config.sentence)
 
         self._active_utterance_id: str = str(uuid.uuid4())[:8]
@@ -237,9 +237,6 @@ class TranscribeEngine(BaseASREngine):
         # P2.5: kết quả preview gần nhất để có thể tái sử dụng cho commit.
         self._last_preview_end_sample: int = -1
         self._last_preview_text: str = ""
-        # Chẩn đoán "ASR viết lại cả câu": đếm số NHỊP preview ủng hộ mỗi câu
-        # (xem `backend/core/hypothesis.py` + `_warn_unseen_commit_text`).
-        self._hypothesis_consensus = HypothesisConsensus()
         # K2: mốc đo thời gian tới preview đầu tiên (đặt lại mỗi khi VAD báo bắt đầu nói).
         self._speech_started_at: float = 0.0
         self._first_preview_reported: bool = True
@@ -630,9 +627,6 @@ class TranscribeEngine(BaseASREngine):
                 extra={"module_tag": "ASR"},
             )
         self.commit_manager.reset_stability()
-        # Câu mới ⇒ lịch sử giả thuyết của câu trước không được dùng để chẩn đoán câu này.
-        # (Khi GHÉP thì text sẽ đổi vì có audio mới ⇒ reset bộ đếm ổn định là đúng.)
-        self._hypothesis_consensus.reset()
         # K2: ĐÁNH THỨC generator ngay. Trước đây nhánh idle ngủ tới `poll_interval_ms`
         # (mặc định 300 ms) nên preview đầu tiên của câu bị trễ thêm tới ~300 ms chỉ vì
         # generator chưa biết là đã có tiếng nói (đo thật: K2 1,29 s -> 0,62 s).
@@ -798,7 +792,7 @@ class TranscribeEngine(BaseASREngine):
         self.language = language or "auto"
 
     # ------------------------------------------------------------------ suy luận
-    def _run_inference_sync(self, pcm_audio: np.ndarray) -> str:
+    def _run_inference_sync(self, pcm_audio: np.ndarray, normalize: bool = False) -> str:
         """Thực hiện suy luận ASR đồng bộ trên luồng worker C++."""
         if pcm_audio is None or len(pcm_audio) < int(16000 * self.min_transcribe_sec):
             return ""
@@ -818,12 +812,18 @@ class TranscribeEngine(BaseASREngine):
                 metrics_collector.increment_counter("asr.audio_truncated")
                 pcm_audio = pcm_audio[-self._max_audio_samples:]
 
-        # Chuẩn hóa âm lượng nếu bật config
-        if config.asr.normalize_speech:
+        # Chuẩn hóa âm lượng nếu bật config và được chỉ định tường minh (mặc định tắt cho preview streaming)
+        if normalize and config.asr.normalize_speech:
             t_norm = time.perf_counter()
             norm_res = self.normalizer.normalize(pcm_audio)
             audio_to_infer = norm_res.audio
             metrics_collector.record_metric("asr", "normalize_ms", (time.perf_counter() - t_norm) * 1000.0)
+            if norm_res.is_modified and bool(getattr(config.asr, "normalize_log_stats", True)):
+                logger.info(
+                    f"[utt={self._active_utterance_id}][NORM] Chuẩn hóa âm lượng (Pipeline A): gain={norm_res.applied_gain:.2f}x "
+                    f"(RMS {norm_res.original_rms:.3f})",
+                    extra={"module_tag": "ASR"},
+                )
         else:
             audio_to_infer = pcm_audio
 
@@ -902,7 +902,12 @@ class TranscribeEngine(BaseASREngine):
                 )
             return cleaned
 
-    def transcribe_block(self, pcm_audio: np.ndarray, language: Optional[str] = None) -> str:
+    def transcribe_block(
+        self,
+        pcm_audio: np.ndarray,
+        language: Optional[str] = None,
+        normalize: bool = True,
+    ) -> str:
         """Thực hiện nhận dạng offline nguyên khối cho mảng audio PCM (16kHz float32).
 
         Chạy dưới `_infer_lock`, chuẩn hóa âm thanh, lọc text và gộp chuỗi lặp an toàn.
@@ -913,7 +918,11 @@ class TranscribeEngine(BaseASREngine):
         if language and language != "auto":
             self.language = language
         try:
-            return self._run_inference_sync(pcm_audio)
+            return self._run_inference_sync(pcm_audio, normalize=normalize)
+        except TypeError as exc:
+            if "normalize" in str(exc):
+                return self._run_inference_sync(pcm_audio)
+            raise
         finally:
             self.language = old_lang
 
@@ -1303,38 +1312,6 @@ class TranscribeEngine(BaseASREngine):
         metrics_collector.record_gauge("asr", "preview_median_ms", median)
         return self._eff_poll_interval
 
-    def _warn_unseen_commit_text(self, final_text: str, utt_id: str) -> None:
-        """Chẩn đoán "ASR viết lại cả câu" ⇒ WARNING `[DRIFT]` (KHÔNG đổi văn bản phát đi).
-
-        Vì sao cần (log thật 2026-09-29 21:29, phim tiếng Nhật): Qwen3-ASR streaming KHÔNG ổn
-        định theo tiền tố — cùng một đoạn audio, khi đuôi audio dài thêm thì model viết lại cả
-        phần ĐẦU của câu::
-
-            t=+0.4s  '焼いて。'
-            t=+0.7s  '寄り行ってくる。'   ← câu đúng (theo người dùng đối chiếu video)
-            t=+0.9s  '泳いてくるね。'     ← trôi, rồi lặp lại 6 nhịp
-            [ASR_COMMIT] [VAD_SILENCE]: '泳いてくるね。'
-
-        Không tầng nào phát hiện ra vì commit chỉ phát văn bản mới nhất. Hàm này ghi lại ca đó
-        (kèm bảng đếm "nhịp nào đọc ra câu gì") để ĐO tần suất, còn quyết định phát câu nào vẫn
-        thuộc về bản chạy lại trên mảnh audio đã đóng — nguồn đáng tin nhất hiện có.
-        """
-        if not final_text:
-            return
-        support = self._hypothesis_consensus.support(final_text)
-        if support > 0:
-            return
-        top = self._hypothesis_consensus.tally(3)
-        if not top or top[0][1] < 2:
-            return
-        metrics_collector.increment_counter("asr.commit_text_unseen_in_preview")
-        logger.warning(
-            f"[utt={utt_id}] [DRIFT] câu chốt CHƯA TỪNG xuất hiện trong "
-            f"{self._hypothesis_consensus.scans} nhịp preview: '{final_text}' | "
-            f"preview đã đọc: " + " · ".join(f"'{t}'×{c}" for t, c in top),
-            extra={"module_tag": "ASR_COMMIT"},
-        )
-
     async def _emit_commit(self, commit_req: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """Chạy inference cho một commit và phát ra message `utterance_update` final."""
         self._commit_event.clear()
@@ -1347,9 +1324,6 @@ class TranscribeEngine(BaseASREngine):
             # F-48: không phát gì thì PHẢI xoá cờ đánh thức, nếu không nhánh idle sẽ
             # `wait_for(event.wait())` trả về tức thì ⇒ quay nóng (xem chú thích ở nhánh idle).
             self._commit_event.clear()
-            # Vùng nói đã tiến (engine đặt `_speech_start_sample` lúc enqueue) ⇒ lịch sử
-            # giả thuyết của vùng cũ không còn giá trị.
-            self._hypothesis_consensus.reset()
             return
 
         # F-44: commit này thuộc đoạn TRƯỚC khi tua ⇒ bỏ (tránh phụ đề lệch vị trí).
@@ -1398,6 +1372,20 @@ class TranscribeEngine(BaseASREngine):
             final_text = self._last_preview_text
             metrics_collector.increment_counter("asr.commit_reused_preview")
         else:
+            # Pipeline A: Chuẩn hóa âm lượng 1 lần duy nhất sau khi chốt câu trước khi gửi qua ASR lần cuối
+            if config.asr.normalize_speech:
+                t_norm = time.perf_counter()
+                norm_res = self.normalizer.normalize(audio_slice)
+                if norm_res.is_modified:
+                    audio_slice = norm_res.audio
+                    if bool(getattr(config.asr, "normalize_log_stats", True)):
+                        logger.info(
+                            f"[utt={utt_id}][NORM] Chuẩn hóa âm lượng (Pipeline A): gain={norm_res.applied_gain:.2f}x "
+                            f"(RMS {norm_res.original_rms:.3f})",
+                            extra={"module_tag": "ASR"},
+                        )
+                metrics_collector.record_metric("asr", "normalize_ms", (time.perf_counter() - t_norm) * 1000.0)
+
             t0 = time.perf_counter()
             final_text = await self._infer_with_watchdog(audio_slice, is_commit=True)
             infer_ms = (time.perf_counter() - t0) * 1000.0
@@ -1412,7 +1400,6 @@ class TranscribeEngine(BaseASREngine):
                 f"{self._stream_generation}) — video đã tua.",
                 extra={"module_tag": "ASR_COMMIT"},
             )
-            self._hypothesis_consensus.reset()
             return
 
         # Ranh giới cắt giữa câu: nếu mảnh quá ngắn thì GỘP vào câu kế tiếp thay vì
@@ -1428,12 +1415,6 @@ class TranscribeEngine(BaseASREngine):
                     extra={"module_tag": "ASR_COMMIT"},
                 )
                 final_text = trimmed
-
-        # CHỐNG "ASR VIẾT LẠI CẢ CÂU": câu phát đi mà CHƯA TỪNG xuất hiện trong lịch sử
-        # preview trong khi có câu khác được preview lặp nhiều nhịp ⇒ ghi WARNING `[DRIFT]`
-        # kèm bảng đếm (xem `backend/core/hypothesis.py`). Đây thuần chẩn đoán — KHÔNG đổi
-        # văn bản phát đi (bản chạy lại trên mảnh đã đóng vẫn là nguồn đáng tin nhất).
-        self._warn_unseen_commit_text(final_text, utt_id)
 
         min_words = int(config.sentence.min_words_to_commit)
         carry_over = bool(getattr(config.sentence, "carry_over_short_fragment", True))
@@ -1458,7 +1439,6 @@ class TranscribeEngine(BaseASREngine):
                     f"đẩy vùng đọc lên {end_s / 16000.0:.2f}s để không lặp lại.",
                     extra={"module_tag": "ASR_COMMIT"},
                 )
-                self._hypothesis_consensus.reset()
                 return
             # FIX-12b: CHỐT AN TOÀN CHỐNG LẶP. Nếu cùng một mảnh ngắn bị gộp HAI lần liên
             # tiếp thì vùng audio rõ ràng không tiến (đã gặp: `'Okay.'` lặp 6 lần tới
@@ -1473,7 +1453,6 @@ class TranscribeEngine(BaseASREngine):
                     f"vùng đọc lên {end_s / 16000.0:.2f}s.",
                     extra={"module_tag": "ASR_COMMIT"},
                 )
-                self._hypothesis_consensus.reset()
                 return
             self._last_carried_text = final_text
             with self._lock:
@@ -1500,8 +1479,6 @@ class TranscribeEngine(BaseASREngine):
         self._last_committed_sample = end_s
         self.commit_manager.record_commit(final_text)
         self._last_carried_text = ""
-        # Vùng nói đã tiến qua câu vừa chốt ⇒ lịch sử giả thuyết bắt đầu lại từ câu kế tiếp.
-        self._hypothesis_consensus.reset()
         metrics_collector.increment_counter(f"asr.commit_reason.{reason}")
         # FIX-10: chốt số liệu lãng phí preview của câu này (đo trước khi tối ưu).
         self._finalize_recompute_metrics()
@@ -1689,8 +1666,6 @@ class TranscribeEngine(BaseASREngine):
                         if preview_text and self._speech_active:
                             self._last_preview_end_sample = current_total
                             self._last_preview_text = preview_text
-                            # FIX-13: ghi nhịp này vào bộ đếm đồng thuận giả thuyết.
-                            self._hypothesis_consensus.observe(preview_text)
                             # K2: đo thời gian từ lúc VAD báo bắt đầu nói tới preview đầu tiên.
                             if not self._first_preview_reported and self._speech_started_at > 0:
                                 self._first_preview_reported = True
@@ -1841,7 +1816,6 @@ class TranscribeEngine(BaseASREngine):
             self._hold_reason = ""
         self.audio_buffer.clear()
         self.commit_manager.reset_stability()
-        self._hypothesis_consensus.reset()
         self._preview_durations.clear()
         self._eff_poll_interval = max(0.05, self.poll_interval_ms / 1000.0)
         self._wake_stream()

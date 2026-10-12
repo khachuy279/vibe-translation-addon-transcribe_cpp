@@ -36,13 +36,19 @@ TRANSLATION_MODELS_YAML_PATH = BACKEND_DIR / "translation_models.yaml"
 GLOSSARY_PATH = BACKEND_DIR / "glossary.yaml"
 VOICES_DIR = BACKEND_DIR / "voices"
 
-# Danh sách ngôn ngữ ASR được hỗ trợ
+# Danh sách ngôn ngữ ASR được hỗ trợ (Qwen3-ASR & Qwen3-ForcedAligner-0.6B)
 SUPPORTED_LANGUAGES = [
     {"code": "auto", "name": "Auto-detect"},
     {"code": "en", "name": "English (en)"},
-    {"code": "ja", "name": "Japanese (ja)"},
     {"code": "zh", "name": "Chinese (zh)"},
+    {"code": "yue", "name": "Cantonese (yue)"},
+    {"code": "ja", "name": "Japanese (ja)"},
     {"code": "ko", "name": "Korean (ko)"},
+    {"code": "fr", "name": "French (fr)"},
+    {"code": "de", "name": "German (de)"},
+    {"code": "es", "name": "Spanish (es)"},
+    {"code": "it", "name": "Italian (it)"},
+    {"code": "pt", "name": "Portuguese (pt)"},
     {"code": "ru", "name": "Russian (ru)"},
 ]
 
@@ -271,7 +277,7 @@ class ASRConfig(BaseModel):
     # phiên native ở cuối vòng đời session để lần sau nạp lại sạch. Bộ nhớ phình nằm trong
     # native/Vulkan (xem báo cáo §12.6) nên đây là cách duy nhất đòi lại mà không patch
     # upstream. 0 = TẮT. Lưu ý: lần nạp lại tốn ~10 s, nên chỉ nên để TẮT nếu không gặp.
-    native_recycle_rss_delta_mb: float = 2048.0
+    native_recycle_rss_delta_mb: float = 4096.0
 
     # P2.2: chỉ xin `full_text` từ binding, không materialize segments/words/tokens.
     request_timestamps: bool = False
@@ -361,11 +367,11 @@ class TranslationConfig(BaseModel):
     #: Giới hạn token sinh tối đa cho MỖI CÂU ĐƠN (Pipeline A).
     #: Tuyến Batch (Pipeline B) tự động tính ngân sách theo số câu trong khối: min(1536, max(256, len(texts) * 80)).
     max_tokens: int = 128
-    # ContextManager: chỉ áp dụng cho Pipeline A (Realtime streaming đơn câu).
-    # Pipeline B sử dụng Batch Context Translation (dịch gộp khối qua JSON instTrans).
-    use_context: bool = False
+    # Ngữ cảnh dịch (Context): áp dụng cho cả Pipeline A (ContextManager đơn câu)
+    # và Pipeline B (Batch Context Translation qua prompt context).
+    use_context: bool = True
     context_window: int = 3
-    prompt_style: Optional[str] = "index"
+    prompt_style: Optional[str] = "gemma-sub"
     n_gpu_layers: int = -1
     #: Kích thước ngữ cảnh (Context Window) của Llama.cpp (bao gồm cả Prompt + Output).
     #: Nâng lên 2048 (KV cache chỉ ~134 MB) để đảm bảo Pipeline B khi dịch gộp cả khối 10-15 câu
@@ -406,7 +412,7 @@ class TranslationConfig(BaseModel):
     #:
     #: Dùng khi muốn giảm token prompt / tránh mọi phỏng đoán về tên riêng (ví dụ model dịch đã
     #: đủ tốt, hoặc gặp nội dung mà suy romaji cho kết quả khó chịu).
-    glossary_detect_names: bool = False
+    glossary_detect_names: bool = True
     #: Suy **romaji** cho tên riêng CHƯA khai trong glossary, ngay từ chuỗi nguồn
     #: (`backend/translation/romaji.py`): `美咲 -> Misaki`, `ミサキ -> Misaki`.
     #:
@@ -572,6 +578,11 @@ class LookaheadConfig(BaseModel):
     #: LỚP NGẮT CÂU BẰNG KHOẢNG LẶNG (VAD) — cho câu dài KHÔNG có dấu câu gộp lời 2–3 người.
     #: Bật/tắt cả lớp; tắt ⇒ giữ nguyên hành vi cũ (chỉ dấu câu + trần ký tự/từ).
     batch_sub_pause_split: bool = True
+    #: Ngưỡng kích hoạt: CHỈ kích hoạt khi câu rất dài VÀ không có dấu câu ở giữa.
+    #: - CJK (Nhật/Trung/Hàn): số ký tự tối thiểu để coi là câu rất dài.
+    batch_sub_pause_min_chars: int = 20
+    #: - Tiếng Latinh (Anh/v.v.): số từ tối thiểu để coi là câu rất dài.
+    batch_sub_pause_min_words: int = 6
     #: Khe giữa hai từ (giây×1000) đủ dài để coi là chỗ ngắt hơi. 350 ms ≈ ngập ngừng giữa lượt
     #: lời; thấp hơn nữa sẽ cắt vào giữa câu nói bình thường.
     #: ĐO THẬT 2026-10-11 (ja_concat_1min.wav, 152 từ): khe ở ranh giới cụm từ = 0.40–0.56 s,

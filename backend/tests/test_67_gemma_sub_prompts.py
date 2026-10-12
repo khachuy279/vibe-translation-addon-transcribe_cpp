@@ -135,6 +135,14 @@ def test_clean_gemma_channel_thought():
     # Tag trần còn sót.
     assert clean_translation_tags("Xin chào <channel|>") == "Xin chào"
 
+    # Ca THẬT trong log Pipeline A (2026-10-12):
+    assert clean_translation_tags(
+        "<|channel>thought <channel|>Ăn sáng xong rồi. Tôi nghĩ chúng ta có thể dành cả ngày để xem mùa cuối của."
+    ) == "Ăn sáng xong rồi. Tôi nghĩ chúng ta có thể dành cả ngày để xem mùa cuối của."
+    assert clean_translation_tags(
+        "<|channel>thought <channel|>Babylon Five kèm lời bình của đạo diễn. Bạn ghét Babylon."
+    ) == "Babylon Five kèm lời bình của đạo diễn. Bạn ghét Babylon."
+
     # Không được ăn mất nội dung hợp lệ khi không có marker.
     assert clean_translation_tags("Ừ, được thôi.") == "Ừ, được thôi."
 

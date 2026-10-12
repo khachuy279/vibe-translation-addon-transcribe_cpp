@@ -54,8 +54,6 @@ def test_engine_khong_con_api_seg_va_timer(restore_config):
     ):
         assert not hasattr(eng, name), f"engine còn API của tầng SEG/timer: {name}"
     assert not hasattr(engine_mod, "_best_matching_sentence")
-    # Chẩn đoán drift thì PHẢI còn (không thuộc tầng SEG).
-    assert hasattr(eng, "_hypothesis_consensus") and hasattr(eng, "_warn_unseen_commit_text")
 
 
 def test_engine_khong_con_tham_chieu_timer_trong_ma_nguon():
