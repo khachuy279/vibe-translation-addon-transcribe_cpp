@@ -371,6 +371,17 @@ class TranslationConfig(BaseModel):
     # và Pipeline B (Batch Context Translation qua prompt context).
     use_context: bool = True
     context_window: int = 3
+    #: P0.3b (2026-10-24): gắn nhãn người nói vào DÒNG NGỮ CẢNH (`[PREVIOUS_SOURCE]` /
+    #: `[PREVIOUS_TRANSLATION]`), cùng hệ nhãn với `[CURRENT_SOURCE]`.
+    #:
+    #: VÌ SAO: ràng buộc cứng của Pipeline B yêu cầu "Keep the SAME speaker and the SAME pronouns as
+    #: the reference context above", nhưng ngữ cảnh cũ KHÔNG có nhãn ⇒ model không biết dòng ngữ
+    #: cảnh nào là của `speaker 5`, tức ràng buộc đó bất khả thi khi khối có nhiều người nói.
+    #:
+    #: ⚠️ CHỈ có tác dụng khi P0.1 đang giữ danh tính bền (`diarization.context_sec > 0`): nếu mỗi
+    #: khối đánh số lại thì nhãn trong ngữ cảnh là SAI NGƯỜI (xem `_context_speaker_tags_enabled`).
+    #: MẶC ĐỊNH TẮT — bật sau khi đo A/B trên log thật (bài học `report/15_subject_constraint_ab`).
+    context_speaker_tags: bool = False
     prompt_style: Optional[str] = "gemma-sub"
     n_gpu_layers: int = -1
     #: Kích thước ngữ cảnh (Context Window) của Llama.cpp (bao gồm cả Prompt + Output).

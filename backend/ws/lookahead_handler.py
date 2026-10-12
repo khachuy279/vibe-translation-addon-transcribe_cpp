@@ -1757,21 +1757,9 @@ class LookaheadSessionState:
 
             # DỊCH GỘP TOÀN BỘ KHỐI: 1 lần gọi GPU duy nhất cho N câu (kèm ngữ cảnh các câu gần nhất sạch ảo giác)
             candidate_texts = [sub.text for _, sub, _, _ in candidate_subs]
-            recent_ctx_list = []
-            if bool(getattr(config.translation, "use_context", True)):
-                ctx_limit = max(1, int(getattr(config.translation, "context_window", 3) or 3))
-                for u in reversed(self._recent_utterances[-8:]):
-                    orig = (u.get("text") or "").strip()
-                    trans = (u.get("translated") or "").strip()
-                    if not orig or is_repetition_hallucination(orig, min_reps=3):
-                        continue
-                    if trans and is_repetition_hallucination(trans, min_reps=3):
-                        continue
-                    recent_ctx_list.append(f"{orig} -> {trans}" if trans else orig)
-                    if len(recent_ctx_list) >= ctx_limit:
-                        break
-                recent_ctx_list.reverse()
-            batch_context = "\n".join(recent_ctx_list)
+            batch_context = self._build_batch_context(
+                [(ps, pe) for _, _, ps, pe in candidate_subs], candidate_texts
+            )
 
             # Nhãn người nói + cờ chồng tiếng cho ĐÚNG các câu sắp dịch (đã lọc theo playhead).
             # Chỉ truyền `speaker_tags` khi thật sự có nhãn: nếu không, giữ nguyên payload JSON cũ
@@ -1820,6 +1808,9 @@ class LookaheadSessionState:
                     "pts_end": pts_end,
                     "text": sub.text,
                     "translated": translated,
+                    # P0.3b: nhãn người nói của mẩu này, để khối SAU gắn được nhãn vào dòng ngữ cảnh
+                    # (`_build_batch_context`). None khi diarization tắt/lỗi hoặc không có dữ liệu.
+                    "speaker": speaker_tags_all[idx],
                 })
                 if len(self._recent_utterances) > 128:
                     del self._recent_utterances[:32]
@@ -2107,6 +2098,102 @@ class LookaheadSessionState:
                     self.tts_queue.task_done()
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _context_speaker_tags_enabled(self) -> bool:
+        """Có được gắn nhãn người nói vào DÒNG NGỮ CẢNH hay không (P0.3b).
+
+        HAI điều kiện, thiếu một là sai:
+          1. Người dùng bật `translation.context_speaker_tags` (mặc định TẮT — bật sau khi đo A/B).
+          2. P0.1 đang giữ danh tính bền (`diarization.context_sec > 0`). Nếu mỗi khối tự đánh số
+             lại thì "speaker 5" trong ngữ cảnh có thể là NGƯỜI KHÁC ⇒ gắn nhãn sẽ chủ động gây sai
+             đại từ, tệ hơn là không gắn gì.
+        """
+        if not bool(getattr(config.translation, "context_speaker_tags", False)):
+            return False
+        diar_cfg = getattr(config, "diarization", None)
+        if not diar_cfg or not getattr(diar_cfg, "enabled", True):
+            return False
+        return float(getattr(diar_cfg, "context_sec", 0.0) or 0.0) > 0
+
+    #: Sai số (giây) để coi khoảng thời gian của mẩu ngữ cảnh là TRÙNG với một mẩu sắp dịch.
+    _CONTEXT_DUP_TOL_SEC = 0.75
+
+    @classmethod
+    def _is_context_duplicate(
+        cls,
+        utterance: Dict[str, Any],
+        candidate_texts: set,
+        candidate_spans: List[Tuple[float, float]],
+    ) -> bool:
+        """True nếu mẩu ngữ cảnh này CHÍNH LÀ một mẩu của khối sắp dịch (bị lặp ở ranh giới khối).
+
+        VÌ SAO CẦN: nếu cùng một câu nằm ở cả `[PREVIOUS_SOURCE]` lẫn `[CURRENT_SOURCE]` mà nội dung
+        hoặc nhãn người nói hai bên khác nhau thì model thấy mâu thuẫn ngay trong prompt. Log thật
+        của người dùng (2026-10-24) có đúng ca này: `ある？` ở dòng 3 của PREVIOUS_SOURCE và ở mục 1
+        của CURRENT_SOURCE.
+
+        CHỈ bỏ khi CẢ HAI đúng: **cùng văn bản** (đã chuẩn hoá) **và khoảng thời gian CHỒNG NHAU**
+        (trong `_CONTEXT_DUP_TOL_SEC`). Bản đầu tiên chỉ so mốc BẮT ĐẦU trong 15 s — đo ra là dương
+        tính giả: mọi mẩu cuối của khối trước đều nằm trong 15 s tính từ mốc khối sau, nên chỉ cần
+        văn bản tình cờ trùng là **cả cửa sổ ngữ cảnh bị xoá sạch**. Câu lặp lại ở đoạn khác của
+        video (cùng chữ, khác thời gian) là hội thoại THẬT ⇒ phải giữ.
+
+        Lọc này chạy LUÔN, không phụ thuộc `translation.context_speaker_tags`: câu vừa nằm trong
+        ngữ cảnh vừa nằm trong khối sắp dịch là lỗi dữ liệu, không phải tính năng.
+        """
+        norm = normalize_for_dedup(utterance.get("text") or "")
+        if not norm or norm not in candidate_texts:
+            return False
+        try:
+            start = float(utterance.get("pts_start") or 0.0)
+            end = float(utterance.get("pts_end") or start)
+        except (TypeError, ValueError):
+            return False
+        tol = cls._CONTEXT_DUP_TOL_SEC
+        return any(
+            min(end, c_end) + tol >= max(start, c_start) for c_start, c_end in candidate_spans
+        )
+
+    def _build_batch_context(
+        self,
+        candidate_pts: List[Tuple[float, float]],
+        candidate_texts: List[str],
+    ) -> str:
+        """Dựng khối NGỮ CẢNH cho lượt dịch gộp (các câu gần nhất đã phát, sạch ảo giác).
+
+        P0.3b: khi `translation.context_speaker_tags` bật VÀ P0.1 đang chạy, mỗi dòng mang nhãn
+        người nói ở **cả hai phía** (`speaker 5: <nguồn> -> speaker 5: <bản dịch>`) — phía bản dịch
+        mới là chỗ chứa thông tin xưng hô mà model cần giữ nhất quán. Định dạng `src -> tgt` giữ
+        nguyên nên `parse_context_history()` của prompt Gemma vẫn tách đúng cặp và hai khối
+        `[PREVIOUS_*]` vẫn song song đúng số dòng.
+        """
+        if not bool(getattr(config.translation, "use_context", True)):
+            return ""
+        ctx_limit = max(1, int(getattr(config.translation, "context_window", 3) or 3))
+        with_labels = self._context_speaker_tags_enabled()
+        candidate_set = {normalize_for_dedup(t) for t in candidate_texts if t}
+        candidate_set.discard("")
+        candidate_spans = [(float(s), float(e)) for s, e in candidate_pts]
+
+        lines: List[str] = []
+        for u in reversed(self._recent_utterances[-8:]):
+            orig = (u.get("text") or "").strip()
+            trans = (u.get("translated") or "").strip()
+            if not orig or is_repetition_hallucination(orig, min_reps=3):
+                continue
+            if trans and is_repetition_hallucination(trans, min_reps=3):
+                continue
+            if self._is_context_duplicate(u, candidate_set, candidate_spans):
+                continue
+            spk = (u.get("speaker") or "").strip() if with_labels else ""
+            if spk:
+                lines.append(f"{spk}: {orig} -> {spk}: {trans}" if trans else f"{spk}: {orig}")
+            else:
+                lines.append(f"{orig} -> {trans}" if trans else orig)
+            if len(lines) >= ctx_limit:
+                break
+        lines.reverse()
+        return "\n".join(lines)
 
     async def _attribute_speakers(
         self,
