@@ -1433,9 +1433,32 @@ class LookaheadSessionState:
                     if bool(getattr(config.asr, "normalize_log_stats", True)):
                         logger.info(
                             f"[NORM] Chuẩn hóa âm lượng (Pipeline B): gain={norm_res.applied_gain:.2f}x "
-                            f"(RMS {norm_res.original_rms:.3f}) khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s]",
+                            f"(RMS {norm_res.original_rms:.3f})",
                             extra={"module_tag": "ASR"},
                         )
+                else:
+                    # KHÔNG im lặng khi bỏ qua chuẩn hoá: trước 2026-10-12 hai đường dưới đây không log
+                    # gì, nên "vì sao không thấy dòng [NORM]" KHÔNG THỂ trả lời từ log.
+                    #   * `RMS < knee_start` (0,025) — audio quá nhỏ, bị coi là nhiễu nền nên KHÔNG
+                    #     boost. Đây là bất thường đáng thấy ⇒ log ở mức INFO.
+                    #   * `gain ≈ 1.0` — audio đã đúng mức, không cần đổi. Bình thường ⇒ chỉ DEBUG.
+                    if norm_res.original_rms < float(self.normalizer.knee_start):
+                        logger.info(
+                            f"[NORM] BỎ QUA chuẩn hoá: RMS {norm_res.original_rms:.4f} < ngưỡng nhiễu nền "
+                            f"{self.normalizer.knee_start:.3f}",
+                            extra={"module_tag": "ASR"},
+                        )
+                    else:
+                        logger.info(
+                            f"[NORM] Giữ nguyên âm lượng: gain={norm_res.applied_gain:.4f} "
+                            f"(RMS {norm_res.original_rms:.4f})",
+                            extra={"module_tag": "ASR"},
+                        )
+            else:
+                logger.debug(
+                    "[NORM] Tắt chuẩn hoá âm lượng (config.asr.normalize_speech=False).",
+                    extra={"module_tag": "ASR"},
+                )
 
             t_asr = time.perf_counter()
             try:
@@ -1703,7 +1726,7 @@ class LookaheadSessionState:
             # theo tỉ lệ độ dài văn bản — xem chú thích ở Bước 2E-ter), mà P0.2 cần mốc TỪNG TỪ để
             # cắt đúng chỗ đổi người nói. Đây cũng là lý do bước này nằm ở đây chứ không nằm cạnh
             # khối dịch như bản cũ (bản cũ chạy SAU khi đã lọc `candidate_subs`).
-            subtitles, speaker_pieces = await self._attribute_speakers(subtitles, chunk)
+            subtitles, speaker_pieces = await self._attribute_speakers(subtitles, chunk, language=align_lang)
 
             # LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
             # câu hiện thành MỘT phụ đề dài khi aligner trả một item duy nhất).
@@ -2199,6 +2222,7 @@ class LookaheadSessionState:
         self,
         subtitles: List[SubtitleSentence],
         chunk: Any,
+        language: str = "",
     ) -> Tuple[List[SubtitleSentence], List[Any]]:
         """Chạy Nemotron-3-Diarization cho khối rồi TÁCH CÂU theo lượt nói (P0.2) + cờ chồng tiếng (P0.3).
 
@@ -2289,6 +2313,11 @@ class LookaheadSessionState:
                     else float("inf")
                 ),
                 label_map=label_map,
+                #: NGÔN NGỮ ẢNH HƯỞNG CÁCH NỐI TOKEN: CJK nối bằng "" (aligner tách theo KÝ TỰ),
+                #: Latinh nối bằng " ". Thiếu tham số này ⇒ tiếng Nhật bị chèn dấu cách giữa mọi ký
+                #: tự ("そ うです。" — sự cố thật 2026-10-12 22:34:40). `attribute_sentences` có lưới
+                #: an toàn tự suy CJK, nhưng vẫn truyền tường minh.
+                language=language,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

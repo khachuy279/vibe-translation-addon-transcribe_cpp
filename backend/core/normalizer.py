@@ -92,7 +92,15 @@ class SpeechNormalizer:
         return float(max(arr.max(), -arr.min()))
 
     def normalize(self, audio: np.ndarray) -> NormalizationResult:
-        """Chuẩn hóa âm lượng cho mảng float32 1D trong [-1.0, 1.0]."""
+        """Chuẩn hóa âm lượng cho mảng float32 1D trong [-1.0, 1.0].
+
+        Bất biến (từ 2026-10-12):
+          * `orig_rms < knee_start` ⇒ giữ nguyên (coi là im lặng/nhiễu nền).
+          * Audio NHỎ hơn `target_rms` ⇒ gain ≥ 1,0 (chỉ kẹp theo trần đỉnh, KHÔNG bao giờ bị nén
+            xuống dưới 1,0 — xem khối "Bảo vệ đỉnh" bên dưới).
+          * Audio TO hơn `target_rms` ⇒ nén về `target_peak` như cũ, sàn `min_gain`.
+          * Đầu ra luôn bị `clip` về [-1, 1] nên không méo tiếng.
+        """
         if audio is None or len(audio) == 0:
             return NormalizationResult(
                 audio=np.zeros(0, dtype=np.float32),
@@ -127,9 +135,26 @@ class SpeechNormalizer:
         # Giới hạn gain trong khoảng an toàn [min_gain, max_gain]
         clamped_gain = max(self.min_gain, min(self.max_gain, desired_gain))
 
-        # Peak protection: không để vượt trần target_peak
+        # ── Bảo vệ đỉnh: KẸP theo trần, KHÔNG nén audio đang nhỏ ────────────────────────────────
+        #
+        # SỰ CỐ THẬT (đo 2026-10-12, `wav_test/English_low_speech_quality_19s.wav`): bản cũ **GÁN**
+        # `clamped_gain = target_peak / orig_peak` cho mọi trường hợp vượt trần. Hệ quả ngược hẳn mục
+        # đích của module ("bù âm lượng cho đoạn phát âm quá nhỏ"):
+        #   * `peak = 0,95` (file đã chuẩn-hoá-đỉnh về đúng trần) ⇒ gain = 0,95/0,95 = **1,0000**
+        #     ⇒ `is_modified=False` ⇒ không boost gì, dù RMS 0,0702 còn thấp hơn mức mục tiêu 0,10.
+        #   * `peak = 0,99` + RMS thấp ⇒ gain = 0,9596 ⇒ **NÉN XUỐNG**, tức làm audio đang cần boost
+        #     nhỏ đi thêm.
+        #
+        # NAY: khi audio ĐANG NHỎ hơn mức mục tiêu (`desired_gain > 1`) thì chỉ **kẹp trần**, và không
+        # bao giờ kéo gain xuống dưới 1,0. Audio TO hơn mức mục tiêu (`desired_gain <= 1`) vẫn được
+        # nén về trần như cũ — đó mới là mục đích của `target_peak`.
         if orig_peak > 0.0 and orig_peak * clamped_gain > self.target_peak:
-            clamped_gain = self.target_peak / orig_peak
+            peak_cap = self.target_peak / orig_peak
+            if desired_gain > 1.0:
+                # Kẹp: tối đa tới trần đỉnh, nhưng KHÔNG nén xuống dưới 1,0.
+                clamped_gain = max(1.0, min(clamped_gain, peak_cap))
+            else:
+                clamped_gain = peak_cap
 
         # Một mảng đích duy nhất + hai phép biến đổi tại chỗ (không mảng tạm).
         out = np.empty_like(arr)

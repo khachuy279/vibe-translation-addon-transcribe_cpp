@@ -185,6 +185,75 @@ def test_speech_normalizer_behavior():
     assert res_silence.audio is silence
 
 
+def test_speech_normalizer_peak_bang_target_thi_khong_chuan_hoa():
+    """HỒI QUY 2026-10-12: `peak == target_peak` (0,95) ⇒ gain bị kẹp về ĐÚNG 1,0 ⇒ không boost.
+
+    VÌ SAO QUAN TRỌNG: đây là nguyên nhân thật của câu hỏi *"sao không thấy log `[NORM] Chuẩn hóa âm
+    lượng (Pipeline B)`"*. Trần đỉnh đặt `peak_cap = target_peak / peak`; khi file đã được
+    chuẩn-hoá-đỉnh về đúng 0,95 (rất phổ biến với file benchmark/TTS) thì cap = 1,0 ⇒
+    `is_modified=False` ⇒ tầng log của handler im lặng, DÙ RMS (0,07) còn thấp hơn mức mục tiêu (0,10).
+
+    Đo thật trên `wav_test/English_low_speech_quality_19s.wav` khối 1: RMS 0,0702 · peak 0,9500 ·
+    gain 1,0000 · is_modified=False.
+    """
+    normalizer = SpeechNormalizer(
+        target_rms=0.10, target_peak=0.95, max_gain=3.0, min_gain=0.3333,
+        knee_start=0.025, knee_end=0.050,
+    )
+    # Tín hiệu ĐỈNH CAO – NỀN NHỎ (đúng dạng file thật): nền sine RMS ~0,07 + một mẫu đỉnh 0,95.
+    base = (0.07 * np.sqrt(2.0) * np.sin(np.linspace(0, 100, 16000))).astype(np.float32)
+    audio = base.copy()
+    audio[0] = 0.95
+    assert abs(SpeechNormalizer.calculate_peak(audio) - 0.95) < 1e-6
+
+    res = normalizer.normalize(audio)
+
+    assert abs(res.original_rms - 0.07) < 0.02, res.original_rms
+    assert res.applied_gain == pytest.approx(1.0, abs=1e-4)
+    assert res.is_modified is False, "peak == target_peak ⇒ gain 1.0 ⇒ không có log NORM"
+
+    # Đối chứng: cùng RMS nhưng đỉnh THẤP hơn ⇒ được boost tới trần (0,95/0,80 = 1,1875).
+    quiet = base.copy()
+    quiet[0] = 0.80
+    res_quiet = normalizer.normalize(quiet)
+    assert res_quiet.is_modified is True
+    assert res_quiet.applied_gain == pytest.approx(0.95 / 0.80, rel=1e-3)
+
+
+def test_speech_normalizer_khong_bao_gio_nen_audio_dang_nho():
+    """SỬA 2026-10-12: audio NHỎ hơn mức mục tiêu KHÔNG được bị nén xuống dưới gain 1,0.
+
+    Bản cũ **gán** `gain = target_peak / peak` cho mọi ca vượt trần, nên file đỉnh cao (0,99) mà
+    nền nhỏ (RMS 0,03 — đúng loại cần boost cho ASR) bị **nén xuống 0,9596**, tức làm nhỏ thêm.
+    Nay chỉ **kẹp trần**, sàn ở 1,0.
+    """
+    normalizer = SpeechNormalizer(
+        target_rms=0.10, target_peak=0.95, max_gain=3.0, min_gain=0.3333,
+        knee_start=0.025, knee_end=0.050,
+    )
+    base = (0.03 * np.sqrt(2.0) * np.sin(np.linspace(0, 100, 16000))).astype(np.float32)
+    small_loud_peak = base.copy()
+    small_loud_peak[0] = 0.99
+
+    res = normalizer.normalize(small_loud_peak)
+
+    assert res.original_rms < normalizer.target_rms, res.original_rms
+    assert res.applied_gain >= 1.0, (
+        f"audio nhỏ (RMS {res.original_rms:.4f}) bị nén xuống gain {res.applied_gain:.4f} — "
+        "ngược mục đích bù âm lượng"
+    )
+    # Trần 0,95/0,99 = 0,9596 < 1,0 nên gain bị kẹp về đúng 1,0 (giữ nguyên, không nén).
+    assert res.applied_gain == pytest.approx(1.0, abs=1e-6)
+    assert res.is_modified is False
+
+    # Audio TO hơn mức mục tiêu thì VẪN nén về trần như cũ (mục đích của target_peak).
+    loud = (0.35 * np.sqrt(2.0) * np.sin(np.linspace(0, 100, 16000))).astype(np.float32)
+    loud[0] = 0.99
+    res_loud = normalizer.normalize(loud)
+    assert res_loud.applied_gain < 1.0
+    assert SpeechNormalizer.calculate_peak(res_loud.audio) <= 0.95 + 1e-6
+
+
 def test_speech_normalizer_from_config():
     """P2.6: các tham số normalize_* trong ASRConfig phải có tác dụng thật.
 

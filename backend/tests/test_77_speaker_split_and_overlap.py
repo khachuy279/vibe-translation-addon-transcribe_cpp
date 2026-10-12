@@ -198,6 +198,90 @@ def test_realign_theo_thoi_gian_sau_khi_bi_che_tiep():
     assert overlaps == [False, False, False]
 
 
+def test_cjk_khong_bi_chen_dau_cach_khi_thieu_language():
+    """HỒI QUY 2026-10-12: quên truyền `language` ⇒ tiếng Nhật bị nối bằng `" "` giữa MỌI ký tự.
+
+    Log thật: `"そ うです。"`, `"あ あ、 ち ょ っ と 先 ほ ど の"` — handler gọi `attribute_sentences`
+    mà không truyền `language`, nên joiner thành dấu cách (aligner tách tiếng Nhật theo KÝ TỰ).
+    Nay phải tự suy CJK từ văn bản ⇒ không còn dấu cách chèn.
+    """
+    chars = list("お一人です。そうです。")
+    ws = [AlignedWord(c, i * 0.15, (i + 1) * 0.15) for i, c in enumerate(chars)]
+    sent = SubtitleSentence(text="".join(chars), start_time=0.0, end_time=len(chars) * 0.15, words=ws)
+    turns = [
+        SpeakerTurn(0.0, 0.9, "speaker_0"),
+        SpeakerTurn(0.9, sent.end_time, "speaker_1"),
+    ]
+
+    for kwargs in ({}, {"language": "Japanese"}, {"language": "english"}):
+        pieces = attribute_sentences([sent], turns, **kwargs)
+        for p in pieces:
+            assert " " not in p.text, f"bị chèn dấu cách ({kwargs}): {p.text!r}"
+        assert "".join(p.text for p in pieces) == sent.text
+
+
+def _cjk_sentence(chars_text: str, boundary_after: int) -> tuple:
+    """Câu tiếng Nhật với aligner tách theo KÝ TỰ (0,15 s/ký tự) + ranh giới lượt sau ký tự đó."""
+    ws = [AlignedWord(c, i * 0.15, (i + 1) * 0.15) for i, c in enumerate(chars_text)]
+    sent = SubtitleSentence(text=chars_text, start_time=0.0, end_time=len(ws) * 0.15, words=ws)
+    return sent, ws[boundary_after].end_time
+
+
+#: `そうですね、ちょっと先ほどの話` — ち(6) ょ(7) っ(8) と(9); cắt giữa `ょ` và `っ` là cắt giữa từ.
+_CJK_TEXT = "そうですね、ちょっと先ほどの話"
+
+
+def test_cjk_khong_che_doi_tu_khi_ranh_gioi_roi_vao_giua():
+    """HỒI QUY 2026-10-12: `ちょっと` bị chẻ thành `…ち ょ` ⏐ `っ と…` vì cắt đúng ranh giới ký tự.
+
+    Luật: mảnh KHÔNG được bắt đầu bằng cỡ nhỏ (っ ゃ ゅ ょ…) / âm dài `ー` / dấu câu đóng, và KHÔNG
+    được kết thúc bằng cỡ nhỏ / âm dài. Ranh giới phải dịch sang chỗ sạch gần nhất — ở đây dịch về
+    ĐẦU từ `ちょっと`, nên cả từ đi trọn vào một phụ đề.
+    """
+    sent, boundary = _cjk_sentence(_CJK_TEXT, boundary_after=7)  # sau `ょ` = giữa ちょっと
+    turns = [SpeakerTurn(0.0, boundary, "speaker_0"), SpeakerTurn(boundary, sent.end_time, "speaker_1")]
+
+    pieces = attribute_sentences([sent], turns, language="Japanese")
+
+    assert len(pieces) == 2, [p.text for p in pieces]
+    assert "".join(p.text for p in pieces) == sent.text
+    small_kana = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶー")
+    for p in pieces:
+        assert p.text[0] not in small_kana, f"mảnh bắt đầu bằng cỡ nhỏ: {p.text!r}"
+        assert p.text[-1] not in small_kana, f"mảnh kết thúc bằng cỡ nhỏ: {p.text!r}"
+    assert pieces[0].text == "そうですね、", pieces[0].text
+    assert pieces[1].text.startswith("ちょっと"), pieces[1].text
+
+
+def test_cjk_manh_duoc_gan_nhan_theo_da_so():
+    """Sau khi dịch ranh giới, nhãn mảnh = bên chiếm ĐA SỐ thời lượng (không phải token đầu).
+
+    Nếu lấy token đầu: `ち,ょ` (người cũ) đứng trước `っと` (người mới) ⇒ mảnh bị gán cho người CŨ,
+    hai mảnh cùng nhãn rồi bị gộp (mất luôn việc tách câu) — đúng lỗi gặp khi sửa lần đầu.
+    """
+    sent, boundary = _cjk_sentence(_CJK_TEXT, boundary_after=7)
+    turns = [SpeakerTurn(0.0, boundary, "speaker_7"), SpeakerTurn(boundary, sent.end_time, "speaker_5")]
+
+    pieces = attribute_sentences([sent], turns, language="Japanese")
+
+    assert len(pieces) == 2, [p.text for p in pieces]
+    # Mảnh 2 = `ちょっと先ほどの話`: chỉ 2 ký tự (ち,ょ) thuộc speaker_7, 7 ký tự thuộc speaker_5.
+    assert pieces[1].speaker == "speaker 2", [p.speaker for p in pieces]
+    assert pieces[1].raw_speaker == "speaker_5"
+    assert pieces[0].raw_speaker == "speaker_7"
+
+
+def test_latin_khong_bi_anh_huong_boi_luat_cjk():
+    """Luật cỡ nhỏ/dấu câu chỉ áp cho CJK — câu tiếng Anh vẫn tách bình thường."""
+    sent = _sentence(12)  # w0…w11, 0,4 s/từ
+    turns = [SpeakerTurn(0.0, 2.4, "speaker_0"), SpeakerTurn(2.4, 4.8, "speaker_1")]
+
+    pieces = attribute_sentences([sent], turns, language="English")
+
+    assert [p.text for p in pieces] == ["w0 w1 w2 w3 w4 w5", "w6 w7 w8 w9 w10 w11"]
+    assert [p.speaker for p in pieces] == ["speaker 1", "speaker 2"]
+
+
 # ────────────────────────────────────────────────────────────────── PROMPT DỊCH (P0.3)
 
 

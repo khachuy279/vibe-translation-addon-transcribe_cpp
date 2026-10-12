@@ -37,6 +37,19 @@ DEFAULT_SPLIT_MIN_SEC = 0.7
 DEFAULT_SPLIT_MIN_WORDS = 2
 DEFAULT_OVERLAP_MIN_SEC = 0.30
 
+#: Ký tự KHÔNG THỂ BẮT ĐẦU một từ tiếng Nhật: cỡ nhỏ (っ ゃ ゅ ょ ぁ ぃ ぅ ぇ ぉ ゎ) và âm dài `ー`.
+#:
+#: VÌ SAO CẦN (log thật 2026-10-12 22:34:40): ForcedAligner tách tiếng Nhật theo **KÝ TỰ**, nên khi
+#: P0.2 cắt câu tại ranh giới lượt nói, điểm cắt rơi vào GIỮA TỪ:
+#:     "…ああ、ち"  ⏐  "ょっと先ほどの"      ← chữ ちょっと bị chẻ đôi qua hai phụ đề
+#: Phụ đề hiện ra hai mảnh vô nghĩa, và prompt dịch cũng nhận hai mảnh cụt đó.
+_SMALL_KANA = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶーゝゞヽヾ")
+#: Ký tự KHÔNG THỂ BẮT ĐẦU một mảnh phụ đề (dấu câu đóng/kết câu).
+_BAD_PIECE_START = set("、。，．・！？!?…‥」』】〉》〕）)]}：:；;")
+
+#: Dịch tối đa bao nhiêu token khi đi tìm ranh giới không chẻ đôi từ (nhỏ để không phá ý nghĩa lượt).
+_MAX_BOUNDARY_SHIFT = 3
+
 #: Sai số (giây) để coi một lượt trong lịch sử là "bị MỐC KHỐI cắt ngang".
 #:
 #: VÌ SAO CẦN (đo thật 2026-10-24, `scratch/p01_real_probe.py`): khối được cắt tại khoảng lặng,
@@ -215,6 +228,117 @@ def arrival_labels(turns: Sequence[SpeakerTurn]) -> Dict[str, str]:
 # ────────────────────────────────────────────────────────────────── tách câu (P0.2)
 
 
+def _looks_cjk(text: str) -> bool:
+    """True nếu văn bản có ký tự Nhật/Trung/Hàn (dùng khi caller KHÔNG truyền `language`).
+
+    VÌ SAO CẦN (lỗi thật 2026-10-12): handler gọi `attribute_sentences()` mà quên `language` ⇒ joiner
+    thành `" "` ⇒ tiếng Nhật (aligner tách theo ký tự) bị chèn dấu cách giữa MỌI ký tự:
+    `"そ うです。"`, `"あ あ、 ち ょ っ と"`. Suy ra từ chính văn bản để không phụ thuộc caller.
+    """
+    for ch in text or "":
+        o = ord(ch)
+        if 0x3040 <= o <= 0x30FF or 0x4E00 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7AF:
+            return True
+    return False
+
+
+def _can_start_piece(token: str) -> bool:
+    """Token có thể BẮT ĐẦU một mảnh phụ đề không (không phải cỡ nhỏ/âm dài/dấu câu đóng)."""
+    t = (token or "").strip()
+    if not t:
+        return False
+    return t[0] not in _SMALL_KANA and t[0] not in _BAD_PIECE_START
+
+
+def _can_end_piece(token: str) -> bool:
+    """Token có thể KẾT THÚC một mảnh phụ đề không (không kết bằng cỡ nhỏ/âm dài)."""
+    t = (token or "").strip()
+    if not t:
+        return False
+    return t[-1] not in _SMALL_KANA
+
+
+def _dominant_label(
+    run: Tuple[int, int],
+    word_key: Sequence[Optional[str]],
+    words: Sequence[Any],
+) -> Tuple[Optional[str], int]:
+    """Nhãn của một đoạn = nhãn của **PHẦN LỚN thời lượng** trong đoạn, kèm chỉ số từ đại diện.
+
+    VÌ SAO KHÔNG dùng token ĐẦU (lỗi thật 2026-10-12): sau khi dịch ranh giới để không chẻ đôi từ
+    (CJK tách theo ký tự), token đầu của đoạn mới có thể vẫn thuộc người nói TRƯỚC — khi đó hai đoạn
+    liền nhau bị coi là cùng nhãn và bị gộp lại, làm mất hẳn việc tách câu. Ví dụ thật:
+    `…ああ、ちょっと` bị cắt vào giữa `ちょっと`; ranh giới lùi về `ち` thì `ち,ょ` (người cũ) đứng
+    trước `っと` (người mới) ⇒ nếu lấy token đầu, cả mảnh bị gán cho người CŨ.
+    """
+    weights: Dict[Optional[str], float] = {}
+    first_idx: Dict[Optional[str], int] = {}
+    for i in range(run[0], run[1] + 1):
+        k = word_key[i]
+        dur = float(getattr(words[i], "duration", 0.0) or 0.0)
+        weights[k] = weights.get(k, 0.0) + max(dur, 0.01)
+        first_idx.setdefault(k, i)
+    if not weights:
+        return None, run[0]
+    best = max(weights, key=lambda k: (weights[k], -first_idx[k]))
+    return best, first_idx[best]
+
+
+def _coalesce_runs_by_label(
+    runs: List[Tuple[int, int]],
+    labels: Sequence[Optional[str]],
+) -> Tuple[List[Tuple[int, int]], List[Optional[str]]]:
+    """Gộp hai đoạn LIỀN KỀ cùng NHÃN (nhãn tính theo đa số thời lượng, xem `_dominant_label`)."""
+    out: List[Tuple[int, int]] = []
+    labs: List[Optional[str]] = []
+    for run, lab in zip(runs, labels):
+        if out and labs[-1] == lab:
+            out[-1] = (out[-1][0], run[1])
+        else:
+            out.append(run)
+            labs.append(lab)
+    return out, labs
+
+
+def _fix_runs_word_boundaries(
+    runs: List[Tuple[int, int]],
+    words: Sequence[Any],
+    max_shift: int = _MAX_BOUNDARY_SHIFT,
+) -> List[Tuple[int, int]]:
+    """Dịch ranh giới giữa hai đoạn để KHÔNG chẻ đôi từ (chỉ có ý nghĩa với CJK).
+
+    Điều kiện hợp lệ tại ranh giới `idx` (token `idx` mở đoạn mới):
+      * token `idx - 1` kết thúc được một từ, VÀ
+      * token `idx` bắt đầu được một từ.
+    Tìm `idx` hợp lệ GẦN NHẤT trong phạm vi `±max_shift`; không có ⇒ gộp hai đoạn (thà một phụ đề
+    hơi dài còn hơn hai mảnh cụt).
+    """
+    if len(runs) < 2:
+        return runs
+    out: List[Tuple[int, int]] = [runs[0]]
+    for run in runs[1:]:
+        prev = out[-1]
+        idx = run[0]
+        best: Optional[int] = None
+        for shift in range(0, max_shift + 1):
+            for cand in ((idx - shift,) if shift == 0 else (idx - shift, idx + shift)):
+                if not (prev[0] + 1 <= cand <= run[1]):
+                    continue
+                if _can_end_piece(getattr(words[cand - 1], "text", "")) and _can_start_piece(
+                    getattr(words[cand], "text", "")
+                ):
+                    best = cand
+                    break
+            if best is not None:
+                break
+        if best is None:
+            out[-1] = (prev[0], run[1])  # gộp: không tìm được chỗ cắt sạch
+            continue
+        out[-1] = (prev[0], best - 1)
+        out.append((best, run[1]))
+    return [r for r in out if r[0] <= r[1]]
+
+
 def _count_tokens(text: str) -> int:
     """Đếm token thô của một từ: có khoảng trắng ⇒ đếm từ; không (CJK) ⇒ đếm ký tự chữ/số."""
     t = (text or "").strip()
@@ -292,10 +416,10 @@ def _coalesce_same_speaker(
     runs: List[Tuple[int, int]],
     word_speakers: Sequence[Optional[str]],
 ) -> List[Tuple[int, int]]:
-    """Gộp hai đoạn LIỀN KỀ mang CÙNG người nói (chúng chỉ tách nhau vì một mảnh ở giữa đã bị gộp).
+    """Gộp hai đoạn LIỀN KỀ mang CÙNG người nói (một mảnh ở giữa đã bị gộp nên chúng tách nhau).
 
-    Không có bước này, ca "chớp nhãn ngắn" vẫn ra hai phụ đề cùng một người — đúng lỗi mà
-    `test_nhap_nhay_nhan_ngan_thi_gop_lai` khoá lại.
+    Dùng cho các lớp gộp theo **khoá từng từ** (khi chưa biết nhãn đa số của đoạn). Ở
+    `attribute_sentences` lớp tương ứng là `_coalesce_runs_by_label` (nhãn theo đa số thời lượng).
     """
     out: List[Tuple[int, int]] = []
     for run in runs:
@@ -336,6 +460,14 @@ def attribute_sentences(
     turns_n = normalize_turns(turns, sample_rate)
     labels: Dict[str, str] = dict(label_map) if label_map else arrival_labels(turns_n)
     joiner = "" if _is_cjk_language(language) else " "
+    #: LƯỚI AN TOÀN: caller quên truyền `language` (lỗi thật 2026-10-12) ⇒ suy từ chính văn bản,
+    #: nếu không tiếng Nhật sẽ bị nối bằng dấu cách giữa từng ký tự.
+    if joiner == " ":
+        sample_text = " ".join(str(getattr(s, "text", "") or "") for s in sentences[:3])
+        if _looks_cjk(sample_text):
+            joiner = ""
+            language = language or "auto-cjk"
+    is_cjk = joiner == ""
 
     def _label_of(raw: Optional[str]) -> Optional[str]:
         return labels.get(raw) if raw else None
@@ -390,14 +522,26 @@ def attribute_sentences(
 
         runs = _group_runs(word_key)
         runs = _merge_short_runs(runs, words, float(split_min_sec), int(split_min_words))
-        runs = _coalesce_same_speaker(runs, word_key)
+        if is_cjk and len(runs) > 1:
+            # Chỉ với CJK: aligner tách theo KÝ TỰ nên ranh giới có thể rơi vào GIỮA TỪ
+            # ("…ああ、ち" ⏐ "ょっと…"). Dịch ranh giới cho sạch rồi gộp lại mảnh quá ngắn.
+            runs = _fix_runs_word_boundaries(runs, words)
+            runs = _merge_short_runs(runs, words, float(split_min_sec), int(split_min_words))
+
+        def _labels_of(rs: List[Tuple[int, int]]) -> List[Optional[str]]:
+            return [_dominant_label(r, word_key, words)[0] for r in rs]
+
+        #: Nhãn của đoạn = bên chiếm ĐA SỐ thời lượng (không phải token đầu — xem `_dominant_label`).
+        runs, run_labels = _coalesce_runs_by_label(runs, _labels_of(runs))
+        # Gộp làm đoạn dài ra ⇒ bên đa số có thể đổi ⇒ tính lại nhãn rồi gộp lần cuối.
+        runs, run_labels = _coalesce_runs_by_label(runs, _labels_of(runs))
 
         if len(runs) <= 1:
             out.append(_whole_piece())
             continue
 
         produced = 0
-        for i0, i1 in runs:
+        for (i0, i1), lab in zip(runs, run_labels):
             run_words = words[i0 : i1 + 1]
             run_text = joiner.join(str(getattr(w, "text", "") or "").strip() for w in run_words).strip()
             if not run_text:
@@ -408,15 +552,15 @@ def attribute_sentences(
                 r_end = r_start + 0.01
             r_span = (r_start, r_end)
             r_ov = overlap_seconds(r_span, turns_n)
-            raw = word_raw[i0]
+            _lab, dom_idx = _dominant_label((i0, i1), word_key, words)
             out.append(
                 SpeakerPiece(
                     text=run_text,
                     start_time=r_start,
                     end_time=r_end,
                     words=run_words,
-                    speaker=word_key[i0] if word_key[i0] is not None else _label_of(raw),
-                    raw_speaker=raw,
+                    speaker=lab if lab is not None else _label_of(word_raw[i0]),
+                    raw_speaker=word_raw[dom_idx],
                     overlap=r_ov >= overlap_min_sec,
                     overlap_sec=r_ov,
                 )
