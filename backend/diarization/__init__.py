@@ -1,6 +1,8 @@
 from backend.diarization.service import DiarizationService, diarize_audio_sync, assign_speakers_to_subtitles
 from backend.diarization.attribution import (
+    SessionTurn,
     SpeakerPiece,
+    SpeakerRegistry,
     SpeakerTurn,
     active_speakers,
     arrival_labels,
@@ -27,4 +29,7 @@ __all__ = [
     "overlap_indices",
     "overlap_seconds",
     "realign_attribution",
+    # P0.1 — danh tính người nói bền qua các khối.
+    "SessionTurn",
+    "SpeakerRegistry",
 ]

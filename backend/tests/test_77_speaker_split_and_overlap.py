@@ -22,8 +22,9 @@ import numpy as np
 import pytest
 
 from backend.asr.forced_aligner import AlignedWord, SubtitleSentence
-from backend.diarization import attribute_sentences, realign_attribution
+from backend.diarization import SpeakerRegistry, attribute_sentences, realign_attribution
 from backend.diarization.attribution import SpeakerTurn, normalize_turns, overlap_seconds
+from backend.tests.fakes import make_speech_pcm
 from backend.translation.prompts import PipelineBPromptStrategy
 
 
@@ -274,6 +275,52 @@ def test_turns_that_tu_model_nemotron_tach_dung_ba_luot():
 # ────────────────────────────────────────────────────────────────── ĐẤU DÂY VÀO HANDLER
 
 
+def _make_chunk(
+    pts_start: float,
+    duration: float,
+    session: Any = None,
+    *,
+    feed_timeline: bool = True,
+) -> Any:
+    """Khối giả có đủ trường mà handler dùng (`pcm`, `pts_start`, `pts_end`, `duration`).
+
+    `feed_timeline=True` ⇒ nạp luôn PCM vào timeline để `_diar_window_pcm()` lấy được ngữ cảnh.
+    """
+    pcm = make_speech_pcm(duration)
+    if session is not None and feed_timeline:
+        session.timeline.append(float(pts_start), pcm)
+    return SimpleNamespace(
+        pcm=pcm,
+        pts_start=float(pts_start),
+        pts_end=float(pts_start) + float(duration),
+        duration=float(duration),
+    )
+
+
+def _fake_diarize_factory(per_call_turns: List[List[Dict[str, Any]]], lengths: List[int]):
+    """Trả về hàm `diarize_chunk` giả: mỗi lượt gọi trả một kịch bản turns khác nhau."""
+
+    async def _fake(_cls, audio, sample_rate: int = 16000):
+        lengths.append(int(np.asarray(audio).size))
+        idx = min(len(lengths) - 1, len(per_call_turns) - 1)
+        return per_call_turns[idx]
+
+    return _fake
+
+
+def _turns(*spans: tuple) -> List[Dict[str, Any]]:
+    """`_turns((0.0, 4.0, "speaker_0"), …)` → danh sách turns theo MẪU 16 kHz."""
+    return [
+        {
+            "start_sample": int(a * 16000),
+            "end_sample": int(b * 16000),
+            "speaker_id": sid,
+            "confidence": 0.9,
+        }
+        for a, b, sid in spans
+    ]
+
+
 class _RecTranslator:
     """Translator giả GHI LẠI cả `speaker_tags` và `overlap_flags` mà handler truyền xuống."""
 
@@ -318,7 +365,7 @@ async def test_handler_attribute_speakers_che_cau_va_gan_nhan(monkeypatch):
     monkeypatch.setattr(DiarizationService, "diarize_chunk", classmethod(_fake_diarize))
 
     subs = [_sentence(12)]
-    chunk = SimpleNamespace(pcm=np.zeros(int(5.0 * 16000), dtype=np.float32))
+    chunk = _make_chunk(0.0, 5.0, session)
     new_subs, pieces = await session._attribute_speakers(subs, chunk)
 
     assert len(new_subs) == 2, "handler phải dùng bản ĐÃ CHẺ"
@@ -347,7 +394,7 @@ async def test_handler_bo_qua_diarization_khi_tat(monkeypatch):
     session = LookaheadSessionState(ws=SimpleNamespace(send_json=None))
     session.apply_init({"source_lang": "en", "target_lang": "vi"})
     subs = [_sentence(12)]
-    chunk = SimpleNamespace(pcm=np.zeros(16000, dtype=np.float32))
+    chunk = SimpleNamespace(pcm=np.zeros(16000, dtype=np.float32), pts_start=0.0)
 
     new_subs, pieces = await session._attribute_speakers(subs, chunk)
 
@@ -376,7 +423,7 @@ async def test_handler_dua_duoc_muc_chong_tieng_vao_translator(monkeypatch):
     monkeypatch.setattr(DiarizationService, "diarize_chunk", classmethod(_fake_diarize))
 
     subs = [_sentence(12)]
-    chunk = SimpleNamespace(pcm=np.zeros(int(5.0 * 16000), dtype=np.float32))
+    chunk = _make_chunk(0.0, 5.0, session)
     new_subs, pieces = await session._attribute_speakers(subs, chunk)
     tags, overlaps = realign_attribution(new_subs, pieces)
 
@@ -387,3 +434,212 @@ async def test_handler_dua_duoc_muc_chong_tieng_vao_translator(monkeypatch):
     assert rec.calls, "translator phải được gọi"
     assert rec.calls[0]["overlap_flags"] == [True]
     assert rec.calls[0]["speaker_tags"] == ["speaker 1"]
+
+
+# ────────────────────────────────────────────────────────────────── P0.1 — DANH TÍNH THEO PHIÊN
+
+
+def test_registry_giu_nhan_khi_model_doi_so():
+    """Cùng một người nhưng model đổi id thô giữa hai cửa sổ ⇒ nhãn PHIÊN phải giữ nguyên."""
+    reg = SpeakerRegistry()
+    # Cửa sổ 1 (0–12 s): A = speaker_0
+    turns1 = [SpeakerTurn(0.0, 12.0, "speaker_0")]
+    labels1 = reg.label_window_turns(turns1, window_start_pts=0.0)
+    reg.observe(turns1, window_start_pts=0.0, labels=labels1, already_covered_until_pts=0.0)
+    assert labels1 == {"speaker_0": "speaker 1"}
+
+    # Cửa sổ 2 (4–24 s): model đổi số — A (đang nói tới 12,5 s) thành speaker_1, B thành speaker_0
+    turns2 = [SpeakerTurn(0.0, 8.5, "speaker_1"), SpeakerTurn(8.5, 20.0, "speaker_0")]
+    labels2 = reg.label_window_turns(turns2, window_start_pts=4.0)
+
+    assert labels2["speaker_1"] == "speaker 1", "A phải giữ ĐÚNG nhãn cũ dù id thô đã đổi"
+    assert labels2["speaker_0"] == "speaker 2", "B là người mới ⇒ nhãn mới"
+
+
+def test_registry_khong_khop_khi_chong_lan_duoi_nguong():
+    """Chồng lấn nhỏ hơn `min_match_sec` là nhiễu ở mép lượt, không phải bằng chứng cùng người."""
+    reg = SpeakerRegistry(min_match_sec=0.5)
+    turns1 = [SpeakerTurn(0.0, 2.0, "speaker_0")]
+    labels1 = reg.label_window_turns(turns1, window_start_pts=0.0)
+    reg.observe(turns1, window_start_pts=0.0, labels=labels1)
+
+    # Cửa sổ sau chỉ chồng 0,2 s với lượt cũ
+    labels2 = reg.label_window_turns([SpeakerTurn(0.0, 0.2, "speaker_7")], window_start_pts=1.8)
+    assert labels2["speaker_7"] == "speaker 2", "0,2 s < 0,5 s ⇒ phải coi là người mới"
+
+
+def test_registry_luat_lien_tuc_tai_moc_khoi_du_lieu_that():
+    """DỮ LIỆU THẬT (`scratch/p01_real_probe.py`, model Nemotron-3 trên `alternating.wav`).
+
+    Khối 1 [0–6 s]: `speaker_0` = A 0–4,02 s | `speaker_1` = B 5,67–6,00 s
+    Khối 2, cửa sổ [0–13,2 s] (6 s ngữ cảnh): `speaker_0` = A 0–4,02 + 8,81–12,83 | `speaker_1` = B 5,65–8,14
+
+    B chỉ kịp để lại **0,33 s** trước mốc khối — DƯỚI `min_match_sec` 0,35 s. Không có luật liên tục
+    thì B bị cấp số mới ("speaker 3") ngay giữa video; đây là lỗi THẬT đã gặp khi chạy model.
+    """
+    reg = SpeakerRegistry()
+    turns1 = _turns((0.0, 4.02, "speaker_0"), (5.67, 6.00, "speaker_1"))
+    labels1 = reg.label_window_turns(turns1, window_start_pts=0.0, boundary_pts=0.0)
+    reg.observe(turns1, window_start_pts=0.0, labels=labels1, already_covered_until_pts=0.0)
+    assert labels1 == {"speaker_0": "speaker 1", "speaker_1": "speaker 2"}
+
+    turns2 = _turns(
+        (0.0, 4.02, "speaker_0"),
+        (5.65, 8.14, "speaker_1"),
+        (8.81, 12.83, "speaker_0"),
+    )
+    labels2 = reg.label_window_turns(turns2, window_start_pts=0.0, boundary_pts=6.0)
+
+    assert labels2 == {"speaker_0": "speaker 1", "speaker_1": "speaker 2"}, (
+        f"B phải giữ 'speaker 2' nhờ luật liên tục tại mốc khối, thực tế: {labels2}"
+    )
+
+
+def test_registry_luat_lien_tuc_khong_ap_khi_luot_cu_da_ket_thuc_truoc_moc():
+    """Lượt cũ KHÔNG dính mốc khối (kết thúc từ lâu) ⇒ chồng lấn nhỏ không đủ để nối danh tính."""
+    reg = SpeakerRegistry()
+    turns1 = _turns((0.0, 4.0, "speaker_0"))
+    labels1 = reg.label_window_turns(turns1, window_start_pts=0.0, boundary_pts=0.0)
+    reg.observe(turns1, window_start_pts=0.0, labels=labels1)
+
+    # Lượt mới ở 5,9–8,0 (phủ mốc khối 6,0) nhưng chỉ chồng 0,1 s với lượt cũ (0–4,0 làn trước)
+    turns2 = _turns((0.0, 2.1, "speaker_9"))
+    labels2 = reg.label_window_turns(turns2, window_start_pts=5.9, boundary_pts=6.0)
+    assert labels2["speaker_9"] == "speaker 2"
+
+
+def test_registry_khong_khop_khi_o_xa_nhau():
+    """Khớp danh tính dựa trên CHỒNG LẤN THỜI GIAN: vùng khác hẳn thì không nối được."""
+    reg = SpeakerRegistry()
+    turns1 = [SpeakerTurn(0.0, 4.0, "speaker_0")]
+    labels1 = reg.label_window_turns(turns1, window_start_pts=0.0)
+    reg.observe(turns1, window_start_pts=0.0, labels=labels1)
+
+    labels2 = reg.label_window_turns([SpeakerTurn(0.0, 4.0, "speaker_5")], window_start_pts=600.0)
+    assert labels2["speaker_5"] == "speaker 2"
+
+
+def test_registry_tran_8_tai_su_dung_nhan_lau_nhat():
+    """Quá `max_speakers` ⇒ tái dùng nhãn lâu nhất không thấy, KHÔNG sinh 'speaker 9'."""
+    reg = SpeakerRegistry(max_speakers=8)
+    for i in range(12):
+        turns = [SpeakerTurn(0.0, 2.0, f"raw_{i}")]
+        labels = reg.label_window_turns(turns, window_start_pts=float(i) * 100.0)
+        reg.observe(turns, window_start_pts=float(i) * 100.0, labels=labels)
+        assert labels[f"raw_{i}"] in {f"speaker {k}" for k in range(1, 9)}
+    assert reg.labels == [f"speaker {k}" for k in range(1, 9)]
+
+
+def test_registry_khong_ghi_lai_luot_da_nam_tron_vung_cu():
+    """Lượt đã nằm TRỌN trong vùng đã gán nhãn không được ghi lần nữa (lịch sử không phình bản sao).
+
+    Lượt VƯỢT qua mốc cũ thì VẪN ghi: model vừa thấy nó dài hơn nên biên được cập nhật.
+    """
+    reg = SpeakerRegistry()
+    turns1 = [SpeakerTurn(0.0, 8.0, "speaker_0")]
+    labels1 = reg.label_window_turns(turns1, window_start_pts=0.0)
+    reg.observe(turns1, window_start_pts=0.0, labels=labels1)
+    assert len(reg.history()) == 1
+
+    # Cửa sổ sau: đuôi 0–8 s đã gán nhãn ở khối trước (khối trước kết thúc ở 8 s)
+    turns2 = [SpeakerTurn(0.0, 8.0, "speaker_0"), SpeakerTurn(8.0, 14.0, "speaker_1")]
+    labels2 = reg.label_window_turns(turns2, window_start_pts=0.0)
+    reg.observe(turns2, window_start_pts=0.0, labels=labels2, already_covered_until_pts=8.0)
+
+    hist = reg.history()
+    assert len(hist) == 2, f"chỉ được thêm lượt MỚI, thực tế: {hist}"
+    assert hist[1].start_pts == pytest.approx(8.0)
+
+
+def test_attribute_sentences_gop_hai_id_tho_cung_mot_nhan():
+    """Hai id thô cùng trỏ về MỘT nhãn phiên (model chớp nhãn) không được tạo 2 phụ đề liền kề."""
+    sent = _sentence(12)
+    # Từ 0–2,4 s: speaker_0; 2,4–4,0 s: speaker_9 (cùng người, model chớp); 4,0–4,8 s: speaker_0
+    turns = [
+        SpeakerTurn(0.0, 2.4, "speaker_0"),
+        SpeakerTurn(2.4, 4.0, "speaker_9"),
+        SpeakerTurn(4.0, 4.8, "speaker_0"),
+    ]
+    label_map = {"speaker_0": "speaker 1", "speaker_9": "speaker 1"}
+
+    pieces = attribute_sentences([sent], turns, language="English", label_map=label_map)
+
+    assert len(pieces) == 1, f"cùng nhãn phiên ⇒ một phụ đề, thực tế: {[p.speaker for p in pieces]}"
+    assert pieces[0].speaker == "speaker 1"
+
+
+@pytest.mark.asyncio
+async def test_handler_noi_danh_tinh_qua_hai_khoi(monkeypatch):
+    """P0.1 đầu-cuối: model ĐỔI SỐ người nói ở khối 2 nhưng nhãn gửi đi KHÔNG đổi.
+
+    Kịch bản (đúng ca đo được ở `scratch/diar_chunk_split.py`):
+      * khối 1 [0–12 s]: A nói suốt ⇒ model gọi A là `speaker_0`.
+      * khối 2 [12–24 s]: A nói tới 12,5 s rồi B nói; model ĐÁNH SỐ LẠI ⇒ A = `speaker_1`, B = `speaker_0`.
+    Không có P0.1, A sẽ bị đổi từ "speaker 1" sang "speaker 2" ngay giữa video.
+    """
+    from backend.diarization import DiarizationService
+    from backend.ws.lookahead_handler import LookaheadSessionState
+
+    session = LookaheadSessionState(ws=SimpleNamespace(send_json=None))
+    session.apply_init({"source_lang": "en", "target_lang": "vi"})
+
+    lengths: List[int] = []
+    fake = _fake_diarize_factory(
+        [
+            # Lượt 1 — cửa sổ = [0–12 s]: chỉ có A
+            _turns((0.0, 12.0, "speaker_0")),
+            # Lượt 2 — cửa sổ = [4–24 s] (đã cộng 8 s ngữ cảnh): A nói tới 16 s, B từ 16 s
+            _turns((0.0, 12.0, "speaker_1"), (12.0, 20.0, "speaker_0")),
+        ],
+        lengths,
+    )
+    monkeypatch.setattr(DiarizationService, "diarize_chunk", classmethod(fake))
+
+    # Khối 1
+    subs1 = [_sentence(30, sec_per_word=0.4)]  # 12 s
+    chunk1 = _make_chunk(0.0, 12.0, session)
+    _subs1, pieces1 = await session._attribute_speakers(subs1, chunk1)
+    assert [p.speaker for p in pieces1] == ["speaker 1"]
+
+    # Khối 2 — câu trải 12 s (mốc khối = 0), A nói 4 s đầu rồi B nói phần còn lại
+    subs2 = [SubtitleSentence(text=" ".join(f"z{i}" for i in range(30)), start_time=0.0,
+                              end_time=12.0, words=_words(30))]
+    chunk2 = _make_chunk(12.0, 12.0, session)
+    _subs2, pieces2 = await session._attribute_speakers(subs2, chunk2)
+
+    labels2 = [p.speaker for p in pieces2]
+    assert labels2 == ["speaker 1", "speaker 2"], (
+        f"A phải GIỮ 'speaker 1' qua ranh giới khối, thực tế: {labels2}"
+    )
+    assert pieces2[0].end_time == pytest.approx(4.0), "ranh giới mảnh bám mốc từ (4 s = 10 từ × 0,4 s)"
+    # Ngữ cảnh có được dùng thật: cửa sổ lượt 2 dài hơn khối (12 s) đúng bằng 8 s ngữ cảnh.
+    assert lengths[0] == 12 * 16000
+    assert lengths[1] == 20 * 16000, "cửa sổ phải gồm 8 s đuôi ngữ cảnh của khối trước"
+
+
+@pytest.mark.asyncio
+async def test_handler_khong_dung_ngu_canh_khi_tat_context(monkeypatch):
+    """`context_sec=0` ⇒ TẮT P0.1: mỗi khối tự đánh số lại (hành vi cũ), cửa sổ = đúng khối."""
+    from backend.config import config
+    from backend.diarization import DiarizationService
+    from backend.ws.lookahead_handler import LookaheadSessionState
+
+    session = LookaheadSessionState(ws=SimpleNamespace(send_json=None))
+    session.apply_init({"source_lang": "en", "target_lang": "vi"})
+
+    lengths: List[int] = []
+    fake = _fake_diarize_factory(
+        [_turns((0.0, 12.0, "speaker_0")), _turns((0.0, 12.0, "speaker_0"))],
+        lengths,
+    )
+    monkeypatch.setattr(DiarizationService, "diarize_chunk", classmethod(fake))
+    monkeypatch.setattr(config.diarization, "context_sec", 0.0, raising=False)
+
+    chunk1 = _make_chunk(0.0, 12.0, session)
+    await session._attribute_speakers([_sentence(30)], chunk1)
+    chunk2 = _make_chunk(12.0, 12.0, session)
+    _subs2, pieces2 = await session._attribute_speakers([_sentence(30)], chunk2)
+
+    assert lengths[1] == 12 * 16000, "tắt ngữ cảnh ⇒ cửa sổ đúng bằng khối"
+    # Không có registry ⇒ khối 2 đánh số lại từ đầu: id thô speaker_0 → "speaker 1".
+    assert [p.speaker for p in pieces2] == ["speaker 1"]

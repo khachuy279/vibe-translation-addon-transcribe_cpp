@@ -74,7 +74,13 @@ from backend.asr.forced_aligner import (
 )
 from backend.core.vad_silence import VADSilenceScanner, find_silence_gaps_streaming
 from backend.vad.engines import VADEngineFactory
-from backend.diarization import DiarizationService, attribute_sentences, realign_attribution
+from backend.diarization import (
+    DiarizationService,
+    SpeakerRegistry,
+    attribute_sentences,
+    normalize_turns,
+    realign_attribution,
+)
 from backend.ws.connection import SafeWebSocketConnection
 from backend.ws.session import (
     SessionConfigPayload,
@@ -209,6 +215,9 @@ class LookaheadSessionState:
         self.translation_engine = translation_engine
         self.vad_processor = None
         self.unavailable_reason: str = ""
+        #: P0.1 — bảng danh tính người nói cho CẢ PHIÊN (id thô của model → nhãn "speaker N").
+        #: Dựng lười ở lần diarize đầu tiên (xem `_get_speaker_registry`), reset khi `apply_init`.
+        self._speaker_registry: Optional[SpeakerRegistry] = None
 
         # Pipeline B CHỈ có một chế độ: OFFLINE_BATCH (Qwen3-ASR + Forced Aligner).
         # v2 "streaming giả lập" (VAD + CommitManager + preview) đã bị XOÁ ngày 2026-10-02 — người
@@ -2127,7 +2136,10 @@ class LookaheadSessionState:
 
         try:
             t_diar0 = time.perf_counter()
-            turns = await DiarizationService.diarize_chunk(chunk.pcm, sample_rate=16000)
+            # P0.1: diarize CẢ CỬA SỔ có ngữ cảnh chồng lấn, không chỉ đúng khối hiện tại.
+            ctx_sec = float(getattr(diar_cfg, "context_sec", 8.0) or 0.0)
+            window_pcm, window_start_pts = self._diar_window_pcm(chunk, ctx_sec)
+            turns = await DiarizationService.diarize_chunk(window_pcm, sample_rate=16000)
             diar_ms = (time.perf_counter() - t_diar0) * 1000.0
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2139,10 +2151,46 @@ class LookaheadSessionState:
         if not turns:
             return subtitles, empty_pieces
 
+        # ── P0.1: id thô của cửa sổ → NHÃN PHIÊN (không đổi số qua các khối) ──────────────────
+        label_map: Optional[Dict[str, str]] = None
+        if ctx_sec > 0:
+            try:
+                registry = self._get_speaker_registry(diar_cfg)
+                label_map = registry.label_window_turns(
+                    turns, window_start_pts, boundary_pts=float(chunk.pts_start)
+                )
+                registry.observe(
+                    turns,
+                    window_start_pts,
+                    label_map,
+                    already_covered_until_pts=float(chunk.pts_start),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Bảng danh tính người nói lỗi (dùng đánh số theo khối): {exc}",
+                    extra={"module_tag": "DIAR"},
+                )
+                label_map = None
+
+        # `turns` có gốc thời gian là ĐẦU CỬA SỔ; câu phụ đề có gốc là ĐẦU KHỐI ⇒ đổi hệ trước khi
+        # dùng cho P0.2/P0.3 (phần đuôi ngữ cảnh ra mốc âm, không giao với câu nào nên vô hại).
+        shift = float(chunk.pts_start) - float(window_start_pts)
+        if abs(shift) > 1e-6:
+            turns_chunk: List[Any] = [
+                {
+                    "start_sec": t.start_sec - shift,
+                    "end_sec": t.end_sec - shift,
+                    "speaker_id": t.speaker_id,
+                }
+                for t in normalize_turns(turns)
+            ]
+        else:
+            turns_chunk = turns
+
         try:
             pieces = attribute_sentences(
                 subtitles,
-                turns,
+                turns_chunk,
                 sample_rate=16000,
                 split=bool(getattr(diar_cfg, "split_by_speaker", True)),
                 split_min_sec=float(getattr(diar_cfg, "split_min_sec", 0.7) or 0.0),
@@ -2153,6 +2201,7 @@ class LookaheadSessionState:
                     if bool(getattr(diar_cfg, "overlap_flag", True))
                     else float("inf")
                 ),
+                label_map=label_map,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2172,16 +2221,68 @@ class LookaheadSessionState:
         ]
         n_split = max(0, len(new_subtitles) - len(subtitles))
         n_overlap = sum(1 for p in pieces if p.overlap)
+        speakers_seen = sorted({p.speaker for p in pieces if p.speaker})
+        win_sec = len(window_pcm) / 16000.0
+        ctx_used_sec = win_sec - float(getattr(chunk, "duration", win_sec) or 0.0)
         #: Danh sách "speaker N: đoạn text" để đọc log — giới hạn 10 mục như bản cũ.
         spk_preview = " ⏐ ".join(
             f'{p.speaker or "?"}: {p.text[:20]}' for p in pieces[:10]
         )
         logger.info(
-            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms): "
-            f"tách câu +{n_split} phụ đề, chồng tiếng {n_overlap}/{len(pieces)} mục: {spk_preview}",
+            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms, cửa sổ {win_sec:.1f}s, "
+            f"ngữ cảnh {ctx_used_sec:.1f}s): "
+            f"tách câu +{n_split} phụ đề, chồng tiếng {n_overlap}/{len(pieces)} mục, "
+            f"người nói={','.join(speakers_seen) or '?'}: {spk_preview}",
             extra={"module_tag": "DIAR"},
         )
         return new_subtitles, pieces
+
+    def _get_speaker_registry(self, diar_cfg: Any) -> SpeakerRegistry:
+        """Bảng danh tính người nói của phiên (P0.1), dựng lười theo cấu hình hiện hành."""
+        registry = self._speaker_registry
+        if registry is None:
+            registry = SpeakerRegistry(
+                max_speakers=int(getattr(diar_cfg, "max_speakers", 8) or 8),
+                min_match_sec=float(getattr(diar_cfg, "identity_min_match_sec", 0.35) or 0.0),
+                history_sec=float(getattr(diar_cfg, "identity_history_sec", 90.0) or 90.0),
+            )
+            self._speaker_registry = registry
+        return registry
+
+    def _diar_window_pcm(self, chunk: Any, context_sec: float) -> Tuple[np.ndarray, float]:
+        """PCM của CỬA SỔ diarize = [đuôi ngữ cảnh khối trước] + [khối hiện tại].
+
+        Trả `(pcm, window_start_pts)`. Ngữ cảnh là thứ cho phép P0.1 nối danh tính qua ranh giới
+        khối: model thấy liền một mạch nên tự giữ số cho người đang nói, còn `SpeakerRegistry` khớp
+        phần chồng lấn để nối tiếp qua NHIỀU khối.
+
+        Không lấy được ngữ cảnh (đầu video, khe hở RAM, vừa tua) ⇒ trả đúng PCM của khối: P0.2/P0.3
+        vẫn chạy, chỉ mất phần nối danh tính ở ranh giới đó.
+        """
+        chunk_pcm = np.asarray(chunk.pcm, dtype=np.float32)
+        chunk_start = float(chunk.pts_start)
+        if context_sec <= 0:
+            return chunk_pcm, chunk_start
+        want_start = max(0.0, chunk_start - float(context_sec))
+        if chunk_start - want_start < 0.5:  # quá gần đầu video ⇒ không có gì để lấy
+            return chunk_pcm, chunk_start
+        try:
+            got = self.timeline.get_audio_range(want_start, chunk_start - want_start)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Không lấy được ngữ cảnh diarization: {exc}", extra={"module_tag": "DIAR"})
+            return chunk_pcm, chunk_start
+        if not got:
+            return chunk_pcm, chunk_start
+        ctx_start, ctx_pcm = got
+        ctx_pcm = np.asarray(ctx_pcm, dtype=np.float32)
+        if ctx_pcm.size == 0:
+            return chunk_pcm, chunk_start
+        # Chỉ dùng khi ngữ cảnh LIỀN MẠCH với đầu khối: nếu có khe hở (tua / vùng RAM trống) thì
+        # ghép lại sẽ tạo một mối nối giả — model sẽ nhìn hai đoạn rời nhau như đang liền nhau.
+        ctx_end = float(ctx_start) + ctx_pcm.size / 16000.0
+        if abs(ctx_end - chunk_start) > 0.35:
+            return chunk_pcm, chunk_start
+        return np.concatenate([ctx_pcm, chunk_pcm]), float(ctx_start)
 
     async def _translate_batch(
         self,
@@ -2483,6 +2584,11 @@ class LookaheadSessionState:
         seek_id = data.get("seek_id")
         if seek_id:
             self.active_seek_id = str(seek_id)
+
+        # P0.1: phiên mới ⇒ bảng danh tính mới. (KHÔNG reset khi tua: danh tính người nói của cùng
+        # một video vẫn đúng, và việc khớp theo chồng lấn thời gian tự vô hiệu khi tua tới vùng chưa
+        # từng gán nhãn.)
+        self._speaker_registry = None
 
 
 async def handle_lookahead_ws(websocket: WebSocket) -> None:

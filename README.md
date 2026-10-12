@@ -64,7 +64,7 @@ PIPELINE B — Lookahead + OFFLINE_BATCH (video VoD / YouTube / phim)      độ
 ## Tính năng Nổi bật
 
 - **Phụ đề song ngữ 0.0s** — bản dịch hiện song song theo câu trọn vẹn, căn đúng mốc thời gian video.
-- **Nhận diện người nói (Speaker Diarization)** — tích hợp SOTA **Nemotron-3-Diarization** (NVIDIA), tự động phân tách tới 8 người nói (`speaker 1`, `speaker 2`...) giúp LLM dịch xưng hô chuẩn xác và giải quyết triệt để lỗi mất chủ ngữ trong hội thoại. Câu vắt qua ranh giới **đổi người nói được TÁCH thành từng phụ đề riêng** theo mốc từng từ của Forced Aligner, và câu có **người nói chồng tiếng** được đánh dấu để bản dịch không tự gán chủ ngữ (chỉ thị hẹp cho đúng các câu đó).
+- **Nhận diện người nói (Speaker Diarization)** — tích hợp SOTA **Nemotron-3-Diarization** (NVIDIA), tự động phân tách tới 8 người nói (`speaker 1`, `speaker 2`...) giúp LLM dịch xưng hô chuẩn xác và giải quyết triệt để lỗi mất chủ ngữ trong hội thoại. **Danh tính người nói bền suốt video**: mỗi khối được diarize kèm ngữ cảnh chồng lấn của khối trước và khớp lại qua bảng danh tính của phiên, nên `speaker 1` không bị đổi số giữa các khối. Câu vắt qua ranh giới **đổi người nói được TÁCH thành từng phụ đề riêng** theo mốc từng từ của Forced Aligner, và câu có **người nói chồng tiếng** được đánh dấu để bản dịch không tự gán chủ ngữ (chỉ thị hẹp cho đúng các câu đó).
 - **Tua an toàn tuyệt đối** — audio nằm trong RAM, tua tới/lui đều có ngay; tự dừng video khi chạm mốc chưa xử lý.
 - **Dịch theo ngữ cảnh 2 chiều** — kế thừa câu trước và câu sau, dịch dạng JSON cấu trúc cao cấp.
 - **Lồng tiếng (TTS)** — OmniVoice GGUF native, voice-cloning, nén WSOLA, auto-ducking.

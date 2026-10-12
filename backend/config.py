@@ -701,6 +701,21 @@ class DiarizationConfig(BaseModel):
     #: Vùng chồng lấn tối thiểu (giây) để coi là chồng tiếng thật, không phải nhiễu ở mép lượt.
     overlap_min_sec: float = 0.30
 
+    # ── P0.1 — danh tính người nói bền qua các khối ──────────────────────────────────────
+    #: Độ dài NGỮ CẢNH chồng lấn (giây) lấy từ cuối khối trước, đưa vào cùng một lần diarize.
+    #: Đây là thứ cho phép khớp danh tính qua ranh giới khối (`SpeakerRegistry`).
+    #: ĐO THẬT: cửa sổ 20 s (khối 12 s + ngữ cảnh 8 s) tốn ~1,15–1,18 s GPU (đã gồm nạp model).
+    #: Đặt 0 ⇒ TẮT P0.1 (mỗi khối tự đánh số lại như trước).
+    context_sec: float = 8.0
+    #: Thời gian chồng lấn tối thiểu (giây) để coi một id thô là CÙNG người với nhãn cũ.
+    identity_min_match_sec: float = 0.35
+    #: Bao lâu (giây) thì một nhãn hết hiệu lực khớp. Người vắng lâu hơn mức này sẽ được cấp số mới
+    #: (khớp danh tính dựa trên chồng lấn thời gian, không dùng embedding giọng).
+    identity_history_sec: float = 90.0
+    #: Trần số người nói của một phiên — khớp `num_speakers: 8` của Nemotron-3. Quá trần thì nhãn
+    #: LÂU NHẤT không thấy bị tái sử dụng (không bao giờ sinh "speaker 9").
+    max_speakers: int = 8
+
 
 class AppConfig(BaseModel):
     """Cấu hình gốc toàn hệ thống Backend."""

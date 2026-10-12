@@ -37,6 +37,14 @@ DEFAULT_SPLIT_MIN_SEC = 0.7
 DEFAULT_SPLIT_MIN_WORDS = 2
 DEFAULT_OVERLAP_MIN_SEC = 0.30
 
+#: Sai số (giây) để coi một lượt trong lịch sử là "bị MỐC KHỐI cắt ngang".
+#:
+#: VÌ SAO CẦN (đo thật 2026-10-24, `scratch/p01_real_probe.py`): khối được cắt tại khoảng lặng,
+#: nhưng người đang nói dở ngay trước mốc cắt chỉ kịp để lại **0,33 s** trong đuôi ngữ cảnh —
+#: DƯỚI ngưỡng khớp 0,35 s ⇒ bị cấp số mới dù rõ ràng là cùng người. Luật liên tục bù đúng ca đó:
+#: lượt mới PHỦ QUA mốc khối + lượt lịch sử KẾT THÚC sát mốc khối ⇒ cùng một người.
+BOUNDARY_TOUCH_TOL_SEC = 0.5
+
 
 @dataclass(frozen=True)
 class SpeakerTurn:
@@ -308,6 +316,7 @@ def attribute_sentences(
     split_min_words: int = DEFAULT_SPLIT_MIN_WORDS,
     overlap_min_sec: float = DEFAULT_OVERLAP_MIN_SEC,
     language: str = "",
+    label_map: Optional[Dict[str, str]] = None,
 ) -> List[SpeakerPiece]:
     """Gán nhãn người nói cho từng câu, TÁCH câu tại ranh giới lượt nói, và đánh cờ chồng tiếng.
 
@@ -315,14 +324,21 @@ def attribute_sentences(
     (`SubtitleSentence` của `backend/asr/forced_aligner.py`), trong đó `.words` là danh sách từ có
     `.text`, `.start_time`, `.end_time` — mốc thời gian **cùng hệ với `turns`** (đều tính từ đầu khối).
 
+    `label_map` (P0.1): ánh xạ `speaker_id` thô của model → **nhãn PHIÊN** ("speaker 1"…). Có nó thì
+    danh tính người nói không đổi số theo từng khối. Không truyền ⇒ đánh số theo thứ tự xuất hiện
+    trong chính khối đó (hành vi cũ).
+
     Trả về danh sách `SpeakerPiece` ĐÃ TÁCH. Câu không tách được giữ NGUYÊN văn bản gốc (không
     dựng lại từ danh sách từ) để không làm mất dấu câu mà `merge_source_text` đã gắn.
 
     `split=False` ⇒ chỉ gán nhãn + cờ (giữ nguyên số câu) — dùng để tắt P0.2 mà vẫn giữ P0.3.
     """
     turns_n = normalize_turns(turns, sample_rate)
-    labels = arrival_labels(turns_n)
+    labels: Dict[str, str] = dict(label_map) if label_map else arrival_labels(turns_n)
     joiner = "" if _is_cjk_language(language) else " "
+
+    def _label_of(raw: Optional[str]) -> Optional[str]:
+        return labels.get(raw) if raw else None
 
     out: List[SpeakerPiece] = []
 
@@ -343,7 +359,7 @@ def attribute_sentences(
                 start_time=s_start,
                 end_time=s_end,
                 words=words,
-                speaker=labels.get(raw) if raw else None,
+                speaker=_label_of(raw),
                 raw_speaker=raw,
                 overlap=span_overlap_sec >= overlap_min_sec,
                 overlap_sec=span_overlap_sec,
@@ -353,25 +369,28 @@ def attribute_sentences(
             out.append(_whole_piece())
             continue
 
-        word_speakers = [
+        word_raw = [
             dominant_speaker((float(w.start_time), float(w.end_time)), turns_n) for w in words
         ]
+        #: KHOÁ GOM ĐOẠN = **nhãn phiên**, không phải id thô: khi registry P0.1 ánh xạ hai id thô
+        #: (model "chớp nhãn" hoặc đổi số giữa hai cửa sổ) về CÙNG một người, chúng phải nằm chung
+        #: một đoạn — nếu gom theo id thô sẽ ra hai phụ đề liền kề cùng nhãn.
+        word_key: List[Optional[str]] = [_label_of(r) for r in word_raw]
 
         # ── KHÔNG CHẺ trong vùng CHỒNG TIẾNG ────────────────────────────────────────────────
         # Trong vùng ≥2 người nói cùng lúc, bản phiên âm là HỖN HỢP nên nhãn từng từ không đáng
         # tin; chẻ ở đó sẽ gán nửa câu trộn cho một người. Vì vậy từ nằm trong vùng chồng tiếng
         # KHÔNG được mở đoạn mới — nó nối tiếp đoạn đang có, và cả mảnh đó được đánh cờ ở dưới.
-        prev_spk: Optional[str] = None
+        prev_key: Optional[str] = None
         for i, w in enumerate(words):
-            w_span = (float(w.start_time), float(w.end_time))
-            if overlap_seconds(w_span, turns_n) >= overlap_min_sec:
-                if prev_spk is not None:
-                    word_speakers[i] = prev_spk
-            prev_spk = word_speakers[i]
+            if overlap_seconds((float(w.start_time), float(w.end_time)), turns_n) >= overlap_min_sec:
+                if prev_key is not None:
+                    word_key[i] = prev_key
+            prev_key = word_key[i]
 
-        runs = _group_runs(word_speakers)
+        runs = _group_runs(word_key)
         runs = _merge_short_runs(runs, words, float(split_min_sec), int(split_min_words))
-        runs = _coalesce_same_speaker(runs, word_speakers)
+        runs = _coalesce_same_speaker(runs, word_key)
 
         if len(runs) <= 1:
             out.append(_whole_piece())
@@ -389,14 +408,14 @@ def attribute_sentences(
                 r_end = r_start + 0.01
             r_span = (r_start, r_end)
             r_ov = overlap_seconds(r_span, turns_n)
-            raw = dominant_speaker(r_span, turns_n) or word_speakers[i0]
+            raw = word_raw[i0]
             out.append(
                 SpeakerPiece(
                     text=run_text,
                     start_time=r_start,
                     end_time=r_end,
                     words=run_words,
-                    speaker=labels.get(raw) if raw else None,
+                    speaker=word_key[i0] if word_key[i0] is not None else _label_of(raw),
                     raw_speaker=raw,
                     overlap=r_ov >= overlap_min_sec,
                     overlap_sec=r_ov,
@@ -408,6 +427,200 @@ def attribute_sentences(
             out.append(_whole_piece())
 
     return out
+
+
+# ────────────────────────────────────────────────────────────────── P0.1 — DANH TÍNH THEO PHIÊN
+
+
+@dataclass(frozen=True)
+class SessionTurn:
+    """Một lượt nói đã được GÁN NHÃN PHIÊN, ở hệ thời gian TUYỆT ĐỐI của video (giây)."""
+
+    start_pts: float
+    end_pts: float
+    label: str
+
+
+class SpeakerRegistry:
+    """Bảng danh tính người nói cho CẢ PHIÊN: `speaker_id` thô của model → nhãn bền ("speaker 1"…).
+
+    VÌ SAO CẦN (đo thật 2026-10-24, `scratch/diar_chunk_split.py`): mỗi lượt gọi diarization là một
+    session OFFLINE mới, model đánh số người nói theo **thứ tự xuất hiện trong chính cửa sổ đó**.
+    Cùng một người bị đổi số khi sang khối kế:
+
+        khối 1 (0–5 s)    → speaker_0 = A
+        khối 2 (5–13,2 s) → speaker_0 = B, speaker_1 = A     ← A từ "speaker 1" thành "speaker 2"
+
+    Prompt dịch lại giả định "speaker 1" là một người xuyên suốt video ⇒ đại từ/vai bị sai.
+
+    CÁCH LÀM: mỗi lượt diarize một cửa sổ có **ngữ cảnh chồng lấn** (đuôi của khối trước). Các lượt
+    đã gán nhãn được ghi vào lịch sử theo mốc TUYỆT ĐỐI; lượt mới trong vùng chồng lấn khớp với
+    lịch sử ⇒ nhận lại đúng nhãn cũ. Id thô không khớp ai ⇒ người nói MỚI.
+
+    GIỚI HẠN (đừng kỳ vọng nhầm): việc khớp dựa trên **chồng lấn thời gian**, nên danh tính bền khi
+    người đó còn xuất hiện trong `history_sec` gần nhất. Ai vắng lâu hơn thế (hoặc sau khi tua tới
+    vùng chưa từng gán nhãn) sẽ được cấp số mới. Model chỉ có 8 slot nên quá `max_speakers` thì nhãn
+    **lâu nhất không thấy** bị tái sử dụng (không bao giờ sinh "speaker 9").
+    """
+
+    def __init__(
+        self,
+        *,
+        max_speakers: int = 8,
+        min_match_sec: float = 0.35,
+        history_sec: float = 90.0,
+        max_history_turns: int = 600,
+    ) -> None:
+        self._max_speakers = max(1, int(max_speakers))
+        self._min_match_sec = max(0.0, float(min_match_sec))
+        self._history_sec = max(5.0, float(history_sec))
+        self._max_history_turns = max(16, int(max_history_turns))
+        self._history: List[SessionTurn] = []
+        self._last_seen: Dict[str, float] = {}
+        self._next_num = 1
+        self._max_pts_seen = 0.0
+
+    # ── truy vấn ─────────────────────────────────────────────────────────────────────────
+    @property
+    def labels(self) -> List[str]:
+        """Các nhãn phiên đã cấp (theo thứ tự cấp)."""
+        return [f"speaker {i}" for i in range(1, self._next_num)]
+
+    def history(self) -> List[SessionTurn]:
+        return list(self._history)
+
+    # ── cấp nhãn ─────────────────────────────────────────────────────────────────────────
+    def _new_label(self) -> str:
+        if self._next_num <= self._max_speakers:
+            label = f"speaker {self._next_num}"
+            self._next_num += 1
+            return label
+        # Quá trần (model chỉ hỗ trợ 8 slot) ⇒ tái dùng nhãn LÂU NHẤT không thấy.
+        candidates = self._last_seen or {f"speaker {i}": 0.0 for i in range(1, self._max_speakers + 1)}
+        return min(candidates, key=lambda k: candidates[k])
+
+    def label_window_turns(
+        self,
+        turns: Sequence[Any],
+        window_start_pts: float,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        boundary_pts: Optional[float] = None,
+    ) -> Dict[str, str]:
+        """Ánh xạ `speaker_id` thô trong cửa sổ → nhãn PHIÊN, bằng cách khớp vùng chồng lấn.
+
+        `turns`: lượt trong cửa sổ (mẫu hoặc giây, gốc = đầu cửa sổ — dùng `normalize_turns`).
+        `window_start_pts`: mốc TUYỆT ĐỐI (giây) của đầu cửa sổ.
+        `boundary_pts`: mốc TUYỆT ĐỐI của ranh giới khối (đầu khối hiện tại). Khi có, áp thêm
+            **luật liên tục**: lượt mới phủ qua mốc khối khớp với lượt lịch sử kết thúc sát mốc khối
+            ngay cả khi phần chồng lấn rất nhỏ (`BOUNDARY_TOUCH_TOL_SEC`).
+        """
+        turns_n = normalize_turns(turns, sample_rate)
+        order: List[str] = []
+        for t in turns_n:
+            if t.speaker_id not in order:
+                order.append(t.speaker_id)
+        if not order:
+            return {}
+
+        #: Khoảng thời gian (tuyệt đối) mà mỗi id thô chiếm, để biết nó có PHỦ QUA mốc khối không.
+        spans: Dict[str, Tuple[float, float]] = {}
+        for t in turns_n:
+            a = window_start_pts + t.start_sec
+            b = window_start_pts + t.end_sec
+            prev = spans.get(t.speaker_id)
+            spans[t.speaker_id] = (min(a, prev[0]), max(b, prev[1])) if prev else (a, b)
+
+        scores: Dict[str, Dict[str, float]] = {}
+        continuity: Dict[str, Dict[str, float]] = {}
+        if self._history:
+            for t in turns_n:
+                a = window_start_pts + t.start_sec
+                b = window_start_pts + t.end_sec
+                for h in self._history:
+                    ov = min(b, h.end_pts) - max(a, h.start_pts)
+                    if ov <= 0:
+                        continue
+                    per_label = scores.setdefault(t.speaker_id, {})
+                    per_label[h.label] = per_label.get(h.label, 0.0) + ov
+                    # Lượt lịch sử bị MỐC KHỐI cắt ngang (kết thúc sát mốc) ⇒ bằng chứng liên tục.
+                    if boundary_pts is not None and abs(h.end_pts - boundary_pts) <= BOUNDARY_TOUCH_TOL_SEC:
+                        cont = continuity.setdefault(t.speaker_id, {})
+                        cont[h.label] = cont.get(h.label, 0.0) + ov
+
+        def _spans_boundary(raw: str) -> bool:
+            if boundary_pts is None:
+                return False
+            start, end = spans[raw]
+            return start < boundary_pts - 0.05 and end > boundary_pts + 0.05
+
+        #: `(raw, label, điểm)` cho mọi id thô có bằng chứng — mạnh nhất xét trước.
+        candidates: List[Tuple[str, str, float]] = []
+        for raw in order:
+            best_label, best_sec = None, 0.0
+            for label, sec in (scores.get(raw) or {}).items():
+                if sec > best_sec:
+                    best_label, best_sec = label, sec
+            if best_label is not None and best_sec >= self._min_match_sec:
+                candidates.append((raw, best_label, best_sec))
+                continue
+            # Luật liên tục: người đang nói dở ngay trước mốc khối.
+            if _spans_boundary(raw):
+                for label, sec in (continuity.get(raw) or {}).items():
+                    if sec > best_sec:
+                        best_label, best_sec = label, sec
+                if best_label is not None and best_sec > 0:
+                    candidates.append((raw, best_label, best_sec))
+
+        candidates.sort(key=lambda c: -c[2])
+        assigned: Dict[str, str] = {}
+        taken: Dict[str, str] = {}
+        for raw, label, _sec in candidates:
+            if raw in assigned or label in taken:
+                continue
+            assigned[raw] = label
+            taken[label] = raw
+
+        for raw in order:
+            if raw not in assigned:
+                label = self._new_label()
+                assigned[raw] = label
+                taken.setdefault(label, raw)
+        return assigned
+
+    # ── ghi lịch sử ──────────────────────────────────────────────────────────────────────
+    def observe(
+        self,
+        turns: Sequence[Any],
+        window_start_pts: float,
+        labels: Dict[str, str],
+        *,
+        already_covered_until_pts: float = float("-inf"),
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+    ) -> None:
+        """Ghi các lượt THUỘC PHẦN MỚI của cửa sổ vào lịch sử (kèm nhãn phiên).
+
+        `already_covered_until_pts`: lượt kết thúc trước mốc này là phần đuôi ngữ cảnh đã ghi ở lượt
+        trước ⇒ bỏ qua để lịch sử không phình bản sao.
+        """
+        for t in normalize_turns(turns, sample_rate):
+            a = window_start_pts + t.start_sec
+            b = window_start_pts + t.end_sec
+            if b <= already_covered_until_pts + 0.25:
+                continue
+            label = labels.get(t.speaker_id)
+            if not label:
+                continue
+            self._history.append(SessionTurn(start_pts=a, end_pts=b, label=label))
+            self._last_seen[label] = max(b, self._last_seen.get(label, 0.0))
+            self._max_pts_seen = max(self._max_pts_seen, b)
+        self._prune()
+
+    def _prune(self) -> None:
+        cutoff = self._max_pts_seen - self._history_sec
+        if cutoff > 0:
+            self._history = [h for h in self._history if h.end_pts >= cutoff]
+        if len(self._history) > self._max_history_turns:
+            self._history = self._history[-self._max_history_turns :]
 
 
 # ────────────────────────────────────────────────────────────────── tiện ích
