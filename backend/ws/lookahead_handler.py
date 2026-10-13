@@ -1343,7 +1343,7 @@ class LookaheadSessionState:
         key = (int(self._seek_seq), round(float(from_pts), 2))
         if key != self._batch_gate_wait_key:
             self._batch_gate_wait_key = key
-            logger.info(
+            logger.debug(
                 f"[SEG_GATE] Chờ gom khối dài từ {from_pts:.2f}s: có {available:.1f}s/{want:.1f}s audio, "
                 f"đã dịch trước playhead {ready_ahead:.1f}s (khẩn cấp khi <= {urgent_lead:.1f}s, "
                 f"xử lý ~{self._batch_proc_ema_sec:.1f}s/khối).",
@@ -1508,8 +1508,12 @@ class LookaheadSessionState:
             timeline = self.timeline
             frontier = timeline.buffered_end_from(chunk.pts_start)
             logger.info(
-                f"[SEG_BATCH] Chọn khối: dài {chunk.duration:.1f}s "
-                f"(mục tiêu {getattr(self.chunker, 'last_effective_target_sec', 0.0):.1f}s, "
+                f"[SEG_BATCH] [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] Chọn khối: dài {chunk.duration:.1f}s",
+                extra={"module_tag": "ASR"},
+            )
+            logger.debug(
+                f"[SEG_BATCH] [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] Chi tiết: "
+                f"mục tiêu {getattr(self.chunker, 'last_effective_target_sec', 0.0):.1f}s, "
                 f"dải tìm tới {getattr(self.chunker, 'last_effective_search_max_sec', 0.0):.1f}s, "
                 f"mốc cắt {chunk.pts_start:.2f}s, "
                 f"biên liên tục tới {(frontier if frontier is not None else -1.0):.2f}s, "
@@ -1517,7 +1521,7 @@ class LookaheadSessionState:
                 f"đệm giải mã trước {available_ahead:.1f}s, "
                 f"playhead {self.current_time:.1f}s, mode={chunk.fallback_mode}, "
                 f"silence={chunk.silence_gap_ms:.0f}ms, cổng={gate_reason}, "
-                f"đã dịch trước playhead lúc cắt {gate_ready_ahead:.1f}s).",
+                f"đã dịch trước playhead lúc cắt {gate_ready_ahead:.1f}s.",
                 extra={"module_tag": "ASR"},
             )
 
@@ -1587,6 +1591,7 @@ class LookaheadSessionState:
                             language=align_lang,
                             silence_gap_sec=silence_gap,
                             comma_min_words=min_comma_words,
+                            chunk_duration_sec=chunk.duration,
                         )
                     elif hasattr(aligner_inst, "group_words_to_subtitles"):
                         # Nhánh tương thích ngược cho các FakeAligner trong test suite cũ
@@ -1605,6 +1610,7 @@ class LookaheadSessionState:
                             aligned_words,
                             language=align_lang,
                             silence_gap_sec=silence_gap,
+                            chunk_duration_sec=chunk.duration,
                         )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1641,11 +1647,14 @@ class LookaheadSessionState:
             # này thì không thể biết vì sao phụ đề hiển thị khác bản phiên âm offline — đúng sự cố
             # 2026-10-02 (ASR log hoàn hảo mà phụ đề ra mảnh cụt không dấu câu).
             if subtitles:
-                preview = " ⏐ ".join(f'"{s.text}"' for s in subtitles[:10])
-                if len(subtitles) > 10:
-                    preview += f" ⏐ …(+{len(subtitles) - 10})"
+                preview = " ⏐ ".join(
+                    f'"{s.text}" [{chunk.pts_start + s.start_time:.1f}s -> {chunk.pts_start + s.end_time:.1f}s]'
+                    for s in subtitles[:15]
+                )
+                if len(subtitles) > 15:
+                    preview += f" ⏐ …(+{len(subtitles) - 15})"
                 logger.info(
-                    f"[SEG_BATCH] Ngắt câu khối [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] "
+                    f"[SEG_BATCH] [{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] "
                     f"({len(subtitles)} phụ đề, align={align_lang}): {preview}",
                     extra={"module_tag": "ASR"},
                 )
@@ -1703,7 +1712,7 @@ class LookaheadSessionState:
                 if len(translated_texts) > 10:
                     preview_trans += f" ⏐ …(+{len(translated_texts) - 10})"
                 logger.info(
-                    f"Lookahead Batch Translation ({len(candidate_subs)} câu, {tr_ms:.0f}ms): {preview_trans}",
+                    f"[{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] {preview_trans}",
                     extra={"module_tag": "TRANSLATE"},
                 )
 
@@ -1759,6 +1768,11 @@ class LookaheadSessionState:
                 self.utterances_sent += 1
 
             if items_to_send and not self._closed and seq == self._seek_seq:
+                pts_summary = f"[{items_to_send[0]['start_pts']:.2f}s -> {items_to_send[-1]['end_pts']:.2f}s]"
+                logger.info(
+                    f"[WS] Gửi {len(items_to_send)} phụ đề {pts_summary} (seek_id={self.active_seek_id})",
+                    extra={"module_tag": "WS"},
+                )
                 await self.send_json({
                     "type": "lookahead_subtitles",
                     "seek_id": self.active_seek_id,
@@ -2198,14 +2212,14 @@ class LookaheadSessionState:
         n_overlap = sum(1 for p in pieces if p.overlap)
         speakers_seen = sorted({p.speaker for p in pieces if p.speaker})
         chunk_sec = len(chunk_pcm) / 16000.0
-        #: Danh sách "speaker N: đoạn text" để đọc log — giới hạn 10 mục như bản cũ.
+        #: Danh sách "speaker N: đoạn text" để đọc log — giới hạn 20 mục như bản cũ.
         spk_preview = " ⏐ ".join(
-            f'{p.speaker or "?"}: {p.text[:20]}' for p in pieces[:10]
+            f'{p.speaker or "?"}: {p.text[:10]}...' for p in pieces[:20]
         )
+        if len(pieces) > 20:
+            spk_preview += f" ⏐ …(+{len(pieces) - 20})"
         logger.info(
-            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms, khối {chunk_sec:.1f}s): "
-            f"tách câu +{n_split} phụ đề, chồng tiếng {n_overlap}/{len(pieces)} mục, "
-            f"người nói={','.join(speakers_seen) or '?'}: {spk_preview}",
+            f"[{chunk.pts_start:.2f}s -> {chunk.pts_end:.2f}s] Nemotron-3: {spk_preview}",
             extra={"module_tag": "DIAR"},
         )
         return new_subtitles, pieces
@@ -2466,7 +2480,7 @@ class LookaheadSessionState:
         self._diag_media_seconds = self.media_seconds
         self._diag_decode_wall = self.decode_wall_sec
 
-        logger.info(
+        logger.debug(
             f"Trạng thái Lookahead | Playhead: {self.current_time:.1f}s | "
             f"Audio RAM: {self.timeline.total_stored_seconds():.1f}s | "
             f"Đệm trước: {buffered_ahead:.1f}s | "

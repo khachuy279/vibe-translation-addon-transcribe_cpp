@@ -796,16 +796,162 @@ class ForcedAlignerService:
                 text = " ".join(w.text for w in sub_words).strip()
             if not text:
                 continue
+            valid_starts = [float(w.start_time) for w in sub_words if float(w.start_time) > 0.001]
+            valid_ends = [float(w.end_time) for w in sub_words if float(w.end_time) > 0.001]
+            st = valid_starts[0] if valid_starts else float(sub_words[0].start_time)
+            en = valid_ends[-1] if valid_ends else float(sub_words[-1].end_time)
+            if en <= st:
+                en = st + 0.5
+
             subtitles.append(
                 SubtitleSentence(
                     text=text,
-                    start_time=float(sub_words[0].start_time),
-                    end_time=float(sub_words[-1].end_time),
+                    start_time=st,
+                    end_time=en,
                     words=sub_words,
                 )
             )
 
-        return subtitles
+        chunk_dur = float(kwargs.get("chunk_duration_sec", 0.0) or kwargs.get("chunk_duration", 0.0) or 0.0)
+        return ForcedAlignerService.sanitize_subtitle_timestamps(subtitles, chunk_duration_sec=chunk_dur)
+
+    @staticmethod
+    def sanitize_subtitle_timestamps(
+        subtitles: List[SubtitleSentence],
+        chunk_duration_sec: float = 0.0,
+    ) -> List[SubtitleSentence]:
+        """Căn chỉnh thời gian hiển thị phụ đề = đúng với thời gian của đoạn audio đó.
+
+        Quy tắc:
+          1. start_time: đúng lúc câu bắt đầu nói trong audio (từ đầu tiên có mốc hợp lệ).
+          2. end_time: bao trọn toàn bộ thời gian nói của câu trong audio:
+             - Nếu câu có các từ sau chưa được align (mốc 0.0), tự bù thời lượng ước lượng của các từ đó
+               hoặc kéo dài đến sát lúc câu tiếp theo bắt đầu (next_start - 0.05s).
+             - Giữ phụ đề hiển thị xuyên suốt đoạn audio của câu + đệm nghe/đọc tự nhiên (~0.4s - 0.6s)
+               nếu có khoảng lặng trước câu kế tiếp.
+             - Tuyệt đối không cắt cụt câu khi người nói chưa dứt lời (không dùng công thức trần cứng).
+             - Đảm bảo tính đơn điệu (monotonic): câu sau không bao giờ bắt đầu trước câu trước.
+        """
+        if not subtitles:
+            return subtitles
+
+        n = len(subtitles)
+        chunk_dur = float(chunk_duration_sec) if chunk_duration_sec > 0 else 0.0
+        if chunk_dur <= 0.0:
+            for s in subtitles:
+                for w in (s.words or []):
+                    chunk_dur = max(chunk_dur, float(w.end_time or 0.0))
+            if chunk_dur <= 0.0:
+                chunk_dur = max(5.0, n * 3.5)
+
+        # Bước 1: Trích xuất mốc thực tế của từng câu từ các từ đã căn chỉnh
+        extracted: List[Dict[str, Any]] = []
+        for s in subtitles:
+            words = getattr(s, "words", None) or []
+            valid_words = [
+                w for w in words
+                if float(w.end_time or 0.0) > float(w.start_time or 0.0) and float(w.end_time or 0.0) > 0.001
+            ]
+
+            if valid_words:
+                first_w = valid_words[0]
+                last_w = valid_words[-1]
+                st = float(first_w.start_time)
+                en = float(last_w.end_time)
+                trailing_unaligned = len(words) - 1 - words.index(last_w)
+            else:
+                st = float(s.start_time or 0.0)
+                en = float(s.end_time or 0.0)
+                trailing_unaligned = 0
+
+            extracted.append({
+                "sub": s,
+                "st": st,
+                "en": en,
+                "has_valid": len(valid_words) > 0,
+                "trailing_words": trailing_unaligned,
+                "word_count": len(words) if words else len(s.text.split()),
+            })
+
+        # Bước 2: Tìm các mốc neo (anchor) chắc chắn từ âm học thực tế
+        anchors: List[int] = []
+        last_t = 0.0
+        for i, item in enumerate(extracted):
+            if item["has_valid"] and item["st"] >= last_t and item["en"] > item["st"]:
+                anchors.append(i)
+                last_t = item["en"]
+
+        # Bước 3: Tính toán start_time và end_time cho từng câu bám sát audio
+        final_subs: List[SubtitleSentence] = []
+        prev_end = 0.0
+
+        for i, item in enumerate(extracted):
+            sub = item["sub"]
+            st = item["st"]
+            en = item["en"]
+            has_valid = item["has_valid"]
+
+            # Nếu mốc bị nhảy lùi về quá khứ hoặc = 0
+            if not has_valid or st < prev_end or en <= st:
+                next_anchor_idx = next((k for k in anchors if k > i), None)
+                if next_anchor_idx is not None:
+                    next_anchor_st = extracted[next_anchor_idx]["st"]
+                    span_available = max(0.6, next_anchor_st - prev_end)
+                    total_words = sum(extracted[k]["word_count"] for k in range(i, next_anchor_idx))
+                    my_ratio = item["word_count"] / max(1, total_words)
+                    alloc = span_available * my_ratio
+                    st = prev_end + 0.02
+                    en = min(next_anchor_st - 0.02, st + alloc)
+                else:
+                    span_available = max(1.0, chunk_dur - prev_end)
+                    total_words = sum(extracted[k]["word_count"] for k in range(i, n))
+                    my_ratio = item["word_count"] / max(1, total_words)
+                    alloc = span_available * my_ratio
+                    st = prev_end + 0.02
+                    en = min(chunk_dur, st + alloc)
+            else:
+                # Câu có mốc hợp lệ: đảm bảo st không lùi về trước câu trước
+                if st < prev_end:
+                    st = prev_end + 0.02
+
+                # Nếu có từ chưa align ở đuôi: bù thời gian cho các từ chưa align
+                if item["trailing_words"] > 0:
+                    en = en + item["trailing_words"] * 0.35
+
+            # Xem xét mốc bắt đầu của câu kế tiếp để phụ đề KHÔNG bị tắt sớm giữa chừng
+            if i < n - 1:
+                next_item = extracted[i + 1]
+                next_st_raw = next_item["st"] if next_item["has_valid"] else None
+                if next_st_raw is not None and next_st_raw > en:
+                    gap = next_st_raw - en
+                    if gap < 0.8:
+                        # Khoảng nghỉ ngắn giữa 2 câu: kéo phụ đề hiện tại đến sát câu sau (-0.05s)
+                        # để người xem nghe trọn vẹn câu mà không bị chớp tắt phụ đề!
+                        en = next_st_raw - 0.05
+                    else:
+                        # Khoảng lặng lớn hơn: giữ đệm nghe tự nhiên 0.4s sau khi dứt từ cuối
+                        en = min(next_st_raw - 0.05, en + 0.4)
+                elif next_st_raw is not None and next_st_raw <= en:
+                    en = max(st + 0.3, next_st_raw - 0.02)
+            else:
+                # Câu cuối cùng của khối: cho phép đệm nghe tự nhiên 0.5s đến hết khối
+                en = min(chunk_dur, en + 0.5)
+
+            # Đảm bảo thời lượng tối thiểu 0.5s
+            if en <= st:
+                en = st + 0.5
+
+            final_subs.append(
+                SubtitleSentence(
+                    text=sub.text,
+                    start_time=round(st, 3),
+                    end_time=round(en, 3),
+                    words=sub.words,
+                )
+            )
+            prev_end = en
+
+        return final_subs
 
     @staticmethod
     def group_words_to_subtitles(

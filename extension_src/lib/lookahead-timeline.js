@@ -196,13 +196,18 @@ class SubtitleTimelineQueue {
     // NGOẠI LỆ DUY NHẤT: chặn SÀN cưng cứng cho câu quá ngắn (aligner có thể trả câu dài 0 ms khi
     // audio không khớp văn bản) để phụ đề không nhấp nháy trong một khung hình. Chỉ được phép KÉO
     // DÀI, không bao giờ cắt ngắn, và không bao giờ vượt mốc bắt đầu của câu kế tiếp.
+    // Chỉ giữ sàn minDurationSec để câu không bị nhấp nháy quá ngắn (< 0.5s),
+    // KHÔNG cắt ngắn trần thời lượng câu: hiển thị trọn vẹn theo thời lượng âm học của audio do backend gửi.
     const floorSec = Number(this.minDurationSec) > 0 ? Number(this.minDurationSec) : 0.0;
-    for (let i = 0; i < this.items.length && floorSec > 0; i++) {
-      const it = this.items[i];
-      if (it.end_pts - it.start_pts >= floorSec) continue;
-      const nextIt = this.items[i + 1];
-      const limit = nextIt ? nextIt.start_pts : it.start_pts + floorSec;
-      it.end_pts = Math.max(it.end_pts, Math.min(it.start_pts + floorSec, limit));
+    if (floorSec > 0) {
+      for (let i = 0; i < this.items.length; i++) {
+        const it = this.items[i];
+        if (it.end_pts - it.start_pts < floorSec) {
+          const nextIt = this.items[i + 1];
+          const limit = nextIt ? nextIt.start_pts : it.start_pts + floorSec;
+          it.end_pts = Math.max(it.end_pts, Math.min(it.start_pts + floorSec, limit));
+        }
+      }
     }
 
     // Nếu đang chờ nạp đệm sau khi Tua -> phát tiếp khi đã có câu khớp vị trí hiện tại
@@ -353,7 +358,11 @@ class SubtitleTimelineQueue {
 
   _startRenderLoop() {
     const loop = () => {
-      this._tick();
+      try {
+        this._tick();
+      } catch (err) {
+        console.error("[BS][Timeline] Lỗi trong _tick():", err);
+      }
       this.rafId = requestAnimationFrame(loop);
     };
     this.rafId = requestAnimationFrame(loop);
