@@ -693,18 +693,23 @@ class DiarizationConfig(BaseModel):
     """
     enabled: bool = True
     active_model: str = "nemotron-3-diarization-bf16.gguf"
-    latency_profile: str = "low"
+    #: Profile trễ: "very_high" (chất lượng offline cao nhất của NVIDIA, context và cache tối đa)
+    latency_profile: str = "very_high"
+    #: Ngưỡng phát hiện hoạt động giọng nói của speaker (0.0 -> 1.0, mặc định 0.5)
+    speaker_threshold: float = 0.5
     backend: str = "cuda"
     threads: int = 4
 
-    # ── P0.2 — tách câu tại ranh giới lượt nói ────────────────────────────────────────────
-    #: Bật/tắt việc CHẺ câu theo người nói (tắt ⇒ vẫn gán nhãn + cờ chồng tiếng như P0.3).
-    split_by_speaker: bool = True
+    # ── P0.2 — gán nhãn người nói (XOÁ HOÀN TOÀN TÁCH CÂU THEO SPEAKER 2026-10-13) ─────────
+    #: Bật/tắt việc CHẺ câu theo người nói. Đã tắt vĩnh viễn: không chẻ câu phụ đề theo speaker.
+    split_by_speaker: bool = False
     #: Mảnh tối thiểu (giây) và tối thiểu token để được đứng riêng. Dưới ngưỡng thì gộp vào mảnh
     #: lân cận — model diarization có lúc "nhấp nháy" nhãn 50–500 ms giữa một mạch nói của CÙNG
     #: một người (đo thật 2026-10-24), cắt tại đó chỉ tạo mảnh vụn.
     split_min_sec: float = 0.7
-    split_min_words: int = 2
+    #: Nâng từ 2 lên 4 (2026-10-13): cụm 2–3 từ như "With our" quá ngắn để đứng riêng;
+    #: diarization hay "nhấp nháy" speaker tại khoảng dừng nhỏ trong câu của CÙNG một người.
+    split_min_words: int = 4
 
     # ── P0.3 — cờ chồng tiếng ────────────────────────────────────────────────────────────
     #: Đánh dấu câu có ≥2 người nói CÙNG LÚC (turns chồng nhau về thời gian).
@@ -712,12 +717,10 @@ class DiarizationConfig(BaseModel):
     #: Vùng chồng lấn tối thiểu (giây) để coi là chồng tiếng thật, không phải nhiễu ở mép lượt.
     overlap_min_sec: float = 0.30
 
-    # ── P0.1 — danh tính người nói bền qua các khối ──────────────────────────────────────
-    #: Độ dài NGỮ CẢNH chồng lấn (giây) lấy từ cuối khối trước, đưa vào cùng một lần diarize.
-    #: Đây là thứ cho phép khớp danh tính qua ranh giới khối (`SpeakerRegistry`).
-    #: ĐO THẬT: cửa sổ 20 s (khối 12 s + ngữ cảnh 8 s) tốn ~1,15–1,18 s GPU (đã gồm nạp model).
-    #: Đặt 0 ⇒ TẮT P0.1 (mỗi khối tự đánh số lại như trước).
-    context_sec: float = 8.0
+    # ── P0.1 — danh tính người nói qua các khối (ĐÃ TẮT: độc lập theo từng khối) ────────
+    #: Độ dài ngữ cảnh chồng lấn (giây). Mặc định 0.0: tắt nhớ speaker qua các khối,
+    #: chỉ lọc speaker tách người nói độc lập trên đúng đoạn âm thanh gửi vào ASR.
+    context_sec: float = 0.0
     #: Thời gian chồng lấn tối thiểu (giây) để coi một id thô là CÙNG người với nhãn cũ.
     identity_min_match_sec: float = 0.35
     #: Bao lâu (giây) thì một nhãn hết hiệu lực khớp. Người vắng lâu hơn mức này sẽ được cấp số mới

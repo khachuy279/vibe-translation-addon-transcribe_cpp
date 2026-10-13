@@ -341,3 +341,140 @@ def test_pause_split_khong_che_cau_tieng_anh_co_dau_phay_o_giua():
     assert out[0].text == "Well, this is fine."
 
 
+# ── ĐẠI TU SEG_BATCH 2026-10-13: Test cases TDD cho kiến trúc segment_aligned_words ──────
+
+
+def test_segment_aligned_words_case_1_with_our_friends():
+    """TEST THỰC TẾ 1:
+    'With our friends moving forward in their relationships, I've decided that we should make progress in ours as well.'
+    Tuyệt đối không được chẻ thành 'With our' | 'friends moving forward...'.
+    Phải giữ nguyên cả câu (nếu max_words lớn) hoặc tách đúng tại dấu phẩy mệnh đề (nếu max_words=12).
+    """
+    raw_words = (
+        "With our friends moving forward in their relationships, "
+        "I've decided that we should make progress in ours as well."
+    ).split()
+    
+    aligned_words = []
+    t = 0.0
+    for w in raw_words:
+        aligned_words.append(AlignedWord(text=w, start_time=t, end_time=t + 0.3))
+        t += 0.35
+
+    # Trường hợp 1: Có dấu phẩy đủ điều kiện (>= 4 từ trước, >= 2 từ sau) -> Tách chuẩn tại dấu phẩy
+    subs_split = ForcedAlignerService.segment_aligned_words(
+        aligned_words, language="English", comma_min_words=4
+    )
+    assert len(subs_split) == 2
+    assert subs_split[0].text == "With our friends moving forward in their relationships,"
+    assert subs_split[1].text == "I've decided that we should make progress in ours as well."
+    assert not any(s.text.startswith("With our ") and len(s.text.split()) == 2 for s in subs_split)
+
+    # Trường hợp tắt tách phẩy (comma_min_words=0) -> Giữ nguyên 1 câu trọn vẹn
+    subs_full = ForcedAlignerService.segment_aligned_words(
+        aligned_words, language="English", comma_min_words=0
+    )
+    assert len(subs_full) == 1
+    assert subs_full[0].text == (
+        "With our friends moving forward in their relationships, "
+        "I've decided that we should make progress in ours as well."
+    )
+
+
+def test_segment_aligned_words_long_sentence_without_comma_kept_whole():
+    """TEST THỰC TẾ (User log 2026-10-13 08:51:03):
+    'What can be more special than having an adequate amount of time to cross the street on your way to buy a tiny Lego Indiana Jones?'
+    Câu dài 26 từ không có dấu phẩy -> BẮT BUỘC giữ trọn vẹn 1 câu, KHÔNG được cắt theo giới hạn 10 từ!
+    """
+    raw_words = (
+        "What can be more special than having an adequate amount of time to "
+        "cross the street on your way to buy a tiny Lego Indiana Jones?"
+    ).split()
+    assert len(raw_words) == 26
+
+    aligned_words = []
+    t = 0.0
+    for w in raw_words:
+        aligned_words.append(AlignedWord(text=w, start_time=t, end_time=t + 0.25))
+        t += 0.28
+
+    subs = ForcedAlignerService.segment_aligned_words(
+        aligned_words, language="English"
+    )
+    assert len(subs) == 1
+    assert subs[0].text == (
+        "What can be more special than having an adequate amount of time to "
+        "cross the street on your way to buy a tiny Lego Indiana Jones?"
+    )
+    assert not any(len(s.text.split()) == 10 for s in subs)
+
+
+def test_segment_aligned_words_case_2_lsd_thought_control():
+    """TEST THỰC TẾ 2:
+    'Hope you're not thinking about some sort of LSD thought control, because there's only one mind-expanding drug that this man enjoys,'
+    Tuyệt đối không được cắt ngang giữa 'LSD thought' và 'control, because...'.
+    Tách chuẩn tại dấu phẩy sau 'control,'.
+    """
+    raw_words = (
+        "Hope you're not thinking about some sort of LSD thought control, "
+        "because there's only one mind-expanding drug that this man enjoys,"
+    ).split()
+    
+    aligned_words = []
+    t = 0.0
+    for w in raw_words:
+        aligned_words.append(AlignedWord(text=w, start_time=t, end_time=t + 0.28))
+        t += 0.32
+
+    subs = ForcedAlignerService.segment_aligned_words(
+        aligned_words, language="English", max_words=12, max_duration_sec=4.5
+    )
+    assert len(subs) == 2
+    assert subs[0].text == "Hope you're not thinking about some sort of LSD thought control,"
+    assert subs[1].text == "because there's only one mind-expanding drug that this man enjoys,"
+    assert not any("LSD thought" in s.text and not s.text.endswith("control,") for s in subs)
+
+
+def test_segment_aligned_words_abbreviation_and_decimal():
+    """Kiểm tra guard từ viết tắt (Dr., Mr.) và số thập phân không bị ngắt câu nhầm."""
+    raw_words = "Fine, Dr. Kuthrapali. I paid $3.14 for it.".split()
+    aligned_words = []
+    t = 0.0
+    for w in raw_words:
+        aligned_words.append(AlignedWord(text=w, start_time=t, end_time=t + 0.3))
+        t += 0.35
+
+    subs = ForcedAlignerService.segment_aligned_words(
+        aligned_words, language="English", max_words=12, max_duration_sec=6.0
+    )
+    # Câu 1: "Fine, Dr. Kuthrapali." (Dr. không bị chẻ)
+    # Câu 2: "I paid $3.14 for it." ($3.14 không bị chẻ)
+    assert len(subs) == 2
+    assert subs[0].text == "Fine, Dr. Kuthrapali."
+    assert subs[1].text == "I paid $3.14 for it."
+
+
+def test_segment_aligned_words_cjk_pause_split():
+    """Kiểm tra Case 2 cho CJK: không có dấu câu, tách bằng word gap >= 0.4s."""
+    raw_tokens = ["じゃ", "ステージランドよ", "よし次こそ勝つぞ", "あらあら楽しそうね"]
+    aligned_words = [
+        AlignedWord("じゃ", 0.0, 0.3),
+        AlignedWord("ステージランドよ", 0.3, 1.2),
+        # Gap 0.5s
+        AlignedWord("よし次こそ勝つぞ", 1.7, 2.6),
+        # Gap 0.6s
+        AlignedWord("あらあら楽しそうね", 3.2, 4.2),
+    ]
+
+    subs = ForcedAlignerService.segment_aligned_words(
+        aligned_words, language="Japanese", silence_gap_sec=0.4, min_chars=4
+    )
+    assert len(subs) == 3
+    assert [s.text for s in subs] == [
+        "じゃステージランドよ",
+        "よし次こそ勝つぞ",
+        "あらあら楽しそうね",
+    ]
+
+
+

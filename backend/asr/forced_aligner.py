@@ -346,6 +346,76 @@ def _has_internal_punctuation(text: str) -> bool:
             prefix = inner[: match.start() + 1]
             if _ends_with_abbreviation(prefix):
                 continue
+    return False
+
+
+def _is_sentence_end_word(words: List[AlignedWord], i: int, is_cjk: bool) -> bool:
+    """Xác định token thứ i trong words có phải là điểm KẾT THÚC CÂU hay không.
+
+    Quy tắc:
+      1. Bỏ qua các ký tự đóng nháy/ngoặc ở đuôi: "well." hoặc "said," hay '」'
+      2. Ký tự kết thúc câu: 。！？!?…
+      3. Nếu là dấu `.`:
+         - Bỏ qua số thập phân (ví dụ 3.14).
+         - Bỏ qua từ viết tắt theo `_ends_with_abbreviation` (Dr., Mr., MIT...).
+         - Với Latinh: nếu từ kế tiếp (i+1) bắt đầu bằng chữ thường (và khe âm học < 0.4s) -> không kết câu.
+    """
+    if i < 0 or i >= len(words):
+        return False
+    w_text = (words[i].text or "").strip()
+    if not w_text:
+        return False
+    core = w_text.rstrip(_SENTENCE_CLOSERS).strip()
+    if not core:
+        return False
+    last_ch = core[-1]
+
+    # CJK kết câu bằng 。 hoặc ！ hoặc ？ hoặc …
+    if last_ch in {"。", "！", "？", "…", "!", "?"}:
+        return True
+
+    if last_ch == ".":
+        # 1. Số thập phân
+        if len(core) >= 2 and core[-2].isdigit():
+            if i + 1 < len(words) and (words[i + 1].text or "").strip()[:1].isdigit():
+                return False
+        elif core == ".":
+            if (
+                i > 0
+                and (words[i - 1].text or "").strip()[-1:].isdigit()
+                and i + 1 < len(words)
+                and (words[i + 1].text or "").strip()[:1].isdigit()
+            ):
+                return False
+
+        # 2. Từ viết tắt: Dr., Mr., vs., etc.
+        if i + 1 < len(words):
+            if _ends_with_abbreviation(core):
+                return False
+
+        # 3. Với Latinh: nếu từ kế tiếp bắt đầu bằng chữ thường và không có khoảng lặng lớn
+        if not is_cjk and i + 1 < len(words):
+            next_t = (words[i + 1].text or "").strip().lstrip("\"'“‘([{<")
+            if next_t and next_t[0].islower():
+                gap = words[i + 1].start_time - words[i].end_time
+                if gap < 0.4:
+                    return False
+
+        return True
+
+    return False
+
+
+def _is_clause_end_word(w_text: str) -> bool:
+    """True nếu từ kết thúc bằng dấu ngắt vế câu (,;、；—)."""
+    core = (w_text or "").strip().rstrip(_SENTENCE_CLOSERS).strip()
+    if not core:
+        return False
+    ch = core[-1]
+    if ch in {",", "、", ";", "；", "—"}:
+        # Bỏ qua nếu là số, ví dụ 1,000
+        if ch == "," and len(core) >= 2 and core[-2].isdigit():
+            return False
         return True
     return False
 
@@ -619,6 +689,123 @@ class ForcedAlignerService:
                 merged.append(item)
 
         return merged
+
+    @staticmethod
+    def segment_aligned_words(
+        aligned_items: List[AlignedWord],
+        language: str = "English",
+        silence_gap_sec: float = 0.4,
+        comma_min_words: int = 4,
+        comma_min_chars: int = 8,
+        min_words: int = 3,
+        min_chars: int = 6,
+        **kwargs: Any,  # Bỏ qua mọi giới hạn cũ: max_words, max_chars, max_duration_sec, etc.
+    ) -> List[SubtitleSentence]:
+        """Đại tu ngắt câu SEG_BATCH (2026-10-13): Chỉ áp dụng đúng 2 trường hợp ngắt câu.
+
+        Xóa bỏ toàn bộ các giới hạn khác (không giới hạn 10 từ, không giới hạn giây, không chẻ vụn):
+          - Trường hợp 1: Có dấu kết thúc câu (.?!。！？…).
+            1. Tách theo dấu kết thúc câu.
+            2. Với mỗi candidate, nếu có dấu phẩy/chấm phẩy (,;、；) và phía trước >= comma_min_words
+               (hoặc comma_min_chars) và phía sau >= 2 từ (hoặc 4 ký tự) -> tách tiếp theo dấu phẩy.
+            3. Nếu không có dấu phẩy: giữ nguyên trọn vẹn cả câu (dù bao nhiêu từ).
+          - Trường hợp 2: Không có dấu kết thúc câu (hoặc đoạn lửng).
+            1. Dùng word timestamps để tìm khoảng lặng / gap lớn giữa các từ (gap >= silence_gap_sec).
+            2. Tách tại các gap đó (mỗi đoạn >= min_units).
+            3. Với mỗi đoạn sau tách khoảng lặng, nếu có dấu phẩy thỏa mãn -> tách tiếp theo dấu phẩy.
+            4. Tuyệt đối không cắt vụn thêm bằng trần từ hay trần giây.
+        """
+        if not aligned_items:
+            return []
+
+        n = len(aligned_items)
+        is_cjk = _is_cjk_language(language)
+
+        def count_units(lo_idx: int, hi_idx: int) -> int:
+            if is_cjk:
+                return sum(len(aligned_items[k].text or "") for k in range(lo_idx, hi_idx + 1))
+            return hi_idx - lo_idx + 1
+
+        min_units = min_chars if is_cjk else min_words
+        comma_thresh = comma_min_chars if is_cjk else comma_min_words
+        comma_min_remain = 4 if is_cjk else 2
+
+        def split_span_by_commas(lo: int, hi: int) -> List[Tuple[int, int]]:
+            """Tách đoạn [lo, hi] tại dấu phẩy/chấm phẩy (,;、；)."""
+            if lo > hi:
+                return []
+            if comma_thresh <= 0:
+                return [(lo, hi)]
+            spans: List[Tuple[int, int]] = []
+            seg_start = lo
+            for k in range(lo, hi):
+                w_txt = aligned_items[k].text
+                if _is_clause_end_word(w_txt):
+                    left_u = count_units(seg_start, k)
+                    right_u = count_units(k + 1, hi)
+                    if left_u >= comma_thresh and right_u >= comma_min_remain:
+                        spans.append((seg_start, k))
+                        seg_start = k + 1
+            spans.append((seg_start, hi))
+            return spans
+
+        # ── BƯỚC 1: Quét Candidate blocks theo dấu kết câu (Case 1)
+        candidates: List[Tuple[int, int, bool]] = []
+        cur_lo = 0
+        for i in range(n):
+            if _is_sentence_end_word(aligned_items, i, is_cjk):
+                candidates.append((cur_lo, i, True))
+                cur_lo = i + 1
+        if cur_lo < n:
+            candidates.append((cur_lo, n - 1, False))
+
+        # ── BƯỚC 2: Xử lý đúng 2 trường hợp
+        final_spans: List[Tuple[int, int]] = []
+        for c_lo, c_hi, has_sent_end in candidates:
+            if has_sent_end:
+                # Trường hợp 1: Có dấu kết câu -> tách dấu phẩy nếu có, giữ trọn vẹn câu
+                final_spans.extend(split_span_by_commas(c_lo, c_hi))
+            else:
+                # Trường hợp 2: Không có dấu kết câu -> tách bằng khoảng lặng giữa các từ
+                pause_spans: List[Tuple[int, int]] = []
+                p_lo = c_lo
+                if silence_gap_sec > 0:
+                    for k in range(c_lo, c_hi):
+                        gap = aligned_items[k + 1].start_time - aligned_items[k].end_time
+                        if gap >= silence_gap_sec:
+                            left_u = count_units(p_lo, k)
+                            right_u = count_units(k + 1, c_hi)
+                            if left_u >= min_units and right_u >= min_units:
+                                pause_spans.append((p_lo, k))
+                                p_lo = k + 1
+                pause_spans.append((p_lo, c_hi))
+
+                # Tách tiếp theo dấu phẩy trên từng đoạn sau khoảng lặng
+                for p_start, p_end in pause_spans:
+                    final_spans.extend(split_span_by_commas(p_start, p_end))
+
+        # ── BƯỚC 3: Dựng SubtitleSentence
+        subtitles: List[SubtitleSentence] = []
+        for s_lo, s_hi in final_spans:
+            sub_words = list(aligned_items[s_lo : s_hi + 1])
+            if not sub_words:
+                continue
+            if is_cjk:
+                text = "".join(w.text for w in sub_words).strip()
+            else:
+                text = " ".join(w.text for w in sub_words).strip()
+            if not text:
+                continue
+            subtitles.append(
+                SubtitleSentence(
+                    text=text,
+                    start_time=float(sub_words[0].start_time),
+                    end_time=float(sub_words[-1].end_time),
+                    words=sub_words,
+                )
+            )
+
+        return subtitles
 
     @staticmethod
     def group_words_to_subtitles(
@@ -916,7 +1103,7 @@ class ForcedAlignerService:
             return subtitles
 
         is_cjk = _is_cjk_language(language)
-        clause_delims = {",", "、", ";", "；"}
+        clause_delims = {",", "\u3001", ";", "\uff1b"}
 
         def count_tokens(s: str) -> int:
             return _count_language_tokens(s, is_cjk)

@@ -1569,22 +1569,46 @@ class LookaheadSessionState:
             # như vậy; Forced Aligner chỉ xác định mốc bắt đầu/kết thúc. Không cắt xén, không bù
             # đắp, không hàn gắn.
 
-            # Bước 2E: Gom từ thành các câu phụ đề (trần từ/giây/ký tự lấy từ `LookaheadConfig`).
-            # Bộ gom câu ưu tiên CÂU TRỌN VẸN; dấu câu đến từ `merge_source_text` vì aligner đã bỏ
-            # hết dấu câu khi tokenize.
+            # Bước 2E: ĐẠI TU NGẮT CÂU SEG_BATCH (2026-10-13)
+            # Phân đoạn AlignedWord[] thành phụ đề chuẩn ngữ nghĩa (Case 1: dấu kết câu/phẩy, Case 2: word gap)
             if aligned_words and self._aligner_service is not None:
                 try:
-                    subtitles = self._aligner_service.group_words_to_subtitles(
-                        aligned_words, language=align_lang, **self._batch_sub_opts
-                    )
-                except TypeError:
-                    # Triển khai aligner cũ không nhận tham số trần ⇒ gọi kiểu tối thiểu.
-                    subtitles = self._aligner_service.group_words_to_subtitles(
-                        aligned_words, language=align_lang
-                    )
+                    pause_split_enabled = bool(getattr(config.lookahead, "batch_sub_pause_split", True))
+                    pause_ms = float(getattr(config.lookahead, "batch_sub_pause_ms", 400.0) or 400.0)
+                    silence_gap = (pause_ms / 1000.0) if (pause_split_enabled and pause_ms > 0) else 0.0
+                    min_comma_words = int(getattr(config.lookahead, "batch_sub_comma_min_words", 4) or 4)
+
+                    aligner_inst = self._aligner_service
+                    # Production (ForcedAlignerService) hoặc aligner có segment_aligned_words
+                    if isinstance(aligner_inst, ForcedAlignerService) or hasattr(aligner_inst, "segment_aligned_words"):
+                        seg_fn = getattr(aligner_inst, "segment_aligned_words", ForcedAlignerService.segment_aligned_words)
+                        subtitles = seg_fn(
+                            aligned_words,
+                            language=align_lang,
+                            silence_gap_sec=silence_gap,
+                            comma_min_words=min_comma_words,
+                        )
+                    elif hasattr(aligner_inst, "group_words_to_subtitles"):
+                        # Nhánh tương thích ngược cho các FakeAligner trong test suite cũ
+                        subtitles = aligner_inst.group_words_to_subtitles(
+                            aligned_words, language=align_lang, **self._batch_sub_opts
+                        )
+                        if pause_split_enabled and pause_ms > 0:
+                            subtitles = ForcedAlignerService.split_subtitles_by_pause(
+                                subtitles,
+                                silences=None,
+                                min_pause_ms=pause_ms,
+                                language=align_lang,
+                            )
+                    else:
+                        subtitles = ForcedAlignerService.segment_aligned_words(
+                            aligned_words,
+                            language=align_lang,
+                            silence_gap_sec=silence_gap,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        f"Gom câu phụ đề lỗi (dùng cả khối làm một câu): {exc}",
+                        f"Phân đoạn phụ đề lỗi (dùng cả khối làm một câu): {exc}",
                         extra={"module_tag": "ASR"},
                     )
                     subtitles = [
@@ -1597,147 +1621,20 @@ class LookaheadSessionState:
                     SubtitleSentence(text=clean_text, start_time=0.0, end_time=chunk.duration)
                 ]
 
-            # Bước 2E-bis: Tách các câu dài tại dấu ngắt vế (、 hoặc ,) khi số từ phía trước >= min_words
-            min_comma_words = int(getattr(config.lookahead, "batch_sub_comma_min_words", 4) or 4)
-            subtitles = ForcedAlignerService.split_subtitles_by_clause_comma(
-                subtitles,
-                language=align_lang,
-                min_words=min_comma_words,
-            )
 
-            # Bước 2E-ter: LỚP NGẮT CÂU BẰNG KHOẢNG LẶNG (VAD) — cho câu dài KHÔNG có dấu câu gộp
-            # lời 2–3 người (log thật 2026-10-11 14:51, trang tiếng Nhật):
-            #     "じゃステージランドよよし次こそ勝つぞあらあら楽しそうねこれいただき物だけどよかったらどうぞうまそう。"
-            # Các lớp trên đều bó tay ở ca này: `group_words_to_subtitles` chỉ ngắt theo dấu câu, bộ
-            # tách dấu phẩy cần `、`/`,`, còn `split_oversized_sentences` chỉ cắt CỨNG theo trần
-            # ký tự/từ nên mảnh cắt ra không trùng ranh giới người nói.
-            #
-            # PHẢI chạy TRƯỚC `split_oversized_sentences`: lớp đó bỏ `words` (chỉ phân bổ thời gian
-            # theo tỉ lệ độ dài văn bản) nên sau nó không còn mốc từ để tìm khe ngắt hơi.
-            if bool(getattr(config.lookahead, "batch_sub_pause_split", True)):
-                pause_ms = float(getattr(config.lookahead, "batch_sub_pause_ms", 350.0) or 0.0)
-                # Ngưỡng QUÉT VAD thấp hơn ngưỡng khe từ và ĐỘC LẬP với nó: khe từ 0.4 s chỉ chứa
-                # ~0.15–0.25 s im lặng, nên quét ở đúng 350 ms sẽ bỏ sót phần lớn khoảng lặng thật.
-                # ĐO THẬT 2026-10-11 (ja_concat_1min.wav, 8 khe thật, 0 artifact):
-                #   FireRed 150 ms → 8/8, 200 ms → 6/8, 350 ms → 3/8   (không nhận nhầm khe nào)
-                #   Silero  150 ms → 6/8, 200 ms → 5/8, 350 ms → 2/8
-                # ⇒ dùng FIRERED (engine mặc định của dự án) ở 150 ms.
-                vad_ms = float(getattr(config.lookahead, "batch_sub_pause_vad_ms", 150.0) or 0.0)
-                min_tokens = int(getattr(config.lookahead, "batch_sub_pause_min_tokens", 3) or 3)
-                pause_min_chars = int(getattr(config.lookahead, "batch_sub_pause_min_chars", 20) or 20)
-                pause_min_words = int(getattr(config.lookahead, "batch_sub_pause_min_words", 6) or 6)
-                silences: Optional[List[Tuple[float, float]]] = None
-                #: off | skipped | firered | silero | empty | error | khe-từ
-                vad_state = "off"
-
-                # (1) ĐẾM khe đủ dài TRƯỚC: quét FireRed tốn ~2.6 s cho khối 32 s (đo thật), nên
-                # chỉ quét khi thật sự có khe cần xác nhận. Phần lớn khối không có khe nào.
-                pre_stats: Dict[str, int] = {}
-                ForcedAlignerService.split_subtitles_by_pause(
-                    subtitles,
-                    min_pause_ms=pause_ms,
-                    language=align_lang,
-                    min_chars=pause_min_chars,
-                    min_words=pause_min_words,
-                    stats=pre_stats,
-                    dry_run=True,
-                )
-                has_candidates = pre_stats.get("candidates", 0) > 0
-
-                if pause_ms <= 0 or not has_candidates:
-                    vad_state = "skipped"
-                elif bool(getattr(config.lookahead, "batch_sub_pause_require_vad", True)):
-                    # (2) Ưu tiên FIRERED (engine mặc định của dự án), chỉ lấy engine ĐÃ NẠP SẴN
-                    # (`peek_engine`) để không tải/nạp model trên đường nóng.
-                    engine = VADEngineFactory.peek_engine("firered-vad")
-                    scanner = None
-                    if engine is not None:
-                        vad_state = "firered"
-                    elif self.silence_scanner is not None:
-                        scanner = self.silence_scanner
-                        vad_state = "silero"
-                    else:
-                        vad_state = "khe-từ"
-                    if engine is not None or scanner is not None:
-                        try:
-                            if engine is not None:
-                                gaps = await asyncio.to_thread(
-                                    find_silence_gaps_streaming,
-                                    engine,
-                                    chunk.pcm,
-                                    float(chunk.pts_start),
-                                    vad_ms,
-                                    int(getattr(config.vad, "sample_rate", 16000) or 16000),
-                                )
-                            else:
-                                gaps = await asyncio.to_thread(
-                                    scanner.find_silence_gaps,
-                                    chunk.pcm,
-                                    float(chunk.pts_start),
-                                    vad_ms,
-                                )
-                            if gaps:
-                                # `words` của aligner tính từ ĐẦU KHỐI ⇒ đổi về cùng hệ thời gian.
-                                silences = [
-                                    (
-                                        float(g.start_pts) - float(chunk.pts_start),
-                                        float(g.end_pts) - float(chunk.pts_start),
-                                    )
-                                    for g in gaps
-                                ]
-                            else:
-                                # KHÔNG veto: "VAD không thấy khoảng lặng nào trong 23 s hội thoại"
-                                # gần như luôn là VAD không kết luận được, chứ không phải bằng
-                                # chứng câu liền một mạch. Rơi về khe từ của Forced Aligner.
-                                vad_state = "empty"
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug(
-                                f"Quét khoảng lặng để ngắt câu lỗi (dùng khe từ của aligner): {exc}",
-                                extra={"module_tag": "ASR"},
-                            )
-                            vad_state = "error"
-
-                pause_stats: Dict[str, int] = {}
-                subtitles = ForcedAlignerService.split_subtitles_by_pause(
-                    subtitles,
-                    silences=silences,
-                    min_pause_ms=pause_ms,
-                    min_tokens=min_tokens,
-                    language=align_lang,
-                    min_chars=pause_min_chars,
-                    min_words=pause_min_words,
-                    stats=pause_stats,
-                )
-                # LUÔN log quyết định của lớp này: không có dòng này thì "không tách" hoàn toàn im
-                # lặng và không thể biết lớp mới có chạy hay không (sự cố 2026-10-11).
-                logger.info(
-                    f"[SEG_BATCH] Khoảng lặng (nguồn={vad_state}, khe≥{pause_ms:.0f}ms, "
-                    f"VAD≥{vad_ms:.0f}ms): "
-                    f"{pause_stats.get('sentences_in', 0)} → {pause_stats.get('sentences_out', 0)} phụ đề "
-                    f"| khe đủ dài={pause_stats.get('candidates', 0)}, "
-                    f"VAD xác nhận={pause_stats.get('vad_confirmed', 0)}, "
-                    f"điểm tách dùng={pause_stats.get('accepted', 0)}",
-                    extra={"module_tag": "ASR"},
-                )
-
-            # ── Bước 2F: GÁN NGƯỜI NÓI + TÁCH CÂU TẠI RANH GIỚI LƯỢT NÓI (P0.2) + CỜ CHỒNG TIẾNG (P0.3)
-            #
-            # PHẢI chạy TRƯỚC `split_oversized_sentences`: lớp đó BỎ `words` (chỉ chia thời gian
-            # theo tỉ lệ độ dài văn bản — xem chú thích ở Bước 2E-ter), mà P0.2 cần mốc TỪNG TỪ để
-            # cắt đúng chỗ đổi người nói. Đây cũng là lý do bước này nằm ở đây chứ không nằm cạnh
-            # khối dịch như bản cũ (bản cũ chạy SAU khi đã lọc `candidate_subs`).
+            # ── Bước 2F: GÁN NGƯỜI NÓI (Majority Vote) + CỜ CHỒNG TIẾNG (P0.3)
+            # XOÁ HOÀN TOÀN TÁCH CÂU BẰNG SPEAKER: subtitles giữ nguyên vẹn 100% từ Bước 2E
             subtitles, speaker_pieces = await self._attribute_speakers(subtitles, chunk, language=align_lang)
 
-            # LƯỚI AN TOÀN ngắt câu ở tầng VĂN BẢN (sự cố thật 2026-10-03: cả khối 3
-            # câu hiện thành MỘT phụ đề dài khi aligner trả một item duy nhất).
-            subtitles = ForcedAlignerService.split_oversized_sentences(
-                subtitles,
-                language=align_lang,
-                max_chars=int(self._batch_sub_opts.get("sentence_max_chars", 160) or 160),
-                max_words=int(self._batch_sub_opts.get("sentence_max_words", 24) or 24),
-            )
+            if not aligned_words:
+                # Chỉ dùng lưới an toàn văn bản khi aligner lỗi (không có mốc từ)
+                subtitles = ForcedAlignerService.split_oversized_sentences(
+                    subtitles,
+                    language=align_lang,
+                    max_chars=int(self._batch_sub_opts.get("sentence_max_chars", 160) or 160),
+                    max_words=int(self._batch_sub_opts.get("sentence_max_words", 24) or 24),
+                )
 
-            # Lớp trên có thể chẻ thêm câu ⇒ gán lại nhãn/cờ THEO THỜI GIAN (không theo chỉ số).
             speaker_tags_all, overlap_flags_all = realign_attribution(subtitles, speaker_pieces)
 
             # CHẨN ĐOÁN: đây là text THẬT SỰ được gửi đi (khác `clean_text` của ASR). Không có log
@@ -2247,10 +2144,9 @@ class LookaheadSessionState:
 
         try:
             t_diar0 = time.perf_counter()
-            # P0.1: diarize CẢ CỬA SỔ có ngữ cảnh chồng lấn, không chỉ đúng khối hiện tại.
-            ctx_sec = float(getattr(diar_cfg, "context_sec", 8.0) or 0.0)
-            window_pcm, window_start_pts = self._diar_window_pcm(chunk, ctx_sec)
-            turns = await DiarizationService.diarize_chunk(window_pcm, sample_rate=16000)
+            # Diarize ĐÚNG ĐOẠN ÂM THANH gửi vào ASR (chunk.pcm), không gộp ngữ cảnh khối trước
+            chunk_pcm = np.asarray(chunk.pcm, dtype=np.float32)
+            turns = await DiarizationService.diarize_chunk(chunk_pcm, sample_rate=16000)
             diar_ms = (time.perf_counter() - t_diar0) * 1000.0
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2262,48 +2158,15 @@ class LookaheadSessionState:
         if not turns:
             return subtitles, empty_pieces
 
-        # ── P0.1: id thô của cửa sổ → NHÃN PHIÊN (không đổi số qua các khối) ──────────────────
-        label_map: Optional[Dict[str, str]] = None
-        if ctx_sec > 0:
-            try:
-                registry = self._get_speaker_registry(diar_cfg)
-                label_map = registry.label_window_turns(
-                    turns, window_start_pts, boundary_pts=float(chunk.pts_start)
-                )
-                registry.observe(
-                    turns,
-                    window_start_pts,
-                    label_map,
-                    already_covered_until_pts=float(chunk.pts_start),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"Bảng danh tính người nói lỗi (dùng đánh số theo khối): {exc}",
-                    extra={"module_tag": "DIAR"},
-                )
-                label_map = None
-
-        # `turns` có gốc thời gian là ĐẦU CỬA SỔ; câu phụ đề có gốc là ĐẦU KHỐI ⇒ đổi hệ trước khi
-        # dùng cho P0.2/P0.3 (phần đuôi ngữ cảnh ra mốc âm, không giao với câu nào nên vô hại).
-        shift = float(chunk.pts_start) - float(window_start_pts)
-        if abs(shift) > 1e-6:
-            turns_chunk: List[Any] = [
-                {
-                    "start_sec": t.start_sec - shift,
-                    "end_sec": t.end_sec - shift,
-                    "speaker_id": t.speaker_id,
-                }
-                for t in normalize_turns(turns)
-            ]
-        else:
-            turns_chunk = turns
-
+        # XOÁ TÍNH NĂNG NHỚ SPEAKER TRONG 1 SESSION:
+        # Không dùng SpeakerRegistry / label_map qua các khối.
+        # Mỗi đoạn âm thanh gửi vào ASR được lọc/tách speaker độc lập (arrival order: speaker 1, speaker 2...).
         try:
             pieces = attribute_sentences(
                 subtitles,
-                turns_chunk,
+                turns,
                 sample_rate=16000,
-                split=bool(getattr(diar_cfg, "split_by_speaker", True)),
+                split=bool(getattr(diar_cfg, "split_by_speaker", False)),
                 split_min_sec=float(getattr(diar_cfg, "split_min_sec", 0.7) or 0.0),
                 split_min_words=int(getattr(diar_cfg, "split_min_words", 2) or 0),
                 # `overlap_flag=False` ⇒ ép ngưỡng lên vô cực để không mục nào bị đánh cờ.
@@ -2312,16 +2175,12 @@ class LookaheadSessionState:
                     if bool(getattr(diar_cfg, "overlap_flag", True))
                     else float("inf")
                 ),
-                label_map=label_map,
-                #: NGÔN NGỮ ẢNH HƯỞNG CÁCH NỐI TOKEN: CJK nối bằng "" (aligner tách theo KÝ TỰ),
-                #: Latinh nối bằng " ". Thiếu tham số này ⇒ tiếng Nhật bị chèn dấu cách giữa mọi ký
-                #: tự ("そ うです。" — sự cố thật 2026-10-12 22:34:40). `attribute_sentences` có lưới
-                #: an toàn tự suy CJK, nhưng vẫn truyền tường minh.
+                label_map=None,
                 language=language,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Tách câu theo người nói lỗi, giữ nguyên câu ASR: {exc}",
+                f"Gán nhãn người nói lỗi, giữ nguyên câu ASR: {exc}",
                 extra={"module_tag": "DIAR"},
             )
             return subtitles, empty_pieces
@@ -2338,15 +2197,13 @@ class LookaheadSessionState:
         n_split = max(0, len(new_subtitles) - len(subtitles))
         n_overlap = sum(1 for p in pieces if p.overlap)
         speakers_seen = sorted({p.speaker for p in pieces if p.speaker})
-        win_sec = len(window_pcm) / 16000.0
-        ctx_used_sec = win_sec - float(getattr(chunk, "duration", win_sec) or 0.0)
+        chunk_sec = len(chunk_pcm) / 16000.0
         #: Danh sách "speaker N: đoạn text" để đọc log — giới hạn 10 mục như bản cũ.
         spk_preview = " ⏐ ".join(
             f'{p.speaker or "?"}: {p.text[:20]}' for p in pieces[:10]
         )
         logger.info(
-            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms, cửa sổ {win_sec:.1f}s, "
-            f"ngữ cảnh {ctx_used_sec:.1f}s): "
+            f"Nemotron-3 ({len(turns)} turns, {diar_ms:.0f}ms, khối {chunk_sec:.1f}s): "
             f"tách câu +{n_split} phụ đề, chồng tiếng {n_overlap}/{len(pieces)} mục, "
             f"người nói={','.join(speakers_seen) or '?'}: {spk_preview}",
             extra={"module_tag": "DIAR"},

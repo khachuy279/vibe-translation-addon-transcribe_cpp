@@ -174,9 +174,10 @@ def diarize_audio_sync(
     audio_data: np.ndarray,
     sample_rate: int = 16000,
     model_filename: str = "nemotron-3-diarization-bf16.gguf",
-    latency_profile: str = "low",
+    latency_profile: str = "very_high",
     backend: str = "cuda",
     threads: int = 4,
+    speaker_threshold: float = 0.5,
 ) -> List[Dict[str, Any]]:
     """Phân tách người nói (Diarization) trên mảng PCM Float32 [-1.0, 1.0].
 
@@ -219,6 +220,7 @@ def diarize_audio_sync(
             "--backend", backend,
             "--threads", str(threads),
             "--session-option", f"nemotron_3_diar.latency_profile={latency_profile}",
+            "--request-option", f"speaker_threshold={float(speaker_threshold):.2f}",
             "--audio", wav_path,
             "--turns-out", turns_path,
         ]
@@ -341,7 +343,8 @@ class DiarizationService:
             audio_data,
             sample_rate,
             getattr(diar_cfg, "active_model", "nemotron-3-diarization-bf16.gguf"),
-            getattr(diar_cfg, "latency_profile", "low"),
+            getattr(diar_cfg, "latency_profile", "very_high"),
             getattr(diar_cfg, "backend", "cuda"),
             getattr(diar_cfg, "threads", 4),
+            float(getattr(diar_cfg, "speaker_threshold", 0.5) or 0.5),
         )

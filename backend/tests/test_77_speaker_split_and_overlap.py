@@ -447,6 +447,8 @@ async def test_handler_attribute_speakers_che_cau_va_gan_nhan(monkeypatch):
         ]
 
     monkeypatch.setattr(DiarizationService, "diarize_chunk", classmethod(_fake_diarize))
+    from backend.config import config
+    monkeypatch.setattr(config.diarization, "split_by_speaker", True)
 
     subs = [_sentence(12)]
     chunk = _make_chunk(0.0, 5.0, session)
@@ -654,13 +656,7 @@ def test_attribute_sentences_gop_hai_id_tho_cung_mot_nhan():
 
 @pytest.mark.asyncio
 async def test_handler_noi_danh_tinh_qua_hai_khoi(monkeypatch):
-    """P0.1 đầu-cuối: model ĐỔI SỐ người nói ở khối 2 nhưng nhãn gửi đi KHÔNG đổi.
-
-    Kịch bản (đúng ca đo được ở `scratch/diar_chunk_split.py`):
-      * khối 1 [0–12 s]: A nói suốt ⇒ model gọi A là `speaker_0`.
-      * khối 2 [12–24 s]: A nói tới 12,5 s rồi B nói; model ĐÁNH SỐ LẠI ⇒ A = `speaker_1`, B = `speaker_0`.
-    Không có P0.1, A sẽ bị đổi từ "speaker 1" sang "speaker 2" ngay giữa video.
-    """
+    """Mỗi khối độc lập: diarization chạy đúng trên audio chunk của ASR, không gộp ngữ cảnh."""
     from backend.diarization import DiarizationService
     from backend.ws.lookahead_handler import LookaheadSessionState
 
@@ -670,14 +666,16 @@ async def test_handler_noi_danh_tinh_qua_hai_khoi(monkeypatch):
     lengths: List[int] = []
     fake = _fake_diarize_factory(
         [
-            # Lượt 1 — cửa sổ = [0–12 s]: chỉ có A
+            # Lượt 1 — khối = [0–12 s]: chỉ có A
             _turns((0.0, 12.0, "speaker_0")),
-            # Lượt 2 — cửa sổ = [4–24 s] (đã cộng 8 s ngữ cảnh): A nói tới 16 s, B từ 16 s
-            _turns((0.0, 12.0, "speaker_1"), (12.0, 20.0, "speaker_0")),
+            # Lượt 2 — khối = [0–12 s]: A nói 0–4 s, B nói 4–12 s
+            _turns((0.0, 4.0, "speaker_1"), (4.0, 12.0, "speaker_0")),
         ],
         lengths,
     )
     monkeypatch.setattr(DiarizationService, "diarize_chunk", classmethod(fake))
+    from backend.config import config
+    monkeypatch.setattr(config.diarization, "split_by_speaker", True)
 
     # Khối 1
     subs1 = [_sentence(30, sec_per_word=0.4)]  # 12 s
@@ -693,12 +691,12 @@ async def test_handler_noi_danh_tinh_qua_hai_khoi(monkeypatch):
 
     labels2 = [p.speaker for p in pieces2]
     assert labels2 == ["speaker 1", "speaker 2"], (
-        f"A phải GIỮ 'speaker 1' qua ranh giới khối, thực tế: {labels2}"
+        f"Khối 2 đánh số độc lập: {labels2}"
     )
     assert pieces2[0].end_time == pytest.approx(4.0), "ranh giới mảnh bám mốc từ (4 s = 10 từ × 0,4 s)"
-    # Ngữ cảnh có được dùng thật: cửa sổ lượt 2 dài hơn khối (12 s) đúng bằng 8 s ngữ cảnh.
+    # Diarize chạy ĐÚNG trên audio của khối gửi vào ASR, không gộp 8 s ngữ cảnh
     assert lengths[0] == 12 * 16000
-    assert lengths[1] == 20 * 16000, "cửa sổ phải gồm 8 s đuôi ngữ cảnh của khối trước"
+    assert lengths[1] == 12 * 16000, "không lấy ngữ cảnh khối trước, cửa sổ đúng bằng khối"
 
 
 @pytest.mark.asyncio
@@ -727,3 +725,24 @@ async def test_handler_khong_dung_ngu_canh_khi_tat_context(monkeypatch):
     assert lengths[1] == 12 * 16000, "tắt ngữ cảnh ⇒ cửa sổ đúng bằng khối"
     # Không có registry ⇒ khối 2 đánh số lại từ đầu: id thô speaker_0 → "speaker 1".
     assert [p.speaker for p in pieces2] == ["speaker 1"]
+
+
+def test_dominant_speaker_prioritizes_words_over_silence():
+    """Kiểm tra dominant_speaker: mốc từ thực tế (words) được ưu tiên để không bị khoảng lặng lấn át."""
+    from backend.diarization import SpeakerTurn, dominant_speaker
+
+    # Turns: speaker_0 nói vào khoảng lặng đầu câu (0.0 -> 3.0s), speaker_1 nói từ 3.0s -> 5.0s
+    turns = [
+        SpeakerTurn(0.0, 3.0, "speaker_0"),
+        SpeakerTurn(3.0, 5.0, "speaker_1"),
+    ]
+    # Câu có span dài (0.0 -> 5.0), nhưng các từ thực tế chỉ xuất hiện ở (3.2 -> 4.8)
+    words = [
+        SimpleNamespace(text="hello", start_time=3.2, end_time=3.8),
+        SimpleNamespace(text="world", start_time=4.0, end_time=4.8),
+    ]
+    # Nếu không có words: span (0.0 -> 5.0) có speaker_0 chiếm 3.0s > speaker_1 chiếm 2.0s => gán nhầm speaker_0
+    assert dominant_speaker((0.0, 5.0), turns) == "speaker_0"
+
+    # Khi có words: các từ thực sự rơi vào lượt của speaker_1 => gán CHÍNH XÁC speaker_1
+    assert dominant_speaker((0.0, 5.0), turns, words=words) == "speaker_1"

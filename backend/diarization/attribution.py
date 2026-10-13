@@ -189,12 +189,24 @@ def overlap_seconds(span: Tuple[float, float], turns: Sequence[SpeakerTurn]) -> 
 def dominant_speaker(
     span: Tuple[float, float],
     turns: Sequence[SpeakerTurn],
+    words: Optional[Sequence[Any]] = None,
 ) -> Optional[str]:
-    """Speaker chiếm nhiều thời gian nhất trong `span`; không ai giao nhau thì lấy lượt gần nhất.
+    """Speaker chiếm nhiều thời gian nhất; ưu tiên tính trên các từ thực tế (words) để tránh khoảng lặng.
 
-    Giữ đúng ngữ nghĩa của `assign_speakers_to_subtitles()` cũ (điểm rơi vào khoảng lặng nhỏ giữa
-    hai lượt thì chọn lượt gần nhất) để hành vi khi KHÔNG tách câu không đổi.
+    - Nếu có `words` và có speaker giao với các từ: lấy speaker có tổng thời lượng lớn nhất trên các từ.
+    - Nếu không có `words` hoặc không ai giao với các từ: lấy theo `span` (không ai giao thì lấy lượt gần nhất).
     """
+    if words:
+        acc: Dict[str, float] = {}
+        for w in words:
+            w_st = float(getattr(w, "start_time", 0.0) or 0.0)
+            w_en = float(getattr(w, "end_time", w_st) or w_st)
+            if w_en > w_st:
+                for spk, dur in _overlap_map((w_st, w_en), turns).items():
+                    acc[spk] = acc.get(spk, 0.0) + dur
+        if acc:
+            return sorted(acc.items(), key=lambda kv: -kv[1])[0][0]
+
     best = active_speakers(span, turns)
     if best:
         return best[0][0]
@@ -485,7 +497,7 @@ def attribute_sentences(
         span_overlap_sec = overlap_seconds(span, turns_n)
 
         def _whole_piece() -> SpeakerPiece:
-            raw = dominant_speaker(span, turns_n)
+            raw = dominant_speaker(span, turns_n, words=words)
             return SpeakerPiece(
                 text=text,
                 start_time=s_start,
