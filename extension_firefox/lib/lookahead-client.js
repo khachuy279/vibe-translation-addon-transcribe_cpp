@@ -430,6 +430,17 @@ class LookaheadClient {
       this.ws.onerror = (err) => {
         if (this._destroyed) return;
         console.error("[Lookahead Client] ❌ Direct WS Error:", err);
+        const api = typeof browser !== "undefined" ? browser : chrome;
+        if (!this.isConnected && api && api.runtime && typeof api.runtime.connect === "function") {
+          console.warn("[Lookahead Client] Direct WS lỗi (CSP/Network), tự động chuyển sang Background Bridge...");
+          this.useBridge = true;
+          if (this.ws) {
+            try { this.ws.close(); } catch (e) {}
+            this.ws = null;
+          }
+          this._initBridge();
+          return;
+        }
         if (this.onError) this.onError(err);
         if (this.onUnavailable && !this.isServerReady) {
           this.onUnavailable("ws_error");
@@ -437,6 +448,13 @@ class LookaheadClient {
       };
     } catch (e) {
       console.error("[Lookahead Client] ❌ Direct WS Connection failed:", e);
+      const api = typeof browser !== "undefined" ? browser : chrome;
+      if (api && api.runtime && typeof api.runtime.connect === "function") {
+        console.warn("[Lookahead Client] Direct WS khởi tạo thất bại (" + e.message + "), chuyển sang Background Bridge...");
+        this.useBridge = true;
+        this._initBridge();
+        return;
+      }
       if (this.onError) this.onError(e);
       if (this.onUnavailable && !this.isServerReady) {
         this.onUnavailable(`ws_init_failed: ${e.message}`);

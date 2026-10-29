@@ -51,7 +51,17 @@ class WSClient {
     if (this.useBridge) {
       return this._connectViaBridge();
     } else {
-      return this._connectDirect();
+      try {
+        return await this._connectDirect();
+      } catch (err) {
+        const api = typeof browser !== "undefined" ? browser : chrome;
+        if (api && api.runtime && typeof api.runtime.connect === "function") {
+          console.warn("[BS WS] Direct WS thất bại (" + (err?.message || err) + "), tự động chuyển sang Background Bridge...");
+          this.useBridge = true;
+          return await this._connectViaBridge();
+        }
+        throw err;
+      }
     }
   }
 

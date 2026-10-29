@@ -30,8 +30,7 @@ EXT_DIRS = ("extension_firefox", "extension_chrome_edge")
 #: Hai file ĐƯỢC PHÉP khác nhau giữa Firefox và Chrome/Edge. Nguồn sự thật:
 #: `tools/build_extensions.py`.
 #:   • `manifest.json`         — Chromium MV3 bắt buộc `background.service_worker` (một file);
-#:                               Firefox MV3 dùng `background.scripts` + gecko id +
-#:                               `match_origin_as_fallback`. Không thể gộp.
+#:                               Firefox MV3 dùng `background.scripts` + gecko id. Không thể gộp.
 #:   • `lib/browser-config.js` — cờ `useBridge`: Chromium kill service worker sau ~30s idle nên
 #:                               phải mở WebSocket thẳng; Firefox giữ background sống nên dùng
 #:                               bridge để vượt CSP/CORS.

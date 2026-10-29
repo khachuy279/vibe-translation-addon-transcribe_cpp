@@ -130,3 +130,7 @@ wav_test/google_fleurs
 /.build-cuda/
 /.cuda-toolkit/
 wav_test/vad
+
+# 11. Android
+
+android/

@@ -1738,20 +1738,22 @@
     if (cachedVideo && cachedVideo.isConnected && !cachedVideo.ended) return cachedVideo;
 
     const allVideos = [];
+    const pushVideo = (v) => {
+      if (v && !allVideos.includes(v)) allVideos.push(v);
+    };
 
     // 1. Light DOM: `document.querySelectorAll("video")` do engine native thực hiện nên rất
     //    nhanh kể cả trên DOM lớn.
     try {
-      document.querySelectorAll("video").forEach(v => allVideos.push(v));
+      document.querySelectorAll("video").forEach(pushVideo);
     } catch (e) {}
 
-    // B10-1 (Hy3): chỉ đi tiếp vào Shadow DOM / iframe khi light DOM CHƯA có video dùng được
-    // VÀ đã qua khoảng nghỉ tối thiểu. Nhờ vậy đường nóng (video ở light DOM — gần như mọi
-    // trang) không bao giờ phải duyệt cây.
-    const lightUsable =
-      allVideos.some(v => !v.paused && !v.ended) || allVideos.some(v => v.readyState > 0);
+    // B10-1 (Hy3): chỉ đi tiếp vào Shadow DOM / iframe khi light DOM CHƯA có video đang phát
+    // VÀ đã qua khoảng nghỉ tối thiểu. Nhờ vậy đường nóng (video ở light DOM đang phát)
+    // không bao giờ phải duyệt cây.
+    const lightPlaying = allVideos.some(v => !v.paused && !v.ended);
     const now = Date.now();
-    if (!lightUsable && now - lastVideoScanAt >= VIDEO_SCAN_MIN_INTERVAL_MS) {
+    if (!lightPlaying && now - lastVideoScanAt >= VIDEO_SCAN_MIN_INTERVAL_MS) {
       lastVideoScanAt = now;
       let budget = MAX_SHADOW_SCAN_NODES;
 
@@ -1760,7 +1762,7 @@
         if (!root || budget <= 0) return;
         try {
           if (!root.querySelectorAll) return;
-          root.querySelectorAll("video").forEach(v => allVideos.push(v));
+          root.querySelectorAll("video").forEach(pushVideo);
           const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
           let el = walker.nextNode();
           while (el && budget > 0) {

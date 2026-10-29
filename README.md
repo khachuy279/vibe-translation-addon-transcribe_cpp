@@ -146,7 +146,7 @@ Hai bản chỉ được phép khác nhau ở **đúng 2 file**, cả hai đều
 
 | File | Vì sao buộc phải khác |
 |---|---|
-| `manifest.json` | Chromium MV3 chỉ cho phép một `background.service_worker`; Firefox MV3 dùng `background.scripts` + gecko id + `match_origin_as_fallback` |
+| `manifest.json` | Chromium MV3 chỉ cho phép một `background.service_worker`; Firefox MV3 dùng `background.scripts` + gecko id (cả hai đều có `match_origin_as_fallback` + `match_about_blank`) |
 | `lib/browser-config.js` | Cờ `useBridge`: Chromium kill service worker sau ~30s idle ⇒ phải mở WebSocket thẳng; Firefox giữ background script sống ⇒ dùng bridge để vượt CSP/CORS |
 
 Mọi file khác — kể cả `background/service-worker.js` — **giống hệt từng byte**.

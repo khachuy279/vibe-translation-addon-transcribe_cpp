@@ -150,3 +150,26 @@ def test_service_worker_chung_cho_ca_hai_ban() -> None:
         "service-worker.js đã lệch giữa 2 bản. Khác biệt nạp thư viện phải nằm trong guard "
         "`typeof BackpressureGate === \"undefined\"` ở đầu file, không phải hai bản copy."
     )
+
+
+@pytest.mark.parametrize("browser_dir", ["extension_firefox", "extension_chrome_edge"])
+def test_content_scripts_bat_video_dong_bo_cho_iframe_va_fallback(browser_dir: str) -> None:
+    """Cả 2 extension phải bật `match_origin_as_fallback` và `match_about_blank` cho mọi content_scripts.
+
+    Nếu thiếu, các trang nhúng video trong iframe (about:blank, about:srcdoc, data:, blob:)
+    sẽ không được tiêm content script ⇒ extension báo 'không tìm thấy video'.
+    """
+    manifest = json.loads(
+        (ROOT / browser_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    blocks = manifest.get("content_scripts", [])
+    assert len(blocks) >= 2, f"{browser_dir}: cần ít nhất 2 khối content_scripts"
+    for idx, block in enumerate(blocks):
+        assert block.get("all_frames") is True, f"{browser_dir} khối {idx}: all_frames phải là True"
+        assert block.get("match_about_blank") is True, (
+            f"{browser_dir} khối {idx}: match_about_blank phải là True"
+        )
+        assert block.get("match_origin_as_fallback") is True, (
+            f"{browser_dir} khối {idx}: match_origin_as_fallback phải là True"
+        )
+
