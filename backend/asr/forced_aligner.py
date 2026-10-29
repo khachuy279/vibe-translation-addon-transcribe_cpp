@@ -1504,17 +1504,27 @@ class ForcedAlignerService:
             stats["sentences_out"] = len(out)
         return out
 
+    @property
+    def is_loaded(self) -> bool:
+        """Kiểm tra model aligner đã được nạp trong worker process hay chưa."""
+        try:
+            from backend.asr.crispasr_aligner import CrispASRAlignerClient
+
+            return CrispASRAlignerClient.get_instance().is_loaded
+        except Exception:
+            return False
+
     def unload_model(self) -> None:
         """Giải phóng model aligner (trả VRAM).
 
         Sau Giai đoạn 3 chỉ còn đường GGUF: model nằm trong TIẾN TRÌNH CON của CrispASR. Gọi
-        `free()` để DLL giải phóng context đang cache; muốn trả sạch 100% VRAM thì tắt hẳn worker
-        (`CrispASRAlignerClient.get_instance().shutdown()`).
+        `shutdown()` để tắt hẳn worker (`CrispASRAlignerClient.get_instance().shutdown()`) và
+        thu hồi 100% VRAM về hệ điều hành.
         """
         try:
             from backend.asr.crispasr_aligner import CrispASRAlignerClient
 
-            CrispASRAlignerClient.get_instance().free()
+            CrispASRAlignerClient.get_instance().shutdown()
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Giải phóng aligner lỗi: {exc}", extra={"module_tag": "ASR"})
         self._is_warmed = False

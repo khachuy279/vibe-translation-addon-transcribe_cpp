@@ -367,6 +367,24 @@ const api = typeof browser !== "undefined" ? browser : chrome;
       const note = document.getElementById(id);
       if (note) note.style.display = isPipelineB ? "block" : "none";
     });
+    if (!isCapturingNow) {
+      const activePipelineText = document.getElementById("activePipelineText");
+      const activePipelineBadge = document.getElementById("activePipelineBadge");
+      if (activePipelineText) {
+        activePipelineText.textContent = isPipelineB ? "Pipeline B" : "Pipeline A";
+      }
+      if (activePipelineBadge) {
+        if (isPipelineB) {
+          activePipelineBadge.textContent = "Lookahead";
+          activePipelineBadge.style.background = "rgba(16, 185, 129, 0.15)";
+          activePipelineBadge.style.color = "#047857";
+        } else {
+          activePipelineBadge.textContent = "Realtime";
+          activePipelineBadge.style.background = "rgba(245, 158, 11, 0.15)";
+          activePipelineBadge.style.color = "#b45309";
+        }
+      }
+    }
   }
 
   async function fetchActiveTab() {
@@ -1185,6 +1203,13 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     if (chkEnableTts && chkEnableTts.checked) {
       prewarmTTS();
     }
+    if (chkEnableLookahead) {
+      if (chkEnableLookahead.checked) {
+        prewarmLookahead();
+      } else {
+        unloadLookahead();
+      }
+    }
 
     const tab = await fetchActiveTab();
     if (!tab) return;
@@ -1309,6 +1334,7 @@ const api = typeof browser !== "undefined" ? browser : chrome;
           stability_min_duration_sec: cfg.stabilityMinDurationSec,
           stability_min_words: cfg.stabilityMinWords,
           trace_stability: cfg.traceStability,
+          lookahead_enabled: cfg.lookaheadEnabled,
         }),
       }).catch(() => { });
     };
@@ -1348,6 +1374,14 @@ const api = typeof browser !== "undefined" ? browser : chrome;
   if (chkStableCut) chkStableCut.onchange = () => onSettingChange(true);
   // Công tắc chẩn đoán: bật/tắt phải có hiệu lực NGAY (không debounce).
   if (chkStableTrace) chkStableTrace.onchange = () => onSettingChange(true);
+  function prewarmLookahead() {
+    fetchBackend("/api/lookahead/prewarm", { method: "POST" }).catch(() => { });
+  }
+
+  function unloadLookahead() {
+    fetchBackend("/api/lookahead/unload", { method: "POST" }).catch(() => { });
+  }
+
   // Lookahead Video Buffering
   if (chkEnableLookahead) chkEnableLookahead.onchange = () => {
     if (isCapturingNow) {
@@ -1358,6 +1392,11 @@ const api = typeof browser !== "undefined" ? browser : chrome;
     updatePipelineAOnlyUi();
     updateRangeLabels();
     onSettingChange(true);
+    if (chkEnableLookahead.checked) {
+      prewarmLookahead();
+    } else {
+      unloadLookahead();
+    }
   };
   if (rangeLookaheadSync) rangeLookaheadSync.oninput = () => onSettingChange();
   [rangeStableMs, rangeStableMinSec, rangeStableMinWords].forEach((el) => {

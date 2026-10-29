@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-EXT_DIRS = ("extension_firefox", "extension_chrome_edge")
+EXT_DIRS = tuple(d for d in ("extension_firefox", "extension_chrome_edge") if (ROOT / d).is_dir())
 
 #: Id được phép không xuất hiện trong JS/CSS. Hiện KHÔNG có ngoại lệ nào — thêm vào đây kèm
 #: lý do nếu thật sự cần một id chỉ để neo (anchor) hay cho công cụ ngoài.

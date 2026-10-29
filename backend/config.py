@@ -790,6 +790,8 @@ def load_config() -> AppConfig:
             cfg.tts.speed = float(saved["tts_speed"])
         except (ValueError, TypeError):
             pass
+    if "lookahead_enabled" in saved:
+        cfg.lookahead.enabled = bool(saved["lookahead_enabled"])
     return cfg
 
 

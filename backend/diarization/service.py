@@ -323,7 +323,58 @@ def assign_speakers_to_subtitles(
 
 
 class DiarizationService:
-    """Singleton service điều phối Diarization."""
+    """Singleton service điều phối Diarization (Nemotron-3 Diarization cho Pipeline B)."""
+
+    _is_warmed: bool = False
+
+    @classmethod
+    def is_ready(cls) -> bool:
+        """Kiểm tra runtime audio.cpp và model Nemotron-3 Diarization đã sẵn sàng chưa."""
+        diar_cfg = getattr(config, "diarization", None)
+        if not diar_cfg or not getattr(diar_cfg, "enabled", True):
+            return False
+        cli = _find_audiocpp_cli()
+        model_name = getattr(diar_cfg, "active_model", "nemotron-3-diarization-bf16.gguf")
+        model = _find_model_path(model_name)
+        return bool(cli and model)
+
+    @classmethod
+    def prewarm(cls) -> bool:
+        """Nạp / prewarm Nemotron-3 Diarization khi kích hoạt lại Pipeline B."""
+        try:
+            diar_cfg = getattr(config, "diarization", None)
+            if diar_cfg is not None:
+                diar_cfg.enabled = True
+            cli_ok = ensure_audiocpp_binaries()
+            model_name = getattr(diar_cfg, "active_model", "nemotron-3-diarization-bf16.gguf") if diar_cfg else "nemotron-3-diarization-bf16.gguf"
+            model_ok = ensure_diarization_model(model_name)
+            cls._is_warmed = bool(cli_ok and model_ok)
+            logger.info(
+                f"Nemotron-3-Diarization sẵn sàng cho Pipeline B (cli={cli_ok}, model={model_ok})",
+                extra={"module_tag": _TAG},
+            )
+            return cls._is_warmed
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Prewarm Nemotron-3 Diarization lỗi: {exc}", extra={"module_tag": _TAG})
+            cls._is_warmed = False
+            return False
+
+    @classmethod
+    def unload_model(cls) -> None:
+        """Giải phóng Nemotron-3 Diarization khi chuyển qua Pipeline A."""
+        try:
+            diar_cfg = getattr(config, "diarization", None)
+            if diar_cfg is not None:
+                diar_cfg.enabled = False
+            cls._is_warmed = False
+            import gc
+            gc.collect()
+            logger.info("Đã giải phóng Nemotron-3 Diarization (chuyển sang Pipeline A).", extra={"module_tag": _TAG})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Giải phóng Nemotron-3 Diarization lỗi: {exc}", extra={"module_tag": _TAG})
+
+    load = prewarm
+    unload = unload_model
 
     @classmethod
     async def diarize_chunk(

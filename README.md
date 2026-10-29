@@ -109,49 +109,8 @@ certutil -user -addstore Root backend\cert.pem
 ### 3. Cài Extension trình duyệt
 
 - **Firefox:** Mở `about:debugging` → **Load Temporary Add-on…** → chọn file `extension_firefox/manifest.json`.
-- **Chrome / Edge:** Mở `chrome://extensions` → bật **Developer mode** → **Load unpacked** → chọn thư mục `extension_chrome_edge/`.
-
-> Hai thư mục trên là **output sinh ra tự động** từ `extension_src/`, không phải nơi sửa code.
-> `git clone` đã có sẵn bản dựng nên load trực tiếp được ngay. Nếu bạn **sửa code extension**,
-> sửa trong `extension_src/` rồi chạy `python tools/build_extensions.py`.
 
 Mở video (YouTube, Netflix...) → bấm icon extension → chọn ngôn ngữ → **Bắt đầu dịch**.
-
----
-
-## Phát triển Extension (một nguồn cho hai trình duyệt)
-
-`extension_firefox/` và `extension_chrome_edge/` trước đây là hai bản copy tay song song, và
-đã **lệch nhau thật** (566 KB trùng lặp; `lib/ws-client.js` + `lib/lookahead-client.js` khác nhau
-ở đúng dòng quyết định cách kết nối backend, trong khi test chỉ phủ bản Firefox). Từ nay:
-
-```text
-extension_src/                 # NGUỒN DUY NHẤT — sửa code ở đây
-  ├── manifest.chrome.json     # manifest theo trình duyệt
-  ├── manifest.firefox.json
-  └── lib|content|popup|background|tests|icons/…
-        │
-        │  python tools/build_extensions.py
-        ▼
-extension_firefox/             # OUTPUT SINH RA (không sửa tay)
-extension_chrome_edge/         # OUTPUT SINH RA (không sửa tay)
-```
-
-```powershell
-python tools\build_extensions.py           # sinh / cập nhật 2 bản
-python tools\build_extensions.py --check   # chỉ kiểm tra lệch, không ghi (dùng trong CI)
-```
-
-Hai bản chỉ được phép khác nhau ở **đúng 2 file**, cả hai đều do script sinh:
-
-| File | Vì sao buộc phải khác |
-|---|---|
-| `manifest.json` | Chromium MV3 chỉ cho phép một `background.service_worker`; Firefox MV3 dùng `background.scripts` + gecko id (cả hai đều có `match_origin_as_fallback` + `match_about_blank`) |
-| `lib/browser-config.js` | Cờ `useBridge`: Chromium kill service worker sau ~30s idle ⇒ phải mở WebSocket thẳng; Firefox giữ background script sống ⇒ dùng bridge để vượt CSP/CORS |
-
-Mọi file khác — kể cả `background/service-worker.js` — **giống hệt từng byte**.
-Bất biến này được khoá bằng test: `backend/tests/test_67_extension_single_source.py` và
-`test_59::test_extension_mirrors_stay_in_sync`.
 
 ---
 

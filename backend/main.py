@@ -442,18 +442,64 @@ def session_payload_from_rest(req: "SwitchModelRequest") -> dict:
     return SessionConfigPayload.model_validate(candidate).model_dump(exclude_none=True)
 
 
-def _prewarm_forced_aligner() -> None:
-    """Nạp + pre-warm ForcedAligner (blocking; gọi qua asyncio.to_thread)."""
+def _check_forced_aligner_loaded() -> bool:
+    try:
+        from backend.asr.forced_aligner import ForcedAlignerService
+
+        return bool(ForcedAlignerService.get_instance().is_loaded)
+    except Exception:
+        return False
+
+
+def _prewarm_pipeline_b_models() -> None:
+    """Nạp + prewarm các model chỉ dùng cho Pipeline B (ForcedAligner, Nemotron-3 Diarization)."""
+    # 1. ForcedAligner
     try:
         from backend.asr.forced_aligner import ForcedAlignerService
 
         logger.info(
-            "[STARTUP] Pre-warming ForcedAligner (Qwen3-ForcedAligner-0.6B) cho Lookahead offline_batch...",
+            "[STARTUP] Pre-warming ForcedAligner (Qwen3-ForcedAligner-0.6B) cho Lookahead Pipeline B...",
             extra={"module_tag": "ASR"},
         )
         ForcedAlignerService.get_instance().prewarm()
     except Exception as e:
         logger.warning(f"[STARTUP] Cảnh báo pre-warm ForcedAligner: {e}", exc_info=True, extra={"module_tag": "ASR"})
+
+    # 2. Nemotron-3 Diarization
+    try:
+        from backend.diarization.service import DiarizationService
+
+        logger.info(
+            "[STARTUP] Pre-warming Nemotron-3 Diarization cho Lookahead Pipeline B...",
+            extra={"module_tag": "DIAR"},
+        )
+        DiarizationService.prewarm()
+    except Exception as e:
+        logger.warning(f"[STARTUP] Cảnh báo pre-warm Nemotron-3 Diarization: {e}", exc_info=True, extra={"module_tag": "DIAR"})
+
+
+def _unload_pipeline_b_models() -> None:
+    """Giải phóng các model chỉ dùng cho Pipeline B (ForcedAligner, Nemotron-3 Diarization) khi chuyển qua Pipeline A."""
+    # 1. ForcedAligner
+    try:
+        from backend.asr.forced_aligner import ForcedAlignerService
+
+        ForcedAlignerService.get_instance().unload_model()
+    except Exception as e:
+        logger.warning(f"Cảnh báo unload ForcedAligner: {e}", exc_info=True, extra={"module_tag": "ASR"})
+
+    # 2. Nemotron-3 Diarization
+    try:
+        from backend.diarization.service import DiarizationService
+
+        DiarizationService.unload_model()
+    except Exception as e:
+        logger.warning(f"Cảnh báo unload Nemotron-3 Diarization: {e}", exc_info=True, extra={"module_tag": "DIAR"})
+
+
+def _prewarm_forced_aligner() -> None:
+    """Nạp + pre-warm ForcedAligner (blocking; gọi qua asyncio.to_thread)."""
+    _prewarm_pipeline_b_models()
 
 
 def _prewarm_asr() -> None:
@@ -694,10 +740,9 @@ async def lifespan(app: FastAPI):
         logger.info("[STARTUP] Phát hiện TTS được bật trong popup/cấu hình => pre-warm OmniVoice TTS...", extra={"module_tag": "TTS"})
         prewarm_jobs.append(asyncio.to_thread(_prewarm_tts))
 
-    # Prewarm ForcedAligner nếu Lookahead đang bật (Pipeline B chỉ có chế độ OFFLINE_BATCH, cần
-    # Qwen3-ForcedAligner-0.6B để gắn mốc từng từ).
+    # Prewarm model Pipeline B (ForcedAligner + Nemotron-3 Diarization) nếu Lookahead đang bật.
     if bool(getattr(config.lookahead, "enabled", True)):
-        prewarm_jobs.append(asyncio.to_thread(_prewarm_forced_aligner))
+        prewarm_jobs.append(asyncio.to_thread(_prewarm_pipeline_b_models))
 
     results = await asyncio.gather(*prewarm_jobs, return_exceptions=True)
     for res in results:
@@ -940,6 +985,13 @@ def _build_config_response(include_catalog: bool = True) -> Dict[str, Any]:
             "voices": VoiceManager.get_available_voices(),
             "is_loaded": getattr(get_tts_engine(), "_is_loaded", False),
         },
+        "lookahead_enabled": bool(getattr(config.lookahead, "enabled", True)),
+        "pipeline": "B" if bool(getattr(config.lookahead, "enabled", True)) else "A",
+        "lookahead": {
+            "enabled": bool(getattr(config.lookahead, "enabled", True)),
+            "forced_aligner_loaded": _check_forced_aligner_loaded(),
+            "diarization_enabled": bool(getattr(config.diarization, "enabled", True)),
+        },
     }
 
     if include_catalog:
@@ -1158,12 +1210,18 @@ async def update_backend_config(req: SwitchModelRequest):
         was_enabled = bool(config.lookahead.enabled)
         config.lookahead.enabled = bool(req.lookahead_enabled)
         save_runtime_state({"lookahead_enabled": config.lookahead.enabled})
-        # Bật Lookahead ⇒ đảm bảo ForcedAligner đã được nạp/pre-warm (Pipeline B cần nó để gắn mốc
-        # từng từ). Trước đây việc này gắn với tham số `processing_mode` đã bị xoá.
-        if config.lookahead.enabled and not was_enabled:
+        # Bật Lookahead ⇒ nạp lại các model chỉ dùng cho Pipeline B (ForcedAligner, Nemotron-3 Diarization).
+        # Chuyển qua Pipeline A ⇒ giải phóng/unload các model này để trả VRAM.
+        if config.lookahead.enabled:
+            if not was_enabled:
+                track_background_task(
+                    asyncio.to_thread(_prewarm_pipeline_b_models),
+                    name="pipeline_b_models_prewarm_post_config",
+                )
+        else:
             track_background_task(
-                asyncio.to_thread(_prewarm_forced_aligner),
-                name="forced_aligner_prewarm_post_config",
+                asyncio.to_thread(_unload_pipeline_b_models),
+                name="pipeline_b_models_unload_post_config",
             )
 
     # P1.10: đẩy các thay đổi vào phiên ĐANG CHẠY (trước đây REST chỉ đổi config toàn
@@ -1256,6 +1314,51 @@ async def unload_tts_endpoint():
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"TTS unload thất bại: {exc}", extra={"module_tag": "MAIN"})
     return {"status": "ok", "unloaded": True}
+
+
+@app.post("/api/lookahead/prewarm")
+@app.post("/api/pipeline/b/prewarm")
+async def prewarm_lookahead_endpoint():
+    """Kích hoạt Pipeline B và load/pre-warm các model của Pipeline B (ForcedAligner, Nemotron-3 Diarization)."""
+    config.lookahead.enabled = True
+    save_runtime_state({"lookahead_enabled": True})
+    await asyncio.to_thread(_prewarm_pipeline_b_models)
+    return {"status": "ok", "pipeline": "B", "prewarmed": True}
+
+
+@app.post("/api/lookahead/unload")
+@app.post("/api/pipeline/b/unload")
+async def unload_lookahead_endpoint():
+    """Chuyển qua Pipeline A và unload các model chỉ dùng cho Pipeline B (ForcedAligner, Nemotron-3 Diarization)."""
+    config.lookahead.enabled = False
+    save_runtime_state({"lookahead_enabled": False})
+    await asyncio.to_thread(_unload_pipeline_b_models)
+    return {"status": "ok", "pipeline": "A", "unloaded": True}
+
+
+class SwitchPipelineRequest(BaseModel):
+    pipeline: str  # "A" | "B"
+
+
+@app.post("/api/pipeline/switch")
+async def switch_pipeline_endpoint(req: SwitchPipelineRequest):
+    """Chuyển đổi Pipeline giữa A (Realtime) và B (Lookahead)."""
+    target = req.pipeline.strip().upper()
+    if target == "B":
+        config.lookahead.enabled = True
+        save_runtime_state({"lookahead_enabled": True})
+        await asyncio.to_thread(_prewarm_pipeline_b_models)
+        return {"status": "ok", "pipeline": "B"}
+    elif target == "A":
+        config.lookahead.enabled = False
+        save_runtime_state({"lookahead_enabled": False})
+        await asyncio.to_thread(_unload_pipeline_b_models)
+        return {"status": "ok", "pipeline": "A"}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline không hợp lệ: '{req.pipeline}'. Chỉ hỗ trợ 'A' hoặc 'B'.",
+        )
 
 
 @app.get("/api/metrics")
